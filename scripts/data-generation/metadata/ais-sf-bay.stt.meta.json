@@ -1,0 +1,22 @@
+{
+  "attribution": "",
+  "bounds": {
+    "maxLat": 38.4996,
+    "maxLon": -121.50065,
+    "minLat": 36.50002,
+    "minLon": -123.49992
+  },
+  "compression": "gzip",
+  "description": "",
+  "filename": "ais-sf-bay.stt",
+  "name": "ais-week-sf-bay",
+  "tileCount": 1214277,
+  "timeRange": {
+    "end": 1673135998000,
+    "start": 1672531200000
+  },
+  "zoomLevels": {
+    "max": 14,
+    "min": 0
+  }
+}

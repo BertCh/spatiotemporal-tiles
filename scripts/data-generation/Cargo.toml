@@ -1,0 +1,69 @@
+[package]
+name = "stt-data-scripts"
+description = "Data download and processing scripts for STT examples"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "generate-covid-data"
+path = "src/covid.rs"
+
+[[bin]]
+name = "generate-taxi-data"
+path = "src/taxis.rs"
+
+[[bin]]
+name = "generate-earthquake-data"
+path = "src/earthquakes.rs"
+
+[[bin]]
+name = "generate-hurricane-data"
+path = "src/hurricanes.rs"
+
+[[bin]]
+name = "generate-flight-data"
+path = "src/flights.rs"
+
+[[bin]]
+name = "generate-wildfire-data"
+path = "src/wildfires.rs"
+
+[[bin]]
+name = "generate-ship-data"
+path = "src/ships.rs"
+
+[[bin]]
+name = "generate-ais-data"
+path = "src/ais.rs"
+
+[[bin]]
+name = "generate-bikeshare-data"
+path = "src/bikeshare.rs"
+
+[dependencies]
+stt-core = { path = "../../crates/stt-core" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+geojson.workspace = true
+geo.workspace = true
+geo-types.workspace = true
+reqwest = { version = "0.11", features = ["blocking", "json"] }
+csv = "1.3"
+chrono = { version = "0.4", features = ["serde"] }
+rayon.workspace = true
+clap.workspace = true
+indicatif.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zip = "0.6"
+flate2.workspace = true
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3.10"
+

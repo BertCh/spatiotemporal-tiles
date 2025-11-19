@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test Earthquake Loading</title>
+    <style>
+        body {
+            font-family: monospace;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #00ff00;
+        }
+        pre {
+            background: #000;
+            padding: 10px;
+            border: 1px solid #00ff00;
+            overflow-x: auto;
+        }
+        .success { color: #00ff00; }
+        .error { color: #ff0000; }
+        .info { color: #00aaff; }
+    </style>
+</head>
+<body>
+    <h1>Earthquake Tile Loading Test</h1>
+    <pre id="output">Loading...</pre>
+
+    <script type="module">
+        const output = document.getElementById('output');
+        let log = '';
+        
+        function addLog(msg, type = 'info') {
+            const prefix = type === 'success' ? '✓' : type === 'error' ? '✗' : '•';
+            log += `<span class="${type}">${prefix} ${msg}</span>\n`;
+            output.innerHTML = log;
+            console.log(msg);
+        }
+
+        async function test() {
+            try {
+                addLog('=== Testing Earthquake Tile Loading ===\n', 'info');
+                
+                // Import STTArchive
+                addLog('Importing STTArchive...', 'info');
+                const { STTArchive } = await import('/packages/core/dist/index.js');
+                addLog('STTArchive imported successfully', 'success');
+                
+                // Create archive
+                const archivePath = 'examples/showcase/public/data/earthquakes.stt';
+                addLog(`Creating archive from: ${archivePath}`, 'info');
+                const archive = new STTArchive(archivePath);
+                
+                // Get metadata
+                addLog('Fetching metadata...', 'info');
+                const metadata = await archive.getMetadata();
+                addLog(`Metadata loaded:`, 'success');
+                addLog(`  Version: ${metadata.version}`, 'info');
+                addLog(`  Zoom levels: ${metadata.minZoom} to ${metadata.maxZoom}`, 'info');
+                addLog(`  Time range: ${new Date(metadata.timeRange.start).toISOString().substring(0,10)} to ${new Date(metadata.timeRange.end).toISOString().substring(0,10)}`, 'info');
+                addLog('', 'info');
+                
+                // Get index
+                addLog('Fetching index...', 'info');
+                const index = await archive.getIndex();
+                addLog(`Index loaded: ${index.tiles.length} tile entries`, 'success');
+                
+                // Show zoom levels
+                const zoomLevels = new Set(index.tiles.map(t => t.zoom));
+                addLog(`Available zoom levels: ${Array.from(zoomLevels).sort((a,b) => a-b).join(', ')}`, 'info');
+                addLog('', 'info');
+                
+                // Test query
+                const testTime = Date.parse('2020-01-01');
+                const testZoom = 2;
+                const testBounds = {
+                    minLon: -180,
+                    minLat: -90,
+                    maxLon: 180,
+                    maxLat: 90,
+                };
+                // Use large time window (400 days)
+                const timeWindow = 400 * 86400000;
+                const testTimeRange = {
+                    start: testTime - timeWindow / 2,
+                    end: testTime + timeWindow / 2,
+                };
+                
+                addLog(`Testing tile query:`, 'info');
+                addLog(`  Zoom: ${testZoom}`, 'info');
+                addLog(`  Time: ${new Date(testTime).toISOString().substring(0,10)}`, 'info');
+                addLog(`  Time window: ${timeWindow / 86400000} days`, 'info');
+                addLog('', 'info');
+                
+                addLog('Querying tiles...', 'info');
+                const tiles = await archive.getTilesInBounds(testBounds, testZoom, testTimeRange);
+                
+                if (tiles.length > 0) {
+                    addLog(`SUCCESS: Loaded ${tiles.length} tiles!`, 'success');
+                    addLog('', 'info');
+                    
+                    // Count features
+                    let totalFeatures = 0;
+                    for (const tile of tiles) {
+                        for (const layer of tile.layers) {
+                            totalFeatures += layer.features.length;
+                        }
+                    }
+                    addLog(`Total features: ${totalFeatures}`, 'success');
+                    
+                    // Show first tile info
+                    if (tiles[0]) {
+                        const tile = tiles[0];
+                        addLog('', 'info');
+                        addLog('First tile details:', 'info');
+                        addLog(`  ID: z=${tile.id.z} x=${tile.id.x} y=${tile.id.y} t=${new Date(tile.id.t).toISOString().substring(0,10)}`, 'info');
+                        addLog(`  Time range: ${new Date(tile.timeRange.start).toISOString().substring(0,10)} to ${new Date(tile.timeRange.end).toISOString().substring(0,10)}`, 'info');
+                        addLog(`  Layers: ${tile.layers.length}`, 'info');
+                        if (tile.layers[0]) {
+                            addLog(`  Features in first layer: ${tile.layers[0].features.length}`, 'info');
+                            if (tile.layers[0].features[0]) {
+                                addLog(`  First feature properties: ${JSON.stringify(tile.layers[0].features[0].properties)}`, 'info');
+                            }
+                        }
+                    }
+                } else {
+                    addLog('FAILURE: No tiles loaded!', 'error');
+                    addLog('Check browser console for detailed logs', 'error');
+                }
+                
+            } catch (error) {
+                addLog(`ERROR: ${error.message}`, 'error');
+                addLog(error.stack, 'error');
+            }
+        }
+        
+        test();
+    </script>
+</body>
+</html>
+

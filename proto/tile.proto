@@ -1,0 +1,148 @@
+syntax = "proto3";
+
+package stt;
+
+// Main tile message containing all feature data for a spatiotemporal tile
+message Tile {
+  // Format version for backward compatibility
+  uint32 version = 1;
+  
+  // Temporal bounds of this tile (Unix timestamp in milliseconds)
+  uint64 time_start = 2;
+  uint64 time_end = 3;
+  
+  // Feature layers (e.g., "roads", "buildings", "points")
+  repeated Layer layers = 4;
+  
+  // Hints for temporal interpolation
+  Interpolation interpolation = 5;
+  
+  // Temporal resolution metadata for this tile
+  TemporalResolution temporal_resolution = 6;
+}
+
+// A layer represents a collection of features with the same schema
+message Layer {
+  // Layer name
+  string name = 1;
+  
+  // Coordinate extent (typically 4096 for MVT compatibility)
+  uint32 extent = 2;
+  
+  // Shared key-value dictionary for properties
+  repeated string keys = 3;
+  repeated Value values = 4;
+  
+  // Features in this layer (snapshot-based)
+  repeated Feature features = 5;
+
+  // Trajectories in this layer (continuous path-based)
+  repeated Trajectory trajectories = 6;
+}
+
+// Individual feature with geometry and properties
+message Feature {
+  // Unique feature identifier
+  uint64 id = 1;
+  
+  // Geometry type
+  enum GeomType {
+    POINT = 0;
+    LINESTRING = 1;
+    POLYGON = 2;
+  }
+  GeomType type = 2;
+  
+  // Delta-encoded geometry (compatible with Mapbox Vector Tiles)
+  // Encoded as sequence of commands (MoveTo, LineTo, ClosePath)
+  // followed by zig-zag encoded coordinate deltas
+  repeated uint32 geometry = 3 [packed = true];
+  
+  // Properties as indices into Layer.keys and Layer.values
+  // Encoded as: [key_idx, value_idx, key_idx, value_idx, ...]
+  repeated uint32 tags = 4 [packed = true];
+  
+  // Optional: temporal validity range for this feature
+  // If not specified, feature is valid for entire tile time range
+  uint64 valid_from = 5;
+  uint64 valid_to = 6;
+  
+  // Change tracking for delta encoding between temporal frames
+  // Used for optimization: skip unchanged features
+  uint64 previous_hash = 7;
+  
+  enum ChangeType {
+    UNCHANGED = 0;  // No change from previous frame
+    CREATED = 1;    // New feature
+    MODIFIED = 2;   // Geometry or properties changed
+    DELETED = 3;    // Feature no longer exists
+  }
+  ChangeType change = 8;
+}
+
+// Moving feature optimized for continuous paths
+message Trajectory {
+  uint64 id = 1;
+  
+  // Columnar data for efficient compression
+  // Time deltas (ms) from tile start
+  repeated uint32 time_offsets = 2 [packed = true];
+  
+  // Spatial deltas (zig-zag encoded)
+  // [x0, y0, dx1, dy1, dx2, dy2...]
+  repeated sint32 coordinates = 3 [packed = true];
+  
+  // Properties (same as Feature)
+  // Encoded as: [key_idx, value_idx, key_idx, value_idx, ...]
+  repeated uint32 tags = 4 [packed = true];
+  
+  // Validity range (if different from min/max of time_offsets)
+  uint64 valid_from = 5;
+  uint64 valid_to = 6;
+}
+
+// Property value (can be string, number, or boolean)
+message Value {
+  oneof value_type {
+    string string_value = 1;
+    double double_value = 2;
+    float float_value = 3;
+    int64 int_value = 4;
+    uint64 uint_value = 5;
+    sint64 sint_value = 6;
+    bool bool_value = 7;
+  }
+}
+
+// Interpolation hints for smooth temporal transitions
+message Interpolation {
+  enum Method {
+    NONE = 0;    // No interpolation (step function)
+    LINEAR = 1;  // Linear interpolation
+    STEP = 2;    // Hold previous value (step function)
+    CUBIC = 3;   // Cubic spline interpolation
+  }
+  Method method = 1;
+  
+  // Property names that support interpolation
+  // Only numeric properties can be interpolated
+  repeated string properties = 2;
+}
+
+// Temporal resolution metadata - tells frontend how to handle animation
+message TemporalResolution {
+  // Temporal bucket size in milliseconds
+  // 0 = exact timestamps, no bucketing
+  uint64 bucket_size_ms = 1;
+  
+  // Zoom level of this tile
+  uint32 zoom_level = 2;
+  
+  // Number of features in this tile
+  uint32 feature_count = 3;
+  
+  // Suggested animation speed multiplier
+  // Frontend should adjust playback speed based on temporal resolution
+  // 1.0 = normal, > 1.0 = faster, < 1.0 = slower
+  float suggested_speed_multiplier = 4;
+}

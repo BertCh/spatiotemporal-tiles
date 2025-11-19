@@ -1,0 +1,47 @@
+[package]
+name = "stt-core"
+description = "Core library for spatiotemporal tile format"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+geo.workspace = true
+geo-types.workspace = true
+flate2.workspace = true
+hilbert_2d.workspace = true
+byteorder.workspace = true
+memmap2.workspace = true
+tracing.workspace = true
+wkt.workspace = true
+chrono.workspace = true
+blake3.workspace = true
+
+# Optional advanced projection support (requires system libproj)
+proj = { version = "0.27", optional = true }
+
+[features]
+# Enable advanced projection support with proj
+# Requires system libproj to be installed
+projection = ["proj"]
+
+[build-dependencies]
+prost-build = "0.12"
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile = "3.10"
+
+# Benchmarks will be added later
+# [[bench]]
+# name = "encoding"
+# harness = false
+

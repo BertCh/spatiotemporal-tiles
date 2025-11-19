@@ -1,0 +1,20 @@
+[package]
+name = "stt-tile"
+description = "CLI tool for streaming tile generation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "stt-tile"
+path = "src/main.rs"
+
+[dependencies]
+stt-core = { path = "../stt-core" }
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+

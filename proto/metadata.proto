@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package stt;
+
+// Archive metadata (stored as JSON in the archive for easy inspection)
+message Metadata {
+  // Format version
+  uint32 version = 1;
+  
+  // Human-readable information
+  string name = 2;
+  string description = 3;
+  string attribution = 4;
+  
+  // Spatial bounds (WGS84)
+  BoundingBox bounds = 5;
+  
+  // Temporal bounds
+  TimeRange time_range = 6;
+  
+  // Zoom levels available
+  uint32 min_zoom = 7;
+  uint32 max_zoom = 8;
+  
+  // Layers present in the tiles
+  repeated LayerInfo layers = 9;
+  
+  // Generation metadata
+  GenerationInfo generation = 10;
+  
+  // Statistics
+  Statistics stats = 11;
+}
+
+message BoundingBox {
+  double min_lon = 1;
+  double min_lat = 2;
+  double max_lon = 3;
+  double max_lat = 4;
+}
+
+message TimeRange {
+  uint64 start = 1;  // Unix timestamp (ms)
+  uint64 end = 2;    // Unix timestamp (ms)
+  
+  // Time interval between frames (for regular time series)
+  uint64 interval = 3;  // milliseconds
+}
+
+message LayerInfo {
+  string name = 1;
+  string description = 2;
+  
+  // Property schema
+  repeated PropertyInfo properties = 3;
+  
+  // Geometry types present
+  repeated string geometry_types = 4;
+}
+
+message PropertyInfo {
+  string name = 1;
+  string type = 2;  // "string", "number", "boolean"
+  string description = 3;
+  
+  // For numeric properties
+  double min_value = 4;
+  double max_value = 5;
+}
+
+message GenerationInfo {
+  string tool = 1;           // e.g., "stt-build"
+  string version = 2;        // Tool version
+  uint64 timestamp = 3;      // Generation timestamp
+  string source = 4;         // Original data source
+  repeated string args = 5;  // Command-line arguments used
+}
+
+message Statistics {
+  uint64 total_tiles = 1;
+  uint64 total_features = 2;
+  uint64 total_size = 3;           // Bytes
+  uint64 uncompressed_size = 4;    // Bytes
+  double compression_ratio = 5;
+  
+  // Per-zoom statistics
+  repeated ZoomStats zoom_stats = 6;
+}
+
+message ZoomStats {
+  uint32 zoom = 1;
+  uint64 tile_count = 2;
+  uint64 feature_count = 3;
+  uint64 total_size = 4;
+  double avg_tile_size = 5;
+  double avg_features_per_tile = 6;
+}
+
