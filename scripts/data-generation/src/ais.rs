@@ -1,20 +1,19 @@
 //! Process real AIS data from NOAA Marine Cadastre
 //!
-//! Downloads and converts USCG Marine Cadastre AIS data to GeoJSON
+//! Downloads and converts USCG Marine Cadastre AIS data to CSV or GeoJSON
 //! Source: https://coast.noaa.gov/htdata/CMSP/AISDataHandler
 
 mod common;
 
 use anyhow::{Context, Result};
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::NaiveDateTime;
 use clap::Parser;
 use csv::ReaderBuilder;
-use geojson::{Feature, Geometry, Value as GeoValue};
 use serde::Deserialize;
 use serde_json::{json, Map};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::BufReader;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -25,8 +24,8 @@ struct Args {
     #[arg(short, long)]
     input: PathBuf,
 
-    /// Output GeoJSON file
-    #[arg(short, long, default_value = "ais-traffic.geojson")]
+    /// Output file (use .csv for streaming output, .geojson for JSON)
+    #[arg(short, long, default_value = "ais-traffic.csv")]
     output: PathBuf,
 
     /// Sampling interval in minutes (default: 10 = keep 1 position per vessel per 10 min)
@@ -95,6 +94,11 @@ fn main() -> Result<()> {
         println!("📍 Geographic filter: {}", bounds_str);
     }
 
+    let use_csv = common::is_csv_output(&args.output);
+    if use_csv {
+        println!("📄 Using streaming CSV output (memory-efficient)");
+    }
+
     println!();
 
     // Parse bounds if provided
@@ -109,19 +113,43 @@ fn main() -> Result<()> {
     let mut csv_reader = ReaderBuilder::new().has_headers(true).from_reader(reader);
 
     let mut vessel_last_time: HashMap<String, i64> = HashMap::new();
-    let mut features = Vec::new();
     let mut total_records = 0;
     let mut filtered_records = 0;
     let mut unique_vessels = std::collections::HashSet::new();
+
+    // Property columns for CSV output
+    let property_columns = vec![
+        "mmsi".to_string(),
+        "vessel_type".to_string(),
+        "speed".to_string(),
+        "course".to_string(),
+        "heading".to_string(),
+        "vessel_name".to_string(),
+        "length".to_string(),
+        "width".to_string(),
+    ];
+
+    // Choose output mode
+    let mut csv_writer = if use_csv {
+        Some(common::StreamingCsvWriter::new(&args.output, property_columns)?)
+    } else {
+        None
+    };
+    let mut features = if use_csv { Vec::new() } else { Vec::new() };
 
     for result in csv_reader.deserialize() {
         total_records += 1;
 
         if total_records % 100000 == 0 {
+            let count = if use_csv {
+                csv_writer.as_ref().map(|w| w.row_count()).unwrap_or(0)
+            } else {
+                features.len()
+            };
             println!(
                 "  Processed {} records, kept {} features, {} unique vessels...",
                 total_records,
-                features.len(),
+                count,
                 unique_vessels.len()
             );
         }
@@ -173,35 +201,31 @@ fn main() -> Result<()> {
         // Parse timestamp
         let timestamp =
             match NaiveDateTime::parse_from_str(&record.base_date_time, "%Y-%m-%dT%H:%M:%S") {
-                Ok(dt) => dt.and_utc().timestamp_millis(),
+                Ok(dt) => dt.and_utc(),
                 Err(_) => continue,
             };
+        let timestamp_ms = timestamp.timestamp_millis();
 
         // Apply temporal sampling
         let sample_interval_ms = args.sample_minutes * 60 * 1000;
         if let Some(&last_time) = vessel_last_time.get(&record.mmsi) {
-            if timestamp - last_time < sample_interval_ms {
+            if timestamp_ms - last_time < sample_interval_ms {
                 continue;
             }
         }
-        vessel_last_time.insert(record.mmsi.clone(), timestamp);
+        vessel_last_time.insert(record.mmsi.clone(), timestamp_ms);
         unique_vessels.insert(record.mmsi.clone());
 
         // Convert vessel type code to category
         let vessel_category = vessel_type_to_category(record.vessel_type);
 
-        // Create GeoJSON feature
+        // Build properties
         let mut properties = Map::new();
         properties.insert("mmsi".to_string(), json!(record.mmsi));
-        properties.insert(
-            "timestamp".to_string(),
-            json!(format!("{}Z", record.base_date_time)),
-        ); // Add Z for UTC
         properties.insert("vessel_type".to_string(), json!(vessel_category));
 
         if let Some(sog) = record.sog {
             if sog >= 0.0 && sog < 100.0 {
-                // Filter invalid speeds
                 properties.insert("speed".to_string(), json!(sog));
             }
         }
@@ -220,7 +244,7 @@ fn main() -> Result<()> {
 
         if let Some(ref name) = record.vessel_name {
             if !name.is_empty() && name != "Unknown" {
-                properties.insert("vessel_name".to_string(), json!(name));
+                properties.insert("vessel_name".to_string(), json!(name.clone()));
             }
         }
 
@@ -236,24 +260,42 @@ fn main() -> Result<()> {
             }
         }
 
-        let feature = Feature {
-            geometry: Some(Geometry::new(GeoValue::Point(vec![record.lon, record.lat]))),
-            properties: Some(properties),
-            ..Default::default()
-        };
-
-        features.push(feature);
+        if use_csv {
+            csv_writer.as_mut().unwrap().write_point(
+                record.lon,
+                record.lat,
+                timestamp,
+                &properties,
+            )?;
+        } else {
+            use geojson::{Feature, Geometry, Value as GeoValue};
+            let feature = Feature {
+                geometry: Some(Geometry::new(GeoValue::Point(vec![record.lon, record.lat]))),
+                properties: Some(properties),
+                ..Default::default()
+            };
+            features.push(feature);
+        }
     }
+
+    let final_count = if use_csv {
+        let writer = csv_writer.take().unwrap();
+        writer.finish()?
+    } else {
+        features.len()
+    };
 
     println!("\n📊 Processing Summary:");
     println!("  Total records read: {}", total_records);
     println!("  Geographic filter: {} records removed", filtered_records);
-    println!("  Final features: {}", features.len());
+    println!("  Final features: {}", final_count);
     println!("  Unique vessels: {}", unique_vessels.len());
 
-    // Write GeoJSON
-    println!("\n💾 Writing GeoJSON...");
-    common::write_geojson(features, &args.output)?;
+    // Write GeoJSON if not using CSV
+    if !use_csv {
+        println!("\n💾 Writing GeoJSON...");
+        common::write_geojson(features, &args.output)?;
+    }
 
     println!("\n✅ Success! Now run:");
     println!(

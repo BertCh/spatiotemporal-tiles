@@ -7,7 +7,6 @@ mod common;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use geojson::Feature;
 use serde::Deserialize;
 use serde_json::{json, Map};
 use std::path::PathBuf;
@@ -16,8 +15,8 @@ use std::path::PathBuf;
 #[command(name = "generate-earthquake-data")]
 #[command(about = "Generate earthquake data from USGS")]
 struct Args {
-    /// Output GeoJSON file
-    #[arg(short, long, default_value = "earthquakes.geojson")]
+    /// Output file (use .csv for streaming output, .geojson for JSON)
+    #[arg(short, long, default_value = "earthquakes.csv")]
     output: PathBuf,
 
     /// Start date (YYYY-MM-DD)
@@ -72,39 +71,83 @@ fn main() -> Result<()> {
     println!("  Date range: {} to {}", args.start_date, args.end_date);
     println!("  Min magnitude: {}", args.min_magnitude);
 
-    let mut all_features = Vec::new();
+    let use_csv = common::is_csv_output(&args.output);
+    if use_csv {
+        println!("📄 Using streaming CSV output (memory-efficient)");
+    }
 
     // USGS API has a limit, so we fetch in yearly chunks
     let start_year = args.start_date[..4].parse::<i32>()?;
     let end_year = args.end_date[..4].parse::<i32>()?;
 
-    for year in start_year..=end_year {
-        let year_start = format!("{}-01-01", year);
-        let year_end = format!("{}-12-31", year);
+    let property_columns = vec![
+        "magnitude".to_string(),
+        "place".to_string(),
+        "depth".to_string(),
+        "type".to_string(),
+        "title".to_string(),
+        "value".to_string(),
+    ];
 
-        println!("\n📅 Fetching data for {}...", year);
+    if use_csv {
+        // Streaming CSV mode
+        let mut csv_writer = common::StreamingCsvWriter::new(&args.output, property_columns)?;
 
-        let url = format!(
-            "https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&starttime={}&endtime={}&minmagnitude={}",
-            year_start, year_end, args.min_magnitude
-        );
+        for year in start_year..=end_year {
+            let year_start = format!("{}-01-01", year);
+            let year_end = format!("{}-12-31", year);
 
-        let response = reqwest::blocking::get(&url)?;
-        let data: UsgsResponse = response.json()?;
+            println!("\n📅 Fetching data for {}...", year);
 
-        println!("  ✓ Fetched {} earthquakes", data.features.len());
+            let url = format!(
+                "https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&starttime={}&endtime={}&minmagnitude={}",
+                year_start, year_end, args.min_magnitude
+            );
 
-        for usgs_feature in data.features {
-            let feature = convert_usgs_feature(usgs_feature)?;
-            all_features.push(feature);
+            let response = reqwest::blocking::get(&url)?;
+            let data: UsgsResponse = response.json()?;
+
+            println!("  ✓ Fetched {} earthquakes", data.features.len());
+
+            for usgs_feature in data.features {
+                let (lon, lat, timestamp, properties) = extract_usgs_data(usgs_feature)?;
+                csv_writer.write_point(lon, lat, timestamp, &properties)?;
+            }
         }
+
+        let row_count = csv_writer.finish()?;
+        println!("\n📊 Total earthquakes: {}", row_count);
+    } else {
+        // GeoJSON mode
+        let mut all_features = Vec::new();
+
+        for year in start_year..=end_year {
+            let year_start = format!("{}-01-01", year);
+            let year_end = format!("{}-12-31", year);
+
+            println!("\n📅 Fetching data for {}...", year);
+
+            let url = format!(
+                "https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&starttime={}&endtime={}&minmagnitude={}",
+                year_start, year_end, args.min_magnitude
+            );
+
+            let response = reqwest::blocking::get(&url)?;
+            let data: UsgsResponse = response.json()?;
+
+            println!("  ✓ Fetched {} earthquakes", data.features.len());
+
+            for usgs_feature in data.features {
+                let (lon, lat, timestamp, properties) = extract_usgs_data(usgs_feature)?;
+                let feature = common::create_point_feature(lon, lat, timestamp, properties);
+                all_features.push(feature);
+            }
+        }
+
+        println!("\n📊 Total earthquakes: {}", all_features.len());
+        println!("\n💾 Writing output...");
+        common::write_geojson(all_features, &args.output)?;
     }
-
-    println!("\n📊 Total earthquakes: {}", all_features.len());
-
-    // Write GeoJSON
-    println!("\n💾 Writing output...");
-    common::write_geojson(all_features, &args.output)?;
 
     println!("\n✅ Success! Now run:");
     println!(
@@ -119,7 +162,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn convert_usgs_feature(usgs: UsgsFeature) -> Result<Feature> {
+/// Extract data from a USGS feature for writing
+fn extract_usgs_data(usgs: UsgsFeature) -> Result<(f64, f64, DateTime<Utc>, Map<String, serde_json::Value>)> {
     let lon = usgs.geometry.coordinates[0];
     let lat = usgs.geometry.coordinates[1];
     let depth = usgs.geometry.coordinates.get(2).copied().unwrap_or(0.0);
@@ -136,7 +180,5 @@ fn convert_usgs_feature(usgs: UsgsFeature) -> Result<Feature> {
     properties.insert("title".to_string(), json!(usgs.properties.title));
     properties.insert("value".to_string(), json!(usgs.properties.mag)); // For visualization
 
-    Ok(common::create_point_feature(
-        lon, lat, timestamp, properties,
-    ))
+    Ok((lon, lat, timestamp, properties))
 }

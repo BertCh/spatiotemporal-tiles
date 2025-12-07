@@ -5,10 +5,9 @@
 mod common;
 
 use anyhow::Result;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use clap::Parser;
 use csv::ReaderBuilder;
-use geojson::Feature;
 use serde::Deserialize;
 use serde_json::{json, Map};
 use std::collections::HashMap;
@@ -19,8 +18,8 @@ use std::path::PathBuf;
 #[command(name = "generate-covid-data")]
 #[command(about = "Generate COVID-19 case data for STT showcase")]
 struct Args {
-    /// Output GeoJSON file
-    #[arg(short, long, default_value = "covid-cases.geojson")]
+    /// Output file (use .csv for streaming output, .geojson for JSON)
+    #[arg(short, long, default_value = "covid-cases.csv")]
     output: PathBuf,
 
     /// Use cached data (skip download)
@@ -54,6 +53,11 @@ fn main() -> Result<()> {
     println!("🦠 COVID-19 Data Generator");
     println!("=============================\n");
 
+    let use_csv = common::is_csv_output(&args.output);
+    if use_csv {
+        println!("📄 Using streaming CSV output (memory-efficient)");
+    }
+
     // Download COVID data
     let covid_csv = PathBuf::from("data/us-counties.csv");
     if !args.cached {
@@ -79,12 +83,8 @@ fn main() -> Result<()> {
 
     // Process COVID data
     println!("\n📊 Processing COVID-19 case data...");
-    let features = process_covid_data(&covid_csv, &coords)?;
-    println!("✓ Generated {} features", features.len());
-
-    // Write GeoJSON
-    println!("\n💾 Writing output...");
-    common::write_geojson(features, &args.output)?;
+    let count = process_covid_data(&covid_csv, &coords, &args.output, use_csv)?;
+    println!("✓ Generated {} features", count);
 
     println!("\n✅ Success! Now run:");
     println!(
@@ -115,10 +115,26 @@ fn load_county_coordinates(path: &PathBuf) -> Result<HashMap<String, CountyLocat
 fn process_covid_data(
     covid_path: &PathBuf,
     coords: &HashMap<String, CountyLocation>,
-) -> Result<Vec<Feature>> {
+    output_path: &PathBuf,
+    use_csv: bool,
+) -> Result<usize> {
     let file = File::open(covid_path)?;
     let mut rdr = ReaderBuilder::new().from_reader(file);
 
+    let property_columns = vec![
+        "county".to_string(),
+        "state".to_string(),
+        "fips".to_string(),
+        "cases".to_string(),
+        "deaths".to_string(),
+        "value".to_string(),
+    ];
+
+    let mut csv_writer = if use_csv {
+        Some(common::StreamingCsvWriter::new(output_path, property_columns)?)
+    } else {
+        None
+    };
     let mut features = Vec::new();
     let mut processed = 0;
 
@@ -141,10 +157,19 @@ fn process_covid_data(
             properties.insert("deaths".to_string(), json!(deaths));
             properties.insert("value".to_string(), json!(cases)); // For visualization
 
-            let feature =
-                common::create_point_feature(location.lon, location.lat, timestamp, properties);
+            if use_csv {
+                csv_writer.as_mut().unwrap().write_point(
+                    location.lon,
+                    location.lat,
+                    timestamp,
+                    &properties,
+                )?;
+            } else {
+                let feature =
+                    common::create_point_feature(location.lon, location.lat, timestamp, properties);
+                features.push(feature);
+            }
 
-            features.push(feature);
             processed += 1;
 
             if processed % 10000 == 0 {
@@ -153,7 +178,14 @@ fn process_covid_data(
         }
     }
 
-    Ok(features)
+    if use_csv {
+        csv_writer.take().unwrap().finish()?;
+        Ok(processed)
+    } else {
+        println!("\n💾 Writing output...");
+        common::write_geojson(features, output_path)?;
+        Ok(processed)
+    }
 }
 
 fn generate_county_coordinates(path: &PathBuf) -> Result<()> {
