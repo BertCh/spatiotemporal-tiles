@@ -38,10 +38,10 @@ impl TileId {
         let n = 1u32 << self.z;
         let x_norm = self.x as f64 / n as f64;
         let y_norm = self.y as f64 / n as f64;
-        
+
         // Use continuous hilbert function
         let h = hilbert_2d::xy2h_continuous_f64(x_norm, y_norm, hilbert_2d::Variant::Hilbert);
-        
+
         // Convert to u64 index
         (h * u64::MAX as f64) as u64
     }
@@ -108,8 +108,6 @@ pub struct Layer {
     pub name: String,
     pub extent: u32,
     pub features: Vec<Feature>,
-    /// Trajectories for moving objects
-    pub trajectories: Vec<Trajectory>,
 }
 
 /// A feature within a layer
@@ -117,23 +115,16 @@ pub struct Layer {
 pub struct Feature {
     pub id: u64,
     pub geometry_type: GeometryType,
-    pub geometry: Vec<u32>,
+    pub positions: Vec<Position>,
     pub properties: std::collections::HashMap<String, Value>,
     pub time_range: Option<TimeRange>,
 }
 
-/// A trajectory for a moving object
-#[derive(Debug, Clone)]
-pub struct Trajectory {
-    pub id: u64,
-    /// Time offsets in milliseconds from tile start
-    pub time_offsets: Vec<u32>,
-    /// Coordinates (x, y pairs) relative to tile origin
-    /// Usually decoded from zigzag encoded deltas
-    pub coordinates: Vec<i32>,
-    pub properties: std::collections::HashMap<String, Value>,
-    pub valid_from: Option<u64>,
-    pub valid_to: Option<u64>,
+/// Absolute geographic position
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Position {
+    pub lon: f64,
+    pub lat: f64,
 }
 
 /// Property value

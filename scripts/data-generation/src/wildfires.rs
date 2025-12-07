@@ -42,8 +42,10 @@ fn main() -> Result<()> {
     println!("⚠️  Note: Using synthetic data based on CA fire patterns");
     println!();
 
-    println!("📊 Generating {} fires from {} to {}...", 
-             args.num_fires, args.start_year, args.end_year);
+    println!(
+        "📊 Generating {} fires from {} to {}...",
+        args.num_fires, args.start_year, args.end_year
+    );
 
     let features = generate_wildfire_data(args.start_year, args.end_year, args.num_fires)?;
 
@@ -51,7 +53,10 @@ fn main() -> Result<()> {
     common::write_geojson(features, &args.output)?;
 
     println!("\n✅ Success! Now run:");
-    println!("   stt-build --input {} --output wildfires.stt \\", args.output.display());
+    println!(
+        "   stt-build --input {} --output wildfires.stt \\",
+        args.output.display()
+    );
     println!("             --time-field timestamp \\");
     println!("             --temporal-bucket day \\");
     println!("             --min-zoom 5 \\");
@@ -62,7 +67,11 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn generate_wildfire_data(start_year: u32, end_year: u32, num_fires: usize) -> Result<Vec<Feature>> {
+fn generate_wildfire_data(
+    start_year: u32,
+    end_year: u32,
+    num_fires: usize,
+) -> Result<Vec<Feature>> {
     let mut rng = rand::thread_rng();
     let mut features = Vec::new();
 
@@ -79,7 +88,7 @@ fn generate_wildfire_data(start_year: u32, end_year: u32, num_fires: usize) -> R
         let year = rng.gen_range(start_year..=end_year);
         let month = rng.gen_range(5..=10);
         let day = rng.gen_range(1..28);
-        
+
         let start_date = NaiveDate::from_ymd_opt(year as i32, month, day)
             .ok_or_else(|| anyhow::anyhow!("Invalid date"))?;
         let start_time = common::date_to_datetime(start_date);
@@ -120,11 +129,14 @@ fn generate_wildfire_data(start_year: u32, end_year: u32, num_fires: usize) -> R
             properties.insert("day".to_string(), json!(day));
             properties.insert("acres".to_string(), json!((radius * 100000.0) as u32));
             properties.insert("severity".to_string(), json!(severity));
-            properties.insert("containment".to_string(), json!(if day > duration_days / 2 { 
-                (day - duration_days / 2) * 100 / (duration_days / 2)
-            } else { 
-                0 
-            }));
+            properties.insert(
+                "containment".to_string(),
+                json!(if day > duration_days / 2 {
+                    (day - duration_days / 2) * 100 / (duration_days / 2)
+                } else {
+                    0
+                }),
+            );
 
             // Create point (in production, would be polygon perimeter)
             let feature = common::create_point_feature(base_lon, base_lat, timestamp, properties);
@@ -138,4 +150,3 @@ fn generate_wildfire_data(start_year: u32, end_year: u32, num_fires: usize) -> R
 
     Ok(features)
 }
-

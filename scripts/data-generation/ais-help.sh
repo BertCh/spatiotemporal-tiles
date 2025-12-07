@@ -25,7 +25,6 @@ echo "   ../../target/release/stt-build \\"
 echo "     --input data/output.geojson \\"
 echo "     --output ../../examples/showcase/public/data/output.stt \\"
 echo "     --time-field timestamp \\"
-echo "     --temporal-resolution high-frequency \\"
 echo "     --min-zoom 0 \\"
 echo "     --max-zoom 14 \\"
 echo "     --compression gzip"
@@ -58,7 +57,3 @@ echo "  • Full guide: AIS_DATA_GENERATION_SUMMARY.md"
 echo "  • Data source info: data/marineCadastre/README.md"
 echo "  • Main docs: ../../README.md"
 echo ""
-
-
-
-

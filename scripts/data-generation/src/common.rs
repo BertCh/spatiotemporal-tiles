@@ -14,12 +14,12 @@ pub fn download_file(url: &str, output_path: &Path) -> Result<()> {
     use std::io::copy;
 
     println!("Downloading: {}", url);
-    
+
     // Ensure parent directory exists
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     let response = reqwest::blocking::get(url)?;
     let total_size = response.content_length().unwrap_or(0);
 
@@ -125,10 +125,7 @@ pub fn parse_date(date_str: &str) -> Result<NaiveDate> {
 
 /// Convert NaiveDate to DateTime<Utc>
 pub fn date_to_datetime(date: NaiveDate) -> DateTime<Utc> {
-    DateTime::from_naive_utc_and_offset(
-        date.and_hms_opt(0, 0, 0).unwrap(),
-        Utc,
-    )
+    DateTime::from_naive_utc_and_offset(date.and_hms_opt(0, 0, 0).unwrap(), Utc)
 }
 
 /// Unzip a file
@@ -157,4 +154,3 @@ pub fn unzip_file(zip_path: &Path, output_dir: &Path) -> Result<()> {
 
     Ok(())
 }
-

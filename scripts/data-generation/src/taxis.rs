@@ -99,18 +99,18 @@ fn main() -> Result<()> {
             properties.insert("status".to_string(), json!(taxi.status.to_string()));
             properties.insert("speed".to_string(), json!(taxi.speed));
 
-            let feature = common::create_point_feature(
-                taxi.lon,
-                taxi.lat,
-                timestamp,
-                properties,
-            );
+            let feature = common::create_point_feature(taxi.lon, taxi.lat, timestamp, properties);
 
             features.push(feature);
         }
 
         if step % 60 == 0 {
-            println!("  Step {}/{} ({:.1}%)", step, num_steps, (step as f64 / num_steps as f64) * 100.0);
+            println!(
+                "  Step {}/{} ({:.1}%)",
+                step,
+                num_steps,
+                (step as f64 / num_steps as f64) * 100.0
+            );
         }
     }
 
@@ -121,13 +121,14 @@ fn main() -> Result<()> {
     common::write_geojson(features, &args.output)?;
 
     println!("\n✅ Success! Now run:");
-    println!("   stt-build --input {} --output sf-taxis.stt \\", args.output.display());
+    println!(
+        "   stt-build --input {} --output sf-taxis.stt \\",
+        args.output.display()
+    );
     println!("             --time-field timestamp \\");
-    println!("             --temporal-resolution high-frequency \\");
     println!("             --min-zoom 10 \\");
     println!("             --max-zoom 16 \\");
     println!("             --compression gzip");
-    println!("\n💡 Temporal resolution: high-frequency profile (day→hour→minute→second)");
 
     Ok(())
 }
@@ -157,14 +158,14 @@ fn update_taxi_position(taxi: &mut TaxiState, rng: &mut impl Rng, interval: i64)
     // Use proper coordinate math instead of rough approximation
     let speed_mps = (taxi.speed * 1000.0) / 3600.0; // Convert km/h to m/s
     let distance_m = speed_mps * interval as f64;
-    
+
     // Convert to degrees using proper Web Mercator math
     // At the equator, 1 degree ≈ 111.32 km
     // Adjust for latitude: distance in lon degrees = distance_m / (111320 * cos(lat))
     let lat_rad = taxi.lat.to_radians();
     let meters_per_degree_lon = 111320.0 * lat_rad.cos();
     let meters_per_degree_lat = 111320.0;
-    
+
     let distance_deg_lon = distance_m / meters_per_degree_lon;
     let distance_deg_lat = distance_m / meters_per_degree_lat;
 
@@ -190,4 +191,3 @@ fn update_taxi_position(taxi: &mut TaxiState, rng: &mut impl Rng, interval: i64)
         taxi.speed = rng.gen_range(0.0..50.0);
     }
 }
-

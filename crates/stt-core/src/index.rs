@@ -42,10 +42,7 @@ impl SpatialIndex {
 
     /// Find tiles within a Hilbert curve range
     pub fn query_range(&self, start: u64, end: u64) -> Vec<u32> {
-        let start_idx = self
-            .hilbert_ids
-            .binary_search(&start)
-            .unwrap_or_else(|i| i);
+        let start_idx = self.hilbert_ids.binary_search(&start).unwrap_or_else(|i| i);
         let end_idx = self.hilbert_ids.binary_search(&end).unwrap_or_else(|i| i);
 
         self.tile_indices[start_idx..=end_idx.min(self.tile_indices.len() - 1)].to_vec()
@@ -175,8 +172,11 @@ pub struct SpatioTemporalIndex {
 impl SpatioTemporalIndex {
     /// Create a new spatiotemporal index
     pub fn new(tile_ids: Vec<TileId>) -> Self {
-        let tiles_with_indices: Vec<(TileId, u32)> =
-            tile_ids.iter().enumerate().map(|(i, id)| (*id, i as u32)).collect();
+        let tiles_with_indices: Vec<(TileId, u32)> = tile_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i as u32))
+            .collect();
 
         Self {
             spatial: SpatialIndex::new(tile_ids),
@@ -239,4 +239,3 @@ mod tests {
         assert_eq!(results.len(), 1);
     }
 }
-

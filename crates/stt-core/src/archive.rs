@@ -134,11 +134,13 @@ impl ArchiveReader {
     /// Get tile by ID
     pub fn get_tile(&mut self, id: &TileId) -> Result<Option<crate::tile::Tile>> {
         // Find tile entry in index
-        let entry = self
-            .index
-            .tiles
-            .iter()
-            .find(|e| e.zoom == id.z as u32 && e.x == id.x && e.y == id.y && e.time_start <= id.t && e.time_end >= id.t);
+        let entry = self.index.tiles.iter().find(|e| {
+            e.zoom == id.z as u32
+                && e.x == id.x
+                && e.y == id.y
+                && e.time_start <= id.t
+                && e.time_end >= id.t
+        });
 
         let entry = match entry {
             Some(e) => e,
@@ -190,7 +192,7 @@ impl ArchiveReader {
         id: TileId,
         proto_tile: crate::proto::Tile,
     ) -> Result<crate::tile::Tile> {
-        use crate::tile::{Feature, Layer, Tile};
+        use crate::tile::{Feature, Layer, Position, Tile};
         use crate::types::GeometryType;
 
         let layers = proto_tile
@@ -201,27 +203,33 @@ impl ArchiveReader {
                     .features
                     .into_iter()
                     .map(|proto_feature| {
-                        let mut properties = std::collections::HashMap::new();
-                        for chunk in proto_feature.tags.chunks(2) {
-                            if chunk.len() == 2 {
-                                let key_idx = chunk[0] as usize;
-                                let val_idx = chunk[1] as usize;
-                                if let (Some(key), Some(val)) = (
-                                    proto_layer.keys.get(key_idx),
-                                    proto_layer.values.get(val_idx),
-                                ) {
-                                    properties.insert(key.clone(), proto_value_to_value(val));
-                                }
-                            }
-                        }
+                        let positions = proto_feature
+                            .positions
+                            .into_iter()
+                            .map(|p| Position {
+                                lon: p.lon,
+                                lat: p.lat,
+                            })
+                            .collect();
+
+                        let properties = proto_feature
+                            .properties
+                            .into_iter()
+                            .map(|(key, val)| (key, proto_value_to_value(&val)))
+                            .collect();
 
                         Feature {
                             id: proto_feature.id,
                             geometry_type: GeometryType::from_proto(proto_feature.r#type),
-                            geometry: proto_feature.geometry,
+                            positions,
                             properties,
-                            time_range: if proto_feature.valid_from > 0 && proto_feature.valid_to > 0 {
-                                Some(TimeRange::new(proto_feature.valid_from, proto_feature.valid_to))
+                            time_range: if proto_feature.valid_from > 0
+                                && proto_feature.valid_to > 0
+                            {
+                                Some(TimeRange::new(
+                                    proto_feature.valid_from,
+                                    proto_feature.valid_to,
+                                ))
                             } else {
                                 None
                             },
@@ -266,14 +274,13 @@ fn proto_value_to_value(proto_value: &crate::proto::Value) -> crate::tile::Value
 /// Now uses the standardized projection module.
 fn bounds_to_tiles(bounds: &BoundingBox, zoom: u8) -> Vec<(u32, u32)> {
     use crate::projection::lonlat_to_tile;
-    
+
     let n = 1u32 << zoom;
 
     // Convert lon/lat to tile coordinates using projection module
-    let (min_x, min_y) = lonlat_to_tile(bounds.min_lon, bounds.max_lat, zoom)
-        .unwrap_or((0, 0));
-    let (max_x, max_y) = lonlat_to_tile(bounds.max_lon, bounds.min_lat, zoom)
-        .unwrap_or((n - 1, n - 1));
+    let (min_x, min_y) = lonlat_to_tile(bounds.min_lon, bounds.max_lat, zoom).unwrap_or((0, 0));
+    let (max_x, max_y) =
+        lonlat_to_tile(bounds.max_lon, bounds.min_lat, zoom).unwrap_or((n - 1, n - 1));
 
     let mut tiles = Vec::new();
     for x in min_x..=max_x.min(n - 1) {
@@ -369,10 +376,10 @@ impl ArchiveWriter {
         let metadata_length = metadata_bytes.len() as u64;
         self.file.write_all(&metadata_bytes)?;
         self.current_offset += metadata_length;
-        
+
         // Flush before truncating to ensure all data is written
         self.file.flush()?;
-        
+
         // Truncate file to current position (remove any extra data)
         self.file.set_len(self.current_offset)?;
 
@@ -386,7 +393,7 @@ impl ArchiveWriter {
         };
         self.file.seek(SeekFrom::Start(0))?;
         header.write(&mut self.file)?;
-        
+
         // Final flush to ensure everything is written to disk
         self.file.flush()?;
 
@@ -476,4 +483,3 @@ mod tests {
         assert_eq!(header.index_length, read_header.index_length);
     }
 }
-

@@ -18,7 +18,7 @@ macro_rules! stub_main {
 
         fn main() -> Result<()> {
             let args = Args::parse();
-            
+
             println!("⚠️  {} Generator - Not Yet Implemented", $name);
             println!("========================================\n");
             println!("This would generate: {}", args.output.display());
@@ -28,7 +28,7 @@ macro_rules! stub_main {
             println!("3. Convert to GeoJSON with timestamps");
             println!("4. Use common::write_geojson() to save");
             println!("\nFor now, you can create sample data manually or wait for implementation.");
-            
+
             Ok(())
         }
     };
@@ -59,4 +59,3 @@ pub mod bikeshare {
     use super::*;
     stub_main!("Bike Share Data", "bike-share.geojson");
 }
-

@@ -114,7 +114,6 @@ echo "📦 Building STT archive..."
     --input "${OUTPUT_FILE}" \
     --output "../../examples/showcase/public/data/ais-${REGION_NAME}.stt" \
     --time-field timestamp \
-    --temporal-resolution daily-aggregates \
     --min-zoom 0 \
     --max-zoom 14 \
     --compression gzip

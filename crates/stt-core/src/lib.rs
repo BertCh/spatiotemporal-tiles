@@ -13,15 +13,11 @@ pub mod analyzer;
 pub mod archive;
 pub mod budget;
 pub mod compression;
-pub mod dedup;
-pub mod delta;
-pub mod encoding;
 pub mod error;
 pub mod geometry;
 pub mod index;
 pub mod metadata;
 pub mod projection;
-pub mod quantization;
 pub mod tile;
 pub mod types;
 
@@ -47,4 +43,3 @@ mod tests {
         assert!(t1 < t2);
     }
 }
-

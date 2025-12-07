@@ -1,0 +1,22 @@
+{
+  "attribution": "",
+  "bounds": {
+    "maxLat": 63.6591,
+    "maxLon": -1.90028,
+    "minLat": 7.0,
+    "minLon": -102.472
+  },
+  "compression": "gzip",
+  "description": "",
+  "filename": "hurricanes.stt",
+  "name": "hurricanes",
+  "tileCount": 2080,
+  "timeRange": {
+    "end": 1700254800000,
+    "start": 1589652000000
+  },
+  "zoomLevels": {
+    "max": 8,
+    "min": 0
+  }
+}

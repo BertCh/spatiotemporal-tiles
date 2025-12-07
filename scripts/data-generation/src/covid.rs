@@ -87,14 +87,14 @@ fn main() -> Result<()> {
     common::write_geojson(features, &args.output)?;
 
     println!("\n✅ Success! Now run:");
-    println!("   stt-build --input {} --output covid-cases.stt \\", args.output.display());
+    println!(
+        "   stt-build --input {} --output covid-cases.stt \\",
+        args.output.display()
+    );
     println!("             --time-field timestamp \\");
-    println!("             --temporal-resolution daily-aggregates \\");
     println!("             --min-zoom 0 \\");
     println!("             --max-zoom 14 \\");
     println!("             --compression gzip");
-    println!("\n💡 Temporal resolution: daily-aggregates profile");
-    println!("   Zoom 0-6: monthly → Zoom 7-10: weekly → Zoom 11+: daily");
 
     Ok(())
 }
@@ -141,12 +141,8 @@ fn process_covid_data(
             properties.insert("deaths".to_string(), json!(deaths));
             properties.insert("value".to_string(), json!(cases)); // For visualization
 
-            let feature = common::create_point_feature(
-                location.lon,
-                location.lat,
-                timestamp,
-                properties,
-            );
+            let feature =
+                common::create_point_feature(location.lon, location.lat, timestamp, properties);
 
             features.push(feature);
             processed += 1;
@@ -163,9 +159,9 @@ fn process_covid_data(
 fn generate_county_coordinates(path: &PathBuf) -> Result<()> {
     // This is a simplified version - in practice, download from:
     // https://www.census.gov/geographies/reference-files/time-series/geo/gazetteer-files.html
-    
+
     println!("📥 Downloading county coordinates...");
-    
+
     let sample_data = r#"fips,county,state,lat,lon
 06001,Alameda,California,37.6017,-121.7195
 06013,Contra Costa,California,37.9161,-121.9511
@@ -174,10 +170,9 @@ fn generate_county_coordinates(path: &PathBuf) -> Result<()> {
 48201,Harris,Texas,29.7604,-95.3698"#;
 
     std::fs::write(path, sample_data)?;
-    
+
     println!("⚠️  Warning: Using sample coordinates. For production, download full dataset from:");
     println!("   https://www.census.gov/geographies/reference-files/time-series/geo/gazetteer-files.html");
-    
+
     Ok(())
 }
-

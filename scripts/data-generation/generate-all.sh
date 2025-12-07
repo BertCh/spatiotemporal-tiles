@@ -3,11 +3,16 @@
 
 set -e
 
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
 echo "🚀 STT Data Generation Pipeline"
 echo "================================"
 echo ""
 
-# Create output directories
+# Create output directories (relative to this script)
 mkdir -p data
 mkdir -p metadata
 mkdir -p ../../examples/showcase/public/data
@@ -15,10 +20,9 @@ mkdir -p ../../examples/showcase/public/data
 # COVID-19 Cases
 echo "📊 1/6 Generating COVID-19 data..."
 cargo run --release --bin generate-covid-data -- --output data/covid-cases.geojson
-stt-build --input data/covid-cases.geojson \
+cargo run -p stt-build --release --bin stt-build -- --input data/covid-cases.geojson \
           --output ../../examples/showcase/public/data/covid-cases.stt \
           --time-field timestamp \
-          --temporal-resolution daily-aggregates \
           --min-zoom 0 \
           --max-zoom 14 \
           --compression gzip \
@@ -33,10 +37,9 @@ cargo run --release --bin generate-earthquake-data -- \
   --start-date 2020-01-01 \
   --end-date 2024-12-31 \
   --min-magnitude 4.0
-stt-build --input data/earthquakes.geojson \
+cargo run -p stt-build --release --bin stt-build -- --input data/earthquakes.geojson \
           --output ../../examples/showcase/public/data/earthquakes.stt \
           --time-field timestamp \
-          --temporal-resolution sparse-events \
           --min-zoom 0 \
           --max-zoom 10 \
           --compression gzip \
@@ -51,10 +54,9 @@ cargo run --release --bin generate-ship-data -- \
   --start-date 2024-01-01 \
   --days 7 \
   --num-ships 500
-stt-build --input data/ships.geojson \
+cargo run -p stt-build --release --bin stt-build -- --input data/ships.geojson \
           --output ../../examples/showcase/public/data/ships.stt \
           --time-field timestamp \
-          --temporal-resolution daily-aggregates \
           --min-zoom 0 \
           --max-zoom 12 \
           --compression gzip \
@@ -66,10 +68,9 @@ echo ""
 echo "🌀 4/6 Generating hurricane track data..."
 cargo run --release --bin generate-hurricane-data -- \
   --output data/hurricanes.geojson
-stt-build --input data/hurricanes.geojson \
+cargo run -p stt-build --release --bin stt-build -- --input data/hurricanes.geojson \
           --output ../../examples/showcase/public/data/hurricanes.stt \
           --time-field timestamp \
-          --temporal-resolution sparse-events \
           --min-zoom 0 \
           --max-zoom 8 \
           --compression gzip \
@@ -81,10 +82,9 @@ echo ""
 echo "✈️  5/6 Generating flight traffic data..."
 cargo run --release --bin generate-flight-data -- \
   --output data/flights.geojson
-stt-build --input data/flights.geojson \
+cargo run -p stt-build --release --bin stt-build -- --input data/flights.geojson \
           --output ../../examples/showcase/public/data/flights.stt \
           --time-field timestamp \
-          --temporal-resolution high-frequency \
           --min-zoom 0 \
           --max-zoom 10 \
           --compression gzip \
@@ -99,10 +99,9 @@ cargo run --release --bin generate-taxi-data -- \
   --num-taxis 100 \
   --date 2024-01-15 \
   --interval 60
-stt-build --input data/sf-taxis.geojson \
+cargo run -p stt-build --release --bin stt-build -- --input data/sf-taxis.geojson \
           --output ../../examples/showcase/public/data/sf-taxis.stt \
           --time-field timestamp \
-          --temporal-resolution high-frequency \
           --min-zoom 10 \
           --max-zoom 16 \
           --compression gzip \

@@ -33,12 +33,6 @@ struct Args {
     #[arg(long, default_value = "iso8601")]
     time_format: String,
 
-    /// Temporal resolution profile: 
-    /// - Profiles: "high-frequency", "sparse-events", "daily-aggregates"
-    /// - Or fixed bucket: "none", "second", "minute", "hour", "day", "week", "month", "year"
-    #[arg(long, default_value = "sparse-events")]
-    temporal_resolution: String,
-
     /// Minimum zoom level
     #[arg(long, default_value = "0")]
     min_zoom: u8,
@@ -59,9 +53,9 @@ struct Args {
     #[arg(long, default_value = "0.0001")]
     simplification: f64,
 
-    /// Maximum tile size in bytes (features will be dropped if exceeded)
+    /// Target chunk size in bytes (features will be grouped into tiles of approximately this size)
     #[arg(long, default_value = "500000")]
-    max_tile_size: usize,
+    chunk_size: usize,
 
     /// Number of parallel workers
     #[arg(short, long, default_value = "4")]
@@ -82,10 +76,6 @@ struct Args {
     /// Layer name
     #[arg(long, default_value = "default")]
     layer: String,
-
-    /// Enable delta encoding (reduces file size for repetitive features)
-    #[arg(long)]
-    delta_encoding: bool,
 
     /// Verbose output
     #[arg(short, long)]
@@ -117,15 +107,6 @@ fn main() -> Result<()> {
     // Parse compression
     let compression = parse_compression(&args.compression)?;
 
-    // Parse temporal resolution profile
-    let temporal_resolution = tiler::TemporalResolutionProfile::from_str(&args.temporal_resolution)
-        .ok_or_else(|| anyhow::anyhow!(
-            "Invalid temporal resolution: {}.\nProfiles: high-frequency, sparse-events, daily-aggregates\nFixed buckets: none, second, minute, hour, day, week, month, year",
-            args.temporal_resolution
-        ))?;
-
-    info!("Temporal resolution: {}", temporal_resolution.description());
-
     // Step 1: Load and parse input
     info!("Loading input data...");
     let pb = ProgressBar::new_spinner();
@@ -136,11 +117,7 @@ fn main() -> Result<()> {
     );
     pb.set_message("Reading input file...");
 
-    let features = input::load_features(
-        &args.input,
-        &args.time_field,
-        &args.time_format,
-    )?;
+    let features = input::load_features(&args.input, &args.time_field, &args.time_format)?;
 
     pb.finish_with_message(format!("Loaded {} features", features.len()));
     info!("Loaded {} features", features.len());
@@ -158,21 +135,13 @@ fn main() -> Result<()> {
 
     // Step 3: Generate tiles
     info!("Generating tiles...");
-    if args.delta_encoding {
-        info!("Delta encoding: enabled");
-    }
     let tile_config = tiler::TileConfig {
         min_zoom: args.min_zoom,
         max_zoom: args.max_zoom,
         extent: args.extent,
         simplification: args.simplification,
-        max_tile_size: args.max_tile_size,
         layer_name: args.layer.clone(),
-        temporal_resolution,
-        use_delta_encoding: args.delta_encoding,
-        use_quantization: false,   // TODO: Make configurable
-        budget: stt_core::budget::TileBudget::new(args.max_tile_size, 10000, 1000),
-        target_chunk_size: args.max_tile_size,
+        target_chunk_size: args.chunk_size,
     };
 
     let tiles = tiler::generate_tiles(&features, &tile_config, args.workers)?;
@@ -198,9 +167,13 @@ fn main() -> Result<()> {
     pb.finish_with_message("Tiles written");
 
     // Step 5: Build metadata
-    let metadata = stt_core::metadata::Metadata::new(
-        args.name.unwrap_or_else(|| args.input.file_stem().unwrap().to_string_lossy().to_string())
-    )
+    let metadata = stt_core::metadata::Metadata::new(args.name.unwrap_or_else(|| {
+        args.input
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string()
+    }))
     .with_description(args.description.unwrap_or_default())
     .with_attribution(args.attribution.unwrap_or_default())
     .with_bounds(bounds)
@@ -252,4 +225,3 @@ fn parse_compression(s: &str) -> Result<stt_core::types::Compression> {
         _ => anyhow::bail!("Invalid compression method: {}. Use 'none' or 'gzip'", s),
     }
 }
-

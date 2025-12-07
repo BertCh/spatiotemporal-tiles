@@ -73,7 +73,7 @@ fn main() -> Result<()> {
     println!("  Min magnitude: {}", args.min_magnitude);
 
     let mut all_features = Vec::new();
-    
+
     // USGS API has a limit, so we fetch in yearly chunks
     let start_year = args.start_date[..4].parse::<i32>()?;
     let end_year = args.end_date[..4].parse::<i32>()?;
@@ -81,9 +81,9 @@ fn main() -> Result<()> {
     for year in start_year..=end_year {
         let year_start = format!("{}-01-01", year);
         let year_end = format!("{}-12-31", year);
-        
+
         println!("\n📅 Fetching data for {}...", year);
-        
+
         let url = format!(
             "https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&starttime={}&endtime={}&minmagnitude={}",
             year_start, year_end, args.min_magnitude
@@ -91,7 +91,7 @@ fn main() -> Result<()> {
 
         let response = reqwest::blocking::get(&url)?;
         let data: UsgsResponse = response.json()?;
-        
+
         println!("  ✓ Fetched {} earthquakes", data.features.len());
 
         for usgs_feature in data.features {
@@ -107,14 +107,14 @@ fn main() -> Result<()> {
     common::write_geojson(all_features, &args.output)?;
 
     println!("\n✅ Success! Now run:");
-    println!("   stt-build --input {} --output earthquakes.stt \\", args.output.display());
+    println!(
+        "   stt-build --input {} --output earthquakes.stt \\",
+        args.output.display()
+    );
     println!("             --time-field timestamp \\");
-    println!("             --temporal-resolution sparse-events \\");
     println!("             --min-zoom 0 \\");
     println!("             --max-zoom 8 \\");
     println!("             --compression gzip");
-    println!("\n💡 Temporal resolution: sparse-events profile");
-    println!("   Zoom 0-4: monthly → Zoom 5-8: weekly → Zoom 9+: daily");
 
     Ok(())
 }
@@ -125,8 +125,8 @@ fn convert_usgs_feature(usgs: UsgsFeature) -> Result<Feature> {
     let depth = usgs.geometry.coordinates.get(2).copied().unwrap_or(0.0);
 
     // Convert Unix milliseconds to DateTime
-    let timestamp = DateTime::from_timestamp_millis(usgs.properties.time)
-        .unwrap_or_else(|| Utc::now());
+    let timestamp =
+        DateTime::from_timestamp_millis(usgs.properties.time).unwrap_or_else(|| Utc::now());
 
     let mut properties = Map::new();
     properties.insert("magnitude".to_string(), json!(usgs.properties.mag));
@@ -136,6 +136,7 @@ fn convert_usgs_feature(usgs: UsgsFeature) -> Result<Feature> {
     properties.insert("title".to_string(), json!(usgs.properties.title));
     properties.insert("value".to_string(), json!(usgs.properties.mag)); // For visualization
 
-    Ok(common::create_point_feature(lon, lat, timestamp, properties))
+    Ok(common::create_point_feature(
+        lon, lat, timestamp, properties,
+    ))
 }
-

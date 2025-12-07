@@ -211,7 +211,13 @@ export const datasets: Dataset[] = [
 
   output += `];\n`;
   output += `\n`;
-  output += `export const defaultDatasetId = 'earthquake-activity';\n`;
+  output += `export const DATASETS = datasets;
+
+export function getDatasetById(id: string): Dataset | undefined {
+  return datasets.find(d => d.id === id);
+}
+
+export const defaultDatasetId = 'earthquake-activity';\n`;
 
   return output;
 }

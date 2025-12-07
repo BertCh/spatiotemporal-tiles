@@ -25,10 +25,7 @@ impl ImportanceScorer {
     /// Calculate importance score for a feature (higher = more important)
     pub fn score(&self, feature: &Feature) -> f64 {
         match self {
-            Self::GeometrySize => {
-                // Larger geometries are more visually important
-                feature.geometry.len() as f64
-            }
+            Self::GeometrySize => feature.positions.len() as f64,
             Self::PropertyCount => {
                 // Features with more properties might be more important
                 feature.properties.len() as f64
@@ -46,8 +43,7 @@ impl ImportanceScorer {
                 (hasher.finish() as f64) / (u64::MAX as f64)
             }
             Self::Combined => {
-                // Combine multiple factors
-                let geom_score = feature.geometry.len() as f64;
+                let geom_score = feature.positions.len() as f64;
                 let prop_score = feature.properties.len() as f64 * 10.0;
                 geom_score + prop_score
             }
@@ -72,7 +68,7 @@ impl Default for TileBudget {
     fn default() -> Self {
         Self {
             max_uncompressed_size: 500 * 1024, // 500KB uncompressed
-            max_compressed_size: 128 * 1024,     // 128KB compressed
+            max_compressed_size: 128 * 1024,   // 128KB compressed
             max_feature_count: 10_000,
             scorer: ImportanceScorer::Combined,
         }
@@ -103,21 +99,21 @@ impl TileBudget {
     /// Estimate the uncompressed size of features
     pub fn estimate_size(features: &[Feature]) -> usize {
         let mut size = 0;
-        
+
         for feature in features {
-            // Geometry size (4 bytes per u32)
-            size += feature.geometry.len() * 4;
-            
+            // Rough geometry size (16 bytes per lon/lat pair)
+            size += feature.positions.len() * 16;
+
             // Properties size (rough estimate)
             for (key, value) in &feature.properties {
                 size += key.len();
                 size += Self::estimate_value_size(value);
             }
-            
+
             // Feature metadata overhead
             size += 32; // ID, type, time range, etc.
         }
-        
+
         size
     }
 
@@ -198,7 +194,9 @@ impl TileBudget {
         scored.sort_by(|a, b| {
             let ratio_a = a.1 / (a.2 as f64);
             let ratio_b = b.1 / (b.2 as f64);
-            ratio_b.partial_cmp(&ratio_a).unwrap_or(std::cmp::Ordering::Equal)
+            ratio_b
+                .partial_cmp(&ratio_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Greedily keep features until we hit the budget
@@ -224,13 +222,13 @@ impl TileBudget {
 
     /// Estimate the size of a single feature
     fn estimate_feature_size(&self, feature: &Feature) -> usize {
-        let mut size = feature.geometry.len() * 4;
-        
+        let mut size = feature.positions.len() * 16;
+
         for (key, value) in &feature.properties {
             size += key.len();
             size += Self::estimate_value_size(value);
         }
-        
+
         size + 32 // metadata overhead
     }
 }
@@ -247,7 +245,13 @@ pub struct BudgetStats {
 
 impl BudgetStats {
     /// Add stats from processing a tile
-    pub fn add_tile(&mut self, original_count: usize, final_count: usize, original_size: usize, final_size: usize) {
+    pub fn add_tile(
+        &mut self,
+        original_count: usize,
+        final_count: usize,
+        original_size: usize,
+        final_size: usize,
+    ) {
         self.tiles_processed += 1;
         if final_count < original_count {
             self.tiles_reduced += 1;
@@ -280,20 +284,17 @@ mod tests {
     use std::collections::HashMap;
 
     fn create_test_feature(id: u64, geometry_size: usize, property_count: usize) -> Feature {
-        let geometry = vec![0u32; geometry_size];
+        let positions = vec![crate::tile::Position { lon: 0.0, lat: 0.0 }; geometry_size];
         let mut properties = HashMap::new();
-        
+
         for i in 0..property_count {
-            properties.insert(
-                format!("key_{}", i),
-                crate::tile::Value::Int(i as i64),
-            );
+            properties.insert(format!("key_{}", i), crate::tile::Value::Int(i as i64));
         }
 
         Feature {
             id,
             geometry_type: GeometryType::Point,
-            geometry,
+            positions,
             properties,
             time_range: None,
         }
@@ -302,18 +303,17 @@ mod tests {
     #[test]
     fn test_importance_scoring() {
         let scorer = ImportanceScorer::GeometrySize;
-        
+
         let feature1 = create_test_feature(1, 100, 0);
         let feature2 = create_test_feature(2, 50, 0);
-        
+
         assert!(scorer.score(&feature1) > scorer.score(&feature2));
     }
 
     #[test]
     fn test_budget_enforcement_by_count() {
-        let budget = TileBudget::default()
-            .with_scorer(ImportanceScorer::GeometrySize);
-        
+        let budget = TileBudget::default().with_scorer(ImportanceScorer::GeometrySize);
+
         let features = vec![
             create_test_feature(1, 100, 0),
             create_test_feature(2, 50, 0),
@@ -322,10 +322,10 @@ mod tests {
         ];
 
         let (kept, dropped) = budget.drop_by_count(features, 2);
-        
+
         assert_eq!(kept.len(), 2);
         assert_eq!(dropped, 2);
-        
+
         // Should keep the largest geometries
         assert_eq!(kept[0].id, 4); // 200
         assert_eq!(kept[1].id, 1); // 100
@@ -335,24 +335,20 @@ mod tests {
     fn test_size_estimation() {
         let feature = create_test_feature(1, 100, 5);
         let size = TileBudget::estimate_size(&[feature]);
-        
-        // Should be roughly: 100*4 (geometry) + 5*8 (properties) + overhead
-        assert!(size > 400);
-        assert!(size < 1000);
+
+        assert!(size > 1000);
+        assert!(size < 3000);
     }
 
     #[test]
     fn test_budget_enforcement_no_drop() {
         let budget = TileBudget::default();
-        
-        let features = vec![
-            create_test_feature(1, 10, 1),
-            create_test_feature(2, 10, 1),
-        ];
+
+        let features = vec![create_test_feature(1, 10, 1), create_test_feature(2, 10, 1)];
 
         let original_count = features.len();
         let (kept, dropped) = budget.enforce(features);
-        
+
         assert_eq!(kept.len(), original_count);
         assert_eq!(dropped, 0);
     }
@@ -360,14 +356,13 @@ mod tests {
     #[test]
     fn test_budget_stats() {
         let mut stats = BudgetStats::default();
-        
+
         stats.add_tile(1000, 800, 100_000, 80_000);
         stats.add_tile(500, 500, 50_000, 50_000);
-        
+
         assert_eq!(stats.tiles_processed, 2);
         assert_eq!(stats.tiles_reduced, 1);
         assert_eq!(stats.features_dropped, 200);
         assert!((stats.reduction_ratio() - 0.8666).abs() < 0.01);
     }
 }
-

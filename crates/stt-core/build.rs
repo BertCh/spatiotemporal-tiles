@@ -3,7 +3,11 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    let proto_files = ["../../proto/tile.proto", "../../proto/index.proto", "../../proto/metadata.proto"];
+    let proto_files = [
+        "../../proto/tile.proto",
+        "../../proto/index.proto",
+        "../../proto/metadata.proto",
+    ];
 
     let mut config = Config::new();
     config.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
@@ -19,4 +23,3 @@ fn main() {
         println!("cargo:rerun-if-changed={}", file);
     }
 }
-

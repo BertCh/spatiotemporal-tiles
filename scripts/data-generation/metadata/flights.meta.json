@@ -1,0 +1,22 @@
+{
+  "attribution": "",
+  "bounds": {
+    "maxLat": -73.8122492589454,
+    "maxLon": 47.369476490789815,
+    "minLat": -122.37856721548448,
+    "minLon": 28.43828439496895
+  },
+  "compression": "gzip",
+  "description": "",
+  "filename": "flights.stt",
+  "name": "flights",
+  "tileCount": 573,
+  "timeRange": {
+    "end": 1704153300000,
+    "start": 1704067200000
+  },
+  "zoomLevels": {
+    "max": 10,
+    "min": 0
+  }
+}

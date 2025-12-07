@@ -62,7 +62,10 @@ fn main() -> Result<()> {
     common::write_geojson(features, &args.output)?;
 
     println!("\n✅ Success! Now run:");
-    println!("   stt-build --input {} --output bike-share.stt \\", args.output.display());
+    println!(
+        "   stt-build --input {} --output bike-share.stt \\",
+        args.output.display()
+    );
     println!("             --time-field timestamp \\");
     println!("             --temporal-bucket hour \\");
     println!("             --min-zoom 11 \\");
@@ -138,4 +141,3 @@ fn generate_bikeshare_data(start_time: DateTime<Utc>, num_trips: usize) -> Resul
 
     Ok(features)
 }
-

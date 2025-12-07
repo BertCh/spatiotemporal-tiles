@@ -1,0 +1,22 @@
+{
+  "attribution": "",
+  "bounds": {
+    "maxLat": 50.86835313638552,
+    "maxLon": 101.43377381512651,
+    "minLat": 1.2338708782842749,
+    "minLon": -121.59317088411323
+  },
+  "compression": "gzip",
+  "description": "",
+  "filename": "ships.stt",
+  "name": "ships",
+  "tileCount": 10856,
+  "timeRange": {
+    "end": 1704668400000,
+    "start": 1704067200000
+  },
+  "zoomLevels": {
+    "max": 12,
+    "min": 0
+  }
+}

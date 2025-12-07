@@ -3,7 +3,7 @@
 //! This module provides standardized coordinate transformations
 //! for accurate Web Mercator projections.
 //!
-//! The basic Web Mercator transformations are always available. 
+//! The basic Web Mercator transformations are always available.
 //! With the `projection` feature, you can use the proj crate for
 //! advanced transformations between different coordinate systems.
 
@@ -60,7 +60,7 @@ pub fn lonlat_to_tile(lon: f64, lat: f64, zoom: u8) -> Result<(u32, u32)> {
     }
 
     let n = 1u32 << zoom;
-    
+
     // Convert lon/lat to tile coordinates using Web Mercator formula
     // This is the standard used by OpenStreetMap, Google Maps, etc.
     let x = ((lon + 180.0) / 360.0 * n as f64).floor() as u32;
@@ -91,7 +91,7 @@ pub fn lonlat_to_tile_coords(
     extent: u32,
 ) -> (u32, u32) {
     let n = 1u32 << zoom;
-    
+
     // Convert to Web Mercator tile coordinates (0-n)
     let world_x = (lon + 180.0) / 360.0 * n as f64;
     let lat_rad = lat.to_radians();
@@ -118,11 +118,11 @@ pub fn lonlat_to_tile_coords(
 /// Point with lon/lat coordinates
 pub fn tile_to_lonlat(tile_x: u32, tile_y: u32, zoom: u8) -> Point<f64> {
     let n = (1u32 << zoom) as f64;
-    
+
     let lon = (tile_x as f64 / n) * 360.0 - 180.0;
     let lat_rad = (1.0 - 2.0 * tile_y as f64 / n).sinh().atan();
     let lat = lat_rad.to_degrees();
-    
+
     Point::new(lon, lat)
 }
 
@@ -147,15 +147,15 @@ pub fn tile_coords_to_lonlat(
     extent: u32,
 ) -> Point<f64> {
     let n = (1u32 << zoom) as f64;
-    
+
     // Convert from tile-relative to world coordinates
     let world_x = tile_x as f64 + (x as f64 / extent as f64);
     let world_y = tile_y as f64 + (y as f64 / extent as f64);
-    
+
     let lon = (world_x / n) * 360.0 - 180.0;
     let lat_rad = (1.0 - 2.0 * world_y / n).sinh().atan();
     let lat = lat_rad.to_degrees();
-    
+
     Point::new(lon, lat)
 }
 
@@ -178,7 +178,10 @@ pub fn wgs84_to_meters(point: Point<f64>) -> Result<Point<f64>> {
     // This is accurate enough for most use cases
     const R: f64 = 6378137.0; // Earth radius in meters
     let x = R * point.x().to_radians();
-    let y = R * (std::f64::consts::FRAC_PI_4 + point.y().to_radians() / 2.0).tan().ln();
+    let y = R
+        * (std::f64::consts::FRAC_PI_4 + point.y().to_radians() / 2.0)
+            .tan()
+            .ln();
     Ok(Point::new(x, y))
 }
 
@@ -208,12 +211,12 @@ pub fn meters_to_wgs84(point: Point<f64>) -> Result<Point<f64>> {
 pub fn tile_bounds(tile_x: u32, tile_y: u32, zoom: u8) -> crate::types::BoundingBox {
     let nw = tile_to_lonlat(tile_x, tile_y, zoom);
     let se = tile_to_lonlat(tile_x + 1, tile_y + 1, zoom);
-    
+
     crate::types::BoundingBox::new(
-        nw.x(),      // min_lon
-        se.y(),      // min_lat (y is flipped)
-        se.x(),      // max_lon
-        nw.y(),      // max_lat
+        nw.x(), // min_lon
+        se.y(), // min_lat (y is flipped)
+        se.x(), // max_lon
+        nw.y(), // max_lat
     )
 }
 
@@ -256,11 +259,12 @@ mod tests {
         let original_lat = 37.7749;
         let zoom = 10;
         let extent = 4096;
-        
+
         let (tile_x, tile_y) = lonlat_to_tile(original_lon, original_lat, zoom).unwrap();
-        let (x, y) = lonlat_to_tile_coords(original_lon, original_lat, zoom, tile_x, tile_y, extent);
+        let (x, y) =
+            lonlat_to_tile_coords(original_lon, original_lat, zoom, tile_x, tile_y, extent);
         let point = tile_coords_to_lonlat(x, y, zoom, tile_x, tile_y, extent);
-        
+
         // Should be very close to original
         assert!((point.x() - original_lon).abs() < 0.001);
         assert!((point.y() - original_lat).abs() < 0.001);
@@ -271,11 +275,11 @@ mod tests {
         // Test San Francisco conversion
         let point = Point::new(-122.4194, 37.7749);
         let meters = wgs84_to_meters(point).unwrap();
-        
+
         // Web Mercator coordinates should be in the millions
         assert!(meters.x().abs() > 10_000_000.0);
         assert!(meters.y().abs() > 4_000_000.0);
-        
+
         // Roundtrip test (allow some tolerance for approximation)
         let back = meters_to_wgs84(meters).unwrap();
         assert!((back.x() - point.x()).abs() < 0.01); // ~1km tolerance
@@ -285,9 +289,8 @@ mod tests {
     #[test]
     fn test_tile_bounds() {
         let bounds = tile_bounds(163, 395, 10);
-        
+
         // San Francisco should be within these bounds
         assert!(bounds.contains(-122.4194, 37.7749));
     }
 }
-

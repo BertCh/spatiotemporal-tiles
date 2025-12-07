@@ -35,15 +35,10 @@ pub fn load_features(
 }
 
 /// Load GeoJSON file
-fn load_geojson(
-    path: &Path,
-    time_field: &str,
-    time_format: &str,
-) -> Result<Vec<ParsedFeature>> {
+fn load_geojson(path: &Path, time_field: &str, time_format: &str) -> Result<Vec<ParsedFeature>> {
     let file = File::open(path).context("Failed to open input file")?;
     let reader = BufReader::new(file);
-    let geojson: GeoJson = serde_json::from_reader(reader)
-        .context("Failed to parse GeoJSON")?;
+    let geojson: GeoJson = serde_json::from_reader(reader).context("Failed to parse GeoJSON")?;
 
     let features = match geojson {
         GeoJson::FeatureCollection(fc) => fc.features,
@@ -66,51 +61,50 @@ fn load_geojson(
 ///
 /// Now uses the standard `csv` crate for robust parsing.
 /// Expects columns: lon, lat, timestamp, and optional property columns.
-fn load_csv(
-    path: &Path,
-    time_field: &str,
-    time_format: &str,
-) -> Result<Vec<ParsedFeature>> {
+fn load_csv(path: &Path, time_field: &str, time_format: &str) -> Result<Vec<ParsedFeature>> {
     use csv::ReaderBuilder;
     use geojson::{Geometry, Value as GeomValue};
-    
+
     let file = File::open(path).context("Failed to open CSV file")?;
-    let mut reader = ReaderBuilder::new()
-        .has_headers(true)
-        .from_reader(file);
-    
-    let headers = reader.headers()
+    let mut reader = ReaderBuilder::new().has_headers(true).from_reader(file);
+
+    let headers = reader
+        .headers()
         .context("Failed to read CSV headers")?
         .clone();
-    
+
     // Find required columns
-    let lon_idx = find_column(&headers, &["lon", "longitude", "lng", "x"])
-        .ok_or_else(|| anyhow::anyhow!("CSV must have a longitude column (lon, longitude, lng, or x)"))?;
+    let lon_idx = find_column(&headers, &["lon", "longitude", "lng", "x"]).ok_or_else(|| {
+        anyhow::anyhow!("CSV must have a longitude column (lon, longitude, lng, or x)")
+    })?;
     let lat_idx = find_column(&headers, &["lat", "latitude", "y"])
         .ok_or_else(|| anyhow::anyhow!("CSV must have a latitude column (lat, latitude, or y)"))?;
     let time_idx = find_column(&headers, &[time_field])
         .ok_or_else(|| anyhow::anyhow!("CSV must have a {} column", time_field))?;
-    
+
     let mut parsed = Vec::new();
-    
+
     for result in reader.records() {
         let record = result.context("Failed to read CSV record")?;
-        
+
         // Parse coordinates
-        let lon: f64 = record.get(lon_idx)
+        let lon: f64 = record
+            .get(lon_idx)
             .ok_or_else(|| anyhow::anyhow!("Missing longitude value"))?
             .parse()
             .context("Failed to parse longitude")?;
-        let lat: f64 = record.get(lat_idx)
+        let lat: f64 = record
+            .get(lat_idx)
             .ok_or_else(|| anyhow::anyhow!("Missing latitude value"))?
             .parse()
             .context("Failed to parse latitude")?;
-        
+
         // Parse timestamp
-        let time_str = record.get(time_idx)
+        let time_str = record
+            .get(time_idx)
             .ok_or_else(|| anyhow::anyhow!("Missing timestamp value"))?;
         let timestamp = parse_timestamp_str(time_str, time_format)?;
-        
+
         // Build properties from other columns
         let mut properties = serde_json::Map::new();
         for (idx, header) in headers.iter().enumerate() {
@@ -130,7 +124,7 @@ fn load_csv(
                 }
             }
         }
-        
+
         // Create GeoJSON feature
         let feature = Feature {
             bbox: None,
@@ -139,7 +133,7 @@ fn load_csv(
             properties: Some(properties),
             foreign_members: None,
         };
-        
+
         parsed.push(ParsedFeature {
             geojson: feature,
             timestamp,
@@ -147,7 +141,7 @@ fn load_csv(
             lat,
         });
     }
-    
+
     Ok(parsed)
 }
 
@@ -167,18 +161,18 @@ fn find_column(headers: &csv::StringRecord, names: &[&str]) -> Option<usize> {
 fn parse_timestamp_str(s: &str, format: &str) -> Result<u64> {
     match format {
         "unix-ms" => {
-            let ms = s.parse::<u64>()
+            let ms = s
+                .parse::<u64>()
                 .context("Expected numeric timestamp in milliseconds")?;
             Ok(ms)
         }
         "unix-sec" => {
-            let sec = s.parse::<u64>()
+            let sec = s
+                .parse::<u64>()
                 .context("Expected numeric timestamp in seconds")?;
             Ok(sec * 1000)
         }
-        "iso8601" => {
-            parse_iso8601(s)
-        }
+        "iso8601" => parse_iso8601(s),
         _ => anyhow::bail!("Unknown time format: {}", format),
     }
 }
@@ -219,13 +213,15 @@ fn parse_feature(
 fn parse_timestamp(value: &Value, format: &str) -> Result<u64> {
     match format {
         "unix-ms" => {
-            let ms = value.as_u64()
+            let ms = value
+                .as_u64()
                 .or_else(|| value.as_i64().map(|i| i as u64))
                 .context("Expected numeric timestamp")?;
             Ok(ms)
         }
         "unix-sec" => {
-            let sec = value.as_u64()
+            let sec = value
+                .as_u64()
                 .or_else(|| value.as_i64().map(|i| i as u64))
                 .context("Expected numeric timestamp")?;
             Ok(sec * 1000)
@@ -356,4 +352,3 @@ mod tests {
         assert_eq!(ts, 1577836800000);
     }
 }
-

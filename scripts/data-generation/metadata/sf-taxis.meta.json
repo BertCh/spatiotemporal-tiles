@@ -1,0 +1,22 @@
+{
+  "attribution": "",
+  "bounds": {
+    "maxLat": 37.81,
+    "maxLon": -122.35,
+    "minLat": 37.7,
+    "minLon": -122.52
+  },
+  "compression": "gzip",
+  "description": "",
+  "filename": "sf-taxis.stt",
+  "name": "sf-taxis",
+  "tileCount": 1474,
+  "timeRange": {
+    "end": 1705363140000,
+    "start": 1705276800000
+  },
+  "zoomLevels": {
+    "max": 16,
+    "min": 10
+  }
+}

@@ -47,34 +47,34 @@ struct Args {
 struct AisRecord {
     #[serde(rename = "MMSI")]
     mmsi: String,
-    
+
     #[serde(rename = "BaseDateTime")]
     base_date_time: String,
-    
+
     #[serde(rename = "LAT")]
     lat: f64,
-    
+
     #[serde(rename = "LON")]
     lon: f64,
-    
+
     #[serde(rename = "SOG")]
     sog: Option<f64>, // Speed Over Ground (knots)
-    
+
     #[serde(rename = "COG")]
     cog: Option<f64>, // Course Over Ground (degrees)
-    
+
     #[serde(rename = "Heading")]
     heading: Option<f64>,
-    
+
     #[serde(rename = "VesselName")]
     vessel_name: Option<String>,
-    
+
     #[serde(rename = "VesselType")]
     vessel_type: Option<u8>,
-    
+
     #[serde(rename = "Length")]
     length: Option<f64>,
-    
+
     #[serde(rename = "Width")]
     width: Option<f64>,
 }
@@ -86,12 +86,15 @@ fn main() -> Result<()> {
     println!("🚢 AIS Data Processor (NOAA Marine Cadastre)");
     println!("============================================\n");
     println!("📂 Input: {}", args.input.display());
-    println!("📊 Sampling: 1 position per vessel per {} minutes", args.sample_minutes);
-    
+    println!(
+        "📊 Sampling: 1 position per vessel per {} minutes",
+        args.sample_minutes
+    );
+
     if let Some(ref bounds_str) = args.bounds {
         println!("📍 Geographic filter: {}", bounds_str);
     }
-    
+
     println!();
 
     // Parse bounds if provided
@@ -101,11 +104,9 @@ fn main() -> Result<()> {
     println!("🔄 Reading CSV data...");
     let file = File::open(&args.input)
         .with_context(|| format!("Failed to open input file: {}", args.input.display()))?;
-    
+
     let reader = BufReader::new(file);
-    let mut csv_reader = ReaderBuilder::new()
-        .has_headers(true)
-        .from_reader(reader);
+    let mut csv_reader = ReaderBuilder::new().has_headers(true).from_reader(reader);
 
     let mut vessel_last_time: HashMap<String, i64> = HashMap::new();
     let mut features = Vec::new();
@@ -115,10 +116,14 @@ fn main() -> Result<()> {
 
     for result in csv_reader.deserialize() {
         total_records += 1;
-        
+
         if total_records % 100000 == 0 {
-            println!("  Processed {} records, kept {} features, {} unique vessels...", 
-                     total_records, features.len(), unique_vessels.len());
+            println!(
+                "  Processed {} records, kept {} features, {} unique vessels...",
+                total_records,
+                features.len(),
+                unique_vessels.len()
+            );
         }
 
         let record: AisRecord = match result {
@@ -141,14 +146,18 @@ fn main() -> Result<()> {
         if record.lon > 180.0 || record.lon < -180.0 {
             continue;
         }
-        if record.lat == 91.0 { // NOAA uses 91 for invalid
+        if record.lat == 91.0 {
+            // NOAA uses 91 for invalid
             continue;
         }
 
         // Apply geographic bounds filter
         if let Some((min_lat, min_lon, max_lat, max_lon)) = bounds {
-            if record.lat < min_lat || record.lat > max_lat ||
-               record.lon < min_lon || record.lon > max_lon {
+            if record.lat < min_lat
+                || record.lat > max_lat
+                || record.lon < min_lon
+                || record.lon > max_lon
+            {
                 filtered_records += 1;
                 continue;
             }
@@ -162,10 +171,11 @@ fn main() -> Result<()> {
         }
 
         // Parse timestamp
-        let timestamp = match NaiveDateTime::parse_from_str(&record.base_date_time, "%Y-%m-%dT%H:%M:%S") {
-            Ok(dt) => dt.and_utc().timestamp_millis(),
-            Err(_) => continue,
-        };
+        let timestamp =
+            match NaiveDateTime::parse_from_str(&record.base_date_time, "%Y-%m-%dT%H:%M:%S") {
+                Ok(dt) => dt.and_utc().timestamp_millis(),
+                Err(_) => continue,
+            };
 
         // Apply temporal sampling
         let sample_interval_ms = args.sample_minutes * 60 * 1000;
@@ -183,39 +193,43 @@ fn main() -> Result<()> {
         // Create GeoJSON feature
         let mut properties = Map::new();
         properties.insert("mmsi".to_string(), json!(record.mmsi));
-        properties.insert("timestamp".to_string(), json!(format!("{}Z", record.base_date_time))); // Add Z for UTC
+        properties.insert(
+            "timestamp".to_string(),
+            json!(format!("{}Z", record.base_date_time)),
+        ); // Add Z for UTC
         properties.insert("vessel_type".to_string(), json!(vessel_category));
-        
+
         if let Some(sog) = record.sog {
-            if sog >= 0.0 && sog < 100.0 { // Filter invalid speeds
+            if sog >= 0.0 && sog < 100.0 {
+                // Filter invalid speeds
                 properties.insert("speed".to_string(), json!(sog));
             }
         }
-        
+
         if let Some(cog) = record.cog {
             if cog >= 0.0 && cog <= 360.0 {
                 properties.insert("course".to_string(), json!(cog));
             }
         }
-        
+
         if let Some(heading) = record.heading {
             if heading >= 0.0 && heading <= 360.0 {
                 properties.insert("heading".to_string(), json!(heading));
             }
         }
-        
+
         if let Some(ref name) = record.vessel_name {
             if !name.is_empty() && name != "Unknown" {
                 properties.insert("vessel_name".to_string(), json!(name));
             }
         }
-        
+
         if let Some(length) = record.length {
             if length > 0.0 && length < 500.0 {
                 properties.insert("length".to_string(), json!(length));
             }
         }
-        
+
         if let Some(width) = record.width {
             if width > 0.0 && width < 100.0 {
                 properties.insert("width".to_string(), json!(width));
@@ -242,9 +256,11 @@ fn main() -> Result<()> {
     common::write_geojson(features, &args.output)?;
 
     println!("\n✅ Success! Now run:");
-    println!("   stt-build --input {} --output ais-traffic.stt \\", args.output.display());
+    println!(
+        "   stt-build --input {} --output ais-traffic.stt \\",
+        args.output.display()
+    );
     println!("             --time-field timestamp \\");
-    println!("             --temporal-resolution high-frequency \\");
     println!("             --min-zoom 0 \\");
     println!("             --max-zoom 14 \\");
     println!("             --compression gzip");
@@ -257,7 +273,7 @@ fn parse_bounds(s: &str) -> Result<(f64, f64, f64, f64)> {
     if parts.len() != 4 {
         anyhow::bail!("Bounds must be: min_lat,min_lon,max_lat,max_lon");
     }
-    
+
     Ok((
         parts[0].parse()?,
         parts[1].parse()?,
@@ -277,4 +293,3 @@ fn vessel_type_to_category(type_code: Option<u8>) -> &'static str {
         _ => "other",
     }
 }
-

@@ -211,7 +211,6 @@ fi
     --input "$MERGED_FILE" \
     --output "$STT_OUTPUT" \
     --time-field timestamp \
-    --temporal-resolution high-frequency \
     --min-zoom 0 \
     --max-zoom 14 \
     --compression gzip \

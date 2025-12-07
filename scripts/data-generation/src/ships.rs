@@ -1,17 +1,17 @@
 //! Generate maritime traffic data
 //!
 //! ## Real AIS Data Source
-//! 
+//!
 //! **Provider:** NOAA Marine Cadastre (Free, public access)
 //! **Base URL:** https://coast.noaa.gov/htdata/CMSP/AISDataHandler
-//! 
+//!
 //! ### Coverage
 //! - **Geographic:** US coastal waters
 //! - **Temporal:** 2009 - Present (daily files)
 //! - **File Format:** ZIP compressed CSV files
 //! - **Naming:** `AIS_YYYY_MM_DD.zip`
 //! - **Size:** ~200-300 MB compressed per day (~800 MB uncompressed)
-//! 
+//!
 //! ### CSV Fields
 //! - `MMSI` - Maritime Mobile Service Identity (vessel ID)
 //! - `BaseDateTime` - UTC timestamp
@@ -21,26 +21,26 @@
 //! - `Heading` - True heading (degrees)
 //! - `VesselName`, `VesselType` - Vessel information
 //! - `Length`, `Width`, `Draft` - Vessel dimensions (meters)
-//! 
+//!
 //! ### Download Example
 //! ```bash
 //! # Download a single day
 //! curl -o AIS_2023_01_01.zip \
 //!   https://coast.noaa.gov/htdata/CMSP/AISDataHandler/2023/AIS_2023_01_01.zip
-//! 
+//!
 //! # Unzip and process
 //! unzip AIS_2023_01_01.zip
-//! 
+//!
 //! # Convert to GeoJSON (custom script needed)
 //! # Then use stt-build to create STT archive
 //! ```
-//! 
+//!
 //! ### References
 //! - NOAA AIS Portal: https://marinecadastre.gov/ais/
 //! - Data Dictionary: https://coast.noaa.gov/data/marinecadastre/ais/AIS-FAQ.pdf
-//! 
+//!
 //! ---
-//! 
+//!
 //! This script generates synthetic ship movements for demonstration purposes.
 //! For production use, process real AIS data from NOAA.
 
@@ -149,26 +149,33 @@ fn main() -> Result<()> {
     let date = NaiveDate::parse_from_str(&args.start_date, "%Y-%m-%d")?;
     let start_time = common::date_to_datetime(date);
 
-    println!("📊 Generating {} ships over {} days...", args.num_ships, args.days);
+    println!(
+        "📊 Generating {} ships over {} days...",
+        args.num_ships, args.days
+    );
     let features = generate_ship_data(start_time, args.days, args.num_ships)?;
 
     println!("\n💾 Writing output...");
     common::write_geojson(features, &args.output)?;
 
     println!("\n✅ Success! Now run:");
-    println!("   stt-build --input {} --output ship-traffic.stt \\", args.output.display());
+    println!(
+        "   stt-build --input {} --output ship-traffic.stt \\",
+        args.output.display()
+    );
     println!("             --time-field timestamp \\");
-    println!("             --temporal-resolution high-frequency \\");
     println!("             --min-zoom 0 \\");
     println!("             --max-zoom 12 \\");
     println!("             --compression gzip");
-    println!("\n💡 Temporal resolution: high-frequency profile");
-    println!("   Zoom 0-3: daily → Zoom 4-6: hourly → Zoom 7-9: minute → Zoom 10+: second");
 
     Ok(())
 }
 
-fn generate_ship_data(start_time: DateTime<Utc>, days: i64, num_ships: usize) -> Result<Vec<Feature>> {
+fn generate_ship_data(
+    start_time: DateTime<Utc>,
+    days: i64,
+    num_ships: usize,
+) -> Result<Vec<Feature>> {
     let mut rng = rand::thread_rng();
     let mut features = Vec::new();
 
@@ -185,10 +192,10 @@ fn generate_ship_data(start_time: DateTime<Utc>, days: i64, num_ships: usize) ->
 
         let route = ROUTES[rng.gen_range(0..ROUTES.len())];
         let progress = rng.gen_range(0.0..1.0);
-        
+
         let lon = route.0 + (route.2 - route.0) * progress;
         let lat = route.1 + (route.3 - route.1) * progress;
-        
+
         ships.push((ship_id, vessel_type, lon, lat, route.2, route.3));
     }
 
@@ -217,7 +224,10 @@ fn generate_ship_data(start_time: DateTime<Utc>, days: i64, num_ships: usize) ->
             properties.insert("ship_id".to_string(), json!(id));
             properties.insert("vessel_type".to_string(), json!(vessel_type.to_string()));
             properties.insert("speed".to_string(), json!(speed));
-            properties.insert("heading".to_string(), json!((dx.atan2(dy) * 180.0 / std::f64::consts::PI) as i32));
+            properties.insert(
+                "heading".to_string(),
+                json!((dx.atan2(dy) * 180.0 / std::f64::consts::PI) as i32),
+            );
 
             let feature = common::create_point_feature(ship.2, ship.3, timestamp, properties);
             features.push(feature);
@@ -230,4 +240,3 @@ fn generate_ship_data(start_time: DateTime<Utc>, days: i64, num_ships: usize) ->
 
     Ok(features)
 }
-

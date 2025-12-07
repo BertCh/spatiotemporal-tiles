@@ -1,17 +1,17 @@
 //! Generate flight density data
 //!
 //! ## Real ADS-B Data Source
-//! 
+//!
 //! **Provider:** ADSBExchange (Free for 1st of each month)
 //! **Base URL:** https://samples.adsbexchange.com/hires-traces
-//! 
+//!
 //! ### Coverage
 //! - **Geographic:** Global coverage
 //! - **Temporal:** 2020 - Present (hourly snapshots)
 //! - **Availability:** Only 1st of each month freely available
 //! - **File Format:** Gzip-compressed JSON traces
 //! - **Organization:** Files bucketed by ICAO hex prefix (00-ff)
-//! 
+//!
 //! ### JSON Structure
 //! Each trace file contains one aircraft's full day of positions:
 //! ```json
@@ -25,7 +25,7 @@
 //!   ]
 //! }
 //! ```
-//! 
+//!
 //! ### Trace Fields
 //! - Index 0: Unix timestamp (seconds)
 //! - Index 1: Latitude (decimal degrees)
@@ -33,7 +33,7 @@
 //! - Index 3: Altitude (feet, barometric)
 //! - Index 4: Ground speed (knots)
 //! - Index 5: Track angle (degrees)
-//! 
+//!
 //! ### Download Example
 //! ```bash
 //! # Download specific aircraft trace for January 1, 2025
@@ -41,23 +41,23 @@
 //! # Example: aircraft a12345 is in bucket "a1"
 //! curl -o trace_a12345.json \
 //!   https://samples.adsbexchange.com/hires-traces/2025/01/01/a1/trace_full_~a12345.json
-//! 
+//!
 //! # Note: You must know the ICAO codes in advance
 //! # Use ADSBExchange index files or the API to get ICAO lists
 //! ```
-//! 
+//!
 //! ### Important Notes
 //! - Only the 1st of each month is freely available
 //! - Must know ICAO codes in advance (use index files)
 //! - Files organized in 256 buckets (00-ff) based on ICAO prefix
 //! - Global coverage but density varies by region
-//! 
+//!
 //! ### References
 //! - ADS-B Exchange: https://www.adsbexchange.com/data-samples/
 //! - Data Format: https://www.adsbexchange.com/version-2-api-wip/
-//! 
+//!
 //! ---
-//! 
+//!
 //! This script generates synthetic flight data for demonstration purposes.
 //! For production use, download and process real ADS-B traces from ADSBExchange.
 
@@ -138,7 +138,9 @@ fn main() -> Result<()> {
     println!();
     println!("   Example download (aircraft a12345 on Jan 1, 2025):");
     println!("   curl -o trace_a12345.json \\");
-    println!("     https://samples.adsbexchange.com/hires-traces/2025/01/01/a1/trace_full_~a12345.json");
+    println!(
+        "     https://samples.adsbexchange.com/hires-traces/2025/01/01/a1/trace_full_~a12345.json"
+    );
     println!();
     println!("   Note: Files organized in 256 buckets (00-ff) by ICAO prefix");
     println!("         Only 1st of each month freely available");
@@ -154,13 +156,14 @@ fn main() -> Result<()> {
     common::write_geojson(features, &args.output)?;
 
     println!("\n✅ Success! Now run:");
-    println!("   stt-build --input {} --output flight-density.stt \\", args.output.display());
+    println!(
+        "   stt-build --input {} --output flight-density.stt \\",
+        args.output.display()
+    );
     println!("             --time-field timestamp \\");
-    println!("             --temporal-resolution high-frequency \\");
     println!("             --min-zoom 3 \\");
     println!("             --max-zoom 10 \\");
     println!("             --compression gzip");
-    println!("\n💡 Temporal resolution: high-frequency profile (day→hour→minute→second)");
 
     Ok(())
 }
@@ -178,7 +181,8 @@ fn generate_flight_data(start_time: DateTime<Utc>, num_flights: usize) -> Result
         // More flights during day, fewer at night
         let hour = interval / 12;
         let flight_multiplier = if hour >= 6 && hour <= 22 { 1.5 } else { 0.5 };
-        let num_this_interval = (num_flights as f64 * flight_multiplier / intervals as f64) as usize;
+        let num_this_interval =
+            (num_flights as f64 * flight_multiplier / intervals as f64) as usize;
 
         for _ in 0..num_this_interval {
             // Pick random route
@@ -214,4 +218,3 @@ fn generate_flight_data(start_time: DateTime<Utc>, num_flights: usize) -> Result
 
     Ok(features)
 }
-

@@ -209,8 +209,8 @@ echo "🧹 Cleaning up temporary files..."
 rm -rf "$TEMP_DIR"
 echo ""
 
-# Build STT archive with hourly temporal resolution
-echo "📦 Building STT archive with HOURLY temporal resolution..."
+# Build STT archive
+echo "📦 Building STT archive..."
 echo "   (This matches the 10-minute sampling rate better than minute-level buckets)"
 STT_OUTPUT="../../examples/showcase/public/data/ais-all-us.stt"
 
@@ -226,7 +226,6 @@ fi
     --input "$MERGED_FILE" \
     --output "$STT_OUTPUT" \
     --time-field timestamp \
-    --temporal-resolution hour \
     --min-zoom 0 \
     --max-zoom 10 \
     --compression gzip \

@@ -25,10 +25,7 @@ pub fn simplify_linestring_coords(coords: &[(f64, f64)], epsilon: f64) -> Vec<(f
         return coords.to_vec();
     }
 
-    let line: LineString<f64> = coords
-        .iter()
-        .map(|(x, y)| Coord { x: *x, y: *y })
-        .collect();
+    let line: LineString<f64> = coords.iter().map(|(x, y)| Coord { x: *x, y: *y }).collect();
 
     simplify_linestring(&line, epsilon)
         .into_iter()
@@ -142,14 +139,9 @@ fn zigzag_decode(n: u32) -> i32 {
 /// Calculate the bounding box of a linestring using geo types
 pub fn bounding_box_line(line: &LineString<f64>) -> crate::types::BoundingBox {
     use geo::algorithm::bounding_rect::BoundingRect;
-    
+
     if let Some(rect) = line.bounding_rect() {
-        crate::types::BoundingBox::new(
-            rect.min().x,
-            rect.min().y,
-            rect.max().x,
-            rect.max().y,
-        )
+        crate::types::BoundingBox::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y)
     } else {
         crate::types::BoundingBox::default()
     }
@@ -158,14 +150,9 @@ pub fn bounding_box_line(line: &LineString<f64>) -> crate::types::BoundingBox {
 /// Calculate the bounding box of a polygon using geo types
 pub fn bounding_box_polygon(polygon: &Polygon<f64>) -> crate::types::BoundingBox {
     use geo::algorithm::bounding_rect::BoundingRect;
-    
+
     if let Some(rect) = polygon.bounding_rect() {
-        crate::types::BoundingBox::new(
-            rect.min().x,
-            rect.min().y,
-            rect.max().x,
-            rect.max().y,
-        )
+        crate::types::BoundingBox::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y)
     } else {
         crate::types::BoundingBox::default()
     }
@@ -223,13 +210,8 @@ mod tests {
 
     #[test]
     fn test_simplify_linestring() {
-        let line: LineString<f64> = vec![
-            (0.0, 0.0),
-            (1.0, 0.1),
-            (2.0, 0.0),
-            (3.0, 0.1),
-            (4.0, 0.0),
-        ].into();
+        let line: LineString<f64> =
+            vec![(0.0, 0.0), (1.0, 0.1), (2.0, 0.0), (3.0, 0.1), (4.0, 0.0)].into();
         let simplified = simplify_linestring(&line, 0.5);
         let num_coords = simplified.coords().count();
         let orig_coords = line.coords().count();
@@ -238,13 +220,7 @@ mod tests {
 
     #[test]
     fn test_simplify_linestring_coords() {
-        let coords = vec![
-            (0.0, 0.0),
-            (1.0, 0.1),
-            (2.0, 0.0),
-            (3.0, 0.1),
-            (4.0, 0.0),
-        ];
+        let coords = vec![(0.0, 0.0), (1.0, 0.1), (2.0, 0.0), (3.0, 0.1), (4.0, 0.0)];
         let simplified = simplify_linestring_coords(&coords, 0.5);
         assert!(simplified.len() < coords.len());
     }
@@ -259,4 +235,3 @@ mod tests {
         assert_eq!(max_y, 2.0);
     }
 }
-

@@ -178,4 +178,3 @@ mod tests {
         assert!(!tr1.overlaps(&tr3));
     }
 }
-

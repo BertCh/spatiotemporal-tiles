@@ -122,12 +122,16 @@ impl Metadata {
             }),
             min_zoom: self.min_zoom as u32,
             max_zoom: self.max_zoom as u32,
-            layers: self.layers.iter().map(|name| crate::proto::LayerInfo {
-                name: name.clone(),
-                description: String::new(),
-                properties: vec![],
-                geometry_types: vec![],
-            }).collect(),
+            layers: self
+                .layers
+                .iter()
+                .map(|name| crate::proto::LayerInfo {
+                    name: name.clone(),
+                    description: String::new(),
+                    properties: vec![],
+                    geometry_types: vec![],
+                })
+                .collect(),
             generation: None,
             stats: Some(crate::proto::Statistics {
                 total_tiles: self.tile_count,
@@ -214,4 +218,3 @@ mod tests {
         assert_eq!(decoded.description, metadata.description);
     }
 }
-
