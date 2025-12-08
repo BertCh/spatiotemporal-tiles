@@ -1,5 +1,6 @@
 //! Tile generation logic
 
+use crate::columnar::{build_columnar_features, ColumnarConfig};
 use crate::input::ParsedFeature;
 use anyhow::Result;
 use rayon::prelude::*;
@@ -19,6 +20,8 @@ pub struct TileConfig {
     pub layer_name: String,
     /// Target chunk size in bytes (default: 512KB)
     pub target_chunk_size: usize,
+    /// Use Version 2 format (quantized coords, columnar properties)
+    pub use_v2_format: bool,
 }
 
 /// Generated tile with Proto representation
@@ -165,6 +168,23 @@ fn create_tile(
     time_start: u64,
     time_end: u64,
 ) -> Result<GeneratedTile> {
+    if config.use_v2_format {
+        // Version 2: Columnar format with quantized coordinates
+        create_tile_v2(tile_id, features, config, time_start, time_end)
+    } else {
+        // Version 1: Original format
+        create_tile_v1(tile_id, features, config, time_start, time_end)
+    }
+}
+
+/// Create a tile using Version 1 format (original)
+fn create_tile_v1(
+    tile_id: TileId,
+    features: &[&ParsedFeature],
+    config: &TileConfig,
+    time_start: u64,
+    time_end: u64,
+) -> Result<GeneratedTile> {
     let mut proto_features = Vec::with_capacity(features.len());
 
     for feature in features {
@@ -176,11 +196,46 @@ fn create_tile(
         name: config.layer_name.clone(),
         extent: config.extent,
         features: proto_features,
+        columnar: None,
     };
 
-    // Create tile (simplified - no interpolation or temporal resolution metadata)
     let proto_tile = stt_core::proto::Tile {
         version: 1,
+        time_start,
+        time_end,
+        layers: vec![layer],
+    };
+
+    Ok(GeneratedTile {
+        id: tile_id,
+        proto: proto_tile,
+    })
+}
+
+/// Create a tile using Version 2 format (columnar, quantized)
+fn create_tile_v2(
+    tile_id: TileId,
+    features: &[&ParsedFeature],
+    config: &TileConfig,
+    time_start: u64,
+    time_end: u64,
+) -> Result<GeneratedTile> {
+    let columnar_config = ColumnarConfig {
+        extent: config.extent,
+        layer_name: config.layer_name.clone(),
+    };
+    
+    let columnar = build_columnar_features(features, &tile_id, &columnar_config, time_start)?;
+    
+    let layer = stt_core::proto::Layer {
+        name: config.layer_name.clone(),
+        extent: config.extent,
+        features: vec![], // Empty for V2 - data is in columnar
+        columnar: Some(columnar),
+    };
+
+    let proto_tile = stt_core::proto::Tile {
+        version: 2,
         time_start,
         time_end,
         layers: vec![layer],
@@ -212,6 +267,7 @@ fn build_feature(feature: &ParsedFeature, config: &TileConfig) -> Result<stt_cor
         properties,
         valid_from: feature.timestamp,
         valid_to: feature.timestamp,
+        geometry: vec![], // V2 field - empty for V1 format
     })
 }
 

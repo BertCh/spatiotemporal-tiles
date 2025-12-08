@@ -5,6 +5,8 @@ package stt;
 // Main tile message containing all feature data for a spatiotemporal tile
 message Tile {
   // Format version for backward compatibility
+  // Version 1: Original format with absolute WGS84 coordinates
+  // Version 2: MVT-style quantized coordinates + columnar properties
   uint32 version = 1;
   
   // Temporal bounds of this tile (Unix timestamp in milliseconds)
@@ -23,14 +25,18 @@ message Layer {
   // Layer name
   string name = 1;
   
-  // Coordinate extent (kept for compatibility, default 4096)
+  // Coordinate extent (default 4096, used for quantized coordinates)
   uint32 extent = 2;
   
-  // Features in this layer
+  // === Version 1 format: Feature-based (original) ===
   repeated Feature features = 3;
+  
+  // === Version 2 format: Columnar layout (new) ===
+  // Use this for better GPU performance
+  ColumnarFeatures columnar = 4;
 }
 
-// Individual feature with geometry and properties
+// Individual feature with geometry and properties (Version 1 format)
 message Feature {
   // Unique feature identifier
   uint64 id = 1;
@@ -43,7 +49,7 @@ message Feature {
   }
   GeomType type = 2;
   
-  // Absolute WGS84 coordinates for this feature
+  // Absolute WGS84 coordinates for this feature (Version 1)
   // Points contain a single position, lines/polygons contain multiple positions
   repeated Position positions = 3;
   
@@ -53,9 +59,14 @@ message Feature {
   // Optional: temporal validity range for this feature
   uint64 valid_from = 5;
   uint64 valid_to = 6;
+  
+  // === Version 2 additions ===
+  // Quantized tile-relative coordinates (when version >= 2)
+  // Uses zigzag + delta encoding for efficiency
+  repeated sint32 geometry = 7 [packed = true];
 }
 
-// Geographic position
+// Geographic position (Version 1 format - absolute WGS84)
 message Position {
   double lon = 1;
   double lat = 2;
@@ -72,4 +83,55 @@ message Value {
     sint64 sint_value = 6;
     bool bool_value = 7;
   }
+}
+
+// === Version 2: Columnar feature layout for GPU-optimized rendering ===
+message ColumnarFeatures {
+  // Number of features in this layer
+  uint32 feature_count = 1;
+  
+  // Geometry type for all features in this layer
+  Feature.GeomType geometry_type = 2;
+  
+  // Feature IDs as flat array
+  repeated uint64 feature_ids = 3 [packed = true];
+  
+  // Quantized geometry data
+  // For points: [x0, y0, x1, y1, ...] (2 values per feature)
+  // For lines/polygons: use geometry_offsets to index
+  repeated sint32 geometry = 4 [packed = true];
+  
+  // For non-point geometries: offset into geometry array for each feature
+  // Length = feature_count + 1 (last value is total geometry count)
+  repeated uint32 geometry_offsets = 5 [packed = true];
+  
+  // Temporal data
+  // Start times relative to tile time_start (delta encoded)
+  repeated sint64 start_times = 6 [packed = true];
+  // End times relative to start_times (delta encoded)
+  repeated sint64 end_times = 7 [packed = true];
+  
+  // Numeric properties (columnar layout)
+  repeated NumericColumn numeric_properties = 8;
+  
+  // Categorical properties (dictionary encoded)
+  repeated CategoricalColumn categorical_properties = 9;
+}
+
+// A column of numeric property values
+message NumericColumn {
+  string name = 1;
+  // Values as float32 (good balance of precision and size)
+  repeated float values = 2 [packed = true];
+  // Optional: original values as float64 for high-precision needs
+  repeated double values_f64 = 3 [packed = true];
+}
+
+// A column of categorical (string) property values
+message CategoricalColumn {
+  string name = 1;
+  // Dictionary of unique values
+  repeated string categories = 2;
+  // Index into categories for each feature (0-255 range)
+  bytes indices = 3;
 }

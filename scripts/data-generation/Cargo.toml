@@ -43,6 +43,10 @@ path = "src/ais.rs"
 name = "generate-bikeshare-data"
 path = "src/bikeshare.rs"
 
+[[bin]]
+name = "generate-nyc-rideshare"
+path = "src/nyc_rideshare.rs"
+
 [dependencies]
 stt-core = { path = "../../crates/stt-core" }
 anyhow.workspace = true
@@ -63,6 +67,8 @@ tracing-subscriber.workspace = true
 zip = "0.6"
 flate2.workspace = true
 rand = "0.8"
+parquet = { version = "53", default-features = false, features = ["arrow", "flate2", "snap", "zstd"] }
+arrow = { version = "53", default-features = false, features = ["chrono-tz"] }
 
 [dev-dependencies]
 tempfile = "3.10"

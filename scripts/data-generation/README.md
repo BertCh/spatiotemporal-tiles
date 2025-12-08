@@ -79,6 +79,49 @@ stt-build \
 
 **Output**: ~144K trajectory points, 24 hours
 
+#### 4. NYC Rideshare (`generate-nyc-rideshare`) ⭐ NEW
+
+Generates realistic NYC taxi trajectories using real TLC trip records + OSRM routing.
+
+**Data Source**: [NYC TLC Trip Record Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) (pre-2017 with lat/long coordinates)
+
+**Routing**: [OSRM](https://project-osrm.org/) (local Docker instance)
+
+```bash
+# 1. First, set up OSRM with NYC data (one-time setup, ~15 minutes)
+./setup-osrm.sh
+
+# 2. Generate trajectories from TLC data
+cargo run --release --bin generate-nyc-rideshare -- \
+  --download 2015-01 \
+  --output nyc-rideshare.csv \
+  --max-trips 10000 \
+  --interval 30
+
+# Or use a local CSV file (e.g., from Kaggle)
+cargo run --release --bin generate-nyc-rideshare -- \
+  --input data/yellow_tripdata_2015-01.csv \
+  --output nyc-rideshare.csv \
+  --max-trips 10000
+
+# 3. Convert to STT
+stt-build \
+  --input nyc-rideshare.csv \
+  --output ../examples/showcase/public/data/nyc-rideshare.stt \
+  --time-field timestamp \
+  --min-zoom 10 \
+  --max-zoom 16 \
+  --compression gzip
+```
+
+**Features**:
+- Uses real NYC TLC trip data (pickup/dropoff times and coordinates)
+- Routes trips through OSRM for realistic street-level trajectories
+- Interpolates trajectory points at configurable intervals
+- Handles trip metadata (passenger count, fare, distance)
+
+**Output**: Variable based on trips and interval settings
+
 ### 🚧 To Be Implemented
 
 #### Maritime Traffic (`generate-ship-data`)

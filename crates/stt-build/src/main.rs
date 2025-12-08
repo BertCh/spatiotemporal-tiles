@@ -3,6 +3,7 @@
 //! This tool converts GeoJSON, CSV, or other spatial data formats into
 //! optimized STT archives for web visualization.
 
+mod columnar;
 mod input;
 mod tiler;
 
@@ -77,6 +78,11 @@ struct Args {
     #[arg(long, default_value = "default")]
     layer: String,
 
+    /// Use Version 2 format (quantized coordinates, columnar properties)
+    /// This produces smaller tiles and faster GPU rendering
+    #[arg(long)]
+    v2: bool,
+
     /// Verbose output
     #[arg(short, long)]
     verbose: bool,
@@ -135,6 +141,10 @@ fn main() -> Result<()> {
 
     // Step 3: Generate tiles
     info!("Generating tiles...");
+    if args.v2 {
+        info!("Using Version 2 format (quantized coordinates, columnar properties)");
+    }
+    
     let tile_config = tiler::TileConfig {
         min_zoom: args.min_zoom,
         max_zoom: args.max_zoom,
@@ -142,6 +152,7 @@ fn main() -> Result<()> {
         simplification: args.simplification,
         layer_name: args.layer.clone(),
         target_chunk_size: args.chunk_size,
+        use_v2_format: args.v2,
     };
 
     let tiles = tiler::generate_tiles(&features, &tile_config, args.workers)?;
