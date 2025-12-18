@@ -42,22 +42,6 @@ const DATASET_CONFIGS = {
       ],
     },
   },
-  "covid-cases": {
-    id: "covid-cases",
-    name: "COVID-19 Cases",
-    description:
-      "NYT county-level data (5 sample counties) from Feb 2020 - May 2022",
-    type: "point",
-    timeWindow: 86400000, // 1 day
-    animationSpeed: 86400000 * 7, // 1 week per second
-    initialViewState: {
-      longitude: -98.5,
-      latitude: 39.8,
-      zoom: 4,
-      pitch: 0,
-      bearing: 0,
-    },
-  },
   hurricanes: {
     id: "hurricanes",
     name: "Hurricane Tracks",
@@ -86,21 +70,6 @@ const DATASET_CONFIGS = {
       latitude: 39.8,
       zoom: 4,
       pitch: 0,
-      bearing: 0,
-    },
-  },
-  "sf-taxis": {
-    id: "sf-taxis",
-    name: "San Francisco Taxis",
-    description: "Simulated taxi trajectories in San Francisco",
-    type: "point",
-    timeWindow: 600000, // 10 minutes
-    animationSpeed: 600000, // 10 minutes per second
-    initialViewState: {
-      longitude: -122.43,
-      latitude: 37.78,
-      zoom: 12,
-      pitch: 45,
       bearing: 0,
     },
   },

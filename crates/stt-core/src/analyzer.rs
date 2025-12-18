@@ -377,12 +377,6 @@ impl ArchiveAnalyzer {
     }
 }
 
-// Use the new index() method instead of accessing private field
-impl ArchiveReader {
-    pub fn get_index(&self) -> &crate::proto::Index {
-        self.index()
-    }
-}
 
 #[cfg(test)]
 mod tests {

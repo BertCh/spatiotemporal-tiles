@@ -3,7 +3,7 @@
 use crate::compression;
 use crate::error::{Error, Result};
 use crate::tile::TileId;
-use crate::types::{BoundingBox, Compression, TimeRange};
+use crate::types::Compression;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use prost::Message;
 use std::fs::{File, OpenOptions};
@@ -131,164 +131,10 @@ impl ArchiveReader {
         &self.index
     }
 
-    /// Get tile by ID
-    pub fn get_tile(&mut self, id: &TileId) -> Result<Option<crate::tile::Tile>> {
-        // Find tile entry in index
-        let entry = self.index.tiles.iter().find(|e| {
-            e.zoom == id.z as u32
-                && e.x == id.x
-                && e.y == id.y
-                && e.time_start <= id.t
-                && e.time_end >= id.t
-        });
-
-        let entry = match entry {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-
-        // Read compressed tile data
-        self.file.seek(SeekFrom::Start(entry.offset))?;
-        let mut compressed = vec![0u8; entry.length as usize];
-        self.file.read_exact(&mut compressed)?;
-
-        // Decompress
-        let compression = Compression::from_proto(entry.compression);
-        let data = compression::decompress(&compressed, compression)?;
-
-        // Decode Protocol Buffer
-        let proto_tile = crate::proto::Tile::decode(&data[..])?;
-
-        // Convert to internal tile format
-        let tile = self.proto_to_tile(*id, proto_tile)?;
-
-        Ok(Some(tile))
+    /// Get the index (alias for backwards compatibility)
+    pub fn get_index(&self) -> &crate::proto::Index {
+        &self.index
     }
-
-    /// Get tiles in a bounding box and time range
-    pub fn get_tiles_in_bounds(
-        &mut self,
-        bounds: &BoundingBox,
-        zoom: u8,
-        time_range: &TimeRange,
-    ) -> Result<Vec<crate::tile::Tile>> {
-        // Convert bounding box to tile coordinates
-        let tile_coords = bounds_to_tiles(bounds, zoom);
-
-        let mut tiles = Vec::new();
-        for (x, y) in tile_coords {
-            // Use time_start as the query time (could be improved with range queries)
-            let id = TileId::new(zoom, x, y, time_range.start);
-            if let Some(tile) = self.get_tile(&id)? {
-                tiles.push(tile);
-            }
-        }
-
-        Ok(tiles)
-    }
-
-    fn proto_to_tile(
-        &self,
-        id: TileId,
-        proto_tile: crate::proto::Tile,
-    ) -> Result<crate::tile::Tile> {
-        use crate::tile::{Feature, Layer, Position, Tile};
-        use crate::types::GeometryType;
-
-        let layers = proto_tile
-            .layers
-            .into_iter()
-            .map(|proto_layer| {
-                let features = proto_layer
-                    .features
-                    .into_iter()
-                    .map(|proto_feature| {
-                        let positions = proto_feature
-                            .positions
-                            .into_iter()
-                            .map(|p| Position {
-                                lon: p.lon,
-                                lat: p.lat,
-                            })
-                            .collect();
-
-                        let properties = proto_feature
-                            .properties
-                            .into_iter()
-                            .map(|(key, val)| (key, proto_value_to_value(&val)))
-                            .collect();
-
-                        Feature {
-                            id: proto_feature.id,
-                            geometry_type: GeometryType::from_proto(proto_feature.r#type),
-                            positions,
-                            properties,
-                            time_range: if proto_feature.valid_from > 0
-                                && proto_feature.valid_to > 0
-                            {
-                                Some(TimeRange::new(
-                                    proto_feature.valid_from,
-                                    proto_feature.valid_to,
-                                ))
-                            } else {
-                                None
-                            },
-                        }
-                    })
-                    .collect();
-
-                Layer {
-                    name: proto_layer.name,
-                    extent: proto_layer.extent,
-                    features,
-                }
-            })
-            .collect();
-
-        Ok(Tile {
-            id,
-            time_range: TimeRange::new(proto_tile.time_start, proto_tile.time_end),
-            layers,
-        })
-    }
-}
-
-fn proto_value_to_value(proto_value: &crate::proto::Value) -> crate::tile::Value {
-    use crate::proto::value::ValueType;
-    use crate::tile::Value;
-
-    match &proto_value.value_type {
-        Some(ValueType::StringValue(s)) => Value::String(s.clone()),
-        Some(ValueType::DoubleValue(d)) => Value::Double(*d),
-        Some(ValueType::FloatValue(f)) => Value::Float(*f),
-        Some(ValueType::IntValue(i)) => Value::Int(*i),
-        Some(ValueType::UintValue(u)) => Value::UInt(*u),
-        Some(ValueType::SintValue(s)) => Value::Int(*s),
-        Some(ValueType::BoolValue(b)) => Value::Bool(*b),
-        None => Value::String(String::new()),
-    }
-}
-
-/// Convert geographic bounding box to tile coordinates
-///
-/// Now uses the standardized projection module.
-fn bounds_to_tiles(bounds: &BoundingBox, zoom: u8) -> Vec<(u32, u32)> {
-    use crate::projection::lonlat_to_tile;
-
-    let n = 1u32 << zoom;
-
-    // Convert lon/lat to tile coordinates using projection module
-    let (min_x, min_y) = lonlat_to_tile(bounds.min_lon, bounds.max_lat, zoom).unwrap_or((0, 0));
-    let (max_x, max_y) =
-        lonlat_to_tile(bounds.max_lon, bounds.min_lat, zoom).unwrap_or((n - 1, n - 1));
-
-    let mut tiles = Vec::new();
-    for x in min_x..=max_x.min(n - 1) {
-        for y in min_y..=max_y.min(n - 1) {
-            tiles.push((x, y));
-        }
-    }
-    tiles
 }
 
 /// Writer for creating STT archives
@@ -348,7 +194,7 @@ impl ArchiveWriter {
             time_end: tile.time_end,
             offset,
             length,
-            feature_count: tile.layers.iter().map(|l| l.features.len() as u32).sum(),
+            feature_count: tile.layers.iter().map(|l| l.columnar.as_ref().map(|c| c.feature_count).unwrap_or(0)).sum(),
             compression: compression.to_proto(),
             uncompressed_size,
         });

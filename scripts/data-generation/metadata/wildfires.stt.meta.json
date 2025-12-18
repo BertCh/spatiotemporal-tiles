@@ -1,0 +1,43 @@
+{
+  "id": "wildfires",
+  "name": "US Wildfires",
+  "description": "NIFC wildfire perimeters (1000+ acres, 2020-2023) - polygon data",
+  "source": {
+    "name": "National Interagency Fire Center (NIFC)",
+    "url": "https://data-nifc.opendata.arcgis.com/",
+    "license": "Public Domain - US Government"
+  },
+  "dataSource": {
+    "api": "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/InterAgencyFirePerimeterHistory_All_Years_View/FeatureServer/0",
+    "type": "ArcGIS Feature Service"
+  },
+  "timeRange": {
+    "start": "2020-06-01T00:00:00Z",
+    "end": "2023-12-11T00:00:00Z"
+  },
+  "spatialExtent": {
+    "minLon": -123.66,
+    "maxLon": -75.85,
+    "minLat": 26.46,
+    "maxLat": 48.38
+  },
+  "statistics": {
+    "featureCount": 118,
+    "geometryType": "Polygon",
+    "years": [2020, 2021, 2022, 2023]
+  },
+  "attributes": {
+    "name": "Fire name/incident name",
+    "year": "Calendar year of the fire",
+    "acres": "Total area burned in acres (GIS calculated)",
+    "agency": "Managing agency (USFS, BLM, etc.)",
+    "severity": "Derived severity based on acres (moderate, high, extreme, catastrophic)"
+  },
+  "generation": {
+    "script": "generate-wildfire-data",
+    "args": "--start-year 2020 --end-year 2023 --min-acres 1000",
+    "sttBuildArgs": "--time-field timestamp --min-zoom 3 --max-zoom 12 --compression gzip"
+  }
+}
+
+

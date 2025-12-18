@@ -1,13 +1,17 @@
 //! Process real AIS data from NOAA Marine Cadastre
 //!
-//! Downloads and converts USCG Marine Cadastre AIS data to CSV or GeoJSON
+//! Downloads and converts USCG Marine Cadastre AIS data to CSV, GeoJSON, or GeoParquet.
 //! Source: https://coast.noaa.gov/htdata/CMSP/AISDataHandler
+//!
+//! GeoParquet is recommended for large datasets - it's 10-50x smaller than GeoJSON
+//! and loads much faster in tools like DuckDB, QGIS, and Python/geopandas.
 
 mod common;
 
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
 use clap::Parser;
+use common::{PropertyColumn, StreamingGeoParquetWriter};
 use csv::ReaderBuilder;
 use serde::Deserialize;
 use serde_json::{json, Map};
@@ -24,8 +28,11 @@ struct Args {
     #[arg(short, long)]
     input: PathBuf,
 
-    /// Output file (use .csv for streaming output, .geojson for JSON)
-    #[arg(short, long, default_value = "ais-traffic.csv")]
+    /// Output file format determined by extension:
+    ///   .parquet / .geoparquet - GeoParquet (recommended, smallest & fastest)
+    ///   .csv - Streaming CSV (memory-efficient)
+    ///   .geojson / .json - GeoJSON (readable but large)
+    #[arg(short, long, default_value = "ais-traffic.parquet")]
     output: PathBuf,
 
     /// Sampling interval in minutes (default: 10 = keep 1 position per vessel per 10 min)
@@ -94,9 +101,16 @@ fn main() -> Result<()> {
         println!("📍 Geographic filter: {}", bounds_str);
     }
 
+    // Detect output format
+    let use_geoparquet = common::is_geoparquet_output(&args.output);
     let use_csv = common::is_csv_output(&args.output);
-    if use_csv {
+    
+    if use_geoparquet {
+        println!("📦 Using GeoParquet output (columnar, efficient)");
+    } else if use_csv {
         println!("📄 Using streaming CSV output (memory-efficient)");
+    } else {
+        println!("📄 Using GeoJSON output");
     }
 
     println!();
@@ -117,8 +131,8 @@ fn main() -> Result<()> {
     let mut filtered_records = 0;
     let mut unique_vessels = std::collections::HashSet::new();
 
-    // Property columns for CSV output
-    let property_columns = vec![
+    // Property columns for CSV output (string names)
+    let csv_property_columns = vec![
         "mmsi".to_string(),
         "vessel_type".to_string(),
         "speed".to_string(),
@@ -128,20 +142,39 @@ fn main() -> Result<()> {
         "length".to_string(),
         "width".to_string(),
     ];
+    
+    // Property columns for GeoParquet output (typed)
+    let geoparquet_property_columns = vec![
+        PropertyColumn::string("mmsi"),
+        PropertyColumn::string("vessel_type"),
+        PropertyColumn::float64("speed"),
+        PropertyColumn::float64("course"),
+        PropertyColumn::float64("heading"),
+        PropertyColumn::string("vessel_name"),
+        PropertyColumn::float64("length"),
+        PropertyColumn::float64("width"),
+    ];
 
     // Choose output mode
-    let mut csv_writer = if use_csv {
-        Some(common::StreamingCsvWriter::new(&args.output, property_columns)?)
+    let mut geoparquet_writer = if use_geoparquet {
+        Some(StreamingGeoParquetWriter::new(&args.output, geoparquet_property_columns)?)
     } else {
         None
     };
-    let mut features = if use_csv { Vec::new() } else { Vec::new() };
+    let mut csv_writer = if use_csv {
+        Some(common::StreamingCsvWriter::new(&args.output, csv_property_columns)?)
+    } else {
+        None
+    };
+    let mut features = Vec::new();
 
     for result in csv_reader.deserialize() {
         total_records += 1;
 
         if total_records % 100000 == 0 {
-            let count = if use_csv {
+            let count = if use_geoparquet {
+                geoparquet_writer.as_ref().map(|w| w.row_count()).unwrap_or(0)
+            } else if use_csv {
                 csv_writer.as_ref().map(|w| w.row_count()).unwrap_or(0)
             } else {
                 features.len()
@@ -260,7 +293,14 @@ fn main() -> Result<()> {
             }
         }
 
-        if use_csv {
+        if use_geoparquet {
+            geoparquet_writer.as_mut().unwrap().write_point(
+                record.lon,
+                record.lat,
+                timestamp,
+                &properties,
+            )?;
+        } else if use_csv {
             csv_writer.as_mut().unwrap().write_point(
                 record.lon,
                 record.lat,
@@ -269,16 +309,22 @@ fn main() -> Result<()> {
             )?;
         } else {
             use geojson::{Feature, Geometry, Value as GeoValue};
+            // Add timestamp to properties for GeoJSON output
+            let mut props = properties.clone();
+            props.insert("timestamp".to_string(), json!(timestamp.to_rfc3339()));
             let feature = Feature {
                 geometry: Some(Geometry::new(GeoValue::Point(vec![record.lon, record.lat]))),
-                properties: Some(properties),
+                properties: Some(props),
                 ..Default::default()
             };
             features.push(feature);
         }
     }
 
-    let final_count = if use_csv {
+    let final_count = if use_geoparquet {
+        let writer = geoparquet_writer.take().unwrap();
+        writer.finish()?
+    } else if use_csv {
         let writer = csv_writer.take().unwrap();
         writer.finish()?
     } else {
@@ -291,21 +337,30 @@ fn main() -> Result<()> {
     println!("  Final features: {}", final_count);
     println!("  Unique vessels: {}", unique_vessels.len());
 
-    // Write GeoJSON if not using CSV
-    if !use_csv {
+    // Write GeoJSON if using that format
+    if !use_geoparquet && !use_csv {
         println!("\n💾 Writing GeoJSON...");
         common::write_geojson(features, &args.output)?;
     }
 
     println!("\n✅ Success! Now run:");
-    println!(
-        "   stt-build --input {} --output ais-traffic.stt \\",
-        args.output.display()
-    );
-    println!("             --time-field timestamp \\");
-    println!("             --min-zoom 0 \\");
-    println!("             --max-zoom 14 \\");
-    println!("             --compression gzip");
+    if use_geoparquet {
+        println!(
+            "   stt-build --input {} --output ais-traffic.stt \\",
+            args.output.display()
+        );
+        println!("             --time-field timestamp \\");
+        println!("             --min-zoom 0 --max-zoom 14 \\");
+        println!("             --compression gzip --features geoparquet");
+    } else {
+        println!(
+            "   stt-build --input {} --output ais-traffic.stt \\",
+            args.output.display()
+        );
+        println!("             --time-field timestamp \\");
+        println!("             --min-zoom 0 --max-zoom 14 \\");
+        println!("             --compression gzip");
+    }
 
     Ok(())
 }

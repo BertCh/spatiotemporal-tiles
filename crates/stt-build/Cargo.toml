@@ -32,15 +32,18 @@ csv.workspace = true
 # Optional advanced projection support (requires system libproj)
 proj = { version = "0.27", optional = true }
 
-# Optional high-performance geospatial formats
-parquet = { version = "53", optional = true }
-arrow = { version = "53", optional = true }
+# GeoParquet/GeoArrow support
+geoarrow = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+arrow = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true }
 
 [features]
 # Enable advanced projection support (requires system libproj)
 projection = ["stt-core/projection", "proj"]
-# Enable Parquet/Arrow support for high-performance I/O  
-parquet-support = ["parquet", "arrow"]
+# Enable GeoParquet/GeoArrow support for high-performance I/O  
+geoparquet = ["geoarrow", "parquet", "arrow", "arrow-schema", "arrow-array"]
 
 [dev-dependencies]
 criterion.workspace = true

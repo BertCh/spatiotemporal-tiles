@@ -1,0 +1,22 @@
+{
+  "attribution": "",
+  "bounds": {
+    "maxLat": 51.78974,
+    "maxLon": -63.04461,
+    "minLat": 2.38814,
+    "minLon": -162.29476
+  },
+  "compression": "gzip",
+  "description": "",
+  "filename": "ais-us-sample.stt",
+  "name": "ais-us-sample",
+  "tileCount": 11722,
+  "timeRange": {
+    "end": 1672790399000,
+    "start": 1672531200000
+  },
+  "zoomLevels": {
+    "max": 10,
+    "min": 0
+  }
+}

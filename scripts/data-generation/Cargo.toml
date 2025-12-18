@@ -8,14 +8,6 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "generate-covid-data"
-path = "src/covid.rs"
-
-[[bin]]
-name = "generate-taxi-data"
-path = "src/taxis.rs"
-
-[[bin]]
 name = "generate-earthquake-data"
 path = "src/earthquakes.rs"
 
@@ -26,6 +18,10 @@ path = "src/hurricanes.rs"
 [[bin]]
 name = "generate-flight-data"
 path = "src/flights.rs"
+
+[[bin]]
+name = "process-opensky-historical"
+path = "src/flights_historical.rs"
 
 [[bin]]
 name = "generate-wildfire-data"
@@ -47,6 +43,10 @@ path = "src/bikeshare.rs"
 name = "generate-nyc-rideshare"
 path = "src/nyc_rideshare.rs"
 
+[[bin]]
+name = "generate-adsb-paths"
+path = "src/adsb_paths.rs"
+
 [dependencies]
 stt-core = { path = "../../crates/stt-core" }
 anyhow.workspace = true
@@ -67,8 +67,14 @@ tracing-subscriber.workspace = true
 zip = "0.6"
 flate2.workspace = true
 rand = "0.8"
-parquet = { version = "53", default-features = false, features = ["arrow", "flate2", "snap", "zstd"] }
-arrow = { version = "53", default-features = false, features = ["chrono-tz"] }
+urlencoding = "2.1"
+
+# GeoArrow/GeoParquet ecosystem
+geoarrow.workspace = true
+parquet.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow-array.workspace = true
 
 [dev-dependencies]
 tempfile = "3.10"

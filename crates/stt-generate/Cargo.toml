@@ -1,0 +1,44 @@
+[package]
+name = "stt-generate"
+description = "Unified CLI for generating spatiotemporal tile datasets"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "stt-generate"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace dependencies
+stt-core = { path = "../stt-core" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+geojson.workspace = true
+geo.workspace = true
+geo-types.workspace = true
+csv.workspace = true
+chrono.workspace = true
+rayon.workspace = true
+clap.workspace = true
+indicatif.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+flate2.workspace = true
+
+# Additional dependencies
+reqwest = { version = "0.11", features = ["blocking", "json"] }
+zip = "0.6"
+rand = "0.8"
+parquet = { version = "53", default-features = false, features = ["arrow", "flate2", "snap", "zstd"] }
+arrow = { version = "53", default-features = false, features = ["chrono-tz"] }
+urlencoding = "2.1"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+

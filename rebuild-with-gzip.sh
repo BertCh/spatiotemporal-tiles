@@ -1,6 +1,8 @@
 #!/bin/bash
 
 # Rebuild all datasets with gzip compression for browser compatibility
+# NOTE: This script is deprecated. Use stt-generate instead:
+#   stt-generate all --output-dir examples/showcase/public/data
 
 cd /Users/robertchristie/Documents/GitHub/spatiotemporal-tiles
 
@@ -17,21 +19,6 @@ if [ -f "examples/showcase/public/data/earthquakes.geojson" ]; then
   echo "✅ Earthquakes rebuilt"
 else
   echo "⚠️  Skipping earthquakes - no source GeoJSON"
-fi
-
-echo -e "\n🔄 Rebuilding COVID data with gzip..."
-if [ -f "examples/showcase/public/data/covid-cases.geojson" ]; then
-  ./target/release/stt-build \
-    --input examples/showcase/public/data/covid-cases.geojson \
-    --output examples/showcase/public/data/covid-cases.stt \
-    --time-field timestamp \
-    --temporal-resolution daily-aggregates \
-    --min-zoom 0 \
-    --max-zoom 14 \
-    --compression gzip
-  echo "✅ COVID cases rebuilt"
-else
-  echo "⚠️  Skipping COVID - no source GeoJSON"
 fi
 
 echo -e "\n✅ Rebuild complete! All datasets now use gzip compression."

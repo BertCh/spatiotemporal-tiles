@@ -30,6 +30,11 @@ struct Args {
     #[arg(short, long, default_value = "timestamp")]
     time_field: String,
 
+    /// Field name containing end timestamps for features with time ranges (optional)
+    /// If provided, features will have valid_from (time_field) and valid_to (end_time_field)
+    #[arg(long)]
+    end_time_field: Option<String>,
+
     /// Time format: "unix-ms", "unix-sec", or "iso8601"
     #[arg(long, default_value = "iso8601")]
     time_format: String,
@@ -78,11 +83,6 @@ struct Args {
     #[arg(long, default_value = "default")]
     layer: String,
 
-    /// Use Version 2 format (quantized coordinates, columnar properties)
-    /// This produces smaller tiles and faster GPU rendering
-    #[arg(long)]
-    v2: bool,
-
     /// Verbose output
     #[arg(short, long)]
     verbose: bool,
@@ -123,7 +123,12 @@ fn main() -> Result<()> {
     );
     pb.set_message("Reading input file...");
 
-    let features = input::load_features(&args.input, &args.time_field, &args.time_format)?;
+    let features = input::load_features(
+        &args.input, 
+        &args.time_field, 
+        args.end_time_field.as_deref(),
+        &args.time_format
+    )?;
 
     pb.finish_with_message(format!("Loaded {} features", features.len()));
     info!("Loaded {} features", features.len());
@@ -141,9 +146,6 @@ fn main() -> Result<()> {
 
     // Step 3: Generate tiles
     info!("Generating tiles...");
-    if args.v2 {
-        info!("Using Version 2 format (quantized coordinates, columnar properties)");
-    }
     
     let tile_config = tiler::TileConfig {
         min_zoom: args.min_zoom,
@@ -152,7 +154,6 @@ fn main() -> Result<()> {
         simplification: args.simplification,
         layer_name: args.layer.clone(),
         target_chunk_size: args.chunk_size,
-        use_v2_format: args.v2,
     };
 
     let tiles = tiler::generate_tiles(&features, &tile_config, args.workers)?;

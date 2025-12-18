@@ -5,10 +5,8 @@ use crate::input::ParsedFeature;
 use anyhow::Result;
 use rayon::prelude::*;
 use std::collections::HashMap;
-use stt_core::geometry::simplify_linestring_coords;
 use stt_core::projection;
 use stt_core::tile::TileId;
-use stt_core::types::GeometryType;
 
 /// Configuration for tile generation
 #[derive(Debug, Clone)]
@@ -20,8 +18,6 @@ pub struct TileConfig {
     pub layer_name: String,
     /// Target chunk size in bytes (default: 512KB)
     pub target_chunk_size: usize,
-    /// Use Version 2 format (quantized coords, columnar properties)
-    pub use_v2_format: bool,
 }
 
 /// Generated tile with Proto representation
@@ -160,60 +156,8 @@ fn estimate_feature_size(feature: &ParsedFeature) -> usize {
     size
 }
 
-/// Create a single tile from features
+/// Create a single tile from features (Version 2 format - columnar, quantized)
 fn create_tile(
-    tile_id: TileId,
-    features: &[&ParsedFeature],
-    config: &TileConfig,
-    time_start: u64,
-    time_end: u64,
-) -> Result<GeneratedTile> {
-    if config.use_v2_format {
-        // Version 2: Columnar format with quantized coordinates
-        create_tile_v2(tile_id, features, config, time_start, time_end)
-    } else {
-        // Version 1: Original format
-        create_tile_v1(tile_id, features, config, time_start, time_end)
-    }
-}
-
-/// Create a tile using Version 1 format (original)
-fn create_tile_v1(
-    tile_id: TileId,
-    features: &[&ParsedFeature],
-    config: &TileConfig,
-    time_start: u64,
-    time_end: u64,
-) -> Result<GeneratedTile> {
-    let mut proto_features = Vec::with_capacity(features.len());
-
-    for feature in features {
-        let proto_feature = build_feature(feature, config)?;
-        proto_features.push(proto_feature);
-    }
-
-    let layer = stt_core::proto::Layer {
-        name: config.layer_name.clone(),
-        extent: config.extent,
-        features: proto_features,
-        columnar: None,
-    };
-
-    let proto_tile = stt_core::proto::Tile {
-        version: 1,
-        time_start,
-        time_end,
-        layers: vec![layer],
-    };
-
-    Ok(GeneratedTile {
-        id: tile_id,
-        proto: proto_tile,
-    })
-}
-
-/// Create a tile using Version 2 format (columnar, quantized)
-fn create_tile_v2(
     tile_id: TileId,
     features: &[&ParsedFeature],
     config: &TileConfig,
@@ -230,7 +174,6 @@ fn create_tile_v2(
     let layer = stt_core::proto::Layer {
         name: config.layer_name.clone(),
         extent: config.extent,
-        features: vec![], // Empty for V2 - data is in columnar
         columnar: Some(columnar),
     };
 
@@ -245,191 +188,4 @@ fn create_tile_v2(
         id: tile_id,
         proto: proto_tile,
     })
-}
-
-fn build_feature(feature: &ParsedFeature, config: &TileConfig) -> Result<stt_core::proto::Feature> {
-    let (geom_type, positions) = geometry_to_positions(feature, config)?;
-
-    let mut properties = HashMap::new();
-    if let Some(props) = &feature.geojson.properties {
-        for (key, value) in props {
-            if value.is_null() {
-                continue;
-            }
-            properties.insert(key.clone(), json_to_proto_value(value));
-        }
-    }
-
-    Ok(stt_core::proto::Feature {
-        id: determine_feature_id(feature),
-        r#type: geom_type_to_proto(geom_type),
-        positions,
-        properties,
-        valid_from: feature.timestamp,
-        valid_to: feature.timestamp,
-        geometry: vec![], // V2 field - empty for V1 format
-    })
-}
-
-fn determine_feature_id(feature: &ParsedFeature) -> u64 {
-    use geojson::feature::Id;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    if let Some(id) = &feature.geojson.id {
-        match id {
-            Id::Number(num) => {
-                if let Some(value) = num.as_u64() {
-                    return value;
-                }
-                if let Some(value) = num.as_i64() {
-                    return value as u64;
-                }
-            }
-            Id::String(s) => {
-                let mut hasher = DefaultHasher::new();
-                s.hash(&mut hasher);
-                return hasher.finish();
-            }
-        }
-    }
-
-    let mut hasher = DefaultHasher::new();
-    hasher.write_u64(feature.timestamp);
-    hasher.write_u64(feature.lon.to_bits());
-    hasher.write_u64(feature.lat.to_bits());
-    hasher.finish()
-}
-
-fn geometry_to_positions(
-    feature: &ParsedFeature,
-    config: &TileConfig,
-) -> Result<(GeometryType, Vec<stt_core::proto::Position>)> {
-    let geom = feature
-        .geojson
-        .geometry
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Feature has no geometry"))?;
-
-    let (geom_type, coords) = collect_coordinates(geom, config.simplification)?;
-    let coords = if coords.is_empty() {
-        vec![(feature.lon, feature.lat)]
-    } else {
-        coords
-    };
-
-    let positions = coords
-        .into_iter()
-        .map(|(lon, lat)| stt_core::proto::Position { lon, lat })
-        .collect();
-
-    Ok((geom_type, positions))
-}
-
-fn collect_coordinates(
-    geom: &geojson::Geometry,
-    simplification: f64,
-) -> Result<(GeometryType, Vec<(f64, f64)>)> {
-    use geojson::Value as GeomValue;
-
-    match &geom.value {
-        GeomValue::Point(coords) => {
-            if coords.len() < 2 {
-                anyhow::bail!("Point missing coordinates");
-            }
-            Ok((GeometryType::Point, vec![(coords[0], coords[1])]))
-        }
-        GeomValue::MultiPoint(points) => {
-            let coords = points
-                .iter()
-                .filter(|c| c.len() >= 2)
-                .map(|c| (c[0], c[1]))
-                .collect();
-            Ok((GeometryType::Point, coords))
-        }
-        GeomValue::LineString(points) => {
-            let coords = linestring_to_pairs(points, simplification);
-            Ok((GeometryType::LineString, coords))
-        }
-        GeomValue::MultiLineString(lines) => {
-            let mut coords = Vec::new();
-            for line in lines {
-                coords.extend(linestring_to_pairs(line, simplification));
-            }
-            Ok((GeometryType::LineString, coords))
-        }
-        GeomValue::Polygon(rings) => {
-            let mut coords = Vec::new();
-            for ring in rings {
-                coords.extend(linestring_to_pairs(ring, simplification));
-            }
-            Ok((GeometryType::Polygon, coords))
-        }
-        GeomValue::MultiPolygon(polygons) => {
-            let mut coords = Vec::new();
-            for polygon in polygons {
-                for ring in polygon {
-                    coords.extend(linestring_to_pairs(ring, simplification));
-                }
-            }
-            Ok((GeometryType::Polygon, coords))
-        }
-        GeomValue::GeometryCollection(collection) => {
-            for geom in collection {
-                if let Ok((geom_type, coords)) = collect_coordinates(geom, simplification) {
-                    if !coords.is_empty() {
-                        return Ok((geom_type, coords));
-                    }
-                }
-            }
-            Ok((GeometryType::Point, Vec::new()))
-        }
-    }
-}
-
-fn linestring_to_pairs(points: &[Vec<f64>], simplification: f64) -> Vec<(f64, f64)> {
-    let mut coords: Vec<(f64, f64)> = points
-        .iter()
-        .filter(|p| p.len() >= 2)
-        .map(|p| (p[0], p[1]))
-        .collect();
-
-    if simplification > 0.0 && coords.len() > 2 {
-        coords = simplify_linestring_coords(&coords, simplification);
-    }
-
-    coords
-}
-
-fn geom_type_to_proto(geom_type: GeometryType) -> i32 {
-    match geom_type {
-        GeometryType::Point => 0,
-        GeometryType::LineString => 1,
-        GeometryType::Polygon => 2,
-    }
-}
-
-/// Convert JSON value to proto Value
-fn json_to_proto_value(value: &serde_json::Value) -> stt_core::proto::Value {
-    use stt_core::proto::value::ValueType;
-
-    let value_type = match value {
-        serde_json::Value::String(s) => Some(ValueType::StringValue(s.clone())),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Some(ValueType::IntValue(i))
-            } else if let Some(u) = n.as_u64() {
-                Some(ValueType::UintValue(u))
-            } else if let Some(f) = n.as_f64() {
-                Some(ValueType::DoubleValue(f))
-            } else {
-                Some(ValueType::StringValue(n.to_string()))
-            }
-        }
-        serde_json::Value::Bool(b) => Some(ValueType::BoolValue(*b)),
-        serde_json::Value::Null => Some(ValueType::StringValue(String::new())),
-        _ => Some(ValueType::StringValue(value.to_string())),
-    };
-
-    stt_core::proto::Value { value_type }
 }

@@ -1,6 +1,6 @@
 //! Columnar tile generation for GPU-optimized rendering
 //!
-//! This module generates tiles in Version 2 format with:
+//! This module generates tiles with:
 //! - Quantized tile-relative coordinates (MVT-style)
 //! - Columnar property layout for efficient GPU upload
 //! - Delta-encoded timestamps
@@ -35,6 +35,7 @@ pub fn build_columnar_features(
     // Determine geometry type from first feature
     let geometry_type = determine_geometry_type(&features[0])?;
     let is_point = geometry_type == GeometryType::Point;
+    let is_polygon = geometry_type == GeometryType::Polygon;
     
     // Pre-allocate arrays
     let mut feature_ids: Vec<u64> = Vec::with_capacity(features.len());
@@ -42,6 +43,10 @@ pub fn build_columnar_features(
     let mut geometry_offsets: Vec<u32> = if is_point { vec![] } else { Vec::with_capacity(features.len() + 1) };
     let mut start_times: Vec<i64> = Vec::with_capacity(features.len());
     let mut end_times: Vec<i64> = Vec::with_capacity(features.len());
+    
+    // Ring offsets for polygon geometries
+    let mut ring_offsets: Vec<u32> = Vec::new();
+    let mut ring_offsets_offsets: Vec<u32> = if is_polygon { Vec::with_capacity(features.len() + 1) } else { vec![] };
     
     // Collect property names and types from first feature
     let mut numeric_props: HashMap<String, Vec<f32>> = HashMap::new();
@@ -73,26 +78,60 @@ pub fn build_columnar_features(
             geometry_offsets.push(geometry.len() as u32 / 2);
         }
         
-        // Quantized coordinates with delta encoding
-        let coords = extract_coordinates(feature)?;
-        for (lon, lat) in coords {
-            let (qx, qy) = quantize_position(lon, lat, tile_id, config.extent);
-            
-            // Delta encode
-            let dx = qx - prev_x;
-            let dy = qy - prev_y;
-            
-            geometry.push(dx);
-            geometry.push(dy);
-            
-            prev_x = qx;
-            prev_y = qy;
+        // Ring offsets offset for polygons
+        if is_polygon {
+            ring_offsets_offsets.push(ring_offsets.len() as u32);
+        }
+        
+        // Extract and encode coordinates with ring structure for polygons
+        if is_polygon {
+            let rings = extract_polygon_rings(feature)?;
+            for ring in rings {
+                // Record the start of this ring
+                ring_offsets.push(geometry.len() as u32 / 2);
+                
+                for (lon, lat) in ring {
+                    let (qx, qy) = quantize_position(lon, lat, tile_id, config.extent);
+                    
+                    // Delta encode
+                    let dx = qx - prev_x;
+                    let dy = qy - prev_y;
+                    
+                    geometry.push(dx);
+                    geometry.push(dy);
+                    
+                    prev_x = qx;
+                    prev_y = qy;
+                }
+            }
+        } else {
+            // Non-polygon: flatten coordinates as before
+            let coords = extract_coordinates(feature)?;
+            for (lon, lat) in coords {
+                let (qx, qy) = quantize_position(lon, lat, tile_id, config.extent);
+                
+                // Delta encode
+                let dx = qx - prev_x;
+                let dy = qy - prev_y;
+                
+                geometry.push(dx);
+                geometry.push(dy);
+                
+                prev_x = qx;
+                prev_y = qy;
+            }
         }
         
         // Timestamps (delta encoded relative to tile start)
         let start_delta = feature.timestamp as i64 - time_start as i64;
         start_times.push(start_delta);
-        end_times.push(0); // Same as start for point-in-time features
+        
+        // Use end_timestamp if available, otherwise duration is 0
+        let end_delta = feature.end_timestamp
+            .map(|t| t as i64 - time_start as i64)
+            .unwrap_or(start_delta);
+        let duration = end_delta - start_delta;
+        end_times.push(duration); // Store duration rather than absolute end time
         
         // Properties
         if let Some(props) = &feature.geojson.properties {
@@ -124,6 +163,11 @@ pub fn build_columnar_features(
         geometry_offsets.push(geometry.len() as u32 / 2);
     }
     
+    // Final ring offsets offset for polygons
+    if is_polygon {
+        ring_offsets_offsets.push(ring_offsets.len() as u32);
+    }
+    
     // Build proto message
     Ok(stt_core::proto::ColumnarFeatures {
         feature_count,
@@ -133,6 +177,8 @@ pub fn build_columnar_features(
         geometry_offsets,
         start_times,
         end_times,
+        ring_offsets,
+        ring_offsets_offsets,
         numeric_properties: numeric_props
             .into_iter()
             .map(|(name, values)| stt_core::proto::NumericColumn {
@@ -164,7 +210,7 @@ fn quantize_position(lon: f64, lat: f64, tile: &TileId, extent: u32) -> (i32, i3
     (x as i32, y as i32)
 }
 
-/// Extract coordinates from a feature
+/// Extract coordinates from a feature (flattened - for non-polygon geometries)
 fn extract_coordinates(feature: &ParsedFeature) -> Result<Vec<(f64, f64)>> {
     let geom = feature
         .geojson
@@ -192,6 +238,7 @@ fn extract_coordinates(feature: &ParsedFeature) -> Result<Vec<(f64, f64)>> {
             .filter(|c| c.len() >= 2)
             .map(|c| (c[0], c[1]))
             .collect(),
+        // For polygons called from non-polygon path (shouldn't happen but handle gracefully)
         GeomValue::Polygon(rings) => rings
             .iter()
             .flatten()
@@ -212,6 +259,68 @@ fn extract_coordinates(feature: &ParsedFeature) -> Result<Vec<(f64, f64)>> {
         Ok(vec![(feature.lon, feature.lat)])
     } else {
         Ok(coords)
+    }
+}
+
+/// Extract polygon rings preserving the ring structure
+/// Returns a vector of rings, where each ring is a vector of (lon, lat) coordinates
+/// For Polygon: returns all rings (first is exterior, rest are holes)
+/// For MultiPolygon: returns all rings from all polygons flattened into one list
+fn extract_polygon_rings(feature: &ParsedFeature) -> Result<Vec<Vec<(f64, f64)>>> {
+    let geom = feature
+        .geojson
+        .geometry
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Feature has no geometry"))?;
+    
+    use geojson::Value as GeomValue;
+    
+    let rings = match &geom.value {
+        GeomValue::Polygon(polygon_rings) => {
+            polygon_rings
+                .iter()
+                .map(|ring| {
+                    ring.iter()
+                        .filter(|c| c.len() >= 2)
+                        .map(|c| (c[0], c[1]))
+                        .collect()
+                })
+                .filter(|ring: &Vec<(f64, f64)>| ring.len() >= 4) // Valid ring needs at least 4 points
+                .collect()
+        }
+        GeomValue::MultiPolygon(polygons) => {
+            // Flatten all rings from all polygons into a single list
+            // deck.gl will interpret this correctly when we provide ring offsets
+            polygons
+                .iter()
+                .flat_map(|polygon| {
+                    polygon.iter().map(|ring| {
+                        ring.iter()
+                            .filter(|c| c.len() >= 2)
+                            .map(|c| (c[0], c[1]))
+                            .collect()
+                    })
+                })
+                .filter(|ring: &Vec<(f64, f64)>| ring.len() >= 4) // Valid ring needs at least 4 points
+                .collect()
+        }
+        // Fallback for other geometry types that shouldn't reach here
+        _ => {
+            let coords = extract_coordinates(feature)?;
+            if coords.len() >= 4 {
+                vec![coords]
+            } else {
+                vec![]
+            }
+        }
+    };
+    
+    // If no valid rings found, create a single ring from the centroid point
+    if rings.is_empty() {
+        // Return a degenerate "ring" with just the feature centroid
+        Ok(vec![vec![(feature.lon, feature.lat)]])
+    } else {
+        Ok(rings)
     }
 }
 

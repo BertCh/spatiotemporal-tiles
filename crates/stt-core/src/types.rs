@@ -147,31 +147,8 @@ impl GeometryType {
     }
 }
 
-/// Tile format version
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum TileVersion {
-    /// Original format: absolute WGS84 coordinates, per-feature properties
-    #[default]
-    V1,
-    /// New format: quantized coordinates, columnar properties
-    V2,
-}
-
-impl TileVersion {
-    pub fn to_proto(&self) -> u32 {
-        match self {
-            TileVersion::V1 => 1,
-            TileVersion::V2 => 2,
-        }
-    }
-
-    pub fn from_proto(value: u32) -> Self {
-        match value {
-            2 => TileVersion::V2,
-            _ => TileVersion::V1,
-        }
-    }
-}
+/// Tile format version (currently only V2 is supported)
+pub const TILE_VERSION: u32 = 2;
 
 #[cfg(test)]
 mod tests {

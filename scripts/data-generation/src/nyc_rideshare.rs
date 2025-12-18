@@ -74,6 +74,11 @@ struct Args {
     /// Skip OSRM routing - just output pickup/dropoff points (for testing)
     #[arg(long)]
     skip_routing: bool,
+
+    /// Output LineString paths instead of individual points
+    /// Each trip becomes a single LineString feature with start_time and end_time
+    #[arg(long)]
+    paths: bool,
 }
 
 /// NYC TLC Yellow Taxi Trip Record (for CSV parsing, pre-2017 format with coordinates)
@@ -380,22 +385,39 @@ fn main() -> Result<()> {
     }
 
     // Generate trajectories
-    let use_csv = common::is_csv_output(&args.output);
-    if use_csv {
-        generate_trajectories_csv(&trips, &args)?;
+    if args.paths {
+        // Generate LineString paths (one per trip)
+        generate_paths_geojson(&trips, &args)?;
+        
+        println!("\n✅ Success! Now run:");
+        println!(
+            "   stt-build --input {} --output nyc-rideshare-paths.stt \\",
+            args.output.display()
+        );
+        println!("             --time-field timestamp \\");
+        println!("             --end-time-field end_time \\");
+        println!("             --min-zoom 10 \\");
+        println!("             --max-zoom 16 \\");
+        println!("             --compression gzip");
     } else {
-        generate_trajectories_geojson(&trips, &args)?;
-    }
+        // Generate individual trajectory points
+        let use_csv = common::is_csv_output(&args.output);
+        if use_csv {
+            generate_trajectories_csv(&trips, &args)?;
+        } else {
+            generate_trajectories_geojson(&trips, &args)?;
+        }
 
-    println!("\n✅ Success! Now run:");
-    println!(
-        "   stt-build --input {} --output nyc-rideshare.stt \\",
-        args.output.display()
-    );
-    println!("             --time-field timestamp \\");
-    println!("             --min-zoom 10 \\");
-    println!("             --max-zoom 16 \\");
-    println!("             --compression gzip");
+        println!("\n✅ Success! Now run:");
+        println!(
+            "   stt-build --input {} --output nyc-rideshare.stt \\",
+            args.output.display()
+        );
+        println!("             --time-field timestamp \\");
+        println!("             --min-zoom 10 \\");
+        println!("             --max-zoom 16 \\");
+        println!("             --compression gzip");
+    }
 
     Ok(())
 }
@@ -1062,6 +1084,91 @@ fn generate_trajectories_geojson(trips: &[Trip], args: &Args) -> Result<()> {
 
     pb.finish_and_clear();
     println!("📊 Generated {} trajectory points from {} trips", features.len(), trips.len());
+    if failed_routes > 0 {
+        println!("⚠️  {} trips used fallback routing (OSRM failures)", failed_routes);
+    }
+
+    common::write_geojson(features, &args.output)?;
+    Ok(())
+}
+
+/// Generate path LineStrings and write to GeoJSON
+/// Each trip becomes a single LineString feature with start_time and end_time
+fn generate_paths_geojson(trips: &[Trip], args: &Args) -> Result<()> {
+    println!("\n🚀 Generating paths (LineString GeoJSON output)...");
+
+    let pb = ProgressBar::new(trips.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{bar:40}] {pos}/{len} trips ({eta})")?
+            .progress_chars("=>-"),
+    );
+
+    let mut features = Vec::new();
+    let mut failed_routes = 0;
+    let mut total_coords = 0;
+
+    for (trip_id, trip) in trips.iter().enumerate() {
+        // Get the route coordinates
+        let coords: Vec<[f64; 2]> = if args.skip_routing {
+            vec![
+                [trip.pickup_lon, trip.pickup_lat],
+                [trip.dropoff_lon, trip.dropoff_lat],
+            ]
+        } else {
+            match get_osrm_route(
+                &args.osrm_url,
+                trip.pickup_lon,
+                trip.pickup_lat,
+                trip.dropoff_lon,
+                trip.dropoff_lat,
+            ) {
+                Ok(Some(route)) => {
+                    // Extract all route coordinates from OSRM geometry
+                    route.geometry.coordinates
+                        .iter()
+                        .map(|c| [c[0], c[1]])
+                        .collect()
+                }
+                Ok(None) | Err(_) => {
+                    failed_routes += 1;
+                    vec![
+                        [trip.pickup_lon, trip.pickup_lat],
+                        [trip.dropoff_lon, trip.dropoff_lat],
+                    ]
+                }
+            }
+        };
+
+        if coords.len() < 2 {
+            // Skip trips with insufficient coordinates
+            pb.inc(1);
+            continue;
+        }
+
+        total_coords += coords.len();
+
+        // Build properties for this trip
+        let mut properties = Map::new();
+        properties.insert("trip_id".to_string(), json!(trip_id));
+        properties.insert("passenger_count".to_string(), json!(trip.passenger_count));
+        properties.insert("trip_distance".to_string(), json!(trip.trip_distance));
+        properties.insert("fare_amount".to_string(), json!(trip.fare_amount));
+
+        // Create LineString feature with time range
+        let feature = common::create_linestring_feature_with_time_range(
+            coords,
+            trip.pickup_time,
+            trip.dropoff_time,
+            properties,
+        );
+        features.push(feature);
+
+        pb.inc(1);
+    }
+
+    pb.finish_and_clear();
+    println!("📊 Generated {} path features with {} total coordinates", features.len(), total_coords);
     if failed_routes > 0 {
         println!("⚠️  {} trips used fallback routing (OSRM failures)", failed_routes);
     }
