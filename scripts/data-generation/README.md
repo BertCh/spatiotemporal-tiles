@@ -1,13 +1,11 @@
-# Data Generation Scripts
+# Data Generation
 
-> **Note:** This directory contains legacy Rust scripts that have been consolidated into the unified `stt-generate` CLI tool.
+Use the unified `stt-generate` CLI tool to download and process datasets.
 
-## Recommended: Use stt-generate
-
-The `stt-generate` tool provides a unified interface for generating all showcase datasets:
+## Quick Start
 
 ```bash
-# Install
+# Install the tool
 cargo install --path ../../crates/stt-generate
 
 # Generate all datasets
@@ -22,21 +20,6 @@ stt-generate flights --date 2020-01-06 --output flights.stt
 ```
 
 See the [Data Generation Guide](../../docs/guides/data-generation.md) for full documentation.
-
-## Legacy Scripts (Deprecated)
-
-The Rust binaries in `src/` are still available but deprecated:
-
-```bash
-# Build legacy scripts
-cargo build --release
-
-# Run legacy scripts
-cargo run --release --bin generate-earthquake-data -- --output earthquakes.geojson
-cargo run --release --bin generate-ais-data -- --input ais.csv --output ais.geojson
-```
-
-These scripts output GeoJSON/CSV files that then need to be processed with `stt-build`.
 
 ## Available Datasets
 
@@ -57,7 +40,14 @@ For data not covered by built-in datasets, use `stt-build` directly:
 stt-build --input my-data.geojson --output my-data.stt --time-field timestamp
 ```
 
-## Setup Files
+## Utility Scripts
 
-- `setup-osrm.sh` - Set up OSRM server for NYC routing (required for nyc-rideshare with real routing)
-- `generate-all.sh` - Wrapper script to generate all datasets using stt-generate
+- `generate-all.sh` - Convenience wrapper to generate all datasets
+- `setup-osrm.sh` - Set up OSRM server for NYC routing (required for nyc-rideshare)
+- `generate-datasets-config.js` - Generate TypeScript config from metadata
+- `validate-ais-coords.js` - Validate AIS coordinate data
+
+## Data Files
+
+- `data/` - Downloaded and processed data files (gitignored)
+- `metadata/` - Dataset metadata JSON files

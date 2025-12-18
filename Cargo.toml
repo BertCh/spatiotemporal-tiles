@@ -6,7 +6,6 @@ members = [
     "crates/stt-join",
     "crates/stt-tile",
     "crates/stt-analyze",
-    "scripts/data-generation",
 ]
 resolver = "2"
 
