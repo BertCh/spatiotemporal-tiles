@@ -3,9 +3,6 @@ members = [
     "crates/stt-core",
     "crates/stt-build",
     "crates/stt-generate",
-    "crates/stt-join",
-    "crates/stt-tile",
-    "crates/stt-analyze",
 ]
 resolver = "2"
 

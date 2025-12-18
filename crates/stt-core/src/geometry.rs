@@ -4,8 +4,7 @@
 //! for use in spatiotemporal tiles. Uses standard geo/geo-types crates.
 
 use geo::algorithm::simplify::Simplify;
-use geo::{LineString, Point, Polygon};
-use geo_types::Coord;
+use geo::{LineString, Polygon};
 
 /// Simplify a linestring using the Douglas-Peucker algorithm
 ///
@@ -19,65 +18,12 @@ pub fn simplify_linestring(line: &LineString<f64>, epsilon: f64) -> LineString<f
     line.simplify(&epsilon)
 }
 
-/// Simplify a linestring from coordinate tuples (legacy API)
-pub fn simplify_linestring_coords(coords: &[(f64, f64)], epsilon: f64) -> Vec<(f64, f64)> {
-    if coords.len() <= 2 {
-        return coords.to_vec();
-    }
-
-    let line: LineString<f64> = coords.iter().map(|(x, y)| Coord { x: *x, y: *y }).collect();
-
-    simplify_linestring(&line, epsilon)
-        .into_iter()
-        .map(|coord| (coord.x, coord.y))
-        .collect()
-}
-
 /// Simplify a polygon using the Douglas-Peucker algorithm
 ///
 /// This uses the standard `geo` crate's Simplify trait for consistent,
 /// well-tested simplification.
 pub fn simplify_polygon(polygon: &Polygon<f64>, epsilon: f64) -> Polygon<f64> {
     polygon.simplify(&epsilon)
-}
-
-/// Simplify a polygon from coordinate tuples (legacy API)
-pub fn simplify_polygon_coords(
-    exterior: &[(f64, f64)],
-    interiors: &[Vec<(f64, f64)>],
-    epsilon: f64,
-) -> (Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>) {
-    let exterior_line: LineString<f64> = exterior
-        .iter()
-        .map(|(x, y)| Coord { x: *x, y: *y })
-        .collect();
-
-    let interior_lines: Vec<LineString<f64>> = interiors
-        .iter()
-        .map(|interior| {
-            interior
-                .iter()
-                .map(|(x, y)| Coord { x: *x, y: *y })
-                .collect()
-        })
-        .collect();
-
-    let polygon = Polygon::new(exterior_line, interior_lines);
-    let simplified = simplify_polygon(&polygon, epsilon);
-
-    let simplified_exterior: Vec<(f64, f64)> = simplified
-        .exterior()
-        .coords()
-        .map(|coord| (coord.x, coord.y))
-        .collect();
-
-    let simplified_interiors: Vec<Vec<(f64, f64)>> = simplified
-        .interiors()
-        .iter()
-        .map(|interior| interior.coords().map(|coord| (coord.x, coord.y)).collect())
-        .collect();
-
-    (simplified_exterior, simplified_interiors)
 }
 
 /// Encode coordinates as integers using a tile extent
@@ -158,27 +104,6 @@ pub fn bounding_box_polygon(polygon: &Polygon<f64>) -> crate::types::BoundingBox
     }
 }
 
-/// Calculate the bounding box of a set of coordinates (legacy API)
-pub fn bounding_box(coords: &[(f64, f64)]) -> (f64, f64, f64, f64) {
-    if coords.is_empty() {
-        return (0.0, 0.0, 0.0, 0.0);
-    }
-
-    let mut min_x = coords[0].0;
-    let mut min_y = coords[0].1;
-    let mut max_x = coords[0].0;
-    let mut max_y = coords[0].1;
-
-    for (x, y) in coords.iter().skip(1) {
-        min_x = min_x.min(*x);
-        min_y = min_y.min(*y);
-        max_x = max_x.max(*x);
-        max_y = max_y.max(*y);
-    }
-
-    (min_x, min_y, max_x, max_y)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,20 +143,4 @@ mod tests {
         assert!(num_coords < orig_coords);
     }
 
-    #[test]
-    fn test_simplify_linestring_coords() {
-        let coords = vec![(0.0, 0.0), (1.0, 0.1), (2.0, 0.0), (3.0, 0.1), (4.0, 0.0)];
-        let simplified = simplify_linestring_coords(&coords, 0.5);
-        assert!(simplified.len() < coords.len());
-    }
-
-    #[test]
-    fn test_bounding_box() {
-        let coords = vec![(0.0, 0.0), (1.0, 2.0), (3.0, 1.0), (-1.0, -1.0)];
-        let (min_x, min_y, max_x, max_y) = bounding_box(&coords);
-        assert_eq!(min_x, -1.0);
-        assert_eq!(min_y, -1.0);
-        assert_eq!(max_x, 3.0);
-        assert_eq!(max_y, 2.0);
-    }
 }
