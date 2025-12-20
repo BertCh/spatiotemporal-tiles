@@ -37,12 +37,20 @@ pub fn build_columnar_features(
     let is_point = geometry_type == GeometryType::Point;
     let is_polygon = geometry_type == GeometryType::Polygon;
     
+    // Check if we have 3D data
+    let is_3d = has_3d_coordinates(features);
+    
     // Pre-allocate arrays
     let mut feature_ids: Vec<u64> = Vec::with_capacity(features.len());
     let mut geometry: Vec<i32> = Vec::new();
     let mut geometry_offsets: Vec<u32> = if is_point { vec![] } else { Vec::with_capacity(features.len() + 1) };
     let mut start_times: Vec<i64> = Vec::with_capacity(features.len());
     let mut end_times: Vec<i64> = Vec::with_capacity(features.len());
+    let mut altitudes: Vec<f32> = if is_3d { Vec::new() } else { vec![] };
+    
+    // Per-vertex timestamps for smooth trail animation (LineStrings with duration)
+    let mut vertex_timestamps: Vec<i64> = Vec::new();
+    let is_linestring = geometry_type == GeometryType::LineString;
     
     // Ring offsets for polygon geometries
     let mut ring_offsets: Vec<u32> = Vec::new();
@@ -105,17 +113,61 @@ pub fn build_columnar_features(
                 }
             }
         } else {
-            // Non-polygon: flatten coordinates as before
-            let coords = extract_coordinates(feature)?;
-            for (lon, lat) in coords {
-                let (qx, qy) = quantize_position(lon, lat, tile_id, config.extent);
+            // Non-polygon: flatten coordinates with optional 3D
+            let coords = extract_coordinates_3d(feature)?;
+            
+            // For LineStrings with duration, compute per-vertex timestamps
+            // This enables smooth GPU-based trail animation without path segmentation
+            let has_duration = is_linestring && feature.end_timestamp.is_some();
+            let duration = if has_duration {
+                feature.end_timestamp.unwrap() as i64 - feature.timestamp as i64
+            } else {
+                0
+            };
+            
+            // Calculate cumulative distances for interpolation
+            let cumulative_distances: Vec<f64> = if has_duration && coords.len() > 1 {
+                let mut distances = vec![0.0];
+                let mut total = 0.0;
+                for i in 1..coords.len() {
+                    let (lon1, lat1, _) = coords[i - 1];
+                    let (lon2, lat2, _) = coords[i];
+                    let dist = haversine_distance(lat1, lon1, lat2, lon2);
+                    total += dist;
+                    distances.push(total);
+                }
+                distances
+            } else {
+                vec![]
+            };
+            
+            let total_distance = cumulative_distances.last().copied().unwrap_or(0.0);
+            
+            for (i, (lon, lat, alt)) in coords.iter().enumerate() {
+                let (qx, qy) = quantize_position(*lon, *lat, tile_id, config.extent);
                 
-                // Delta encode
+                // Delta encode geometry
                 let dx = qx - prev_x;
                 let dy = qy - prev_y;
                 
                 geometry.push(dx);
                 geometry.push(dy);
+                
+                if is_3d {
+                    altitudes.push(*alt as f32);
+                }
+                
+                // Compute per-vertex timestamp for LineStrings with duration
+                if has_duration && total_distance > 0.0 {
+                    let fraction = cumulative_distances[i] / total_distance;
+                    let vertex_time = feature.timestamp as i64 + (fraction * duration as f64) as i64;
+                    let vertex_time_delta = vertex_time - time_start as i64;
+                    vertex_timestamps.push(vertex_time_delta);
+                } else if is_linestring {
+                    // No duration - use feature start time for all vertices
+                    let vertex_time_delta = feature.timestamp as i64 - time_start as i64;
+                    vertex_timestamps.push(vertex_time_delta);
+                }
                 
                 prev_x = qx;
                 prev_y = qy;
@@ -195,23 +247,36 @@ pub fn build_columnar_features(
                 indices: builder.indices,
             })
             .collect(),
+        altitudes,
+        // Per-vertex timestamps for smooth trail animation (LineStrings with duration)
+        // Each vertex has its timestamp as delta from tile time_start
+        // This enables GPU-based trail clipping without path segmentation
+        vertex_timestamps,
     })
 }
 
 /// Quantize WGS84 coordinates to tile-relative integers
+/// Note: Returns i32 because coordinates can be outside tile bounds [0, extent]
+/// for paths that cross tile boundaries
 fn quantize_position(lon: f64, lat: f64, tile: &TileId, extent: u32) -> (i32, i32) {
-    let (x, y) = projection::lonlat_to_tile_coords(
+    projection::lonlat_to_tile_coords(
         lon, lat,
         tile.z,
         tile.x,
         tile.y,
         extent,
-    );
-    (x as i32, y as i32)
+    )
 }
 
-/// Extract coordinates from a feature (flattened - for non-polygon geometries)
+/// Extract 2D coordinates from a feature (flattened - for non-polygon geometries)
 fn extract_coordinates(feature: &ParsedFeature) -> Result<Vec<(f64, f64)>> {
+    let coords_3d = extract_coordinates_3d(feature)?;
+    Ok(coords_3d.into_iter().map(|(lon, lat, _)| (lon, lat)).collect())
+}
+
+/// Extract 3D coordinates from a feature (lon, lat, altitude)
+/// Returns (lon, lat, altitude) tuples. Altitude is 0.0 if not present.
+fn extract_coordinates_3d(feature: &ParsedFeature) -> Result<Vec<(f64, f64, f64)>> {
     let geom = feature
         .geojson
         .geometry
@@ -220,46 +285,67 @@ fn extract_coordinates(feature: &ParsedFeature) -> Result<Vec<(f64, f64)>> {
     
     use geojson::Value as GeomValue;
     
+    // Helper to extract coord with optional altitude
+    fn coord_3d(c: &Vec<f64>) -> (f64, f64, f64) {
+        let alt = if c.len() >= 3 { c[2] } else { 0.0 };
+        (c[0], c[1], alt)
+    }
+    
     let coords = match &geom.value {
-        GeomValue::Point(c) if c.len() >= 2 => vec![(c[0], c[1])],
+        GeomValue::Point(c) if c.len() >= 2 => vec![coord_3d(c)],
         GeomValue::MultiPoint(points) => points
             .iter()
             .filter(|c| c.len() >= 2)
-            .map(|c| (c[0], c[1]))
+            .map(|c| coord_3d(c))
             .collect(),
         GeomValue::LineString(points) => points
             .iter()
             .filter(|c| c.len() >= 2)
-            .map(|c| (c[0], c[1]))
+            .map(|c| coord_3d(c))
             .collect(),
         GeomValue::MultiLineString(lines) => lines
             .iter()
             .flatten()
             .filter(|c| c.len() >= 2)
-            .map(|c| (c[0], c[1]))
+            .map(|c| coord_3d(c))
             .collect(),
         // For polygons called from non-polygon path (shouldn't happen but handle gracefully)
         GeomValue::Polygon(rings) => rings
             .iter()
             .flatten()
             .filter(|c| c.len() >= 2)
-            .map(|c| (c[0], c[1]))
+            .map(|c| coord_3d(c))
             .collect(),
         GeomValue::MultiPolygon(polygons) => polygons
             .iter()
             .flatten()
             .flatten()
             .filter(|c| c.len() >= 2)
-            .map(|c| (c[0], c[1]))
+            .map(|c| coord_3d(c))
             .collect(),
-        _ => vec![(feature.lon, feature.lat)],
+        _ => vec![(feature.lon, feature.lat, 0.0)],
     };
     
     if coords.is_empty() {
-        Ok(vec![(feature.lon, feature.lat)])
+        Ok(vec![(feature.lon, feature.lat, 0.0)])
     } else {
         Ok(coords)
     }
+}
+
+/// Check if features have 3D coordinates (altitude)
+fn has_3d_coordinates(features: &[&ParsedFeature]) -> bool {
+    features.iter().any(|f| {
+        f.geojson.geometry.as_ref().map_or(false, |geom| {
+            use geojson::Value as GeomValue;
+            match &geom.value {
+                GeomValue::Point(c) => c.len() >= 3 && c[2] != 0.0,
+                GeomValue::LineString(points) => points.iter().any(|c| c.len() >= 3 && c[2] != 0.0),
+                GeomValue::MultiLineString(lines) => lines.iter().flatten().any(|c| c.len() >= 3 && c[2] != 0.0),
+                _ => false,
+            }
+        })
+    })
 }
 
 /// Extract polygon rings preserving the ring structure
@@ -381,6 +467,22 @@ fn determine_feature_id(feature: &ParsedFeature) -> u64 {
     hasher.write_u64(feature.lon.to_bits());
     hasher.write_u64(feature.lat.to_bits());
     hasher.finish()
+}
+
+/// Haversine distance between two points in meters
+fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS: f64 = 6_371_000.0; // meters
+    
+    let lat1_rad = lat1.to_radians();
+    let lat2_rad = lat2.to_radians();
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1_rad.cos() * lat2_rad.cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().asin();
+    
+    EARTH_RADIUS * c
 }
 
 /// Builder for categorical (string) properties with dictionary encoding

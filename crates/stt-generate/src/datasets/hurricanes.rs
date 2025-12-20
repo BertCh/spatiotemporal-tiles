@@ -2,7 +2,7 @@
 //!
 //! Data source: https://www.ncei.noaa.gov/products/international-best-track-archive
 
-use crate::common;
+use crate::common::{self, LineStringRecord, StreamingLineStringParquetWriter};
 use anyhow::Result;
 use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 use clap::Parser;
@@ -82,26 +82,38 @@ pub fn run(args: Args) -> Result<()> {
         )?;
     }
 
-    // Determine intermediate output format
+    // Determine intermediate output format (prefer Parquet for efficiency)
     let intermediate_path = if args.output.extension().map(|e| e == "stt").unwrap_or(false) {
-        args.output.with_extension("geojson")
+        args.output.with_extension("parquet")
     } else {
         args.output.clone()
     };
 
-    println!("\n📊 Processing hurricane tracks...");
-    let features = process_hurricane_data(&ibtracs_csv, &args)?;
-    println!("✓ Generated {} track segments", features.len());
+    let use_parquet = common::is_parquet_output(&intermediate_path);
+    
+    if use_parquet {
+        println!("📄 Using streaming GeoParquet output (efficient)");
+    }
 
-    println!("\n💾 Writing output...");
-    common::write_geojson(features, &intermediate_path)?;
+    println!("\n📊 Processing hurricane tracks...");
+
+    if use_parquet {
+        let count = process_hurricane_data_parquet(&ibtracs_csv, &intermediate_path, &args)?;
+        println!("✓ Generated {} track segments", count);
+    } else {
+        let features = process_hurricane_data(&ibtracs_csv, &args)?;
+        println!("✓ Generated {} track segments", features.len());
+        println!("\n💾 Writing output...");
+        common::write_geojson(features, &intermediate_path)?;
+    }
 
     // Build STT if output is .stt
     if args.output.extension().map(|e| e == "stt").unwrap_or(false) && !args.skip_build {
-        common::run_stt_build(
+        common::run_stt_build_with_end_time(
             &intermediate_path,
             &args.output,
             "timestamp",
+            Some("end_timestamp"),
             0,
             10,
             "gzip",
@@ -247,6 +259,144 @@ fn get_status(category: i32, nature: &str) -> String {
         5 => "category_5".to_string(),
         _ => "unknown".to_string(),
     }
+}
+
+/// Process hurricane data directly to GeoParquet format (streaming)
+fn process_hurricane_data_parquet(path: &PathBuf, output: &PathBuf, args: &Args) -> Result<usize> {
+    let file = File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut rdr = csv::ReaderBuilder::new().from_reader(reader);
+
+    // Group records by storm ID
+    let mut storm_records: HashMap<String, Vec<IbtracsRecord>> = HashMap::new();
+
+    for result in rdr.deserialize() {
+        let record: IbtracsRecord = match result {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        // Filter by basin (Atlantic)
+        if record.basin != "NA" {
+            continue;
+        }
+
+        storm_records
+            .entry(record.storm_id.clone())
+            .or_insert_with(Vec::new)
+            .push(record);
+    }
+
+    // Create streaming Parquet writer
+    let property_columns = vec![
+        "storm_id".to_string(),
+        "name".to_string(),
+        "wind_speed".to_string(),
+        "category".to_string(),
+        "status".to_string(),
+        "nature".to_string(),
+        "value".to_string(),
+    ];
+    let mut writer = StreamingLineStringParquetWriter::new(output, property_columns)?;
+
+    let mut processed_storms = 0;
+
+    let target_year = args.synthetic_year.unwrap_or(args.start_year as i32);
+
+    for (_, mut records) in storm_records {
+        records.sort_by(|a, b| a.iso_time.cmp(&b.iso_time));
+
+        if records.is_empty() {
+            continue;
+        }
+
+        let first_record_dt =
+            match NaiveDateTime::parse_from_str(&records[0].iso_time, "%Y-%m-%d %H:%M:%S") {
+                Ok(dt) => dt,
+                Err(_) => continue,
+            };
+
+        let start_year = first_record_dt.year();
+
+        if (start_year as u32) < args.start_year || (start_year as u32) > args.end_year {
+            continue;
+        }
+
+        let year_offset = if args.synthetic {
+            target_year - start_year
+        } else {
+            0
+        };
+
+        for i in 0..records.len().saturating_sub(1) {
+            let start_record = &records[i];
+            let end_record = &records[i + 1];
+
+            let mut start_dt =
+                match NaiveDateTime::parse_from_str(&start_record.iso_time, "%Y-%m-%d %H:%M:%S") {
+                    Ok(dt) => dt,
+                    Err(_) => continue,
+                };
+
+            let mut end_dt =
+                match NaiveDateTime::parse_from_str(&end_record.iso_time, "%Y-%m-%d %H:%M:%S") {
+                    Ok(dt) => dt,
+                    Err(_) => continue,
+                };
+
+            if args.synthetic {
+                start_dt = start_dt
+                    .with_year(start_dt.year() + year_offset)
+                    .unwrap_or(start_dt);
+                end_dt = end_dt
+                    .with_year(end_dt.year() + year_offset)
+                    .unwrap_or(end_dt);
+            }
+
+            let start_time = DateTime::from_naive_utc_and_offset(start_dt, Utc);
+            let end_time = DateTime::from_naive_utc_and_offset(end_dt, Utc);
+
+            let wind_speed: f64 = start_record.wind_speed.trim().parse().unwrap_or(0.0);
+            let category = start_record.category.trim();
+            let category_num = if category.is_empty() || category == " " {
+                0
+            } else {
+                category.parse().unwrap_or(0)
+            };
+
+            let nature = start_record.nature.as_deref().unwrap_or("").trim();
+
+            let mut properties = Map::new();
+            properties.insert("storm_id".to_string(), json!(start_record.storm_id));
+            properties.insert("name".to_string(), json!(start_record.name));
+            properties.insert("wind_speed".to_string(), json!(wind_speed));
+            properties.insert("category".to_string(), json!(category_num));
+            properties.insert("status".to_string(), json!(get_status(category_num, nature)));
+            properties.insert("nature".to_string(), json!(nature));
+            properties.insert("value".to_string(), json!(wind_speed));
+
+            let coordinates = vec![
+                [start_record.lon, start_record.lat],
+                [end_record.lon, end_record.lat],
+            ];
+
+            let record = LineStringRecord::new(
+                coordinates,
+                start_time,
+                Some(end_time),
+                properties,
+            );
+
+            writer.write_linestring(&record)?;
+        }
+
+        processed_storms += 1;
+        if processed_storms % 100 == 0 {
+            println!("   Processed {} storms...", processed_storms);
+        }
+    }
+
+    writer.finish()
 }
 
 

@@ -87,6 +87,18 @@ message ColumnarFeatures {
   // Length = feature_count + 1 (last value is total ring count)
   // For feature i, its rings are ring_offsets[ring_offsets_offsets[i]..ring_offsets_offsets[i+1]]
   repeated uint32 ring_offsets_offsets = 11 [packed = true];
+  
+  // Altitude data for 3D coordinates (in meters)
+  // When present, has same length as geometry / 2 (one altitude per coordinate pair)
+  // Used for satellite orbits and other 3D path data
+  repeated float altitudes = 12 [packed = true];
+  
+  // Per-vertex timestamps for accurate path animation (optional)
+  // When present, has same length as geometry / 2 (one timestamp per coordinate)
+  // Values are relative to tile time_start (delta encoded)
+  // This enables accurate "vehicle at position" animation instead of linear interpolation
+  // If not present, renderers should interpolate linearly between start_times and end_times
+  repeated sint64 vertex_timestamps = 13 [packed = true];
 }
 
 // A column of numeric property values

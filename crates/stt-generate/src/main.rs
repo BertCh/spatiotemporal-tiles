@@ -51,6 +51,9 @@ enum Commands {
 
     /// Generate NYC rideshare trajectory data from TLC records + OSRM routing
     NycRideshare(datasets::nyc_rideshare::Args),
+
+    /// Generate satellite orbit data from CelesTrak TLE
+    Satellites(datasets::satellites::Args),
 }
 
 fn main() -> Result<()> {
@@ -69,6 +72,7 @@ fn main() -> Result<()> {
         Commands::Hurricanes(args) => datasets::hurricanes::run(args),
         Commands::Wildfires(args) => datasets::wildfires::run(args),
         Commands::NycRideshare(args) => datasets::nyc_rideshare::run(args),
+        Commands::Satellites(args) => datasets::satellites::run(args),
     }
 }
 
@@ -112,13 +116,13 @@ fn run_all(output_dir: &PathBuf, skip_existing: bool) -> Result<()> {
         }
     }
 
-    // Note: AIS, Flights, and NYC Rideshare require external data sources
-    // and are not included in the automatic 'all' command
-    println!("\n📝 Note: Some datasets require additional setup:");
-    println!("   - ais: Requires downloaded NOAA Marine Cadastre CSV files");
-    println!("   - flights: Requires OpenSky historical data (Mondays 2017-2020)");
-    println!("   - nyc-rideshare: Requires OSRM server with NYC data");
-    println!("\nRun individual commands for these datasets.");
+    // Note: Some datasets require specific dates or additional setup
+    println!("\n📝 Note: Some datasets require additional parameters:");
+    println!("   - ais: Specify --date YYYY-MM-DD to download from NOAA Marine Cadastre");
+    println!("   - flights: Specify --date YYYY-MM-DD (Mondays 2017-2020 only)");
+    println!("   - nyc-rideshare: Use --download YYYY-MM or --synthetic");
+    println!("   - satellites: Uses CelesTrak TLE data");
+    println!("\nRun individual commands with --help for options.");
 
     println!("\n✅ Dataset generation complete!");
     println!("📁 Output directory: {}", output_dir.display());

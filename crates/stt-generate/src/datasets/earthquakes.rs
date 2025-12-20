@@ -2,7 +2,7 @@
 //!
 //! Data source: https://earthquake.usgs.gov/fdsnws/event/1/
 
-use crate::common;
+use crate::common::{self, PointRecord, StreamingParquetWriter};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::Parser;
@@ -70,15 +70,19 @@ pub fn run(args: Args) -> Result<()> {
     println!("   Date range: {} to {}", args.start_date, args.end_date);
     println!("   Min magnitude: {}", args.min_magnitude);
 
-    // Determine intermediate output format
+    // Determine intermediate output format (prefer Parquet for efficiency)
     let intermediate_path = if args.output.extension().map(|e| e == "stt").unwrap_or(false) {
-        args.output.with_extension("geojson")
+        args.output.with_extension("parquet")
     } else {
         args.output.clone()
     };
 
+    let use_parquet = common::is_parquet_output(&intermediate_path);
     let use_csv = common::is_csv_output(&intermediate_path);
-    if use_csv {
+    
+    if use_parquet {
+        println!("📄 Using streaming GeoParquet output (efficient)");
+    } else if use_csv {
         println!("📄 Using streaming CSV output");
     }
 
@@ -96,6 +100,11 @@ pub fn run(args: Args) -> Result<()> {
     ];
 
     let mut all_features = Vec::new();
+    let mut parquet_writer = if use_parquet {
+        Some(StreamingParquetWriter::new(&intermediate_path, property_columns.clone())?)
+    } else {
+        None
+    };
     let mut csv_writer = if use_csv {
         Some(common::StreamingCsvWriter::new(&intermediate_path, property_columns)?)
     } else {
@@ -121,8 +130,11 @@ pub fn run(args: Args) -> Result<()> {
         for usgs_feature in data.features {
             let (lon, lat, timestamp, properties) = extract_usgs_data(usgs_feature)?;
 
-            if use_csv {
-                csv_writer.as_mut().unwrap().write_point(lon, lat, timestamp, &properties)?;
+            if let Some(ref mut writer) = parquet_writer {
+                let record = PointRecord::new(lon, lat, timestamp, properties);
+                writer.write_point(&record)?;
+            } else if let Some(ref mut writer) = csv_writer {
+                writer.write_point(lon, lat, timestamp, &properties)?;
             } else {
                 let feature = common::create_point_feature(lon, lat, timestamp, properties);
                 all_features.push(feature);
@@ -130,8 +142,9 @@ pub fn run(args: Args) -> Result<()> {
         }
     }
 
-    let total_count = if use_csv {
-        let writer = csv_writer.take().unwrap();
+    let total_count = if let Some(writer) = parquet_writer.take() {
+        writer.finish()?
+    } else if let Some(writer) = csv_writer.take() {
         writer.finish()?
     } else {
         let count = all_features.len();

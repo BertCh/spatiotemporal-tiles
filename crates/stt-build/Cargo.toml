@@ -29,6 +29,9 @@ tracing-subscriber.workspace = true
 chrono.workspace = true
 csv.workspace = true
 
+# Spatial indexing for efficient tile intersection
+rstar = "0.12"
+
 # Optional advanced projection support (requires system libproj)
 proj = { version = "0.27", optional = true }
 
@@ -40,6 +43,7 @@ arrow-schema = { workspace = true, optional = true }
 arrow-array = { workspace = true, optional = true }
 
 [features]
+default = ["geoparquet"]
 # Enable advanced projection support (requires system libproj)
 projection = ["stt-core/projection", "proj"]
 # Enable GeoParquet/GeoArrow support for high-performance I/O  

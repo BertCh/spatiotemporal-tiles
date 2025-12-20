@@ -2,9 +2,9 @@
 //!
 //! Data source: https://data-nifc.opendata.arcgis.com/
 
-use crate::common;
+use crate::common::{self, PolygonRecord, StreamingPolygonParquetWriter};
 use anyhow::{Context, Result};
-use chrono::{Datelike, TimeZone, Utc};
+use chrono::{DateTime, Datelike, TimeZone, Utc};
 use clap::Parser;
 use geojson::{Feature, Geometry, Value as GeoValue};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -215,22 +215,39 @@ pub fn run(args: Args) -> Result<()> {
     }
     println!();
 
-    // Determine intermediate output format
+    // Determine intermediate output format (prefer Parquet for efficiency)
     let intermediate_path = if args.output.extension().map(|e| e == "stt").unwrap_or(false) {
-        args.output.with_extension("geojson")
+        args.output.with_extension("parquet")
     } else {
         args.output.clone()
     };
 
-    let features = fetch_wildfire_data(&args)?;
-
-    if features.is_empty() {
-        println!("\n⚠️  No features found matching criteria");
-        return Ok(());
+    let use_parquet = common::is_parquet_output(&intermediate_path);
+    
+    if use_parquet {
+        println!("📄 Using streaming GeoParquet output (efficient)");
     }
 
-    println!("\n💾 Writing {} features...", features.len());
-    common::write_geojson(features, &intermediate_path)?;
+    if use_parquet {
+        let count = fetch_wildfire_data_parquet(&args, &intermediate_path)?;
+        
+        if count == 0 {
+            println!("\n⚠️  No features found matching criteria");
+            return Ok(());
+        }
+        
+        println!("\n✓ Written {} features", count);
+    } else {
+        let features = fetch_wildfire_data(&args)?;
+
+        if features.is_empty() {
+            println!("\n⚠️  No features found matching criteria");
+            return Ok(());
+        }
+
+        println!("\n💾 Writing {} features...", features.len());
+        common::write_geojson(features, &intermediate_path)?;
+    }
 
     // Build STT if output is .stt
     if args.output.extension().map(|e| e == "stt").unwrap_or(false) && !args.skip_build {
@@ -442,6 +459,207 @@ fn convert_to_geojson(arcgis: &ArcGISFeature) -> Option<Feature> {
         properties: Some(properties),
         foreign_members: None,
     })
+}
+
+/// Fetch wildfire data directly to GeoParquet format (streaming)
+fn fetch_wildfire_data_parquet(args: &Args, output: &PathBuf) -> Result<usize> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+
+    let mut where_clauses = vec![
+        format!("FIRE_YEAR >= {} AND FIRE_YEAR <= {}", args.start_year, args.end_year),
+        format!("GIS_ACRES >= {}", args.min_acres),
+    ];
+
+    if args.wildfires_only {
+        where_clauses.push("FEATURE_CA = 'Wildfire'".to_string());
+    }
+
+    let where_clause = where_clauses.join(" AND ");
+    println!("🔍 Query filter: {}", where_clause);
+
+    // Get count first
+    let count_url = format!(
+        "{}?where={}&returnCountOnly=true&f=json",
+        NIFC_SERVICE_URL,
+        urlencoding::encode(&where_clause)
+    );
+
+    let count_response: serde_json::Value = client.get(&count_url).send()?.json()?;
+    let total_count = count_response["count"].as_u64().unwrap_or(0);
+    println!("📈 Found {} matching fires", total_count);
+
+    if total_count == 0 {
+        return Ok(0);
+    }
+
+    let max_to_fetch = if args.max_fires > 0 {
+        args.max_fires.min(total_count as usize)
+    } else {
+        total_count as usize
+    };
+
+    // Create streaming Parquet writer
+    let property_columns = vec![
+        "name".to_string(),
+        "year".to_string(),
+        "acres".to_string(),
+        "agency".to_string(),
+        "unit_id".to_string(),
+        "fire_type".to_string(),
+        "irwin_id".to_string(),
+        "object_id".to_string(),
+        "severity".to_string(),
+    ];
+    let mut writer = StreamingPolygonParquetWriter::new(output, property_columns)?;
+
+    let pb = ProgressBar::new(max_to_fetch as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} fires ({eta})")?
+            .progress_chars("#>-"),
+    );
+
+    let mut offset = 0u32;
+
+    loop {
+        let url = format!(
+            "{}?where={}&outFields=*&resultOffset={}&resultRecordCount={}&f=json&outSR=4326",
+            NIFC_SERVICE_URL,
+            urlencoding::encode(&where_clause),
+            offset,
+            MAX_RECORDS_PER_REQUEST
+        );
+
+        let response: ArcGISResponse = client
+            .get(&url)
+            .send()
+            .context("Failed to send request to NIFC API")?
+            .json()
+            .context("Failed to parse NIFC API response")?;
+
+        let batch_size = response.features.len();
+        if batch_size == 0 {
+            break;
+        }
+
+        for arcgis_feature in response.features {
+            if let Some(polygon_record) = convert_to_polygon_record(&arcgis_feature) {
+                writer.write_polygon(&polygon_record)?;
+                pb.inc(1);
+
+                if args.max_fires > 0 && writer.row_count() >= args.max_fires {
+                    pb.finish_with_message("Limit reached");
+                    return writer.finish();
+                }
+            }
+        }
+
+        offset += batch_size as u32;
+
+        if response.exceeded_transfer_limit != Some(true) || offset as u64 >= total_count {
+            break;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    pb.finish_with_message("Download complete");
+    writer.finish()
+}
+
+/// Convert ArcGIS feature to PolygonRecord for Parquet output
+fn convert_to_polygon_record(arcgis: &ArcGISFeature) -> Option<PolygonRecord> {
+    let geometry = arcgis.geometry.as_ref()?;
+    let rings = geometry.rings.as_ref()?;
+
+    if rings.is_empty() || rings[0].is_empty() {
+        return None;
+    }
+
+    // Convert to our ring format: Vec<Vec<[f64; 2]>>
+    let polygon_rings: Vec<Vec<[f64; 2]>> = rings
+        .iter()
+        .map(|ring| {
+            ring.iter()
+                .filter_map(|coord| {
+                    if coord.len() >= 2 {
+                        Some([coord[0], coord[1]])
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .filter(|ring: &Vec<[f64; 2]>| ring.len() >= 4)
+        .collect();
+
+    if polygon_rings.is_empty() {
+        return None;
+    }
+
+    let attrs = &arcgis.attributes;
+
+    let timestamp: DateTime<Utc> = if let Some(date_ms) = attrs.date_cur {
+        let secs = date_ms / 1000;
+        let nsecs = ((date_ms % 1000) * 1_000_000) as u32;
+        if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
+            if dt.year() >= 1990 && dt.year() <= 2050 {
+                dt
+            } else if let Some(year) = attrs.fire_year {
+                Utc.with_ymd_and_hms(year, 7, 1, 0, 0, 0).unwrap()
+            } else {
+                return None;
+            }
+        } else if let Some(year) = attrs.fire_year {
+            Utc.with_ymd_and_hms(year, 7, 1, 0, 0, 0).unwrap()
+        } else {
+            return None;
+        }
+    } else if let Some(year) = attrs.fire_year {
+        Utc.with_ymd_and_hms(year, 7, 1, 0, 0, 0).unwrap()
+    } else {
+        return None;
+    };
+
+    let mut properties = Map::new();
+
+    if let Some(ref name) = attrs.incident {
+        properties.insert("name".to_string(), json!(name));
+    }
+    if let Some(year) = attrs.fire_year {
+        properties.insert("year".to_string(), json!(year));
+    }
+    if let Some(acres) = attrs.gis_acres {
+        properties.insert("acres".to_string(), json!(acres.round() as i64));
+    }
+    if let Some(ref agency) = attrs.agency {
+        properties.insert("agency".to_string(), json!(agency));
+    }
+    if let Some(ref unit_id) = attrs.unit_id {
+        properties.insert("unit_id".to_string(), json!(unit_id));
+    }
+    if let Some(ref category) = attrs.feature_category {
+        properties.insert("fire_type".to_string(), json!(category));
+    }
+    if let Some(ref irwin_id) = attrs.irwin_id {
+        properties.insert("irwin_id".to_string(), json!(irwin_id));
+    }
+    if let Some(id) = attrs.object_id {
+        properties.insert("object_id".to_string(), json!(id));
+    }
+
+    let severity = match attrs.gis_acres {
+        Some(acres) if acres >= 100_000.0 => "catastrophic",
+        Some(acres) if acres >= 50_000.0 => "extreme",
+        Some(acres) if acres >= 10_000.0 => "high",
+        Some(acres) if acres >= 1_000.0 => "moderate",
+        _ => "low",
+    };
+    properties.insert("severity".to_string(), json!(severity));
+
+    Some(PolygonRecord::new(polygon_rings, timestamp, properties))
 }
 
 

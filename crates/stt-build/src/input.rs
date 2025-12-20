@@ -14,7 +14,7 @@ use stt_core::types::{BoundingBox, TimeRange};
 
 #[cfg(feature = "geoparquet")]
 use {
-    arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampMillisecondArray},
+    arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampMillisecondArray, TimestampMicrosecondArray},
     arrow::datatypes::DataType,
     geojson::{Geometry, Value as GeomValue},
     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
@@ -192,8 +192,9 @@ fn load_csv(path: &Path, time_field: &str, end_time_field: Option<&str>, time_fo
 /// Load GeoParquet file
 ///
 /// Reads GeoParquet files using the geoarrow crate. Supports:
-/// - Point geometries (directly from geometry column)
-/// - LineString and Polygon geometries (extracts first coordinate)
+/// - Point geometries (directly from geometry column or lon/lat columns)
+/// - LineString geometries (full geometry preserved)
+/// - Polygon geometries (full geometry preserved)
 /// - Temporal columns (timestamp, start_time, end_time, etc.)
 ///
 /// The geometry column is auto-detected from GeoParquet metadata.
@@ -226,8 +227,8 @@ fn load_geoparquet(
     for batch_result in reader {
         let batch = batch_result.context("Failed to read Parquet batch")?;
         
-        // Extract coordinates from geometry column
-        let coords = extract_coords_from_batch(&batch, &geom_col_name)?;
+        // Extract geometries from geometry column (returns full geometry + centroid)
+        let geometries = extract_geometries_from_batch(&batch, &geom_col_name)?;
         
         // Extract timestamps
         let timestamps = extract_timestamps_from_batch(&batch, time_col_idx, time_format)?;
@@ -237,8 +238,8 @@ fn load_geoparquet(
 
         // Build features
         for i in 0..batch.num_rows() {
-            let (lon, lat) = coords.get(i).copied()
-                .ok_or_else(|| anyhow::anyhow!("Missing coordinates at row {}", i))?;
+            let (geometry, lon, lat) = geometries.get(i).cloned()
+                .ok_or_else(|| anyhow::anyhow!("Missing geometry at row {}", i))?;
             let timestamp = timestamps.get(i).copied()
                 .ok_or_else(|| anyhow::anyhow!("Missing timestamp at row {}", i))?;
             let end_timestamp = end_timestamps.as_ref().and_then(|ts| ts.get(i).copied());
@@ -247,10 +248,13 @@ fn load_geoparquet(
             let mut properties = serde_json::Map::new();
             for (col_idx, field) in schema.fields().iter().enumerate() {
                 let col_name = field.name();
-                // Skip geometry and time columns
+                // Skip geometry columns (including separate lon/lat)
                 if col_name == &geom_col_name 
                     || col_name == time_field 
-                    || end_time_field.map(|f| col_name == f).unwrap_or(false) 
+                    || end_time_field.map(|f| col_name == f).unwrap_or(false)
+                    || col_name == "lon" || col_name == "lat"
+                    || col_name == "longitude" || col_name == "latitude"
+                    || col_name == "x" || col_name == "y"
                 {
                     continue;
                 }
@@ -260,10 +264,10 @@ fn load_geoparquet(
                 }
             }
 
-            // Create GeoJSON feature
+            // Create GeoJSON feature with full geometry
             let feature = Feature {
                 bbox: None,
-                geometry: Some(Geometry::new(GeomValue::Point(vec![lon, lat]))),
+                geometry: Some(geometry),
                 id: None,
                 properties: Some(properties),
                 foreign_members: None,
@@ -308,19 +312,68 @@ fn find_geometry_column(schema: &arrow::datatypes::Schema) -> Result<String> {
         }
     }
     
+    // Check for separate lon/lat columns (common in our generated Parquet files)
+    let has_lon = schema.field_with_name("lon").is_ok() 
+        || schema.field_with_name("longitude").is_ok()
+        || schema.field_with_name("x").is_ok();
+    let has_lat = schema.field_with_name("lat").is_ok()
+        || schema.field_with_name("latitude").is_ok()
+        || schema.field_with_name("y").is_ok();
+    
+    if has_lon && has_lat {
+        // Return a sentinel value - extract_coords_from_batch will handle the fallback
+        return Ok("__lon_lat__".to_string());
+    }
+    
     anyhow::bail!("Could not find geometry column in Parquet schema. Expected columns: {:?}", common_names)
 }
 
-/// Extract coordinates from a record batch's geometry column
+/// Extract geometries from a record batch's geometry column
+/// Returns (geometry, centroid_lon, centroid_lat) for each row
 #[cfg(feature = "geoparquet")]
-fn extract_coords_from_batch(
+fn extract_geometries_from_batch(
     batch: &arrow::record_batch::RecordBatch,
     geom_col_name: &str,
-) -> Result<Vec<(f64, f64)>> {
+) -> Result<Vec<(Geometry, f64, f64)>> {
+    let mut geometries = Vec::with_capacity(batch.num_rows());
+    
+    // Handle separate lon/lat columns (sentinel from find_geometry_column)
+    if geom_col_name == "__lon_lat__" {
+        let lon_col = batch.column_by_name("lon")
+            .or_else(|| batch.column_by_name("longitude"))
+            .or_else(|| batch.column_by_name("x"));
+        let lat_col = batch.column_by_name("lat")
+            .or_else(|| batch.column_by_name("latitude"))
+            .or_else(|| batch.column_by_name("y"));
+        
+        if let (Some(lon), Some(lat)) = (lon_col, lat_col) {
+            if let (Some(lon_arr), Some(lat_arr)) = (
+                lon.as_any().downcast_ref::<Float64Array>(),
+                lat.as_any().downcast_ref::<Float64Array>(),
+            ) {
+                for i in 0..batch.num_rows() {
+                    if lon_arr.is_valid(i) && lat_arr.is_valid(i) {
+                        let x = lon_arr.value(i);
+                        let y = lat_arr.value(i);
+                        geometries.push((
+                            Geometry::new(GeomValue::Point(vec![x, y])),
+                            x, y
+                        ));
+                    } else {
+                        geometries.push((
+                            Geometry::new(GeomValue::Point(vec![0.0, 0.0])),
+                            0.0, 0.0
+                        ));
+                    }
+                }
+                return Ok(geometries);
+            }
+        }
+        anyhow::bail!("Expected lon/lat columns but could not read them");
+    }
+    
     let geom_col = batch.column_by_name(geom_col_name)
         .ok_or_else(|| anyhow::anyhow!("Geometry column '{}' not found", geom_col_name))?;
-    
-    let mut coords = Vec::with_capacity(batch.num_rows());
     
     // Try to interpret as GeoArrow point array (struct with x, y fields)
     if let Some(struct_array) = geom_col.as_any().downcast_ref::<arrow::array::StructArray>() {
@@ -339,31 +392,51 @@ fn extract_coords_from_batch(
             ) {
                 for i in 0..batch.num_rows() {
                     if x_arr.is_valid(i) && y_arr.is_valid(i) {
-                        coords.push((x_arr.value(i), y_arr.value(i)));
+                        let x = x_arr.value(i);
+                        let y = y_arr.value(i);
+                        geometries.push((
+                            Geometry::new(GeomValue::Point(vec![x, y])),
+                            x, y
+                        ));
                     } else {
-                        coords.push((0.0, 0.0));
+                        geometries.push((
+                            Geometry::new(GeomValue::Point(vec![0.0, 0.0])),
+                            0.0, 0.0
+                        ));
                     }
                 }
-                return Ok(coords);
+                return Ok(geometries);
             }
         }
     }
     
-    // Try WKB binary column
+    // Try WKB binary column - supports Point, LineString, and Polygon
     if let Some(binary_array) = geom_col.as_any().downcast_ref::<arrow::array::BinaryArray>() {
         for i in 0..batch.num_rows() {
             if binary_array.is_valid(i) {
                 let wkb = binary_array.value(i);
-                let (lon, lat) = parse_wkb_point(wkb).unwrap_or((0.0, 0.0));
-                coords.push((lon, lat));
+                // Use full geometry parsing for all geometry types
+                if let Some((geom, lon, lat)) = parse_wkb_geometry(wkb) {
+                    geometries.push((geom, lon, lat));
+                } else {
+                    // Fallback to point parsing for backwards compatibility
+                    let (lon, lat) = parse_wkb_point(wkb).unwrap_or((0.0, 0.0));
+                    geometries.push((
+                        Geometry::new(GeomValue::Point(vec![lon, lat])),
+                        lon, lat
+                    ));
+                }
             } else {
-                coords.push((0.0, 0.0));
+                geometries.push((
+                    Geometry::new(GeomValue::Point(vec![0.0, 0.0])),
+                    0.0, 0.0
+                ));
             }
         }
-        return Ok(coords);
+        return Ok(geometries);
     }
     
-    // Fallback: look for separate lon/lat columns
+    // Fallback: look for separate lon/lat columns in the batch
     let lon_col = batch.column_by_name("lon")
         .or_else(|| batch.column_by_name("longitude"))
         .or_else(|| batch.column_by_name("x"));
@@ -378,19 +451,110 @@ fn extract_coords_from_batch(
         ) {
             for i in 0..batch.num_rows() {
                 if lon_arr.is_valid(i) && lat_arr.is_valid(i) {
-                    coords.push((lon_arr.value(i), lat_arr.value(i)));
+                    let x = lon_arr.value(i);
+                    let y = lat_arr.value(i);
+                    geometries.push((
+                        Geometry::new(GeomValue::Point(vec![x, y])),
+                        x, y
+                    ));
                 } else {
-                    coords.push((0.0, 0.0));
+                    geometries.push((
+                        Geometry::new(GeomValue::Point(vec![0.0, 0.0])),
+                        0.0, 0.0
+                    ));
                 }
             }
-            return Ok(coords);
+            return Ok(geometries);
         }
     }
     
-    anyhow::bail!("Could not extract coordinates from geometry column '{}'", geom_col_name)
+    anyhow::bail!("Could not extract geometries from column '{}'", geom_col_name)
+}
+
+/// Extract coordinates from a record batch's geometry column
+/// Kept for backwards compatibility - use extract_geometries_from_batch for new code
+#[cfg(feature = "geoparquet")]
+fn extract_coords_from_batch(
+    batch: &arrow::record_batch::RecordBatch,
+    geom_col_name: &str,
+) -> Result<Vec<(f64, f64)>> {
+    let geometries = extract_geometries_from_batch(batch, geom_col_name)?;
+    Ok(geometries.into_iter().map(|(_, lon, lat)| (lon, lat)).collect())
+}
+
+/// WKB geometry types
+#[cfg(feature = "geoparquet")]
+const WKB_POINT: u32 = 1;
+#[cfg(feature = "geoparquet")]
+const WKB_LINESTRING: u32 = 2;
+#[cfg(feature = "geoparquet")]
+const WKB_POLYGON: u32 = 3;
+
+/// Parse WKB to GeoJSON geometry, returning (geometry, centroid_lon, centroid_lat)
+#[cfg(feature = "geoparquet")]
+fn parse_wkb_geometry(wkb: &[u8]) -> Option<(Geometry, f64, f64)> {
+    if wkb.len() < 5 {
+        return None;
+    }
+    
+    // Byte order (1 = little endian, 0 = big endian)
+    let little_endian = wkb[0] == 1;
+    
+    // Geometry type (mask off Z/M flags for simplicity)
+    let geom_type = if little_endian {
+        u32::from_le_bytes([wkb[1], wkb[2], wkb[3], wkb[4]]) % 1000
+    } else {
+        u32::from_be_bytes([wkb[1], wkb[2], wkb[3], wkb[4]]) % 1000
+    };
+    
+    match geom_type {
+        WKB_POINT => parse_wkb_point_geometry(wkb, little_endian),
+        WKB_LINESTRING => parse_wkb_linestring_geometry(wkb, little_endian),
+        WKB_POLYGON => parse_wkb_polygon_geometry(wkb, little_endian),
+        _ => None,
+    }
+}
+
+/// Read a f64 from WKB at given offset
+#[cfg(feature = "geoparquet")]
+fn read_f64(wkb: &[u8], offset: usize, little_endian: bool) -> Option<f64> {
+    if offset + 8 > wkb.len() {
+        return None;
+    }
+    let bytes: [u8; 8] = wkb[offset..offset+8].try_into().ok()?;
+    Some(if little_endian {
+        f64::from_le_bytes(bytes)
+    } else {
+        f64::from_be_bytes(bytes)
+    })
+}
+
+/// Read a u32 from WKB at given offset
+#[cfg(feature = "geoparquet")]
+fn read_u32(wkb: &[u8], offset: usize, little_endian: bool) -> Option<u32> {
+    if offset + 4 > wkb.len() {
+        return None;
+    }
+    let bytes: [u8; 4] = wkb[offset..offset+4].try_into().ok()?;
+    Some(if little_endian {
+        u32::from_le_bytes(bytes)
+    } else {
+        u32::from_be_bytes(bytes)
+    })
+}
+
+/// Parse WKB Point geometry
+#[cfg(feature = "geoparquet")]
+fn parse_wkb_point_geometry(wkb: &[u8], little_endian: bool) -> Option<(Geometry, f64, f64)> {
+    let x = read_f64(wkb, 5, little_endian)?;
+    let y = read_f64(wkb, 13, little_endian)?;
+    
+    let geom = Geometry::new(GeomValue::Point(vec![x, y]));
+    Some((geom, x, y))
 }
 
 /// Parse WKB Point geometry (simplified - only handles Point type)
+/// Kept for backwards compatibility
 #[cfg(feature = "geoparquet")]
 fn parse_wkb_point(wkb: &[u8]) -> Option<(f64, f64)> {
     if wkb.len() < 21 {
@@ -429,6 +593,82 @@ fn parse_wkb_point(wkb: &[u8]) -> Option<(f64, f64)> {
     Some((x, y))
 }
 
+/// Parse WKB LineString geometry
+#[cfg(feature = "geoparquet")]
+fn parse_wkb_linestring_geometry(wkb: &[u8], little_endian: bool) -> Option<(Geometry, f64, f64)> {
+    let num_points = read_u32(wkb, 5, little_endian)? as usize;
+    
+    if num_points == 0 {
+        return None;
+    }
+    
+    let mut coords: Vec<Vec<f64>> = Vec::with_capacity(num_points);
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut offset = 9;
+    
+    for _ in 0..num_points {
+        let x = read_f64(wkb, offset, little_endian)?;
+        let y = read_f64(wkb, offset + 8, little_endian)?;
+        coords.push(vec![x, y]);
+        sum_x += x;
+        sum_y += y;
+        offset += 16;
+    }
+    
+    let centroid_x = sum_x / num_points as f64;
+    let centroid_y = sum_y / num_points as f64;
+    
+    let geom = Geometry::new(GeomValue::LineString(coords));
+    Some((geom, centroid_x, centroid_y))
+}
+
+/// Parse WKB Polygon geometry
+#[cfg(feature = "geoparquet")]
+fn parse_wkb_polygon_geometry(wkb: &[u8], little_endian: bool) -> Option<(Geometry, f64, f64)> {
+    let num_rings = read_u32(wkb, 5, little_endian)? as usize;
+    
+    if num_rings == 0 {
+        return None;
+    }
+    
+    let mut rings: Vec<Vec<Vec<f64>>> = Vec::with_capacity(num_rings);
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut total_points = 0usize;
+    let mut offset = 9;
+    
+    for _ in 0..num_rings {
+        let num_points = read_u32(wkb, offset, little_endian)? as usize;
+        offset += 4;
+        
+        let mut ring: Vec<Vec<f64>> = Vec::with_capacity(num_points);
+        
+        for _ in 0..num_points {
+            let x = read_f64(wkb, offset, little_endian)?;
+            let y = read_f64(wkb, offset + 8, little_endian)?;
+            ring.push(vec![x, y]);
+            
+            // Only use exterior ring for centroid calculation
+            if rings.is_empty() {
+                sum_x += x;
+                sum_y += y;
+                total_points += 1;
+            }
+            
+            offset += 16;
+        }
+        
+        rings.push(ring);
+    }
+    
+    let centroid_x = if total_points > 0 { sum_x / total_points as f64 } else { 0.0 };
+    let centroid_y = if total_points > 0 { sum_y / total_points as f64 } else { 0.0 };
+    
+    let geom = Geometry::new(GeomValue::Polygon(rings));
+    Some((geom, centroid_x, centroid_y))
+}
+
 /// Extract timestamps from a column
 #[cfg(feature = "geoparquet")]
 fn extract_timestamps_from_batch(
@@ -439,11 +679,24 @@ fn extract_timestamps_from_batch(
     let column = batch.column(col_idx);
     let mut timestamps = Vec::with_capacity(batch.num_rows());
     
-    // Try as timestamp array
+    // Try as timestamp array (milliseconds)
     if let Some(ts_array) = column.as_any().downcast_ref::<TimestampMillisecondArray>() {
         for i in 0..batch.num_rows() {
             if ts_array.is_valid(i) {
                 timestamps.push(ts_array.value(i) as u64);
+            } else {
+                timestamps.push(0);
+            }
+        }
+        return Ok(timestamps);
+    }
+    
+    // Try as timestamp array (microseconds) - convert to milliseconds
+    if let Some(ts_array) = column.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        for i in 0..batch.num_rows() {
+            if ts_array.is_valid(i) {
+                // Convert microseconds to milliseconds
+                timestamps.push((ts_array.value(i) / 1000) as u64);
             } else {
                 timestamps.push(0);
             }
@@ -699,7 +952,9 @@ pub fn calculate_bounds(features: &[ParsedFeature]) -> Result<(BoundingBox, Time
         min_lat = min_lat.min(feature.lat);
         max_lat = max_lat.max(feature.lat);
         min_time = min_time.min(feature.timestamp);
-        max_time = max_time.max(feature.timestamp);
+        // Use end_timestamp for max_time if available (for features with time ranges)
+        let feature_end = feature.end_timestamp.unwrap_or(feature.timestamp);
+        max_time = max_time.max(feature_end);
     }
 
     let bounds = BoundingBox::new(min_lon, min_lat, max_lon, max_lat);

@@ -28,11 +28,11 @@ wkt = "0.10"
 geo-traits = "0.2"
 
 # GeoArrow/GeoParquet ecosystem
-geoarrow = { version = "0.3", default-features = false }
-arrow = { version = "53", default-features = false, features = ["chrono-tz"] }
-parquet = { version = "53", default-features = false, features = ["arrow", "flate2", "snap", "zstd"] }
-arrow-schema = "53"
-arrow-array = "53"
+geoarrow = { version = "0.6", default-features = false }
+arrow = { version = "54", default-features = false, features = ["chrono-tz"] }
+parquet = { version = "54", default-features = false, features = ["arrow", "flate2", "snap", "zstd"] }
+arrow-schema = "54"
+arrow-array = "54"
 
 # Data I/O
 csv = "1.3"

@@ -2,17 +2,16 @@
 //!
 //! Data source: https://s3.opensky-network.org/data-samples/
 
-use crate::common;
+use crate::common::{self, LineStringRecord, PointRecord, StreamingLineStringParquetWriter, StreamingParquetWriter};
 use anyhow::{Context, Result};
-use chrono::{Datelike, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use clap::Parser;
 use csv::ReaderBuilder;
 use flate2::read::GzDecoder;
-use geojson::Feature;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 use serde_json::{json, Map};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
@@ -56,6 +55,18 @@ pub struct Args {
     /// Skip stt-build step
     #[arg(long)]
     pub skip_build: bool,
+
+    /// Output flight paths (LineStrings) instead of individual points
+    #[arg(long)]
+    pub paths: bool,
+
+    /// Minimum points per flight for path output (filters short tracks)
+    #[arg(long, default_value = "5")]
+    pub min_points: usize,
+
+    /// Maximum gap in seconds between points before starting a new segment
+    #[arg(long, default_value = "300")]
+    pub max_gap_seconds: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,11 +112,16 @@ pub fn run(args: Args) -> Result<()> {
     println!("📅 Date: {}", args.date);
     println!("⏰ Hours: {:02}:00 - {:02}:59 UTC ({} hours)", start_hour, end_hour, total_hours);
     println!("📍 Bounds: {}", args.bounds);
+    if args.paths {
+        println!("🛤️  Mode: Flight paths (LineStrings)");
+    } else {
+        println!("📍 Mode: Flight points");
+    }
     println!();
 
-    // Determine intermediate output format
+    // Determine intermediate output format (use Parquet for efficiency)
     let intermediate_path = if args.output.extension().map(|e| e == "stt").unwrap_or(false) {
-        args.output.with_extension("geojson")
+        args.output.with_extension("parquet")
     } else {
         args.output.clone()
     };
@@ -213,7 +229,11 @@ pub fn run(args: Args) -> Result<()> {
         }
 
         // Process combined file
-        process_csv(&combined_path, &intermediate_path, Some(&args.bounds), args.sample_seconds)?;
+        if args.paths {
+            process_csv_paths(&combined_path, &intermediate_path, Some(&args.bounds), args.sample_seconds, args.min_points, args.max_gap_seconds)?;
+        } else {
+            process_csv(&combined_path, &intermediate_path, Some(&args.bounds), args.sample_seconds)?;
+        }
 
         // Cleanup if requested
         if !args.keep_downloads {
@@ -238,19 +258,35 @@ pub fn run(args: Args) -> Result<()> {
         if !combined_path.exists() {
             anyhow::bail!("Combined CSV not found: {}. Run without --skip-download first.", combined_path.display());
         }
-        process_csv(&combined_path, &intermediate_path, Some(&args.bounds), args.sample_seconds)?;
+        if args.paths {
+            process_csv_paths(&combined_path, &intermediate_path, Some(&args.bounds), args.sample_seconds, args.min_points, args.max_gap_seconds)?;
+        } else {
+            process_csv(&combined_path, &intermediate_path, Some(&args.bounds), args.sample_seconds)?;
+        }
     }
 
     // Build STT if output is .stt
     if args.output.extension().map(|e| e == "stt").unwrap_or(false) && !args.skip_build {
-        common::run_stt_build(
-            &intermediate_path,
-            &args.output,
-            "timestamp",
-            0,
-            10,
-            "gzip",
-        )?;
+        if args.paths {
+            common::run_stt_build_with_end_time(
+                &intermediate_path,
+                &args.output,
+                "timestamp",
+                Some("end_timestamp"),
+                0,
+                10,
+                "gzip",
+            )?;
+        } else {
+            common::run_stt_build(
+                &intermediate_path,
+                &args.output,
+                "timestamp",
+                0,
+                10,
+                "gzip",
+            )?;
+        }
 
         // Clean up intermediate file
         let _ = fs::remove_file(&intermediate_path);
@@ -315,19 +351,30 @@ fn process_csv(
     let mut csv_reader = ReaderBuilder::new().has_headers(true).from_reader(buf_reader);
 
     let mut aircraft_last_time: HashMap<String, i64> = HashMap::new();
-    let mut features: Vec<Feature> = Vec::new();
     let mut total_records = 0;
     let mut filtered_records = 0;
     let mut ground_filtered = 0;
     let mut unique_aircraft = HashSet::new();
+
+    // Use streaming Parquet writer for efficiency (~10x smaller than GeoJSON)
+    let property_columns = vec![
+        "icao24".to_string(),
+        "callsign".to_string(),
+        "altitude".to_string(),
+        "speed".to_string(),
+        "heading".to_string(),
+        "vertical_rate".to_string(),
+        "squawk".to_string(),
+    ];
+    let mut writer = StreamingParquetWriter::new(output, property_columns)?;
 
     for result in csv_reader.deserialize() {
         total_records += 1;
 
         if total_records % 500000 == 0 {
             println!(
-                "   Processed {} records, {} features, {} aircraft...",
-                total_records, features.len(), unique_aircraft.len()
+                "   Processed {} records, {} written, {} aircraft...",
+                total_records, writer.row_count(), unique_aircraft.len()
             );
         }
 
@@ -393,22 +440,244 @@ fn process_csv(
             properties.insert("squawk".to_string(), json!(squawk));
         }
 
-        let feature = common::create_point_feature(lon, lat, timestamp, properties);
-        features.push(feature);
+        let point_record = PointRecord::new(lon, lat, timestamp, properties);
+        writer.write_point(&point_record)?;
     }
+
+    let final_count = writer.finish()?;
 
     println!("\n📊 Processing Summary:");
     println!("   Total records: {}", total_records);
     println!("   Ground filtered: {}", ground_filtered);
     println!("   Geographic filtered: {}", filtered_records);
-    println!("   Final features: {}", features.len());
+    println!("   Final features: {}", final_count);
     println!("   Unique aircraft: {}", unique_aircraft.len());
 
-    if !features.is_empty() {
-        common::write_geojson(features, output)?;
+    Ok(())
+}
+
+/// A flight position with timestamp and altitude
+#[derive(Debug, Clone)]
+struct FlightPosition {
+    time: i64,
+    lon: f64,
+    lat: f64,
+    altitude_m: f64, // Altitude in meters for 3D paths
+    callsign: Option<String>,
+}
+
+/// Process CSV to generate flight path LineStrings (grouped by aircraft)
+fn process_csv_paths(
+    input: &PathBuf,
+    output: &PathBuf,
+    bounds: Option<&str>,
+    sample_seconds: i64,
+    min_points: usize,
+    max_gap_seconds: i64,
+) -> Result<()> {
+    println!("\n🔄 Processing flight data into paths...");
+
+    let bounds_parsed = bounds.map(|s| common::parse_bounds(s)).transpose()?;
+
+    let file = File::open(input)?;
+    let is_gzipped = input.extension().map(|ext| ext == "gz").unwrap_or(false);
+
+    let reader: Box<dyn Read> = if is_gzipped {
+        Box::new(GzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+
+    let buf_reader = BufReader::new(reader);
+    let mut csv_reader = ReaderBuilder::new().has_headers(true).from_reader(buf_reader);
+
+    // Group positions by aircraft (icao24)
+    // Use BTreeMap to maintain insertion order for reproducibility
+    let mut aircraft_positions: HashMap<String, BTreeMap<i64, FlightPosition>> = HashMap::new();
+    let mut total_records = 0;
+    let mut filtered_records = 0;
+    let mut ground_filtered = 0;
+
+    println!("   Reading and grouping flight positions...");
+
+    for result in csv_reader.deserialize() {
+        total_records += 1;
+
+        if total_records % 500000 == 0 {
+            println!(
+                "   Read {} records, {} aircraft...",
+                total_records, aircraft_positions.len()
+            );
+        }
+
+        let record: StateRecord = match result {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        // Skip ground positions
+        if record.onground.to_lowercase() == "true" {
+            ground_filtered += 1;
+            continue;
+        }
+
+        let (lat, lon) = match (record.lat, record.lon) {
+            (Some(lat), Some(lon)) if lat.abs() <= 90.0 && lon.abs() <= 180.0 => (lat, lon),
+            _ => continue,
+        };
+
+        // Apply bounds filter
+        if let Some((min_lat, min_lon, max_lat, max_lon)) = bounds_parsed {
+            if lat < min_lat || lat > max_lat || lon < min_lon || lon > max_lon {
+                filtered_records += 1;
+                continue;
+            }
+        }
+
+        // Get altitude in meters (baroaltitude is in meters in OpenSky data)
+        let altitude_m = record.baroaltitude.unwrap_or(0.0);
+
+        let positions = aircraft_positions
+            .entry(record.icao24.clone())
+            .or_insert_with(BTreeMap::new);
+
+        // Use time as key to handle duplicates - only keep one position per second
+        // Apply sampling - only keep positions at sample_seconds intervals
+        let sample_key = record.time / sample_seconds * sample_seconds;
+        
+        if !positions.contains_key(&sample_key) {
+            positions.insert(sample_key, FlightPosition {
+                time: record.time,
+                lon,
+                lat,
+                altitude_m,
+                callsign: record.callsign.clone(),
+            });
+        }
     }
 
+    println!("   Found {} unique aircraft", aircraft_positions.len());
+    println!("   Creating path segments...");
+
+    // Create streaming LineString writer
+    let property_columns = vec![
+        "icao24".to_string(),
+        "callsign".to_string(),
+        "segment_id".to_string(),
+    ];
+    let mut writer = StreamingLineStringParquetWriter::new(output, property_columns)?;
+
+    let mut total_segments = 0;
+    let mut total_points = 0;
+
+    let pb = ProgressBar::new(aircraft_positions.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{bar:40}] {pos}/{len} aircraft")?
+            .progress_chars("=>-"),
+    );
+
+    for (icao24, positions) in aircraft_positions {
+        if positions.len() < min_points {
+            pb.inc(1);
+            continue;
+        }
+
+        // Convert to sorted vec
+        let sorted_positions: Vec<FlightPosition> = positions.into_values().collect();
+
+        // Split into segments based on time gaps
+        let segments = split_into_segments(&sorted_positions, max_gap_seconds, min_points);
+
+        for (segment_id, segment) in segments.iter().enumerate() {
+            if segment.len() < 2 {
+                continue;
+            }
+
+            let start_time = Utc.timestamp_opt(segment.first().unwrap().time, 0)
+                .single()
+                .unwrap_or(Utc::now());
+            let end_time = Utc.timestamp_opt(segment.last().unwrap().time, 0)
+                .single()
+                .unwrap_or(Utc::now());
+
+            // Use the most common callsign in this segment
+            let callsign = segment.iter()
+                .filter_map(|p| p.callsign.as_ref())
+                .filter(|s| !s.trim().is_empty())
+                .next()
+                .cloned();
+
+            let mut properties = Map::new();
+            properties.insert("icao24".to_string(), json!(icao24));
+            if let Some(cs) = callsign {
+                properties.insert("callsign".to_string(), json!(cs.trim()));
+            }
+            properties.insert("segment_id".to_string(), json!(segment_id));
+
+            // Create 2D coordinates (altitude is scaled for visualization)
+            // Note: For proper 3D, we'd need to handle altitude separately
+            let coordinates: Vec<[f64; 2]> = segment.iter()
+                .map(|p| [p.lon, p.lat])
+                .collect();
+
+            let record = LineStringRecord::new(
+                coordinates,
+                start_time,
+                Some(end_time),
+                properties,
+            );
+
+            writer.write_linestring(&record)?;
+            total_segments += 1;
+            total_points += segment.len();
+        }
+
+        pb.inc(1);
+    }
+
+    pb.finish_and_clear();
+    let final_count = writer.finish()?;
+
+    println!("\n📊 Processing Summary:");
+    println!("   Total records: {}", total_records);
+    println!("   Ground filtered: {}", ground_filtered);
+    println!("   Geographic filtered: {}", filtered_records);
+    println!("   Final path segments: {}", final_count);
+    println!("   Total points in paths: {}", total_points);
+
     Ok(())
+}
+
+/// Split a sorted list of positions into segments based on time gaps
+fn split_into_segments(
+    positions: &[FlightPosition],
+    max_gap_seconds: i64,
+    min_points: usize,
+) -> Vec<Vec<FlightPosition>> {
+    let mut segments: Vec<Vec<FlightPosition>> = Vec::new();
+    let mut current_segment: Vec<FlightPosition> = Vec::new();
+
+    for pos in positions {
+        if let Some(last) = current_segment.last() {
+            if pos.time - last.time > max_gap_seconds {
+                // Gap too large - start new segment
+                if current_segment.len() >= min_points {
+                    segments.push(std::mem::take(&mut current_segment));
+                } else {
+                    current_segment.clear();
+                }
+            }
+        }
+        current_segment.push(pos.clone());
+    }
+
+    // Don't forget the last segment
+    if current_segment.len() >= min_points {
+        segments.push(current_segment);
+    }
+
+    segments
 }
 
 

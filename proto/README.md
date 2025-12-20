@@ -73,9 +73,8 @@ The temporal index uses a sorted timestamp array with offsets because:
 
 Tiles can be compressed with:
 
-1. **Brotli** (recommended): Best compression ratio, good speed
-2. **Gzip**: Faster decode, slightly worse compression
-3. **None**: For pre-compressed data or debugging
+1. **Gzip** (recommended): Good compression ratio, fast decode, universal support
+2. **None**: For pre-compressed data or debugging
 
 The index and metadata are stored uncompressed for fast access.
 
@@ -109,7 +108,7 @@ The STT archive uses a simple container format:
 └─────────────────────────────────────┘
 ```
 
-Total header size: 56 bytes
+Total header size: 53 bytes
 
 ### Why This Format?
 

@@ -81,7 +81,10 @@ pub fn lonlat_to_tile(lon: f64, lat: f64, zoom: u8) -> Result<(u32, u32)> {
 /// * `extent` - Tile extent (typically 4096)
 ///
 /// # Returns
-/// Tuple of (x, y) coordinates within the tile (0 to extent)
+/// Tuple of (x, y) coordinates within the tile.
+/// Note: Values CAN be outside [0, extent] for coordinates outside the tile.
+/// This is intentional - it allows paths that cross tile boundaries to be
+/// rendered correctly. deck.gl handles clipping at render time.
 pub fn lonlat_to_tile_coords(
     lon: f64,
     lat: f64,
@@ -89,7 +92,7 @@ pub fn lonlat_to_tile_coords(
     tile_x: u32,
     tile_y: u32,
     extent: u32,
-) -> (u32, u32) {
+) -> (i32, i32) {
     let n = 1u32 << zoom;
 
     // Convert to Web Mercator tile coordinates (0-n)
@@ -97,14 +100,12 @@ pub fn lonlat_to_tile_coords(
     let lat_rad = lat.to_radians();
     let world_y = (1.0 - lat_rad.tan().asinh() / std::f64::consts::PI) / 2.0 * n as f64;
 
-    // Convert to tile-relative coordinates (0-extent)
+    // Convert to tile-relative coordinates
+    // DO NOT CLAMP - allow values outside [0, extent] for cross-tile paths
     let tile_rel_x = (world_x - tile_x as f64) * extent as f64;
     let tile_rel_y = (world_y - tile_y as f64) * extent as f64;
 
-    (
-        tile_rel_x.clamp(0.0, extent as f64) as u32,
-        tile_rel_y.clamp(0.0, extent as f64) as u32,
-    )
+    (tile_rel_x.round() as i32, tile_rel_y.round() as i32)
 }
 
 /// Convert tile coordinates back to WGS84 lon/lat
