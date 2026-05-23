@@ -1,0 +1,53 @@
+[package]
+name = "stt-optimize"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Spatiotemporal dataset analyzer and optimizer for STT file generation"
+
+[lib]
+name = "stt_optimize"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stt-optimize"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace crate
+stt-core = { path = "../stt-core" }
+
+# Core dependencies
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# GeoParquet/Arrow
+parquet.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow-array.workspace = true
+
+# Geometry
+geo.workspace = true
+geo-types.workspace = true
+geojson.workspace = true
+
+# CLI
+clap.workspace = true
+indicatif.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Parallel processing
+rayon.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+

@@ -40,12 +40,27 @@ impl SpatialIndex {
         }
     }
 
-    /// Find tiles within a Hilbert curve range
+    /// Find tiles within an inclusive Hilbert curve range `[start, end]`.
+    ///
+    /// Uses half-open slicing internally: `start_idx` is the first element
+    /// `>= start`, and `end_idx` is the first element `> end` (the exclusive
+    /// upper bound). This avoids over-returning one element and never panics
+    /// on an empty / fully-out-of-range query.
     pub fn query_range(&self, start: u64, end: u64) -> Vec<u32> {
-        let start_idx = self.hilbert_ids.binary_search(&start).unwrap_or_else(|i| i);
-        let end_idx = self.hilbert_ids.binary_search(&end).unwrap_or_else(|i| i);
+        if start > end || self.hilbert_ids.is_empty() {
+            return vec![];
+        }
 
-        self.tile_indices[start_idx..=end_idx.min(self.tile_indices.len() - 1)].to_vec()
+        // First index with value >= start.
+        let start_idx = self.hilbert_ids.partition_point(|&h| h < start);
+        // First index with value > end (exclusive upper bound).
+        let end_idx = self.hilbert_ids.partition_point(|&h| h <= end);
+
+        if start_idx >= end_idx {
+            return vec![];
+        }
+
+        self.tile_indices[start_idx..end_idx].to_vec()
     }
 
     /// Find the closest tile to a given Hilbert index
@@ -122,22 +137,30 @@ impl TemporalIndex {
         self.tile_refs[start..end].to_vec()
     }
 
-    /// Find tiles within a time range
+    /// Find tiles within an inclusive time range `[start_time, end_time]`.
+    ///
+    /// `start_idx` is the first timestamp `>= start_time`. `end_idx` is the
+    /// first timestamp `> end_time`, so the matching timestamp buckets are
+    /// `[start_idx, end_idx)`. The flattened `tile_refs` slice for those
+    /// buckets is `tile_ref_offsets[start_idx] .. (tile_ref_offsets[end_idx]
+    /// or tile_refs.len())`.
     pub fn query_range(&self, start_time: u64, end_time: u64) -> Vec<u32> {
-        let start_idx = self
-            .timestamps
-            .binary_search(&start_time)
-            .unwrap_or_else(|i| i);
-        let end_idx = self
-            .timestamps
-            .binary_search(&end_time)
-            .unwrap_or_else(|i| i);
+        if start_time > end_time || self.timestamps.is_empty() {
+            return vec![];
+        }
 
-        if start_idx >= self.timestamps.len() {
+        // First timestamp >= start_time.
+        let start_idx = self.timestamps.partition_point(|&t| t < start_time);
+        // First timestamp > end_time (exclusive bucket bound).
+        let end_idx = self.timestamps.partition_point(|&t| t <= end_time);
+
+        if start_idx >= end_idx {
             return vec![];
         }
 
         let first_offset = self.tile_ref_offsets[start_idx] as usize;
+        // end_idx is in [1, timestamps.len()]. If it points one past the
+        // last bucket, the slice extends to the end of tile_refs.
         let last_offset = if end_idx < self.tile_ref_offsets.len() {
             self.tile_ref_offsets[end_idx] as usize
         } else {
@@ -237,5 +260,121 @@ mod tests {
 
         let results = index.query_exact(2000);
         assert_eq!(results.len(), 1);
+    }
+
+    /// Build a temporal index with timestamps 100, 200, 300 (one tile each).
+    fn sample_temporal_index() -> TemporalIndex {
+        let tiles = vec![
+            (TileId::new(10, 0, 0, 100), 0),
+            (TileId::new(10, 0, 0, 200), 1),
+            (TileId::new(10, 0, 0, 300), 2),
+        ];
+        TemporalIndex::new(&tiles)
+    }
+
+    #[test]
+    fn test_temporal_query_range_empty_result() {
+        let index = sample_temporal_index();
+        // Range falls entirely between buckets - no match.
+        assert!(index.query_range(120, 180).is_empty());
+    }
+
+    #[test]
+    fn test_temporal_query_range_past_end() {
+        let index = sample_temporal_index();
+        // Query entirely after the last timestamp.
+        assert!(index.query_range(400, 500).is_empty());
+        // Query that starts past the end but with a huge end bound.
+        assert!(index.query_range(301, u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn test_temporal_query_range_before_start() {
+        let index = sample_temporal_index();
+        // Query entirely before the first timestamp.
+        assert!(index.query_range(0, 50).is_empty());
+    }
+
+    #[test]
+    fn test_temporal_query_range_single_match() {
+        let index = sample_temporal_index();
+        // Range that includes exactly the middle bucket.
+        let r = index.query_range(150, 250);
+        assert_eq!(r, vec![1]);
+        // Exact single timestamp.
+        assert_eq!(index.query_range(300, 300), vec![2]);
+    }
+
+    #[test]
+    fn test_temporal_query_range_spanning_all() {
+        let index = sample_temporal_index();
+        let mut r = index.query_range(0, u64::MAX);
+        r.sort();
+        assert_eq!(r, vec![0, 1, 2]);
+        // Includes the last bucket (regression: last bucket must not be dropped).
+        let mut r2 = index.query_range(100, 300);
+        r2.sort();
+        assert_eq!(r2, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_temporal_query_range_reversed() {
+        let index = sample_temporal_index();
+        // Reversed range must not panic; returns empty.
+        assert!(index.query_range(300, 100).is_empty());
+    }
+
+    /// Build a spatial index from three tiles at the same zoom.
+    fn sample_spatial_index() -> (SpatialIndex, Vec<u64>) {
+        let tile_ids = vec![
+            TileId::new(10, 100, 100, 0),
+            TileId::new(10, 200, 200, 0),
+            TileId::new(10, 300, 300, 0),
+        ];
+        let index = SpatialIndex::new(tile_ids);
+        let ids = index.hilbert_ids.clone();
+        (index, ids)
+    }
+
+    #[test]
+    fn test_spatial_query_range_empty_and_bounds() {
+        let (index, ids) = sample_spatial_index();
+
+        // Single exact match on the middle hilbert id.
+        assert_eq!(index.query_range(ids[1], ids[1]), vec![1]);
+
+        // Range spanning all.
+        let mut all = index.query_range(0, u64::MAX);
+        all.sort();
+        assert_eq!(all, vec![0, 1, 2]);
+
+        // Query past the end - empty, no panic.
+        assert!(index.query_range(ids[2] + 1, u64::MAX).is_empty());
+
+        // Query before the start - empty, no panic.
+        assert!(index.query_range(0, ids[0].saturating_sub(1)).is_empty());
+
+        // Reversed range - empty, no panic.
+        assert!(index.query_range(u64::MAX, 0).is_empty());
+
+        // Empty index.
+        let empty = SpatialIndex::new(vec![]);
+        assert!(empty.query_range(0, u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn test_spatiotemporal_index_roundtrip() {
+        let tile_ids = vec![
+            TileId::new(10, 100, 100, 1000),
+            TileId::new(10, 200, 200, 2000),
+            TileId::new(10, 300, 300, 3000),
+        ];
+        let index = SpatioTemporalIndex::new(tile_ids);
+
+        // Temporal-only: all three timestamps present.
+        assert_eq!(index.temporal.timestamps.len(), 3);
+        let mut t = index.temporal.query_range(0, u64::MAX);
+        t.sort();
+        assert_eq!(t, vec![0, 1, 2]);
     }
 }

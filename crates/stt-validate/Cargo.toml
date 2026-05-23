@@ -1,0 +1,20 @@
+[package]
+name = "stt-validate"
+description = "Validate STT archives: header, content hashes, Arrow IPC decode."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "stt-validate"
+path = "src/main.rs"
+
+[dependencies]
+stt-core = { path = "../stt-core" }
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+indicatif.workspace = true

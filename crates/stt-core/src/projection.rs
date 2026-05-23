@@ -121,7 +121,12 @@ pub fn tile_to_lonlat(tile_x: u32, tile_y: u32, zoom: u8) -> Point<f64> {
     let n = (1u32 << zoom) as f64;
 
     let lon = (tile_x as f64 / n) * 360.0 - 180.0;
-    let lat_rad = (1.0 - 2.0 * tile_y as f64 / n).sinh().atan();
+    // Web Mercator inverse: lat = atan(sinh(π·(1 - 2y/n))).
+    // The π factor is the exact inverse of the forward projection, which
+    // divides by π (see `lonlat_to_tile`). Omitting it badly distorts latitude.
+    let lat_rad = (std::f64::consts::PI * (1.0 - 2.0 * tile_y as f64 / n))
+        .sinh()
+        .atan();
     let lat = lat_rad.to_degrees();
 
     Point::new(lon, lat)
@@ -130,8 +135,9 @@ pub fn tile_to_lonlat(tile_x: u32, tile_y: u32, zoom: u8) -> Point<f64> {
 /// Convert tile-relative coordinates to WGS84 lon/lat
 ///
 /// # Arguments
-/// * `x` - X coordinate within tile (0 to extent)
-/// * `y` - Y coordinate within tile (0 to extent)
+/// * `x` - X coordinate within tile (signed: values outside [0, extent] are
+///   valid for coordinates that belong to cross-tile paths)
+/// * `y` - Y coordinate within tile (signed, same as `x`)
 /// * `zoom` - Tile zoom level
 /// * `tile_x` - Tile X coordinate
 /// * `tile_y` - Tile Y coordinate
@@ -139,9 +145,12 @@ pub fn tile_to_lonlat(tile_x: u32, tile_y: u32, zoom: u8) -> Point<f64> {
 ///
 /// # Returns
 /// Point with lon/lat coordinates
+///
+/// Note: `x`/`y` are `i32` to be the exact inverse of [`lonlat_to_tile_coords`],
+/// which produces signed quantized coordinates that may fall outside the tile.
 pub fn tile_coords_to_lonlat(
-    x: u32,
-    y: u32,
+    x: i32,
+    y: i32,
     zoom: u8,
     tile_x: u32,
     tile_y: u32,
@@ -154,7 +163,11 @@ pub fn tile_coords_to_lonlat(
     let world_y = tile_y as f64 + (y as f64 / extent as f64);
 
     let lon = (world_x / n) * 360.0 - 180.0;
-    let lat_rad = (1.0 - 2.0 * world_y / n).sinh().atan();
+    // Web Mercator inverse: lat = atan(sinh(π·(1 - 2y/n))). The π factor is
+    // the exact inverse of `lonlat_to_tile_coords`, which divides by π.
+    let lat_rad = (std::f64::consts::PI * (1.0 - 2.0 * world_y / n))
+        .sinh()
+        .atan();
     let lat = lat_rad.to_degrees();
 
     Point::new(lon, lat)
@@ -240,10 +253,16 @@ mod tests {
 
     #[test]
     fn test_tile_to_lonlat() {
+        // tile_to_lonlat returns the NW corner of the tile. Tile (163,395) at
+        // zoom 10 has its NW corner near SF (the corner, not the tile centre).
         let point = tile_to_lonlat(163, 395, 10);
-        // Should be close to San Francisco
-        assert!((point.x() + 122.34).abs() < 0.1);
-        assert!((point.y() - 37.77).abs() < 0.1);
+        assert!((point.x() + 122.695).abs() < 0.01, "lon = {}", point.x());
+        assert!((point.y() - 37.996).abs() < 0.01, "lat = {}", point.y());
+
+        // Round-trip: lonlat -> tile -> lonlat-of-corner must land back in the
+        // same tile when re-projected.
+        let (tx, ty) = lonlat_to_tile(-122.4194, 37.7749, 10).unwrap();
+        assert_eq!((tx, ty), (163, 395));
     }
 
     #[test]

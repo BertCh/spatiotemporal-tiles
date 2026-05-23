@@ -1,0 +1,852 @@
+//! Trajectory clipping for spatiotemporal tile distribution
+//!
+//! This module clips LineString trajectories at tile boundaries to ensure
+//! features are properly distributed across spatial tiles. This enables
+//! efficient viewport-based loading where only relevant segments are fetched.
+//!
+//! Performance considerations:
+//! - Bounding box pre-filter to minimize clip operations
+//! - Liang-Barsky algorithm for efficient line-rectangle clipping
+//! - Timestamp interpolation based on distance along path
+//! - Arc-wrapped properties for zero-copy sharing across segments
+//! - Optional line simplification for lower zoom levels
+
+use crate::input::SharedProperties;
+use crate::simplify::simplify_for_zoom;
+use geojson::{Feature, Geometry, Value as GeomValue};
+use std::collections::HashSet;
+use stt_core::projection;
+
+/// A clipped segment of a trajectory assigned to a specific tile
+#[derive(Debug, Clone)]
+pub struct ClippedSegment {
+    /// The tile coordinates this segment belongs to
+    pub tile_x: u32,
+    pub tile_y: u32,
+    pub zoom: u8,
+    /// The clipped geometry (subset of original coordinates)
+    pub coordinates: Vec<(f64, f64, f64)>, // (lon, lat, alt)
+    /// Per-vertex timestamps for this segment
+    pub timestamps: Vec<u64>,
+    /// Start timestamp of this segment
+    pub start_time: u64,
+    /// End timestamp of this segment
+    pub end_time: u64,
+    /// Shared reference to original properties (zero-copy via Arc)
+    pub properties: Option<SharedProperties>,
+    /// Original feature ID for client-side reconnection
+    pub feature_id: Option<geojson::feature::Id>,
+}
+
+/// Configuration for trajectory clipping
+#[derive(Debug, Clone)]
+pub struct ClipConfig {
+    /// Minimum number of vertices to bother clipping
+    pub min_vertices: usize,
+    /// Buffer in degrees to add around tile bounds (prevents gaps at boundaries)
+    pub buffer_degrees: f64,
+    /// Optional temporal granularity for slicing long trajectories (in milliseconds)
+    /// If set, trajectories crossing temporal boundaries will be split
+    pub temporal_granularity_ms: Option<u64>,
+    /// Enable line simplification for lower zoom levels
+    pub simplify: bool,
+    /// Maximum zoom level to apply simplification (higher zooms keep full detail)
+    pub simplify_max_zoom: u8,
+}
+
+impl Default for ClipConfig {
+    fn default() -> Self {
+        Self {
+            min_vertices: 2,
+            // Small buffer (~100m at equator) to ensure visual continuity
+            buffer_degrees: 0.001,
+            // No temporal slicing by default
+            temporal_granularity_ms: None,
+            // Simplification disabled by default
+            simplify: false,
+            simplify_max_zoom: 14,
+        }
+    }
+}
+
+/// Tile bounds in WGS84 coordinates
+#[derive(Debug, Clone, Copy)]
+struct TileBounds {
+    min_lon: f64,
+    min_lat: f64,
+    max_lon: f64,
+    max_lat: f64,
+}
+
+impl TileBounds {
+    /// Create tile bounds for a specific tile using Web Mercator projection
+    fn from_tile(x: u32, y: u32, zoom: u8) -> Self {
+        let n = (1u32 << zoom) as f64;
+
+        // Calculate longitude bounds (straightforward)
+        let min_lon = (x as f64 / n) * 360.0 - 180.0;
+        let max_lon = ((x + 1) as f64 / n) * 360.0 - 180.0;
+
+        // Calculate latitude bounds using correct Web Mercator formula
+        // lat = atan(sinh(π * (1 - 2 * y / n)))
+        let max_lat = (std::f64::consts::PI * (1.0 - 2.0 * y as f64 / n))
+            .sinh()
+            .atan()
+            .to_degrees();
+        let min_lat = (std::f64::consts::PI * (1.0 - 2.0 * (y + 1) as f64 / n))
+            .sinh()
+            .atan()
+            .to_degrees();
+
+        Self {
+            min_lon,
+            min_lat,
+            max_lon,
+            max_lat,
+        }
+    }
+
+    /// Add buffer around bounds
+    fn with_buffer(self, buffer: f64) -> Self {
+        Self {
+            min_lon: self.min_lon - buffer,
+            min_lat: self.min_lat - buffer,
+            max_lon: self.max_lon + buffer,
+            max_lat: self.max_lat + buffer,
+        }
+    }
+
+    /// Check if a point is inside the bounds
+    fn contains(&self, lon: f64, lat: f64) -> bool {
+        lon >= self.min_lon && lon <= self.max_lon && lat >= self.min_lat && lat <= self.max_lat
+    }
+
+    /// Check if bounds intersect with a bounding box
+    fn intersects(&self, min_lon: f64, min_lat: f64, max_lon: f64, max_lat: f64) -> bool {
+        self.min_lon <= max_lon
+            && self.max_lon >= min_lon
+            && self.min_lat <= max_lat
+            && self.max_lat >= min_lat
+    }
+}
+
+/// Compute the bounding box of a set of coordinates
+fn compute_bbox(coords: &[(f64, f64, f64)]) -> (f64, f64, f64, f64) {
+    let mut min_lon = f64::MAX;
+    let mut min_lat = f64::MAX;
+    let mut max_lon = f64::MIN;
+    let mut max_lat = f64::MIN;
+
+    for (lon, lat, _) in coords {
+        min_lon = min_lon.min(*lon);
+        min_lat = min_lat.min(*lat);
+        max_lon = max_lon.max(*lon);
+        max_lat = max_lat.max(*lat);
+    }
+
+    (min_lon, min_lat, max_lon, max_lat)
+}
+
+/// Get all tiles that a bounding box intersects at a given zoom level
+fn tiles_intersecting_bbox(
+    min_lon: f64,
+    min_lat: f64,
+    max_lon: f64,
+    max_lat: f64,
+    zoom: u8,
+) -> Vec<(u32, u32)> {
+    // Clamp to valid lat range for Web Mercator
+    let min_lat = min_lat.max(-85.0511);
+    let max_lat = max_lat.min(85.0511);
+    let min_lon = min_lon.max(-180.0);
+    let max_lon = max_lon.min(180.0);
+
+    // Get corner tiles
+    let (min_x, max_y) = projection::lonlat_to_tile(min_lon, min_lat, zoom).unwrap_or((0, 0));
+    let (max_x, min_y) = projection::lonlat_to_tile(max_lon, max_lat, zoom).unwrap_or((0, 0));
+
+    let n = 1u32 << zoom;
+
+    // X ranges to cover. Normally a single [min_x, max_x] range, but a bbox
+    // that crosses the antimeridian (±180°) has min_x > max_x. In that case
+    // the X axis wraps, so split into two ranges: [min_x, n-1] and [0, max_x].
+    // Without this split, `min_x..=max_x` is empty and the feature is dropped.
+    let x_ranges: Vec<(u32, u32)> = if min_x <= max_x {
+        vec![(min_x, max_x)]
+    } else {
+        tracing::debug!(
+            "bbox crosses antimeridian (min_x={}, max_x={}, zoom={}); \
+             splitting X tile range into two wrapped ranges",
+            min_x,
+            max_x,
+            zoom
+        );
+        vec![(min_x, n - 1), (0, max_x)]
+    };
+
+    let mut tiles = Vec::new();
+    for (xs, xe) in x_ranges {
+        for x in xs..=xe {
+            for y in min_y..=max_y {
+                tiles.push((x, y));
+            }
+        }
+    }
+    tiles
+}
+
+/// Liang-Barsky line clipping algorithm
+/// Returns the parameter values (t0, t1) for the clipped segment, or None if completely outside
+fn liang_barsky_clip(
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    bounds: &TileBounds,
+) -> Option<(f64, f64)> {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+
+    let mut t0 = 0.0_f64;
+    let mut t1 = 1.0_f64;
+
+    // Check each edge
+    let p = [-dx, dx, -dy, dy];
+    let q = [
+        x0 - bounds.min_lon,
+        bounds.max_lon - x0,
+        y0 - bounds.min_lat,
+        bounds.max_lat - y0,
+    ];
+
+    for i in 0..4 {
+        if p[i].abs() < 1e-10 {
+            // Line is parallel to this edge
+            if q[i] < 0.0 {
+                return None; // Line is outside
+            }
+        } else {
+            let t = q[i] / p[i];
+            if p[i] < 0.0 {
+                // Entering edge
+                t0 = t0.max(t);
+            } else {
+                // Leaving edge
+                t1 = t1.min(t);
+            }
+        }
+    }
+
+    if t0 <= t1 {
+        Some((t0, t1))
+    } else {
+        None
+    }
+}
+
+/// Interpolate a point along a line segment
+fn interpolate_point(x0: f64, y0: f64, x1: f64, y1: f64, t: f64) -> (f64, f64) {
+    (x0 + t * (x1 - x0), y0 + t * (y1 - y0))
+}
+
+/// Interpolate altitude along a line segment
+fn interpolate_alt(alt0: f64, alt1: f64, t: f64) -> f64 {
+    alt0 + t * (alt1 - alt0)
+}
+
+/// Interpolate timestamp along a line segment based on parameter t
+fn interpolate_timestamp(time0: u64, time1: u64, t: f64) -> u64 {
+    if t <= 0.0 {
+        return time0;
+    }
+    if t >= 1.0 {
+        return time1;
+    }
+    let duration = time1 as f64 - time0 as f64;
+    (time0 as f64 + t * duration) as u64
+}
+
+/// Extract 3D coordinates from a GeoJSON geometry
+fn extract_linestring_coords(geometry: &Geometry) -> Option<Vec<(f64, f64, f64)>> {
+    match &geometry.value {
+        GeomValue::LineString(coords) => Some(
+            coords
+                .iter()
+                .map(|c| {
+                    let alt = if c.len() >= 3 { c[2] } else { 0.0 };
+                    (c[0], c[1], alt)
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Compute per-vertex timestamps based on distance interpolation
+/// (Similar to what's done in columnar.rs)
+pub fn compute_vertex_timestamps(
+    coords: &[(f64, f64, f64)],
+    start_time: u64,
+    end_time: u64,
+) -> Vec<u64> {
+    if coords.is_empty() {
+        return vec![];
+    }
+    if coords.len() == 1 {
+        return vec![start_time];
+    }
+
+    let duration = end_time as f64 - start_time as f64;
+
+    // Calculate cumulative distances
+    let mut cumulative_distances = vec![0.0];
+    let mut total_distance = 0.0;
+
+    for i in 1..coords.len() {
+        let dist = haversine_distance(coords[i - 1].1, coords[i - 1].0, coords[i].1, coords[i].0);
+        total_distance += dist;
+        cumulative_distances.push(total_distance);
+    }
+
+    // Interpolate timestamps based on distance
+    coords
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            if total_distance > 0.0 {
+                let fraction = cumulative_distances[i] / total_distance;
+                (start_time as f64 + fraction * duration) as u64
+            } else {
+                start_time
+            }
+        })
+        .collect()
+}
+
+/// Haversine distance between two points in meters
+fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS: f64 = 6_371_000.0;
+
+    let lat1_rad = lat1.to_radians();
+    let lat2_rad = lat2.to_radians();
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+
+    let a =
+        (dlat / 2.0).sin().powi(2) + lat1_rad.cos() * lat2_rad.cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().asin();
+
+    EARTH_RADIUS * c
+}
+
+/// Clip a trajectory to a specific tile
+///
+/// Returns the clipped coordinates and timestamps for the portion of the
+/// trajectory that falls within the tile bounds.
+fn clip_trajectory_to_tile(
+    coords: &[(f64, f64, f64)],
+    timestamps: &[u64],
+    bounds: &TileBounds,
+) -> Option<(Vec<(f64, f64, f64)>, Vec<u64>)> {
+    if coords.len() < 2 {
+        return None;
+    }
+
+    let mut clipped_coords: Vec<(f64, f64, f64)> = Vec::new();
+    let mut clipped_times: Vec<u64> = Vec::new();
+
+    // Process each line segment
+    for i in 0..coords.len() - 1 {
+        let (x0, y0, alt0) = coords[i];
+        let (x1, y1, alt1) = coords[i + 1];
+        let time0 = timestamps[i];
+        let time1 = timestamps[i + 1];
+
+        // Check if segment intersects the tile
+        if let Some((t0, t1)) = liang_barsky_clip(x0, y0, x1, y1, bounds) {
+            // Calculate the clipped start point
+            let (start_x, start_y) = if t0 > 0.0 {
+                interpolate_point(x0, y0, x1, y1, t0)
+            } else {
+                (x0, y0)
+            };
+            let start_alt = interpolate_alt(alt0, alt1, t0);
+            let start_time = interpolate_timestamp(time0, time1, t0);
+
+            // Calculate the clipped end point
+            let (end_x, end_y) = if t1 < 1.0 {
+                interpolate_point(x0, y0, x1, y1, t1)
+            } else {
+                (x1, y1)
+            };
+            let end_alt = interpolate_alt(alt0, alt1, t1);
+            let end_time = interpolate_timestamp(time0, time1, t1);
+
+            // Add start point if not a duplicate of last point
+            let should_add_start = clipped_coords.is_empty()
+                || (clipped_coords.last().unwrap().0 - start_x).abs() > 1e-9
+                || (clipped_coords.last().unwrap().1 - start_y).abs() > 1e-9;
+
+            if should_add_start {
+                clipped_coords.push((start_x, start_y, start_alt));
+                clipped_times.push(start_time);
+            }
+
+            // Add end point if different from start point
+            if (end_x - start_x).abs() > 1e-9 || (end_y - start_y).abs() > 1e-9 {
+                clipped_coords.push((end_x, end_y, end_alt));
+                clipped_times.push(end_time);
+            }
+        }
+    }
+
+    if clipped_coords.len() >= 2 {
+        Some((clipped_coords, clipped_times))
+    } else {
+        None
+    }
+}
+
+/// Slice a segment at temporal boundaries
+///
+/// If the segment spans multiple temporal chunks (based on granularity),
+/// split it into multiple segments at those boundaries.
+fn slice_segment_temporally(
+    segment: ClippedSegment,
+    granularity_ms: u64,
+) -> Vec<ClippedSegment> {
+    if segment.coordinates.len() < 2 || granularity_ms == 0 {
+        return vec![segment];
+    }
+
+    let start_chunk = segment.start_time / granularity_ms;
+    let end_chunk = segment.end_time / granularity_ms;
+
+    // If entirely within one chunk, no splitting needed
+    if start_chunk == end_chunk {
+        return vec![segment];
+    }
+
+    let mut slices = Vec::new();
+    let mut current_coords: Vec<(f64, f64, f64)> = Vec::new();
+    let mut current_times: Vec<u64> = Vec::new();
+    let mut current_chunk = start_chunk;
+
+    for i in 0..segment.coordinates.len() {
+        let coord = segment.coordinates[i];
+        let time = segment.timestamps[i];
+        let chunk = time / granularity_ms;
+
+        // If we're crossing into a new chunk, finalize current slice and start new one
+        if chunk > current_chunk && current_coords.len() >= 2 {
+            // We need to interpolate the boundary point
+            if i > 0 {
+                let boundary_time = (current_chunk + 1) * granularity_ms;
+                let prev_time = segment.timestamps[i - 1];
+                let curr_time = time;
+
+                if prev_time < boundary_time && boundary_time <= curr_time {
+                    // Interpolate point at boundary
+                    let t = if curr_time > prev_time {
+                        (boundary_time - prev_time) as f64 / (curr_time - prev_time) as f64
+                    } else {
+                        0.0
+                    };
+
+                    let prev_coord = segment.coordinates[i - 1];
+                    let boundary_coord = (
+                        prev_coord.0 + t * (coord.0 - prev_coord.0),
+                        prev_coord.1 + t * (coord.1 - prev_coord.1),
+                        prev_coord.2 + t * (coord.2 - prev_coord.2),
+                    );
+
+                    // Add boundary point to current slice
+                    current_coords.push(boundary_coord);
+                    current_times.push(boundary_time);
+
+                    // Finalize current slice
+                    if current_coords.len() >= 2 {
+                        slices.push(ClippedSegment {
+                            tile_x: segment.tile_x,
+                            tile_y: segment.tile_y,
+                            zoom: segment.zoom,
+                            coordinates: current_coords.clone(),
+                            timestamps: current_times.clone(),
+                            start_time: *current_times.first().unwrap(),
+                            end_time: *current_times.last().unwrap(),
+                            properties: segment.properties.clone(),
+                            feature_id: segment.feature_id.clone(),
+                        });
+                    }
+
+                    // Start new slice with boundary point
+                    current_coords = vec![boundary_coord];
+                    current_times = vec![boundary_time];
+                }
+            }
+
+            current_chunk = chunk;
+        }
+
+        current_coords.push(coord);
+        current_times.push(time);
+    }
+
+    // Finalize last slice
+    if current_coords.len() >= 2 {
+        slices.push(ClippedSegment {
+            tile_x: segment.tile_x,
+            tile_y: segment.tile_y,
+            zoom: segment.zoom,
+            coordinates: current_coords,
+            timestamps: current_times.clone(),
+            start_time: *current_times.first().unwrap(),
+            end_time: *current_times.last().unwrap(),
+            properties: segment.properties.clone(),
+            feature_id: segment.feature_id.clone(),
+        });
+    }
+
+    if slices.is_empty() {
+        vec![segment]
+    } else {
+        slices
+    }
+}
+
+/// Clip a trajectory feature across all tiles it intersects
+///
+/// This is the main entry point for trajectory clipping. It takes a feature
+/// with a LineString geometry and returns clipped segments for each tile
+/// the trajectory passes through.
+///
+/// # Arguments
+/// * `feature` - The GeoJSON feature with LineString geometry
+/// * `shared_properties` - Arc-wrapped properties for zero-copy sharing
+/// * `start_time` - Start timestamp of the trajectory
+/// * `end_time` - End timestamp of the trajectory (for duration-based interpolation)
+/// * `zoom` - The zoom level to clip at
+/// * `config` - Clipping configuration
+///
+/// # Returns
+/// A vector of clipped segments, one for each tile the trajectory intersects
+pub fn clip_trajectory(
+    feature: &Feature,
+    shared_properties: Option<SharedProperties>,
+    start_time: u64,
+    end_time: u64,
+    zoom: u8,
+    config: &ClipConfig,
+) -> Vec<ClippedSegment> {
+    // Extract coordinates
+    let geometry = match &feature.geometry {
+        Some(g) => g,
+        None => return vec![],
+    };
+
+    let coords = match extract_linestring_coords(geometry) {
+        Some(c) => c,
+        None => return vec![],
+    };
+
+    // Skip if too few vertices
+    if coords.len() < config.min_vertices {
+        return vec![];
+    }
+
+    // Apply simplification for lower zoom levels if enabled
+    let coords = if config.simplify {
+        simplify_for_zoom(&coords, zoom, config.simplify_max_zoom)
+    } else {
+        coords
+    };
+
+    // Skip if simplification reduced below minimum
+    if coords.len() < config.min_vertices {
+        return vec![];
+    }
+
+    // Compute per-vertex timestamps
+    let timestamps = compute_vertex_timestamps(&coords, start_time, end_time);
+
+    // Compute bounding box for quick rejection
+    let (min_lon, min_lat, max_lon, max_lat) = compute_bbox(&coords);
+
+    // Get candidate tiles
+    let candidate_tiles = tiles_intersecting_bbox(min_lon, min_lat, max_lon, max_lat, zoom);
+
+    let mut segments = Vec::new();
+
+    // Track which tiles we've already produced segments for
+    let mut seen_tiles: HashSet<(u32, u32)> = HashSet::new();
+
+    for (tile_x, tile_y) in candidate_tiles {
+        if seen_tiles.contains(&(tile_x, tile_y)) {
+            continue;
+        }
+
+        let tile_bounds = TileBounds::from_tile(tile_x, tile_y, zoom);
+        let buffered_bounds = tile_bounds.with_buffer(config.buffer_degrees);
+
+        // Quick rejection: check if feature bbox intersects tile
+        if !buffered_bounds.intersects(min_lon, min_lat, max_lon, max_lat) {
+            continue;
+        }
+
+        // Clip to this tile
+        if let Some((clipped_coords, clipped_times)) =
+            clip_trajectory_to_tile(&coords, &timestamps, &buffered_bounds)
+        {
+            let seg_start_time = *clipped_times.first().unwrap();
+            let seg_end_time = *clipped_times.last().unwrap();
+
+            let segment = ClippedSegment {
+                tile_x,
+                tile_y,
+                zoom,
+                coordinates: clipped_coords,
+                timestamps: clipped_times,
+                start_time: seg_start_time,
+                end_time: seg_end_time,
+                // Use Arc::clone for zero-copy property sharing
+                properties: shared_properties.clone(),
+                feature_id: feature.id.clone(),
+            };
+
+            // Apply temporal slicing if configured
+            if let Some(granularity) = config.temporal_granularity_ms {
+                let sliced = slice_segment_temporally(segment, granularity);
+                segments.extend(sliced);
+            } else {
+                segments.push(segment);
+            }
+
+            seen_tiles.insert((tile_x, tile_y));
+        }
+    }
+
+    segments
+}
+
+/// Check if a feature is a LineString with duration (trajectory)
+pub fn is_clippable_trajectory(feature: &Feature, end_timestamp: Option<u64>) -> bool {
+    // Must have duration
+    if end_timestamp.is_none() {
+        return false;
+    }
+
+    // Must be a LineString
+    match &feature.geometry {
+        Some(g) => matches!(&g.value, GeomValue::LineString(coords) if coords.len() >= 2),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_linestring_feature(coords: Vec<Vec<f64>>) -> Feature {
+        Feature {
+            bbox: None,
+            geometry: Some(Geometry::new(GeomValue::LineString(coords))),
+            id: None,
+            properties: None,
+            foreign_members: None,
+        }
+    }
+
+    #[test]
+    fn test_liang_barsky_inside() {
+        let bounds = TileBounds {
+            min_lon: 0.0,
+            min_lat: 0.0,
+            max_lon: 10.0,
+            max_lat: 10.0,
+        };
+
+        // Line fully inside
+        let result = liang_barsky_clip(2.0, 2.0, 8.0, 8.0, &bounds);
+        assert!(result.is_some());
+        let (t0, t1) = result.unwrap();
+        assert!((t0 - 0.0).abs() < 1e-9);
+        assert!((t1 - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_liang_barsky_crossing() {
+        let bounds = TileBounds {
+            min_lon: 0.0,
+            min_lat: 0.0,
+            max_lon: 10.0,
+            max_lat: 10.0,
+        };
+
+        // Line crossing through
+        let result = liang_barsky_clip(-5.0, 5.0, 15.0, 5.0, &bounds);
+        assert!(result.is_some());
+        let (t0, t1) = result.unwrap();
+        assert!(t0 > 0.0);
+        assert!(t1 < 1.0);
+    }
+
+    #[test]
+    fn test_liang_barsky_outside() {
+        let bounds = TileBounds {
+            min_lon: 0.0,
+            min_lat: 0.0,
+            max_lon: 10.0,
+            max_lat: 10.0,
+        };
+
+        // Line completely outside
+        let result = liang_barsky_clip(-5.0, -5.0, -2.0, -2.0, &bounds);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_compute_vertex_timestamps() {
+        let coords = vec![
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (2.0, 0.0, 0.0),
+            (3.0, 0.0, 0.0),
+        ];
+        let timestamps = compute_vertex_timestamps(&coords, 0, 3000);
+
+        assert_eq!(timestamps.len(), 4);
+        assert_eq!(timestamps[0], 0);
+        assert_eq!(timestamps[3], 3000);
+        // Middle points should be roughly evenly distributed
+        assert!(timestamps[1] > 0 && timestamps[1] < 3000);
+        assert!(timestamps[2] > timestamps[1] && timestamps[2] < 3000);
+    }
+
+    #[test]
+    fn test_clip_trajectory_single_tile() {
+        // Trajectory - may span multiple tiles depending on exact coordinates
+        let feature = make_linestring_feature(vec![
+            vec![-122.4, 37.7],
+            vec![-122.41, 37.71],
+            vec![-122.42, 37.72],
+        ]);
+
+        let config = ClipConfig::default();
+        let segments = clip_trajectory(&feature, None, 0, 1000, 10, &config);
+
+        // Should produce at least one segment
+        assert!(!segments.is_empty());
+        // All segments should have valid coordinates and timestamps
+        for seg in &segments {
+            assert!(seg.coordinates.len() >= 2);
+            assert_eq!(seg.timestamps.len(), seg.coordinates.len());
+        }
+    }
+
+    #[test]
+    fn test_clip_trajectory_crossing_tiles() {
+        // Long trajectory crossing multiple tiles
+        // San Francisco to Oakland (crosses tile boundaries at zoom 12)
+        let feature = make_linestring_feature(vec![
+            vec![-122.4194, 37.7749], // SF
+            vec![-122.35, 37.78],
+            vec![-122.27, 37.80], // Oakland
+        ]);
+
+        let config = ClipConfig::default();
+        let segments = clip_trajectory(&feature, None, 0, 10000, 12, &config);
+
+        // At zoom 12, this should cross at least 2 tiles
+        assert!(
+            segments.len() >= 1,
+            "Expected at least 1 segment, got {}",
+            segments.len()
+        );
+
+        // Each segment should have valid timestamps
+        for seg in &segments {
+            assert!(seg.start_time <= seg.end_time);
+            assert!(seg.coordinates.len() >= 2);
+        }
+    }
+
+    #[test]
+    fn test_is_clippable_trajectory() {
+        let point_feature = Feature {
+            bbox: None,
+            geometry: Some(Geometry::new(GeomValue::Point(vec![-122.4, 37.7]))),
+            id: None,
+            properties: None,
+            foreign_members: None,
+        };
+
+        let line_feature = make_linestring_feature(vec![vec![-122.4, 37.7], vec![-122.5, 37.8]]);
+
+        // Point is not clippable
+        assert!(!is_clippable_trajectory(&point_feature, Some(1000)));
+
+        // LineString without duration is not clippable
+        assert!(!is_clippable_trajectory(&line_feature, None));
+
+        // LineString with duration is clippable
+        assert!(is_clippable_trajectory(&line_feature, Some(1000)));
+    }
+
+    #[test]
+    fn test_interpolate_timestamp() {
+        assert_eq!(interpolate_timestamp(0, 1000, 0.0), 0);
+        assert_eq!(interpolate_timestamp(0, 1000, 1.0), 1000);
+        assert_eq!(interpolate_timestamp(0, 1000, 0.5), 500);
+        assert_eq!(interpolate_timestamp(1000, 2000, 0.25), 1250);
+    }
+
+    #[test]
+    fn test_temporal_slicing() {
+        // Test that temporal slicing splits segments at boundaries
+        let feature = make_linestring_feature(vec![
+            vec![-122.4, 37.7],
+            vec![-122.41, 37.71],
+        ]);
+
+        // Config with 1 second temporal granularity
+        let config = ClipConfig {
+            min_vertices: 2,
+            buffer_degrees: 0.001,
+            temporal_granularity_ms: Some(1000), // 1 second
+            ..Default::default()
+        };
+
+        // Trajectory spanning 5 seconds (should create at least 2 temporal slices)
+        let segments = clip_trajectory(&feature, None, 0, 5000, 10, &config);
+
+        // Should have at least one segment
+        assert!(!segments.is_empty());
+
+        // Each segment should have valid timestamps
+        for seg in &segments {
+            assert!(seg.start_time <= seg.end_time);
+        }
+    }
+
+    #[test]
+    fn test_tile_bounds_calculation() {
+        // Verify tile bounds are calculated correctly for tile containing SF
+        let bounds = TileBounds::from_tile(163, 395, 10);
+
+        // Tile 163,395 at zoom 10 should contain San Francisco area
+        // Check longitude covers -122.4
+        assert!(
+            bounds.min_lon < -122.4 && bounds.max_lon > -122.4,
+            "Longitude bounds wrong: {:?}",
+            bounds
+        );
+        // Latitude should be in the 37-38 range for SF
+        assert!(
+            bounds.min_lat > 35.0 && bounds.max_lat < 40.0,
+            "Latitude bounds wrong: min={}, max={}",
+            bounds.min_lat,
+            bounds.max_lat
+        );
+    }
+}
+

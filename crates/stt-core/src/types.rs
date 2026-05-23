@@ -94,61 +94,28 @@ impl TimeRange {
     }
 }
 
-/// Compression method for tiles
+/// Compression method for tiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Compression {
+    /// No compression.
     None,
+    /// Gzip (DEFLATE).
     Gzip,
+    /// Zstandard (typically 10-20% better ratio than gzip with faster
+    /// browser-side decompression via WASM).
+    Zstd,
 }
 
-impl Compression {
-    /// Convert to Protocol Buffer enum value
-    pub fn to_proto(&self) -> i32 {
-        match self {
-            Compression::None => 0,
-            Compression::Gzip => 1,
-        }
-    }
-
-    /// Convert from Protocol Buffer enum value
-    pub fn from_proto(value: i32) -> Self {
-        match value {
-            1 => Compression::Gzip,
-            _ => Compression::None,
-        }
-    }
-}
-
-/// Geometry type
+/// Geometry type of a tile layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GeometryType {
+    /// Point geometry.
     Point,
+    /// LineString geometry.
     LineString,
+    /// Polygon geometry.
     Polygon,
 }
-
-impl GeometryType {
-    /// Convert to Protocol Buffer enum value
-    pub fn to_proto(&self) -> i32 {
-        match self {
-            GeometryType::Point => 0,
-            GeometryType::LineString => 1,
-            GeometryType::Polygon => 2,
-        }
-    }
-
-    /// Convert from Protocol Buffer enum value
-    pub fn from_proto(value: i32) -> Self {
-        match value {
-            1 => GeometryType::LineString,
-            2 => GeometryType::Polygon,
-            _ => GeometryType::Point,
-        }
-    }
-}
-
-/// Tile format version (currently only V2 is supported)
-pub const TILE_VERSION: u32 = 2;
 
 #[cfg(test)]
 mod tests {

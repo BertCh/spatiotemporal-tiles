@@ -809,7 +809,7 @@ pub fn run_stt_build(
     max_zoom: u8,
     compression: &str,
 ) -> Result<()> {
-    run_stt_build_with_end_time(input, output, time_field, None, min_zoom, max_zoom, compression)
+    run_stt_build_with_options(input, output, time_field, None, min_zoom, max_zoom, compression, None)
 }
 
 /// Find the stt-build binary - uses local binary if available, otherwise falls back to PATH
@@ -830,6 +830,20 @@ pub fn run_stt_build_with_end_time(
     min_zoom: u8,
     max_zoom: u8,
     compression: &str,
+) -> Result<()> {
+    run_stt_build_with_options(input, output, time_field, end_time_field, min_zoom, max_zoom, compression, None)
+}
+
+/// Run stt-build to create an STT archive with all options
+pub fn run_stt_build_with_options(
+    input: &Path,
+    output: &Path,
+    time_field: &str,
+    end_time_field: Option<&str>,
+    min_zoom: u8,
+    max_zoom: u8,
+    compression: &str,
+    temporal_bucket: Option<&str>,
 ) -> Result<()> {
     use std::process::Command;
 
@@ -855,6 +869,11 @@ pub fn run_stt_build_with_end_time(
         .arg(max_zoom.to_string())
         .arg("--compression")
         .arg(compression);
+    
+    // Add temporal bucket if specified
+    if let Some(bucket) = temporal_bucket {
+        cmd.arg("--temporal-bucket").arg(bucket);
+    }
 
     let status = cmd.status();
 

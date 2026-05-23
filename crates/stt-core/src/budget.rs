@@ -321,7 +321,9 @@ mod tests {
             create_test_feature(4, 200, 0), // Largest, should be kept
         ];
 
-        let (kept, dropped) = budget.drop_by_count(features, 2);
+        let original_count = features.len();
+        let kept = budget.drop_by_count(features, 2);
+        let dropped = original_count - kept.len();
 
         assert_eq!(kept.len(), 2);
         assert_eq!(dropped, 2);

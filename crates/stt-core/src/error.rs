@@ -7,12 +7,6 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Protocol Buffer decode error: {0}")]
-    ProtobufDecode(#[from] prost::DecodeError),
-
-    #[error("Protocol Buffer encode error: {0}")]
-    ProtobufEncode(#[from] prost::EncodeError),
-
     #[error("Invalid tile coordinates: z={0}, x={1}, y={2}")]
     InvalidCoordinates(u8, u32, u32),
 

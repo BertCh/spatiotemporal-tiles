@@ -3,6 +3,8 @@ members = [
     "crates/stt-core",
     "crates/stt-build",
     "crates/stt-generate",
+    "crates/stt-optimize",
+    "crates/stt-validate",
 ]
 resolver = "2"
 
@@ -29,17 +31,16 @@ geo-traits = "0.2"
 
 # GeoArrow/GeoParquet ecosystem
 geoarrow = { version = "0.6", default-features = false }
-arrow = { version = "54", default-features = false, features = ["chrono-tz"] }
+arrow = { version = "54", default-features = false, features = ["chrono-tz", "ipc"] }
 parquet = { version = "54", default-features = false, features = ["arrow", "flate2", "snap", "zstd"] }
+
+# WKB / geometry decoding for input parsing
+geozero = { version = "0.14", default-features = false, features = ["with-wkb", "with-geo"] }
 arrow-schema = "54"
 arrow-array = "54"
 
 # Data I/O
 csv = "1.3"
-
-# Protocol Buffers
-prost = "0.12"
-prost-types = "0.12"
 
 # Compression
 flate2 = "1.0"

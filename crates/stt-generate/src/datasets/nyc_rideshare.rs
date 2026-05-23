@@ -89,6 +89,15 @@ pub struct Args {
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Take first N trips chronologically instead of random sampling (use with --max-trips)
+    #[arg(long)]
+    pub chronological: bool,
+
+    /// Temporal bucket size for tile chunking (e.g., "1h", "6h", "1d", "30m")
+    /// Uses fixed time intervals for predictable tile boundaries during animation.
+    #[arg(long, default_value = "1h")]
+    pub temporal_bucket: String,
 }
 
 #[derive(Debug, Clone)]
@@ -241,11 +250,24 @@ pub fn run(args: Args) -> Result<()> {
 
     // Sample trips if max_trips is set
     let trips = if let Some(max) = args.max_trips {
-        let mut rng = rand::thread_rng();
         let mut sampled: Vec<_> = trips.clone();
-        sampled.shuffle(&mut rng);
-        sampled.truncate(max);
-        println!("   📊 Sampled {} trips (from {})", sampled.len(), trips.len());
+        if args.chronological {
+            // Sort by pickup time and take first N
+            sampled.sort_by_key(|t| t.pickup_time);
+            sampled.truncate(max);
+            if let (Some(first), Some(last)) = (sampled.first(), sampled.last()) {
+                println!("   📊 Selected first {} trips chronologically (from {})", sampled.len(), trips.len());
+                println!("   📅 Time range: {} to {}", 
+                    first.pickup_time.format("%Y-%m-%d %H:%M"),
+                    last.pickup_time.format("%Y-%m-%d %H:%M"));
+            }
+        } else {
+            // Random sampling
+            let mut rng = rand::thread_rng();
+            sampled.shuffle(&mut rng);
+            sampled.truncate(max);
+            println!("   📊 Sampled {} trips randomly (from {})", sampled.len(), trips.len());
+        }
         sampled
     } else {
         trips
@@ -323,6 +345,7 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
         println!("   End time:   {}", end_field);
     }
     println!("   Zoom:       10-16");
+    println!("   Temporal bucket: {}", args.temporal_bucket);
     println!();
 
     if end_time_field.is_some() {
@@ -341,6 +364,7 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
             .arg("--min-zoom").arg("10")
             .arg("--max-zoom").arg("16")
             .arg("--compression").arg("gzip")
+            .arg("--temporal-bucket").arg(&args.temporal_bucket)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
@@ -353,13 +377,15 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
         }
         println!("\n   ✓ STT archive created successfully");
     } else {
-        common::run_stt_build(
+        common::run_stt_build_with_options(
             intermediate_path,
             &args.output,
             time_field,
+            None,
             10,
             16,
             "gzip",
+            Some(&args.temporal_bucket),
         )?;
     }
 

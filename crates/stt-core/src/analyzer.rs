@@ -5,7 +5,6 @@
 
 use crate::archive::ArchiveReader;
 use crate::error::Result;
-use crate::tile::TileId;
 use std::collections::HashMap;
 
 /// Archive performance statistics
@@ -288,12 +287,8 @@ impl ArchiveAnalyzer {
         let mut feature_counts: Vec<usize> = Vec::new();
         let mut timestamps: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-        // Get tile entries from index
-        let index = reader.get_index();
-
-        for entry in &index.tiles {
-            let tile_id = TileId::new(entry.zoom as u8, entry.x, entry.y, entry.time_start);
-
+        // Walk every directory entry.
+        for entry in reader.entries() {
             stats.tile_count += 1;
             stats.total_features += entry.feature_count as usize;
             stats.compressed_size += entry.length as u64;
@@ -302,7 +297,7 @@ impl ArchiveAnalyzer {
             // Update zoom stats
             let zoom_stat = stats
                 .zoom_stats
-                .entry(tile_id.z)
+                .entry(entry.zoom)
                 .or_insert_with(ZoomStats::default);
 
             zoom_stat.tile_count += 1;
@@ -313,7 +308,7 @@ impl ArchiveAnalyzer {
             // Collect distributions
             tile_sizes.push(entry.length as u64);
             feature_counts.push(entry.feature_count as usize);
-            timestamps.insert(entry.time_start);
+            timestamps.insert(entry.time_start.max(0) as u64);
         }
 
         // Calculate per-zoom averages

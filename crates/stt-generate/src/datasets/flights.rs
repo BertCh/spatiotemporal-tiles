@@ -170,23 +170,31 @@ pub fn run(args: Args) -> Result<()> {
                 }
             }
 
-            // Extract tar
+            // Extract tar (produces .csv.gz file)
             if tar_path.exists() && !gz_path.exists() {
-                let _ = Command::new("tar")
+                let status = Command::new("tar")
                     .args(["-xf", tar_path.to_str().unwrap()])
                     .current_dir(&args.download_dir)
-                    .output();
+                    .status();
+                if let Err(e) = status {
+                    eprintln!("Warning: Failed to extract {}: {}", tar_path.display(), e);
+                }
             }
 
-            // Decompress gzip
+            // Decompress gzip (produces .csv file)
             if gz_path.exists() && !csv_path.exists() {
-                let _ = Command::new("gunzip")
-                    .args(["-f", gz_path.to_str().unwrap()])
-                    .output();
+                let status = Command::new("gunzip")
+                    .args(["-k", gz_path.to_str().unwrap()])  // -k keeps the original .gz file
+                    .status();
+                if let Err(e) = status {
+                    eprintln!("Warning: Failed to decompress {}: {}", gz_path.display(), e);
+                }
             }
 
             if csv_path.exists() {
                 downloaded_files.push(csv_path);
+            } else {
+                eprintln!("Warning: CSV file not found after extraction: {}", csv_path.display());
             }
 
             pb.inc(1);
@@ -201,32 +209,7 @@ pub fn run(args: Args) -> Result<()> {
         // Combine CSV files
         println!("\n📦 Combining {} CSV files...", downloaded_files.len());
         let combined_path = args.download_dir.join(format!("combined-{}.csv", args.date));
-
-        {
-            let mut combined_file = File::create(&combined_path)?;
-
-            // Write header from first file
-            let first_file = File::open(&downloaded_files[0])?;
-            let mut reader = BufReader::new(first_file);
-            let mut header = String::new();
-            std::io::BufRead::read_line(&mut reader, &mut header)?;
-            combined_file.write_all(header.as_bytes())?;
-
-            for csv_path in &downloaded_files {
-                let file = File::open(csv_path)?;
-                let reader = BufReader::new(file);
-                let mut first_line = true;
-                for line in std::io::BufRead::lines(reader) {
-                    let line = line?;
-                    if first_line {
-                        first_line = false;
-                        continue;
-                    }
-                    combined_file.write_all(line.as_bytes())?;
-                    combined_file.write_all(b"\n")?;
-                }
-            }
-        }
+        combine_csv_files(&downloaded_files, &combined_path)?;
 
         // Process combined file
         if args.paths {
@@ -253,11 +236,44 @@ pub fn run(args: Args) -> Result<()> {
             }
         }
     } else {
-        // Process existing combined file
+        // Process existing files
         let combined_path = args.download_dir.join(format!("combined-{}.csv", args.date));
+        
         if !combined_path.exists() {
-            anyhow::bail!("Combined CSV not found: {}. Run without --skip-download first.", combined_path.display());
+            // Try to find and combine individual CSV files
+            let (start_hour, end_hour) = parse_hours_range(&args.hours)?;
+            let mut csv_files: Vec<PathBuf> = Vec::new();
+            
+            for hour in start_hour..=end_hour {
+                let hour_str = format!("{:02}", hour);
+                let csv_path = args.download_dir.join(format!("states_{}-{}.csv", args.date, hour_str));
+                let gz_path = args.download_dir.join(format!("states_{}-{}.csv.gz", args.date, hour_str));
+                
+                // If only .gz exists, decompress it
+                if gz_path.exists() && !csv_path.exists() {
+                    println!("   Decompressing {}...", gz_path.display());
+                    let status = Command::new("gunzip")
+                        .args(["-k", gz_path.to_str().unwrap()])
+                        .status();
+                    if let Err(e) = status {
+                        eprintln!("Warning: Failed to decompress {}: {}", gz_path.display(), e);
+                    }
+                }
+                
+                if csv_path.exists() {
+                    csv_files.push(csv_path);
+                }
+            }
+            
+            if csv_files.is_empty() {
+                anyhow::bail!("No CSV files found in {}. Run without --skip-download first.", args.download_dir.display());
+            }
+            
+            // Combine CSV files
+            println!("📦 Combining {} CSV files...", csv_files.len());
+            combine_csv_files(&csv_files, &combined_path)?;
         }
+        
         if args.paths {
             process_csv_paths(&combined_path, &intermediate_path, Some(&args.bounds), args.sample_seconds, args.min_points, args.max_gap_seconds)?;
         } else {
@@ -298,16 +314,54 @@ pub fn run(args: Args) -> Result<()> {
 }
 
 fn download_file(url: &str, output_path: &PathBuf) -> Result<()> {
-    let response = reqwest::blocking::get(url)
-        .with_context(|| format!("Failed to download: {}", url))?;
+    // Use curl for more reliable downloads of large files (100-200MB each)
+    // reqwest tends to timeout on these large files
+    let status = Command::new("curl")
+        .args([
+            "-L",           // Follow redirects
+            "-f",           // Fail silently on server errors
+            "-S",           // Show error messages
+            "--connect-timeout", "30",
+            "--max-time", "600",  // 10 minute max for large files
+            "-o", output_path.to_str().unwrap(),
+            url,
+        ])
+        .status()
+        .with_context(|| "Failed to run curl command")?;
 
-    if !response.status().is_success() {
-        anyhow::bail!("Download failed with status: {}", response.status());
+    if !status.success() {
+        // Clean up partial download
+        let _ = fs::remove_file(output_path);
+        anyhow::bail!("Download failed for: {}", url);
     }
 
-    let bytes = response.bytes()?;
-    let mut file = File::create(output_path)?;
-    file.write_all(&bytes)?;
+    Ok(())
+}
+
+fn combine_csv_files(files: &[PathBuf], output: &PathBuf) -> Result<()> {
+    let mut combined_file = File::create(output)?;
+    let mut header_written = false;
+
+    for csv_path in files {
+        let file = File::open(csv_path)?;
+        let reader = BufReader::new(file);
+        let mut first_line = true;
+        
+        for line in std::io::BufRead::lines(reader) {
+            let line = line?;
+            if first_line {
+                first_line = false;
+                if !header_written {
+                    combined_file.write_all(line.as_bytes())?;
+                    combined_file.write_all(b"\n")?;
+                    header_written = true;
+                }
+                continue;
+            }
+            combined_file.write_all(line.as_bytes())?;
+            combined_file.write_all(b"\n")?;
+        }
+    }
 
     Ok(())
 }

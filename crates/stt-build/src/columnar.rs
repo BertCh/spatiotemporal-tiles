@@ -1,444 +1,408 @@
-//! Columnar tile generation for GPU-optimized rendering
+//! Build Arrow [`ColumnarLayer`]s from parsed features and clipped segments.
 //!
-//! This module generates tiles with:
-//! - Quantized tile-relative coordinates (MVT-style)
-//! - Columnar property layout for efficient GPU upload
-//! - Delta-encoded timestamps
+//! Geometry is stored as real WGS84 lon/lat (`f64`) — no quantization, no
+//! delta encoding. Arrow IPC + gzip handle compression, and the payload is
+//! consumable directly by GeoArrow-aware renderers.
 
+use crate::clip::ClippedSegment;
 use crate::input::ParsedFeature;
 use anyhow::Result;
-use std::collections::HashMap;
-use stt_core::projection;
-use stt_core::tile::TileId;
+use std::collections::BTreeMap;
+use stt_core::arrow_tile::{ColumnarLayer, Coord, GeometryColumn, PropertyColumn};
 use stt_core::types::GeometryType;
 
-/// Configuration for columnar tile generation
-#[derive(Debug, Clone)]
-pub struct ColumnarConfig {
-    pub extent: u32,
-    pub layer_name: String,
+/// Build layers from a set of features sharing a tile. Features are grouped by
+/// geometry type — a single layer holds exactly one geometry kind, so a tile
+/// with mixed points and polygons yields one layer per kind.
+pub fn build_layers_from_features(
+    features: &[&ParsedFeature],
+    layer_name: &str,
+) -> Result<Vec<ColumnarLayer>> {
+    if features.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Partition by geometry type, preserving input order within each group.
+    let mut points: Vec<&ParsedFeature> = Vec::new();
+    let mut lines: Vec<&ParsedFeature> = Vec::new();
+    let mut polygons: Vec<&ParsedFeature> = Vec::new();
+    for f in features {
+        match determine_geometry_type(f) {
+            Ok(GeometryType::Point) => points.push(f),
+            Ok(GeometryType::LineString) => lines.push(f),
+            Ok(GeometryType::Polygon) => polygons.push(f),
+            Err(e) => tracing::warn!("skipping feature with no geometry: {e}"),
+        }
+    }
+
+    let mut layers = Vec::new();
+    // When a tile has multiple kinds, suffix the layer name so a reader can
+    // tell them apart; the dominant kind keeps the bare name.
+    let kinds_present =
+        [!points.is_empty(), !lines.is_empty(), !polygons.is_empty()]
+            .iter()
+            .filter(|p| **p)
+            .count();
+    let name_for = |kind: &str| -> String {
+        if kinds_present <= 1 {
+            layer_name.to_string()
+        } else {
+            format!("{layer_name}_{kind}")
+        }
+    };
+
+    if !points.is_empty() {
+        layers.push(build_point_layer(&points, name_for("points"))?);
+    }
+    if !lines.is_empty() {
+        layers.push(build_line_layer(&lines, name_for("lines"))?);
+    }
+    if !polygons.is_empty() {
+        layers.push(build_polygon_layer(&polygons, name_for("polygons"))?);
+    }
+    Ok(layers)
 }
 
-/// Build columnar features from parsed features
-pub fn build_columnar_features(
-    features: &[&ParsedFeature],
-    tile_id: &TileId,
-    config: &ColumnarConfig,
-    time_start: u64,
-) -> Result<stt_core::proto::ColumnarFeatures> {
-    let feature_count = features.len() as u32;
-    
-    if feature_count == 0 {
-        return Ok(stt_core::proto::ColumnarFeatures::default());
+/// Build a single linestring layer from clipped trajectory segments. Segments
+/// carry real per-vertex timestamps produced by the clipper.
+pub fn build_layer_from_segments(
+    segments: &[&ClippedSegment],
+    layer_name: &str,
+) -> Result<ColumnarLayer> {
+    let n = segments.len();
+    let mut feature_ids = Vec::with_capacity(n);
+    let mut start_times = Vec::with_capacity(n);
+    let mut end_times = Vec::with_capacity(n);
+    let mut geometry: Vec<Vec<Coord>> = Vec::with_capacity(n);
+    let mut vertex_times: Vec<Vec<i64>> = Vec::with_capacity(n);
+
+    let mut props = PropertyAccumulator::new();
+
+    for seg in segments {
+        feature_ids.push(segment_feature_id(seg));
+        start_times.push(seg.start_time as i64);
+        end_times.push(seg.end_time as i64);
+
+        let coords: Vec<Coord> = seg.coordinates.iter().map(|(x, y, _alt)| [*x, *y]).collect();
+
+        // Per-vertex timestamps: use the segment's real timestamps where
+        // present, padding with the start time if the clipper produced fewer.
+        let mut times: Vec<i64> = Vec::with_capacity(coords.len());
+        for i in 0..coords.len() {
+            let t = seg.timestamps.get(i).copied().unwrap_or(seg.start_time);
+            times.push(t as i64);
+        }
+        geometry.push(coords);
+        vertex_times.push(times);
+
+        props.observe(seg.properties.as_deref());
     }
-    
-    // Determine geometry type from first feature
-    let geometry_type = determine_geometry_type(&features[0])?;
-    let is_point = geometry_type == GeometryType::Point;
-    let is_polygon = geometry_type == GeometryType::Polygon;
-    
-    // Check if we have 3D data
-    let is_3d = has_3d_coordinates(features);
-    
-    // Pre-allocate arrays
-    let mut feature_ids: Vec<u64> = Vec::with_capacity(features.len());
-    let mut geometry: Vec<i32> = Vec::new();
-    let mut geometry_offsets: Vec<u32> = if is_point { vec![] } else { Vec::with_capacity(features.len() + 1) };
-    let mut start_times: Vec<i64> = Vec::with_capacity(features.len());
-    let mut end_times: Vec<i64> = Vec::with_capacity(features.len());
-    let mut altitudes: Vec<f32> = if is_3d { Vec::new() } else { vec![] };
-    
-    // Per-vertex timestamps for smooth trail animation (LineStrings with duration)
-    let mut vertex_timestamps: Vec<i64> = Vec::new();
-    let is_linestring = geometry_type == GeometryType::LineString;
-    
-    // Ring offsets for polygon geometries
-    let mut ring_offsets: Vec<u32> = Vec::new();
-    let mut ring_offsets_offsets: Vec<u32> = if is_polygon { Vec::with_capacity(features.len() + 1) } else { vec![] };
-    
-    // Collect property names and types from first feature
-    let mut numeric_props: HashMap<String, Vec<f32>> = HashMap::new();
-    let mut categorical_props: HashMap<String, CategoricalBuilder> = HashMap::new();
-    
-    if let Some(props) = &features[0].geojson.properties {
+    // Second pass fills one value per feature for every discovered property.
+    for seg in segments {
+        props.push_row(seg.properties.as_deref());
+    }
+
+    Ok(ColumnarLayer {
+        name: layer_name.to_string(),
+        feature_ids,
+        start_times,
+        end_times,
+        geometry: GeometryColumn::LineString(geometry),
+        vertex_times: Some(vertex_times),
+        properties: props.finish(),
+    })
+}
+
+// ----------------------------------------------------------------------------
+// Per-geometry-kind builders
+// ----------------------------------------------------------------------------
+
+fn build_point_layer(features: &[&ParsedFeature], name: String) -> Result<ColumnarLayer> {
+    let (ids, start, end, props) = common_columns(features);
+    let geometry: Vec<Coord> = features.iter().map(|f| [f.lon, f.lat]).collect();
+    Ok(ColumnarLayer {
+        name,
+        feature_ids: ids,
+        start_times: start,
+        end_times: end,
+        geometry: GeometryColumn::Point(geometry),
+        vertex_times: None,
+        properties: props,
+    })
+}
+
+fn build_line_layer(features: &[&ParsedFeature], name: String) -> Result<ColumnarLayer> {
+    let (ids, start, end, props) = common_columns(features);
+
+    let mut geometry: Vec<Vec<Coord>> = Vec::with_capacity(features.len());
+    let mut vertex_times: Vec<Vec<i64>> = Vec::with_capacity(features.len());
+    let mut any_duration = false;
+
+    for f in features {
+        let coords = extract_line_coords(f)?;
+        // Synthesise per-vertex times by distance when the feature has a
+        // duration; otherwise every vertex shares the feature start time.
+        let times = if let Some(end_ts) = f.end_timestamp {
+            any_duration = true;
+            interpolate_vertex_times(&coords, f.timestamp, end_ts)
+        } else {
+            vec![f.timestamp as i64; coords.len()]
+        };
+        geometry.push(coords);
+        vertex_times.push(times);
+    }
+
+    Ok(ColumnarLayer {
+        name,
+        feature_ids: ids,
+        start_times: start,
+        end_times: end,
+        geometry: GeometryColumn::LineString(geometry),
+        // Only attach per-vertex times if at least one feature has a real
+        // duration — otherwise they carry no information.
+        vertex_times: any_duration.then_some(vertex_times),
+        properties: props,
+    })
+}
+
+fn build_polygon_layer(features: &[&ParsedFeature], name: String) -> Result<ColumnarLayer> {
+    let (ids, start, end, props) = common_columns(features);
+    let mut geometry: Vec<Vec<Vec<Coord>>> = Vec::with_capacity(features.len());
+    for f in features {
+        geometry.push(extract_polygon_rings(f)?);
+    }
+    Ok(ColumnarLayer {
+        name,
+        feature_ids: ids,
+        start_times: start,
+        end_times: end,
+        geometry: GeometryColumn::Polygon(geometry),
+        vertex_times: None,
+        properties: props,
+    })
+}
+
+/// Build the id / start / end / property columns shared by every layer kind.
+fn common_columns(
+    features: &[&ParsedFeature],
+) -> (Vec<u64>, Vec<i64>, Vec<i64>, Vec<(String, PropertyColumn)>) {
+    let mut ids = Vec::with_capacity(features.len());
+    let mut start = Vec::with_capacity(features.len());
+    let mut end = Vec::with_capacity(features.len());
+    let mut props = PropertyAccumulator::new();
+
+    for f in features {
+        ids.push(determine_feature_id(f));
+        start.push(f.timestamp as i64);
+        end.push(f.end_timestamp.unwrap_or(f.timestamp) as i64);
+        props.observe(f.shared_properties.as_deref());
+    }
+    for f in features {
+        props.push_row(f.shared_properties.as_deref());
+    }
+    (ids, start, end, props.finish())
+}
+
+// ----------------------------------------------------------------------------
+// Property accumulation
+// ----------------------------------------------------------------------------
+
+/// Discovers the property schema across a group of features (the union of all
+/// keys, classifying each as numeric or categorical) and then materialises one
+/// value per feature, inserting `None` for missing entries.
+struct PropertyAccumulator {
+    /// Discovered columns, in stable (sorted) order.
+    numeric: BTreeMap<String, Vec<Option<f64>>>,
+    categorical: BTreeMap<String, Vec<Option<String>>>,
+    /// True once `push_row` has started; `observe` is then a no-op.
+    sealed: bool,
+}
+
+impl PropertyAccumulator {
+    fn new() -> Self {
+        Self {
+            numeric: BTreeMap::new(),
+            categorical: BTreeMap::new(),
+            sealed: false,
+        }
+    }
+
+    /// First pass: register the keys present on a feature.
+    fn observe(&mut self, props: Option<&serde_json::Map<String, serde_json::Value>>) {
+        if self.sealed {
+            return;
+        }
+        let Some(props) = props else { return };
         for (key, value) in props {
             if value.is_null() {
                 continue;
             }
-            if value.is_number() || value.is_f64() {
-                numeric_props.insert(key.clone(), Vec::with_capacity(features.len()));
-            } else if value.is_string() {
-                categorical_props.insert(key.clone(), CategoricalBuilder::new(features.len()));
+            if value.is_number() {
+                // Numeric wins over categorical for a given key.
+                if !self.categorical.contains_key(key) {
+                    self.numeric.entry(key.clone()).or_default();
+                }
+            } else if value.is_string() && !self.numeric.contains_key(key) {
+                self.categorical.entry(key.clone()).or_default();
             }
         }
     }
-    
-    // Process each feature
-    let mut prev_x: i32 = 0;
-    let mut prev_y: i32 = 0;
-    
-    for feature in features {
-        // Feature ID
-        feature_ids.push(determine_feature_id(feature));
-        
-        // Geometry offset for non-point
-        if !is_point {
-            geometry_offsets.push(geometry.len() as u32 / 2);
+
+    /// Second pass: append this feature's value for every discovered column.
+    fn push_row(&mut self, props: Option<&serde_json::Map<String, serde_json::Value>>) {
+        self.sealed = true;
+        for (key, col) in self.numeric.iter_mut() {
+            let v = props
+                .and_then(|p| p.get(key))
+                .and_then(|v| v.as_f64());
+            col.push(v);
         }
-        
-        // Ring offsets offset for polygons
-        if is_polygon {
-            ring_offsets_offsets.push(ring_offsets.len() as u32);
-        }
-        
-        // Extract and encode coordinates with ring structure for polygons
-        if is_polygon {
-            let rings = extract_polygon_rings(feature)?;
-            for ring in rings {
-                // Record the start of this ring
-                ring_offsets.push(geometry.len() as u32 / 2);
-                
-                for (lon, lat) in ring {
-                    let (qx, qy) = quantize_position(lon, lat, tile_id, config.extent);
-                    
-                    // Delta encode
-                    let dx = qx - prev_x;
-                    let dy = qy - prev_y;
-                    
-                    geometry.push(dx);
-                    geometry.push(dy);
-                    
-                    prev_x = qx;
-                    prev_y = qy;
-                }
-            }
-        } else {
-            // Non-polygon: flatten coordinates with optional 3D
-            let coords = extract_coordinates_3d(feature)?;
-            
-            // For LineStrings with duration, compute per-vertex timestamps
-            // This enables smooth GPU-based trail animation without path segmentation
-            let has_duration = is_linestring && feature.end_timestamp.is_some();
-            let duration = if has_duration {
-                feature.end_timestamp.unwrap() as i64 - feature.timestamp as i64
-            } else {
-                0
-            };
-            
-            // Calculate cumulative distances for interpolation
-            let cumulative_distances: Vec<f64> = if has_duration && coords.len() > 1 {
-                let mut distances = vec![0.0];
-                let mut total = 0.0;
-                for i in 1..coords.len() {
-                    let (lon1, lat1, _) = coords[i - 1];
-                    let (lon2, lat2, _) = coords[i];
-                    let dist = haversine_distance(lat1, lon1, lat2, lon2);
-                    total += dist;
-                    distances.push(total);
-                }
-                distances
-            } else {
-                vec![]
-            };
-            
-            let total_distance = cumulative_distances.last().copied().unwrap_or(0.0);
-            
-            for (i, (lon, lat, alt)) in coords.iter().enumerate() {
-                let (qx, qy) = quantize_position(*lon, *lat, tile_id, config.extent);
-                
-                // Delta encode geometry
-                let dx = qx - prev_x;
-                let dy = qy - prev_y;
-                
-                geometry.push(dx);
-                geometry.push(dy);
-                
-                if is_3d {
-                    altitudes.push(*alt as f32);
-                }
-                
-                // Compute per-vertex timestamp for LineStrings with duration
-                if has_duration && total_distance > 0.0 {
-                    let fraction = cumulative_distances[i] / total_distance;
-                    let vertex_time = feature.timestamp as i64 + (fraction * duration as f64) as i64;
-                    let vertex_time_delta = vertex_time - time_start as i64;
-                    vertex_timestamps.push(vertex_time_delta);
-                } else if is_linestring {
-                    // No duration - use feature start time for all vertices
-                    let vertex_time_delta = feature.timestamp as i64 - time_start as i64;
-                    vertex_timestamps.push(vertex_time_delta);
-                }
-                
-                prev_x = qx;
-                prev_y = qy;
-            }
-        }
-        
-        // Timestamps (delta encoded relative to tile start)
-        let start_delta = feature.timestamp as i64 - time_start as i64;
-        start_times.push(start_delta);
-        
-        // Use end_timestamp if available, otherwise duration is 0
-        let end_delta = feature.end_timestamp
-            .map(|t| t as i64 - time_start as i64)
-            .unwrap_or(start_delta);
-        let duration = end_delta - start_delta;
-        end_times.push(duration); // Store duration rather than absolute end time
-        
-        // Properties
-        if let Some(props) = &feature.geojson.properties {
-            for (key, value) in props {
-                if let Some(col) = numeric_props.get_mut(key) {
-                    col.push(value.as_f64().unwrap_or(0.0) as f32);
-                }
-                if let Some(col) = categorical_props.get_mut(key) {
-                    col.add(value.as_str().unwrap_or(""));
-                }
-            }
-        }
-        
-        // Fill missing properties with defaults
-        for col in numeric_props.values_mut() {
-            if col.len() < feature_ids.len() {
-                col.push(0.0);
-            }
-        }
-        for col in categorical_props.values_mut() {
-            if col.indices.len() < feature_ids.len() {
-                col.add("");
-            }
+        for (key, col) in self.categorical.iter_mut() {
+            let v = props
+                .and_then(|p| p.get(key))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            col.push(v);
         }
     }
-    
-    // Final geometry offset
-    if !is_point {
-        geometry_offsets.push(geometry.len() as u32 / 2);
+
+    fn finish(self) -> Vec<(String, PropertyColumn)> {
+        let mut out = Vec::new();
+        for (name, values) in self.numeric {
+            out.push((name, PropertyColumn::Numeric(values)));
+        }
+        for (name, values) in self.categorical {
+            out.push((name, PropertyColumn::Categorical(values)));
+        }
+        out
     }
-    
-    // Final ring offsets offset for polygons
-    if is_polygon {
-        ring_offsets_offsets.push(ring_offsets.len() as u32);
-    }
-    
-    // Build proto message
-    Ok(stt_core::proto::ColumnarFeatures {
-        feature_count,
-        geometry_type: geometry_type.to_proto(),
-        feature_ids,
-        geometry,
-        geometry_offsets,
-        start_times,
-        end_times,
-        ring_offsets,
-        ring_offsets_offsets,
-        numeric_properties: numeric_props
-            .into_iter()
-            .map(|(name, values)| stt_core::proto::NumericColumn {
-                name,
-                values,
-                values_f64: vec![],
-            })
-            .collect(),
-        categorical_properties: categorical_props
-            .into_iter()
-            .map(|(name, builder)| stt_core::proto::CategoricalColumn {
-                name,
-                categories: builder.categories,
-                indices: builder.indices,
-            })
-            .collect(),
-        altitudes,
-        // Per-vertex timestamps for smooth trail animation (LineStrings with duration)
-        // Each vertex has its timestamp as delta from tile time_start
-        // This enables GPU-based trail clipping without path segmentation
-        vertex_timestamps,
-    })
 }
 
-/// Quantize WGS84 coordinates to tile-relative integers
-/// Note: Returns i32 because coordinates can be outside tile bounds [0, extent]
-/// for paths that cross tile boundaries
-fn quantize_position(lon: f64, lat: f64, tile: &TileId, extent: u32) -> (i32, i32) {
-    projection::lonlat_to_tile_coords(
-        lon, lat,
-        tile.z,
-        tile.x,
-        tile.y,
-        extent,
-    )
-}
+// ----------------------------------------------------------------------------
+// Geometry extraction
+// ----------------------------------------------------------------------------
 
-/// Extract 2D coordinates from a feature (flattened - for non-polygon geometries)
-fn extract_coordinates(feature: &ParsedFeature) -> Result<Vec<(f64, f64)>> {
-    let coords_3d = extract_coordinates_3d(feature)?;
-    Ok(coords_3d.into_iter().map(|(lon, lat, _)| (lon, lat)).collect())
-}
-
-/// Extract 3D coordinates from a feature (lon, lat, altitude)
-/// Returns (lon, lat, altitude) tuples. Altitude is 0.0 if not present.
-fn extract_coordinates_3d(feature: &ParsedFeature) -> Result<Vec<(f64, f64, f64)>> {
+/// Determine a feature's geometry type.
+pub fn determine_geometry_type(feature: &ParsedFeature) -> Result<GeometryType> {
+    use geojson::Value as GeomValue;
     let geom = feature
         .geojson
         .geometry
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Feature has no geometry"))?;
-    
+        .ok_or_else(|| anyhow::anyhow!("feature has no geometry"))?;
+    Ok(match &geom.value {
+        GeomValue::Point(_) | GeomValue::MultiPoint(_) => GeometryType::Point,
+        GeomValue::LineString(_) | GeomValue::MultiLineString(_) => GeometryType::LineString,
+        GeomValue::Polygon(_) | GeomValue::MultiPolygon(_) => GeometryType::Polygon,
+        GeomValue::GeometryCollection(c) => match c.first().map(|g| &g.value) {
+            Some(GeomValue::Point(_)) | Some(GeomValue::MultiPoint(_)) => GeometryType::Point,
+            Some(GeomValue::LineString(_)) | Some(GeomValue::MultiLineString(_)) => {
+                GeometryType::LineString
+            }
+            _ => GeometryType::Polygon,
+        },
+    })
+}
+
+/// Extract a flat vertex list for a (multi)linestring feature.
+fn extract_line_coords(feature: &ParsedFeature) -> Result<Vec<Coord>> {
     use geojson::Value as GeomValue;
-    
-    // Helper to extract coord with optional altitude
-    fn coord_3d(c: &Vec<f64>) -> (f64, f64, f64) {
-        let alt = if c.len() >= 3 { c[2] } else { 0.0 };
-        (c[0], c[1], alt)
-    }
-    
-    let coords = match &geom.value {
-        GeomValue::Point(c) if c.len() >= 2 => vec![coord_3d(c)],
-        GeomValue::MultiPoint(points) => points
-            .iter()
-            .filter(|c| c.len() >= 2)
-            .map(|c| coord_3d(c))
-            .collect(),
-        GeomValue::LineString(points) => points
-            .iter()
-            .filter(|c| c.len() >= 2)
-            .map(|c| coord_3d(c))
-            .collect(),
+    let geom = feature
+        .geojson
+        .geometry
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("feature has no geometry"))?;
+    let coords: Vec<Coord> = match &geom.value {
+        GeomValue::LineString(pts) => pts.iter().filter(|c| c.len() >= 2).map(|c| [c[0], c[1]]).collect(),
         GeomValue::MultiLineString(lines) => lines
             .iter()
             .flatten()
             .filter(|c| c.len() >= 2)
-            .map(|c| coord_3d(c))
+            .map(|c| [c[0], c[1]])
             .collect(),
-        // For polygons called from non-polygon path (shouldn't happen but handle gracefully)
-        GeomValue::Polygon(rings) => rings
-            .iter()
-            .flatten()
-            .filter(|c| c.len() >= 2)
-            .map(|c| coord_3d(c))
-            .collect(),
-        GeomValue::MultiPolygon(polygons) => polygons
-            .iter()
-            .flatten()
-            .flatten()
-            .filter(|c| c.len() >= 2)
-            .map(|c| coord_3d(c))
-            .collect(),
-        _ => vec![(feature.lon, feature.lat, 0.0)],
+        _ => vec![[feature.lon, feature.lat]],
     };
-    
     if coords.is_empty() {
-        Ok(vec![(feature.lon, feature.lat, 0.0)])
+        Ok(vec![[feature.lon, feature.lat]])
     } else {
         Ok(coords)
     }
 }
 
-/// Check if features have 3D coordinates (altitude)
-fn has_3d_coordinates(features: &[&ParsedFeature]) -> bool {
-    features.iter().any(|f| {
-        f.geojson.geometry.as_ref().map_or(false, |geom| {
-            use geojson::Value as GeomValue;
-            match &geom.value {
-                GeomValue::Point(c) => c.len() >= 3 && c[2] != 0.0,
-                GeomValue::LineString(points) => points.iter().any(|c| c.len() >= 3 && c[2] != 0.0),
-                GeomValue::MultiLineString(lines) => lines.iter().flatten().any(|c| c.len() >= 3 && c[2] != 0.0),
-                _ => false,
-            }
-        })
-    })
-}
-
-/// Extract polygon rings preserving the ring structure
-/// Returns a vector of rings, where each ring is a vector of (lon, lat) coordinates
-/// For Polygon: returns all rings (first is exterior, rest are holes)
-/// For MultiPolygon: returns all rings from all polygons flattened into one list
-fn extract_polygon_rings(feature: &ParsedFeature) -> Result<Vec<Vec<(f64, f64)>>> {
+/// Extract polygon rings (ring 0 is the exterior). MultiPolygon rings are
+/// flattened — `ring_offsets` semantics in GeoArrow keep them separable.
+fn extract_polygon_rings(feature: &ParsedFeature) -> Result<Vec<Vec<Coord>>> {
+    use geojson::Value as GeomValue;
     let geom = feature
         .geojson
         .geometry
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Feature has no geometry"))?;
-    
-    use geojson::Value as GeomValue;
-    
-    let rings = match &geom.value {
-        GeomValue::Polygon(polygon_rings) => {
-            polygon_rings
-                .iter()
-                .map(|ring| {
-                    ring.iter()
-                        .filter(|c| c.len() >= 2)
-                        .map(|c| (c[0], c[1]))
-                        .collect()
-                })
-                .filter(|ring: &Vec<(f64, f64)>| ring.len() >= 4) // Valid ring needs at least 4 points
-                .collect()
-        }
-        GeomValue::MultiPolygon(polygons) => {
-            // Flatten all rings from all polygons into a single list
-            // deck.gl will interpret this correctly when we provide ring offsets
-            polygons
-                .iter()
-                .flat_map(|polygon| {
-                    polygon.iter().map(|ring| {
-                        ring.iter()
-                            .filter(|c| c.len() >= 2)
-                            .map(|c| (c[0], c[1]))
-                            .collect()
-                    })
-                })
-                .filter(|ring: &Vec<(f64, f64)>| ring.len() >= 4) // Valid ring needs at least 4 points
-                .collect()
-        }
-        // Fallback for other geometry types that shouldn't reach here
-        _ => {
-            let coords = extract_coordinates(feature)?;
-            if coords.len() >= 4 {
-                vec![coords]
-            } else {
-                vec![]
-            }
-        }
+        .ok_or_else(|| anyhow::anyhow!("feature has no geometry"))?;
+    let to_ring = |ring: &Vec<Vec<f64>>| -> Vec<Coord> {
+        ring.iter().filter(|c| c.len() >= 2).map(|c| [c[0], c[1]]).collect()
     };
-    
-    // If no valid rings found, create a single ring from the centroid point
+    let rings: Vec<Vec<Coord>> = match &geom.value {
+        GeomValue::Polygon(rings) => rings
+            .iter()
+            .map(to_ring)
+            .filter(|r| r.len() >= 4)
+            .collect(),
+        GeomValue::MultiPolygon(polys) => polys
+            .iter()
+            .flat_map(|p| p.iter().map(to_ring))
+            .filter(|r| r.len() >= 4)
+            .collect(),
+        _ => vec![],
+    };
     if rings.is_empty() {
-        // Return a degenerate "ring" with just the feature centroid
-        Ok(vec![vec![(feature.lon, feature.lat)]])
+        // Degenerate fallback: a zero-area ring at the centroid.
+        Ok(vec![vec![[feature.lon, feature.lat]]])
     } else {
         Ok(rings)
     }
 }
 
-/// Determine geometry type from a feature
-fn determine_geometry_type(feature: &ParsedFeature) -> Result<GeometryType> {
-    let geom = feature
-        .geojson
-        .geometry
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Feature has no geometry"))?;
-    
-    use geojson::Value as GeomValue;
-    
-    Ok(match &geom.value {
-        GeomValue::Point(_) | GeomValue::MultiPoint(_) => GeometryType::Point,
-        GeomValue::LineString(_) | GeomValue::MultiLineString(_) => GeometryType::LineString,
-        GeomValue::Polygon(_) | GeomValue::MultiPolygon(_) => GeometryType::Polygon,
-        GeomValue::GeometryCollection(collection) => {
-            if let Some(first) = collection.first() {
-                match &first.value {
-                    GeomValue::Point(_) | GeomValue::MultiPoint(_) => GeometryType::Point,
-                    GeomValue::LineString(_) | GeomValue::MultiLineString(_) => GeometryType::LineString,
-                    _ => GeometryType::Polygon,
-                }
-            } else {
-                GeometryType::Point
-            }
-        }
-    })
+/// Synthesise per-vertex timestamps by cumulative distance along a path.
+fn interpolate_vertex_times(coords: &[Coord], start: u64, end: u64) -> Vec<i64> {
+    let n = coords.len();
+    if n == 0 {
+        return vec![];
+    }
+    if n == 1 {
+        return vec![start as i64];
+    }
+    let mut cumulative = vec![0.0f64; n];
+    for i in 1..n {
+        let [lon1, lat1] = coords[i - 1];
+        let [lon2, lat2] = coords[i];
+        cumulative[i] = cumulative[i - 1] + haversine_distance(lat1, lon1, lat2, lon2);
+    }
+    let total = cumulative[n - 1];
+    let duration = end as f64 - start as f64;
+    if total <= 0.0 {
+        return vec![start as i64; n];
+    }
+    cumulative
+        .iter()
+        .map(|d| start as i64 + (d / total * duration) as i64)
+        .collect()
 }
 
-/// Determine feature ID (same as original tiler)
+/// Haversine distance in metres.
+fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS: f64 = 6_371_000.0;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+    EARTH_RADIUS * 2.0 * a.sqrt().asin()
+}
+
+// ----------------------------------------------------------------------------
+// Feature ids
+// ----------------------------------------------------------------------------
+
+/// Resolve a stable u64 feature id (from the GeoJSON id, else a hash).
 fn determine_feature_id(feature: &ParsedFeature) -> u64 {
     use geojson::feature::Id;
     use std::collections::hash_map::DefaultHasher;
@@ -447,75 +411,162 @@ fn determine_feature_id(feature: &ParsedFeature) -> u64 {
     if let Some(id) = &feature.geojson.id {
         match id {
             Id::Number(num) => {
-                if let Some(value) = num.as_u64() {
-                    return value;
+                if let Some(v) = num.as_u64() {
+                    return v;
                 }
-                if let Some(value) = num.as_i64() {
-                    return value as u64;
+                if let Some(v) = num.as_i64() {
+                    return v as u64;
                 }
             }
             Id::String(s) => {
-                let mut hasher = DefaultHasher::new();
-                s.hash(&mut hasher);
-                return hasher.finish();
+                let mut h = DefaultHasher::new();
+                s.hash(&mut h);
+                return h.finish();
             }
         }
     }
-
-    let mut hasher = DefaultHasher::new();
-    hasher.write_u64(feature.timestamp);
-    hasher.write_u64(feature.lon.to_bits());
-    hasher.write_u64(feature.lat.to_bits());
-    hasher.finish()
+    let mut h = DefaultHasher::new();
+    h.write_u64(feature.timestamp);
+    h.write_u64(feature.lon.to_bits());
+    h.write_u64(feature.lat.to_bits());
+    h.finish()
 }
 
-/// Haversine distance between two points in meters
-fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const EARTH_RADIUS: f64 = 6_371_000.0; // meters
-    
-    let lat1_rad = lat1.to_radians();
-    let lat2_rad = lat2.to_radians();
-    let dlat = (lat2 - lat1).to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-    
-    let a = (dlat / 2.0).sin().powi(2)
-        + lat1_rad.cos() * lat2_rad.cos() * (dlon / 2.0).sin().powi(2);
-    let c = 2.0 * a.sqrt().asin();
-    
-    EARTH_RADIUS * c
-}
+/// Resolve a stable u64 id for a clipped segment.
+fn segment_feature_id(segment: &ClippedSegment) -> u64 {
+    use geojson::feature::Id;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
-/// Builder for categorical (string) properties with dictionary encoding
-struct CategoricalBuilder {
-    categories: Vec<String>,
-    category_map: HashMap<String, u8>,
-    indices: Vec<u8>,
-}
-
-impl CategoricalBuilder {
-    fn new(capacity: usize) -> Self {
-        Self {
-            categories: Vec::new(),
-            category_map: HashMap::new(),
-            indices: Vec::with_capacity(capacity),
+    if let Some(id) = &segment.feature_id {
+        match id {
+            Id::Number(num) => {
+                if let Some(v) = num.as_u64() {
+                    return v;
+                }
+                if let Some(v) = num.as_i64() {
+                    return v as u64;
+                }
+            }
+            Id::String(s) => {
+                let mut h = DefaultHasher::new();
+                s.hash(&mut h);
+                return h.finish();
+            }
         }
     }
-    
-    fn add(&mut self, value: &str) {
-        let index = if let Some(&idx) = self.category_map.get(value) {
-            idx
-        } else {
-            let idx = self.categories.len() as u8;
-            if idx < 255 {
-                self.categories.push(value.to_string());
-                self.category_map.insert(value.to_string(), idx);
-                idx
-            } else {
-                // Overflow - use last category
-                254
-            }
-        };
-        self.indices.push(index);
+    let mut h = DefaultHasher::new();
+    h.write_u64(segment.start_time);
+    if let Some((lon, lat, _)) = segment.coordinates.first() {
+        h.write_u64(lon.to_bits());
+        h.write_u64(lat.to_bits());
     }
+    h.finish()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use geojson::{Feature, Geometry, Value as GeomValue};
+    use serde_json::json;
+
+    fn point_feature(lon: f64, lat: f64, props: serde_json::Value) -> ParsedFeature {
+        ParsedFeature {
+            geojson: Feature {
+                bbox: None,
+                geometry: Some(Geometry::new(GeomValue::Point(vec![lon, lat]))),
+                id: None,
+                properties: None,
+                foreign_members: None,
+            },
+            // Properties live in shared_properties (see input.rs).
+            shared_properties: props
+                .as_object()
+                .filter(|m| !m.is_empty())
+                .map(|m| std::sync::Arc::new(m.clone())),
+            timestamp: 1000,
+            end_timestamp: None,
+            lon,
+            lat,
+        }
+    }
+
+    fn line_feature(coords: Vec<[f64; 2]>, start: u64, end: Option<u64>) -> ParsedFeature {
+        let pts: Vec<Vec<f64>> = coords.iter().map(|c| vec![c[0], c[1]]).collect();
+        ParsedFeature {
+            geojson: Feature {
+                bbox: None,
+                geometry: Some(Geometry::new(GeomValue::LineString(pts))),
+                id: None,
+                properties: None,
+                foreign_members: None,
+            },
+            shared_properties: None,
+            timestamp: start,
+            end_timestamp: end,
+            lon: coords[0][0],
+            lat: coords[0][1],
+        }
+    }
+
+    #[test]
+    fn point_features_become_one_layer() {
+        let f1 = point_feature(-122.4, 37.7, json!({ "speed": 10.0, "kind": "car" }));
+        let f2 = point_feature(-122.5, 37.8, json!({ "speed": 20.0 }));
+        let refs = vec![&f1, &f2];
+        let layers = build_layers_from_features(&refs, "default").unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].feature_count(), 2);
+        // "kind" present only on f1 must still be discovered, with None for f2.
+        let kind = layers[0]
+            .properties
+            .iter()
+            .find(|(n, _)| n == "kind")
+            .expect("kind column");
+        match &kind.1 {
+            PropertyColumn::Categorical(v) => {
+                assert_eq!(v[0].as_deref(), Some("car"));
+                assert_eq!(v[1], None);
+            }
+            _ => panic!("kind should be categorical"),
+        }
+    }
+
+    #[test]
+    fn mixed_geometry_types_split_into_separate_layers() {
+        let pt = point_feature(0.0, 0.0, json!({}));
+        let line = line_feature(vec![[0.0, 0.0], [1.0, 1.0]], 1000, None);
+        let refs = vec![&pt, &line];
+        let layers = build_layers_from_features(&refs, "default").unwrap();
+        assert_eq!(layers.len(), 2);
+        // Distinct, kind-suffixed names so a reader can tell them apart.
+        let names: Vec<&str> = layers.iter().map(|l| l.name.as_str()).collect();
+        assert!(names.contains(&"default_points"));
+        assert!(names.contains(&"default_lines"));
+    }
+
+    #[test]
+    fn line_with_duration_gets_interpolated_vertex_times() {
+        let line = line_feature(
+            vec![[0.0, 0.0], [0.0, 1.0], [0.0, 2.0]],
+            1000,
+            Some(3000),
+        );
+        let refs = vec![&line];
+        let layers = build_layers_from_features(&refs, "default").unwrap();
+        let vt = layers[0].vertex_times.as_ref().expect("vertex times present");
+        assert_eq!(vt[0].len(), 3);
+        // Evenly spaced vertices -> first 1000, last 3000, middle ~2000.
+        assert_eq!(vt[0][0], 1000);
+        assert_eq!(vt[0][2], 3000);
+        assert!((vt[0][1] - 2000).abs() <= 1);
+    }
+
+    #[test]
+    fn line_without_duration_has_no_vertex_times() {
+        let line = line_feature(vec![[0.0, 0.0], [1.0, 1.0]], 1000, None);
+        let refs = vec![&line];
+        let layers = build_layers_from_features(&refs, "default").unwrap();
+        assert!(layers[0].vertex_times.is_none());
+    }
+}

@@ -2,12 +2,16 @@
 //!
 //! This module provides types for storing and managing archive metadata.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::{BoundingBox, TimeRange};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Archive metadata
-#[derive(Debug, Clone)]
+/// Archive metadata.
+///
+/// Stored in the archive as UTF-8 JSON — small, human-inspectable, and
+/// versionless thanks to serde's field defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     /// Archive name
     pub name: String,
@@ -31,6 +35,9 @@ pub struct Metadata {
     pub layers: Vec<String>,
     /// Custom properties
     pub properties: HashMap<String, String>,
+    /// Temporal bucket size in milliseconds for tile chunking
+    /// Tiles are organized into fixed temporal intervals (e.g., 3600000 = 1 hour)
+    pub temporal_bucket_ms: u64,
 }
 
 impl Default for Metadata {
@@ -52,6 +59,7 @@ impl Default for Metadata {
             feature_count: 0,
             layers: vec!["default".to_string()],
             properties: HashMap::new(),
+            temporal_bucket_ms: 3600 * 1000, // 1 hour default
         }
     }
 }
@@ -96,101 +104,50 @@ impl Metadata {
         self
     }
 
+    /// Set temporal bucket size in milliseconds
+    pub fn with_temporal_bucket_ms(mut self, temporal_bucket_ms: u64) -> Self {
+        self.temporal_bucket_ms = temporal_bucket_ms;
+        self
+    }
+
     /// Add a custom property
     pub fn with_property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.properties.insert(key.into(), value.into());
         self
     }
 
-    /// Convert to Protocol Buffer Metadata
-    pub fn to_proto(&self) -> crate::proto::Metadata {
-        crate::proto::Metadata {
-            version: 1,
-            name: self.name.clone(),
-            description: self.description.clone(),
-            attribution: self.attribution.clone(),
-            bounds: Some(crate::proto::BoundingBox {
-                min_lon: self.bounds.min_lon,
-                min_lat: self.bounds.min_lat,
-                max_lon: self.bounds.max_lon,
-                max_lat: self.bounds.max_lat,
-            }),
-            time_range: Some(crate::proto::TimeRange {
-                start: self.time_range.start,
-                end: self.time_range.end,
-                interval: 0, // No regular interval specified
-            }),
-            min_zoom: self.min_zoom as u32,
-            max_zoom: self.max_zoom as u32,
-            layers: self
-                .layers
-                .iter()
-                .map(|name| crate::proto::LayerInfo {
-                    name: name.clone(),
-                    description: String::new(),
-                    properties: vec![],
-                    geometry_types: vec![],
-                })
-                .collect(),
-            generation: None,
-            stats: Some(crate::proto::Statistics {
-                total_tiles: self.tile_count,
-                total_features: self.feature_count,
-                total_size: 0,
-                uncompressed_size: 0,
-                compression_ratio: 0.0,
-                zoom_stats: vec![],
-            }),
-        }
+    /// Serialise to the JSON byte form stored in an archive.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self)
+            .map_err(|e| Error::Other(format!("metadata JSON encode failed: {e}")))
     }
 
-    /// Convert from Protocol Buffer Metadata
-    pub fn from_proto(proto: &crate::proto::Metadata) -> Result<Self> {
-        let bounds = proto
-            .bounds
-            .as_ref()
-            .map(|b| BoundingBox {
-                min_lon: b.min_lon,
-                min_lat: b.min_lat,
-                max_lon: b.max_lon,
-                max_lat: b.max_lat,
-            })
-            .unwrap_or(BoundingBox {
-                min_lon: -180.0,
-                min_lat: -85.0511,
-                max_lon: 180.0,
-                max_lat: 85.0511,
-            });
-
-        let time_range = proto
-            .time_range
-            .as_ref()
-            .map(|tr| TimeRange::new(tr.start, tr.end))
-            .unwrap_or(TimeRange::new(0, 0));
-
-        let stats = proto.stats.as_ref();
-        let tile_count = stats.map(|s| s.total_tiles).unwrap_or(0);
-        let feature_count = stats.map(|s| s.total_features).unwrap_or(0);
-
-        Ok(Self {
-            name: proto.name.clone(),
-            description: proto.description.clone(),
-            attribution: proto.attribution.clone(),
-            bounds,
-            time_range,
-            min_zoom: proto.min_zoom as u8,
-            max_zoom: proto.max_zoom as u8,
-            tile_count,
-            feature_count,
-            layers: proto.layers.iter().map(|l| l.name.clone()).collect(),
-            properties: HashMap::new(), // No custom properties in proto
-        })
+    /// Parse from the JSON byte form stored in an archive.
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| Error::InvalidArchive(format!("metadata JSON decode failed: {e}")))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_metadata_json_roundtrip() {
+        let metadata = Metadata::new("json-test")
+            .with_description("desc")
+            .with_zoom_levels(2, 12)
+            .with_temporal_bucket_ms(3_600_000)
+            .with_property("source", "unit-test");
+        let bytes = metadata.to_json_bytes().unwrap();
+        let decoded = Metadata::from_json_bytes(&bytes).unwrap();
+        assert_eq!(decoded.name, "json-test");
+        assert_eq!(decoded.min_zoom, 2);
+        assert_eq!(decoded.max_zoom, 12);
+        assert_eq!(decoded.temporal_bucket_ms, 3_600_000);
+        assert_eq!(decoded.properties.get("source").map(String::as_str), Some("unit-test"));
+    }
 
     #[test]
     fn test_metadata_builder() {
@@ -205,16 +162,5 @@ mod tests {
         assert_eq!(metadata.min_zoom, 0);
         assert_eq!(metadata.max_zoom, 14);
         assert_eq!(metadata.properties.get("key"), Some(&"value".to_string()));
-    }
-
-    #[test]
-    fn test_metadata_proto_roundtrip() {
-        let metadata = Metadata::new("test").with_description("Test archive");
-
-        let proto = metadata.to_proto();
-        let decoded = Metadata::from_proto(&proto).unwrap();
-
-        assert_eq!(decoded.name, metadata.name);
-        assert_eq!(decoded.description, metadata.description);
     }
 }

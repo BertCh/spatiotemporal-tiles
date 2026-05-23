@@ -1,16 +1,16 @@
-//! Core library for spatiotemporal tile format
+//! Core library for the SpatioTemporal Tiles (STT) format.
 //!
 //! This crate provides the fundamental types and operations for working with
-//! SpatioTemporal Tiles (STT), including:
+//! STT archives, including:
 //!
-//! - Tile encoding and decoding (Protocol Buffers)
-//! - Spatial indexing (Hilbert curve)
-//! - Temporal indexing (sorted timestamps)
-//! - Archive I/O operations
-//! - Compression (Brotli, Gzip)
+//! - Arrow-IPC tile payloads with GeoArrow geometry ([`arrow_tile`])
+//! - The single-file [`archive`] container (Arrow index, JSON metadata)
+//! - Spatial (Hilbert curve) and temporal indexing
+//! - Gzip compression
 
 pub mod analyzer;
 pub mod archive;
+pub mod arrow_tile;
 pub mod budget;
 pub mod compression;
 pub mod error;
@@ -24,13 +24,8 @@ pub mod types;
 // Re-export commonly used types
 pub use archive::{Archive, ArchiveReader, ArchiveWriter};
 pub use error::{Error, Result};
-pub use tile::{Feature, Layer, Tile, TileId};
+pub use tile::TileId;
 pub use types::{BoundingBox, TimeRange};
-
-// Include generated Protocol Buffer code
-pub mod proto {
-    include!(concat!(env!("OUT_DIR"), "/stt.rs"));
-}
 
 #[cfg(test)]
 mod tests {
