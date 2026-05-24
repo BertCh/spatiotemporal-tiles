@@ -59,6 +59,18 @@ struct Args {
     #[arg(long, default_value = "1h")]
     temporal_bucket: String,
 
+    /// Optional temporal LOD pyramid (e.g. "1d,30d"). Each entry is a coarser
+    /// bucket size. The archive will carry one extra aggregate-tile tier per
+    /// level, in addition to the base `--temporal-bucket` tiles, so a client
+    /// animating decades of data at "year scale" can pick the coarser tier.
+    ///
+    /// Each entry MUST be a strict multiple of `--temporal-bucket` and the
+    /// list MUST be sorted by ascending duration. Each level applies up to
+    /// (and including) `max-zoom-level`, configurable as `1d@8,30d@4`
+    /// (default: every level applies at every zoom).
+    #[arg(long)]
+    temporal_lod: Option<String>,
+
     /// Number of parallel workers
     #[arg(short, long, default_value = "4")]
     workers: usize,
@@ -181,6 +193,17 @@ fn main() -> Result<()> {
     if args.streaming_arrow {
         info!("Using streaming-Arrow pipeline (bounded RAM)...");
         let temporal_bucket_ms = parse_duration(&args.temporal_bucket)?;
+        let temporal_lod = match args.temporal_lod.as_deref() {
+            Some(s) => parse_temporal_lod(s, args.max_zoom)?,
+            None => Vec::new(),
+        };
+        if !temporal_lod.is_empty() {
+            warn!(
+                "--temporal-lod ignored in --streaming-arrow mode: LOD aggregation \
+                 requires the in-memory pipeline (will be lifted to streaming in a \
+                 follow-up)."
+            );
+        }
         let tile_config = tiler::TileConfig {
             min_zoom: args.min_zoom,
             max_zoom: args.max_zoom,
@@ -190,6 +213,7 @@ fn main() -> Result<()> {
             clip_min_vertices: args.clip_min_vertices,
             simplify: args.simplify,
             simplify_max_zoom: args.simplify_max_zoom,
+            temporal_lod: Vec::new(),
         };
         let mut writer = stt_core::Archive::create(&args.output, compression)?;
         let mut bounds_lon = (f64::MAX, f64::MIN);
@@ -347,6 +371,22 @@ fn main() -> Result<()> {
         );
     }
 
+    let temporal_lod = match args.temporal_lod.as_deref() {
+        Some(s) => parse_temporal_lod(s, args.max_zoom)?,
+        None => Vec::new(),
+    };
+    if !temporal_lod.is_empty() {
+        info!(
+            "Temporal LOD: {} levels — {}",
+            temporal_lod.len(),
+            temporal_lod
+                .iter()
+                .map(|l| format!("{}ms@z<={}", l.bucket_ms, l.max_zoom_level))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     let tile_config = tiler::TileConfig {
         min_zoom: args.min_zoom,
         max_zoom: args.max_zoom,
@@ -356,11 +396,40 @@ fn main() -> Result<()> {
         clip_min_vertices: args.clip_min_vertices,
         simplify: args.simplify,
         simplify_max_zoom: args.simplify_max_zoom,
+        temporal_lod: temporal_lod.clone(),
     };
 
     let mut writer = stt_core::Archive::create(&args.output, compression)?;
 
-    let tile_count = if args.streaming {
+    let tile_count = if !temporal_lod.is_empty() {
+        // --temporal-lod path: emit base tiles + per-level aggregate tiles.
+        // Streams through the LodTileWriter so each directory entry carries
+        // its temporal_bucket_ms. The streaming pipeline doesn't (yet) do
+        // LOD aggregation — that's a follow-up — so this path goes through
+        // the in-memory builder regardless of --streaming.
+        if args.streaming {
+            warn!("--streaming ignored when --temporal-lod is set (in-memory pipeline used)");
+        }
+        use tiler::LodTileWriter;
+        let tiles = tiler::generate_tiles_with_lod(&features, &tile_config, args.workers)?;
+        info!(
+            "Generated {} tiles (base + LOD aggregate tiers)",
+            tiles.len()
+        );
+        let pb = ProgressBar::new(tiles.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("[{bar:40.cyan/blue}] {pos}/{len} tiles ({eta})")
+                .unwrap()
+                .progress_chars("##-"),
+        );
+        for tagged in &tiles {
+            writer.write_lod_tile(&tagged.tile, tagged.temporal_bucket_ms)?;
+            pb.inc(1);
+        }
+        pb.finish_with_message("Tiles written");
+        tiles.len()
+    } else if args.streaming {
         // Streaming mode: write tiles as each zoom level completes
         info!("Using streaming mode (lower memory usage)...");
         let stats = tiler::generate_tiles_streaming(
@@ -399,7 +468,7 @@ fn main() -> Result<()> {
     };
 
     // Step 5: Build metadata
-    let metadata = stt_core::metadata::Metadata::new(args.name.unwrap_or_else(|| {
+    let metadata_builder = stt_core::metadata::Metadata::new(args.name.unwrap_or_else(|| {
         args.input
             .file_stem()
             .unwrap()
@@ -412,6 +481,13 @@ fn main() -> Result<()> {
     .with_time_range(time_range)
     .with_zoom_levels(args.min_zoom, args.max_zoom)
     .with_temporal_bucket_ms(temporal_bucket_ms);
+    let metadata = if temporal_lod.is_empty() {
+        metadata_builder
+    } else {
+        metadata_builder
+            .with_temporal_lod(temporal_lod.clone())
+            .with_context(|| "temporal LOD validation failed")?
+    };
 
     writer.finalize(&metadata)?;
 
@@ -506,6 +582,40 @@ fn parse_compression(s: &str) -> Result<stt_core::types::Compression> {
             s
         ),
     }
+}
+
+/// Parse a `--temporal-lod` spec like `"1d,30d"` or `"1d@8,30d@4"`. Each
+/// entry is `<duration>` (applies at every zoom) or `<duration>@<zoom>`
+/// (applies at zoom <= the given level). Entries are returned in input
+/// order so the build can re-validate sorting against the base bucket.
+fn parse_temporal_lod(
+    s: &str,
+    fallback_max_zoom: u8,
+) -> Result<Vec<stt_core::metadata::TemporalLodLevel>> {
+    let mut levels = Vec::new();
+    for piece in s.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let (dur, zoom) = match piece.split_once('@') {
+            Some((d, z)) => {
+                let z: u8 = z
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("invalid zoom in temporal-lod entry '{piece}'"))?;
+                (d.trim(), z)
+            }
+            None => (piece, fallback_max_zoom),
+        };
+        let bucket_ms = parse_duration(dur)
+            .with_context(|| format!("invalid duration in temporal-lod entry '{piece}'"))?;
+        levels.push(stt_core::metadata::TemporalLodLevel {
+            bucket_ms,
+            max_zoom_level: zoom,
+        });
+    }
+    Ok(levels)
 }
 
 /// Parse a duration string like "1h", "6h", "1d", "30m" into milliseconds
