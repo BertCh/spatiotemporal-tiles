@@ -34,6 +34,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 
+# H3 hexagonal aggregation cells for the summary tier.
+h3o = "0.7"
+
 # Optional advanced projection support (requires system libproj)
 proj = { version = "0.27", optional = true }
 

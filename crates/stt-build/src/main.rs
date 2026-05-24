@@ -2,7 +2,7 @@
 //!
 //! This tool converts GeoParquet files into optimized STT archives for web visualization.
 
-use stt_build::{input, tiler};
+use stt_build::{input, summary, tiler};
 use stt_build::tiler::TileWriter;
 
 use anyhow::{Context, Result};
@@ -129,6 +129,41 @@ struct Args {
     /// values are filled in from the recommendation.
     #[arg(long)]
     auto: bool,
+
+    // --- Summary-tier options (server-aggregated low-zoom tier) ---
+    /// Emit a pre-aggregated summary tier alongside the raw tier.
+    /// Aggregation scheme: `h3` (Uber H3 hexes) or `quadbin` (CARTO quadbin).
+    /// Currently only `h3` is implemented.
+    ///
+    /// Summary tiles live in the same archive directory as raw tiles but use
+    /// a distinct layer name (`summary` by default). Readers dispatch
+    /// between the two tiers automatically.
+    #[arg(long)]
+    summary_tier: Option<String>,
+
+    /// Lowest zoom at which summary tiles are emitted. Defaults to the
+    /// archive's `--min-zoom`.
+    #[arg(long)]
+    summary_min_zoom: Option<u8>,
+
+    /// Highest zoom at which summary tiles are emitted. Defaults to
+    /// `--min-zoom + 4` — past this point raw tiles take over.
+    #[arg(long)]
+    summary_max_zoom: Option<u8>,
+
+    /// Aggregated columns for the summary tier. Comma-separated list of
+    /// `name:agg` entries, e.g. `magnitude:mean,magnitude:max,depth:sum`.
+    /// The implicit `count` aggregate is always emitted; pass `count`
+    /// explicitly only if you want it positioned among the other columns
+    /// (the implicit one is otherwise emitted first).
+    #[arg(long, default_value = "")]
+    summary_columns: String,
+
+    /// Layer name carried in summary tile frames. Defaults to `summary`.
+    /// You only need to change this if your raw layer name happens to be
+    /// `summary` already.
+    #[arg(long, default_value = "summary")]
+    summary_layer: String,
 }
 
 fn main() -> Result<()> {
@@ -398,8 +433,72 @@ fn main() -> Result<()> {
         tiles.len()
     };
 
+    // Step 4b: Optional summary tier (server-aggregated cells).
+    //
+    // The summary tier is written into the SAME archive as the raw tiles.
+    // Raw tiles at low zoom levels still exist but the TS reader dispatches
+    // to summary tiles when the metadata declares the tier covers that zoom.
+    // This is intentional — keeping the raw tier untouched means a v3-aware
+    // reader that doesn't understand `summary_tier` falls back cleanly.
+    let summary_tier_descriptor = if let Some(scheme) = &args.summary_tier {
+        let scheme = match scheme.to_ascii_lowercase().as_str() {
+            "h3" => stt_core::metadata::SummaryScheme::H3,
+            "quadbin" => {
+                anyhow::bail!("--summary-tier quadbin is not implemented yet (h3 only)");
+            }
+            other => anyhow::bail!(
+                "--summary-tier must be 'h3' or 'quadbin', got '{other}'"
+            ),
+        };
+        let sm_min = args.summary_min_zoom.unwrap_or(args.min_zoom);
+        let sm_max = args
+            .summary_max_zoom
+            .unwrap_or_else(|| (args.min_zoom + 4).min(args.max_zoom));
+        if sm_min > sm_max {
+            anyhow::bail!(
+                "--summary-min-zoom ({sm_min}) > --summary-max-zoom ({sm_max})"
+            );
+        }
+        let mut cols = summary::parse_summary_columns(&args.summary_columns)?;
+        // Guarantee a count aggregate is recorded in the metadata even if
+        // the user did not list it. The build step always emits one in
+        // the `count` column; recording it in the descriptor lets the
+        // reader know it can be used as a heatmap weight.
+        if !cols
+            .iter()
+            .any(|c| matches!(c.agg, stt_core::metadata::SummaryAggregation::Count))
+        {
+            cols.insert(
+                0,
+                stt_core::metadata::SummaryColumn {
+                    name: "_count".to_string(),
+                    agg: stt_core::metadata::SummaryAggregation::Count,
+                },
+            );
+        }
+
+        let summary_config = summary::SummaryConfig {
+            scheme,
+            min_zoom: sm_min,
+            max_zoom: sm_max,
+            temporal_bucket_ms,
+            columns: cols,
+            layer_name: args.summary_layer.clone(),
+        };
+
+        info!(
+            "Building summary tier ({scheme:?}, zooms {sm_min}..={sm_max}, columns {})",
+            summary_config.columns.len()
+        );
+        let n_summary = summary::build_summary_tier(&features, &summary_config, &mut writer)?;
+        info!("Summary tier: {n_summary} aggregate tiles emitted");
+        Some(summary_config.to_tier())
+    } else {
+        None
+    };
+
     // Step 5: Build metadata
-    let metadata = stt_core::metadata::Metadata::new(args.name.unwrap_or_else(|| {
+    let mut metadata = stt_core::metadata::Metadata::new(args.name.unwrap_or_else(|| {
         args.input
             .file_stem()
             .unwrap()
@@ -412,6 +511,9 @@ fn main() -> Result<()> {
     .with_time_range(time_range)
     .with_zoom_levels(args.min_zoom, args.max_zoom)
     .with_temporal_bucket_ms(temporal_bucket_ms);
+    if let Some(tier) = summary_tier_descriptor {
+        metadata = metadata.with_summary_tier(tier);
+    }
 
     writer.finalize(&metadata)?;
 
