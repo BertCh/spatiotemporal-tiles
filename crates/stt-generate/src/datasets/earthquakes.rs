@@ -2,7 +2,7 @@
 //!
 //! Data source: https://earthquake.usgs.gov/fdsnws/event/1/
 
-use crate::common::{self, PointRecord, StreamingParquetWriter};
+use crate::common::{self, PointRecord, PropertyColumn, StreamingParquetWriter};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::Parser;
@@ -90,23 +90,35 @@ pub fn run(args: Args) -> Result<()> {
     let start_year = args.start_date[..4].parse::<i32>()?;
     let end_year = args.end_date[..4].parse::<i32>()?;
 
-    let property_columns = vec![
-        "magnitude".to_string(),
-        "place".to_string(),
-        "depth".to_string(),
-        "type".to_string(),
-        "title".to_string(),
-        "value".to_string(),
+    // Typed columns so magnitude/depth/mag_band survive stt-build's
+    // categorical-vs-numeric inference. magnitude and depth are used by the
+    // showcase deck.gl layers as radius/elevation drivers; mag_band is the
+    // categorical key for color-by-magnitude.
+    let typed_columns = vec![
+        PropertyColumn::numeric("magnitude"),
+        PropertyColumn::numeric("depth"),
+        PropertyColumn::string("place"),
+        PropertyColumn::string("type"),
+        PropertyColumn::string("title"),
+        PropertyColumn::string("mag_band"),
     ];
+    let property_column_names: Vec<String> =
+        typed_columns.iter().map(|c| c.name.clone()).collect();
 
     let mut all_features = Vec::new();
     let mut parquet_writer = if use_parquet {
-        Some(StreamingParquetWriter::new(&intermediate_path, property_columns.clone())?)
+        Some(StreamingParquetWriter::with_columns(
+            &intermediate_path,
+            typed_columns.clone(),
+        )?)
     } else {
         None
     };
     let mut csv_writer = if use_csv {
-        Some(common::StreamingCsvWriter::new(&intermediate_path, property_columns)?)
+        Some(common::StreamingCsvWriter::new(
+            &intermediate_path,
+            property_column_names,
+        )?)
     } else {
         None
     };
@@ -185,13 +197,32 @@ fn extract_usgs_data(usgs: UsgsFeature) -> Result<(f64, f64, DateTime<Utc>, Map<
 
     let mut properties = Map::new();
     properties.insert("magnitude".to_string(), json!(usgs.properties.mag));
-    properties.insert("place".to_string(), json!(usgs.properties.place));
     properties.insert("depth".to_string(), json!(depth));
+    properties.insert("place".to_string(), json!(usgs.properties.place));
     properties.insert("type".to_string(), json!(usgs.properties.event_type));
     properties.insert("title".to_string(), json!(usgs.properties.title));
-    properties.insert("value".to_string(), json!(usgs.properties.mag));
+    // Categorical band for color-by-magnitude in the showcase. The bands map
+    // to a 5-stop reds palette in datasets.ts. Lexicographic order matches
+    // the palette order (BTreeMap keys stay sorted through stt-build).
+    properties.insert("mag_band".to_string(), json!(mag_band(usgs.properties.mag)));
 
     Ok((lon, lat, timestamp, properties))
+}
+
+/// Bucket magnitude into legend-aligned bands. Bands are zero-padded to keep
+/// the BTreeMap order stable across builds (1-..., 2-..., etc.).
+fn mag_band(mag: f64) -> &'static str {
+    if mag < 5.0 {
+        "1-M4.5-5"
+    } else if mag < 6.0 {
+        "2-M5-6"
+    } else if mag < 7.0 {
+        "3-M6-7"
+    } else if mag < 8.0 {
+        "4-M7-8"
+    } else {
+        "5-M8+"
+    }
 }
 
 

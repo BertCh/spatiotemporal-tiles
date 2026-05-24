@@ -170,30 +170,109 @@ impl PointRecord {
     }
 }
 
+/// Type of a property column written to the intermediate parquet.
+///
+/// stt-build inspects each value's JSON type to decide whether a column is
+/// `PropertyColumn::Numeric` or `PropertyColumn::Categorical` in the .stt
+/// tile. If we write a number as a Utf8 string here, stt-build sees a JSON
+/// string and classifies the column as Categorical — which then can't drive
+/// `radiusProperty` / numeric color ramps in the deck.gl layers. Declare
+/// numeric columns explicitly so they survive the round-trip.
+#[derive(Debug, Clone)]
+pub enum PropertyKind {
+    /// f64 column. Missing values become null.
+    Numeric,
+    /// Utf8 column. Missing values become null.
+    String,
+}
+
+/// A property column spec for [`StreamingParquetWriter`].
+#[derive(Debug, Clone)]
+pub struct PropertyColumn {
+    pub name: String,
+    pub kind: PropertyKind,
+}
+
+impl PropertyColumn {
+    pub fn numeric(name: impl Into<String>) -> Self {
+        Self { name: name.into(), kind: PropertyKind::Numeric }
+    }
+    pub fn string(name: impl Into<String>) -> Self {
+        Self { name: name.into(), kind: PropertyKind::String }
+    }
+}
+
+enum PropertyBuilder {
+    Numeric(Float64Builder),
+    String(StringBuilder),
+}
+
+impl PropertyBuilder {
+    fn new(kind: &PropertyKind, capacity: usize) -> Self {
+        match kind {
+            PropertyKind::Numeric => Self::Numeric(Float64Builder::with_capacity(capacity)),
+            PropertyKind::String => Self::String(StringBuilder::with_capacity(capacity, capacity * 32)),
+        }
+    }
+    fn append(&mut self, value: Option<&JsonValue>) {
+        match self {
+            Self::Numeric(b) => {
+                let n = value.and_then(|v| v.as_f64());
+                match n {
+                    Some(x) => b.append_value(x),
+                    None => b.append_null(),
+                }
+            }
+            Self::String(b) => match value {
+                Some(JsonValue::Null) | None => b.append_null(),
+                Some(JsonValue::String(s)) => b.append_value(s),
+                Some(other) => b.append_value(json_value_to_string(other)),
+            },
+        }
+    }
+    fn finish(&mut self) -> ArrayRef {
+        match self {
+            Self::Numeric(b) => Arc::new(b.finish()),
+            Self::String(b) => Arc::new(b.finish()),
+        }
+    }
+}
+
 /// Streaming GeoParquet writer for point data
-/// 
+///
 /// Uses Arrow/Parquet for efficient columnar storage. Output is ~10x smaller than GeoJSON.
 pub struct StreamingParquetWriter {
     writer: ArrowWriter<File>,
     schema: Arc<Schema>,
-    property_columns: Vec<String>,
-    
+    property_columns: Vec<PropertyColumn>,
+
     // Batch builders
     lon_builder: Float64Builder,
     lat_builder: Float64Builder,
     timestamp_builder: TimestampMillisecondBuilder,
-    property_builders: Vec<StringBuilder>,
-    
+    property_builders: Vec<PropertyBuilder>,
+
     batch_size: usize,
     current_batch_size: usize,
     total_rows: usize,
 }
 
 impl StreamingParquetWriter {
-    /// Create a new streaming Parquet writer
-    /// 
-    /// `property_columns` specifies which properties to include as columns
+    /// Create a writer with all-string property columns (legacy default).
+    ///
+    /// Prefer [`StreamingParquetWriter::with_columns`] when any property is
+    /// numeric — string-typed numerics survive parquet but are misclassified
+    /// downstream by stt-build's columnar property inference.
     pub fn new(output_path: &Path, property_columns: Vec<String>) -> Result<Self> {
+        let columns = property_columns
+            .into_iter()
+            .map(PropertyColumn::string)
+            .collect();
+        Self::with_columns(output_path, columns)
+    }
+
+    /// Create a writer with explicitly-typed property columns.
+    pub fn with_columns(output_path: &Path, property_columns: Vec<PropertyColumn>) -> Result<Self> {
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -204,24 +283,29 @@ impl StreamingParquetWriter {
             Field::new("lat", DataType::Float64, false),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), false),
         ];
-        
+
         for col in &property_columns {
-            fields.push(Field::new(col, DataType::Utf8, true));
+            let dt = match col.kind {
+                PropertyKind::Numeric => DataType::Float64,
+                PropertyKind::String => DataType::Utf8,
+            };
+            fields.push(Field::new(&col.name, dt, true));
         }
-        
+
         let schema = Arc::new(Schema::new(fields));
-        
+
         // Create Parquet writer with compression
         let file = File::create(output_path)?;
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(Default::default()))
             .build();
-        
+
         let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
-        
+
         let batch_size = 100_000; // Write in batches of 100k rows
-        let property_builders: Vec<StringBuilder> = property_columns.iter()
-            .map(|_| StringBuilder::with_capacity(batch_size, batch_size * 32))
+        let property_builders: Vec<PropertyBuilder> = property_columns
+            .iter()
+            .map(|c| PropertyBuilder::new(&c.kind, batch_size))
             .collect();
 
         Ok(Self {
@@ -243,21 +327,19 @@ impl StreamingParquetWriter {
         self.lon_builder.append_value(record.lon);
         self.lat_builder.append_value(record.lat);
         self.timestamp_builder.append_value(record.timestamp_ms);
-        
+
         for (i, col) in self.property_columns.iter().enumerate() {
-            let value = record.properties.get(col)
-                .map(|v| json_value_to_string(v))
-                .unwrap_or_default();
-            self.property_builders[i].append_value(&value);
+            let value = record.properties.get(&col.name);
+            self.property_builders[i].append(value);
         }
-        
+
         self.current_batch_size += 1;
         self.total_rows += 1;
-        
+
         if self.current_batch_size >= self.batch_size {
             self.flush_batch()?;
         }
-        
+
         Ok(())
     }
 
@@ -271,14 +353,14 @@ impl StreamingParquetWriter {
             Arc::new(self.lat_builder.finish()),
             Arc::new(self.timestamp_builder.finish().with_timezone("UTC")),
         ];
-        
+
         for builder in &mut self.property_builders {
-            columns.push(Arc::new(builder.finish()));
+            columns.push(builder.finish());
         }
-        
+
         let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
         self.writer.write(&batch)?;
-        
+
         self.current_batch_size = 0;
         Ok(())
     }

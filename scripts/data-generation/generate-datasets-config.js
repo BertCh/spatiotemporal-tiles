@@ -20,25 +20,47 @@ const DATASET_CONFIGS = {
   "earthquake-activity": {
     id: "earthquake-activity",
     name: "Earthquake Activity",
-    description: "USGS real-time earthquake feed (M4.5+ from past 30 days)",
+    description:
+      "USGS earthquake archive — global M4.5+ events, 2020-01 → 2024-12",
     type: "point",
-    timeWindow: 86400000, // 1 day
-    animationSpeed: 3600000, // 1 hour per second
+    timeWindow: 86400000 * 30, // 30 day window for multi-year data
+    targetPlaybackSeconds: 120, // ~5 years plays in ~2 min
     initialViewState: {
-      longitude: -122.4,
-      latitude: 37.8,
-      zoom: 4,
+      longitude: 140,
+      latitude: 20,
+      zoom: 2,
       pitch: 0,
       bearing: 0,
     },
+    // Radius scales with magnitude. Earthquake energy is log-scale
+    // (≈ 10^(1.5·M)), so a near-quadratic visual mapping reads better.
+    radiusProperty: "magnitude",
+    radiusUnits: "pixels",
+    radiusScale: 1,
+    radiusMinPixels: 2,
+    radiusMaxPixels: 40,
+    radiusTransform: "(mag) => Math.max(2, (mag - 3) * 2.2)",
+    // Color by magnitude band (categorical column emitted by stt-generate).
+    colorProperty: "mag_band",
+    colorMapping: {
+      "1-M4.5-5": [254, 229, 217, 230],
+      "2-M5-6": [252, 174, 145, 230],
+      "3-M6-7": [251, 106, 74, 230],
+      "4-M7-8": [222, 45, 38, 230],
+      "5-M8+": [165, 15, 21, 240],
+    },
+    colorMappingDefault: [120, 120, 120, 180],
+    stroked: true,
+    strokeColor: [20, 20, 20, 180],
+    lineWidthMinPixels: 0.5,
     legend: {
       title: "Magnitude",
       items: [
-        { color: "#FEE5D9", label: "4.5-5.0" },
-        { color: "#FCAE91", label: "5.0-6.0" },
-        { color: "#FB6A4A", label: "6.0-7.0" },
-        { color: "#DE2D26", label: "7.0-8.0" },
-        { color: "#A50F15", label: "8.0+" },
+        { color: "#FEE5D9", label: "M4.5–5.0" },
+        { color: "#FCAE91", label: "M5.0–6.0" },
+        { color: "#FB6A4A", label: "M6.0–7.0" },
+        { color: "#DE2D26", label: "M7.0–8.0" },
+        { color: "#A50F15", label: "M8.0+" },
       ],
     },
   },
