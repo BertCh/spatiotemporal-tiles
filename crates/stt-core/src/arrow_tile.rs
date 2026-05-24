@@ -14,7 +14,7 @@
 //! | `end_time`    | `Int64`                                 | Unix ms, absolute             |
 //! | `geometry`    | GeoArrow point / linestring / polygon   | interleaved f64 lon/lat       |
 //! | `vertex_time` | `List<Int64>` (nullable)                | per-vertex Unix ms (optional) |
-//! | `<property>`  | `Float64` or `Utf8` (nullable)          | one column per property       |
+//! | `<property>`  | `Float64` or `Dictionary<UInt16,Utf8>`   | one column per property       |
 //!
 //! All layers in one tile are concatenated with a tiny frame so a tile can
 //! carry, say, a linestring layer and a point layer side by side:
@@ -27,11 +27,11 @@
 use crate::error::{Error, Result};
 use crate::types::GeometryType;
 use arrow::array::{
-    Array, ArrayRef, FixedSizeListArray, Float64Array, Int64Array, Int64Builder, ListArray,
-    ListBuilder, RecordBatch, StringArray, UInt16Builder, UInt64Array,
+    Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float64Array, Int64Array, Int64Builder,
+    ListArray, ListBuilder, RecordBatch, StringArray, UInt16Array, UInt16Builder, UInt64Array,
 };
 use arrow::buffer::OffsetBuffer;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, UInt16Type};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use std::collections::HashMap;
@@ -238,6 +238,42 @@ fn build_geometry_array(geom: &GeometryColumn) -> ArrayRef {
 const VERTEX_TIME_ORIGIN_KEY: &str = "stt:vertex_time_origin_ms";
 const VERTEX_TIME_STEP_KEY: &str = "stt:vertex_time_step_ms";
 
+/// Build a (key_array, value_array) pair for a Dictionary<UInt16, Utf8>
+/// column. Null inputs become null keys (the corresponding string is not
+/// inserted into the dictionary); strings are deduplicated in first-seen
+/// order so the on-disk Arrow dictionary is stable across runs.
+///
+/// Saturates at u16::MAX categories — additional unique strings beyond
+/// that limit collapse to the last seen index. In practice STT
+/// categorical columns top out in the low hundreds; this cap exists to
+/// keep the on-disk key width bounded.
+fn build_dictionary_indices(values: &[Option<String>]) -> (Vec<Option<u16>>, Vec<String>) {
+    let mut categories: Vec<String> = Vec::new();
+    let mut lookup: HashMap<String, u16> = HashMap::new();
+    let mut indices: Vec<Option<u16>> = Vec::with_capacity(values.len());
+    for v in values {
+        match v {
+            Some(s) => {
+                if let Some(&idx) = lookup.get(s) {
+                    indices.push(Some(idx));
+                } else if categories.len() < u16::MAX as usize {
+                    let idx = categories.len() as u16;
+                    categories.push(s.clone());
+                    lookup.insert(s.clone(), idx);
+                    indices.push(Some(idx));
+                } else {
+                    // Overflow: reuse the last index. A producer that
+                    // genuinely needs >65k unique strings should split the
+                    // column into multiple categorical fields.
+                    indices.push(Some(u16::MAX - 1));
+                }
+            }
+            None => indices.push(None),
+        }
+    }
+    (indices, categories)
+}
+
 /// Built per-vertex time column, alongside the per-layer schema metadata
 /// that lets the reader reconstruct absolute timestamps.
 struct VertexTimeColumn {
@@ -390,10 +426,22 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
                 columns.push(Arc::new(Float64Array::from(values.clone())));
             }
             PropertyColumn::Categorical(values) => {
-                fields.push(Arc::new(Field::new(name, DataType::Utf8, true)));
-                let opt: Vec<Option<&str>> =
-                    values.iter().map(|v| v.as_deref()).collect();
-                columns.push(Arc::new(StringArray::from(opt)));
+                // Build a Dictionary<UInt16, Utf8>: deduplicate strings once
+                // here so the TS reader can lift the dictionary table out of
+                // the Arrow batch directly instead of rebuilding it per tile.
+                let (indices, categories) = build_dictionary_indices(values);
+                let key_type = DataType::UInt16;
+                let value_type = DataType::Utf8;
+                let dict_type = DataType::Dictionary(Box::new(key_type), Box::new(value_type));
+                fields.push(Arc::new(Field::new(name, dict_type, true)));
+
+                let value_array: ArrayRef = Arc::new(StringArray::from(
+                    categories.iter().map(|s| Some(s.as_str())).collect::<Vec<_>>(),
+                ));
+                let key_array = UInt16Array::from(indices);
+                let dict = DictionaryArray::<UInt16Type>::try_new(key_array, value_array)
+                    .map_err(|e| Error::Other(format!("dictionary build failed: {e}")))?;
+                columns.push(Arc::new(dict));
             }
         }
     }
@@ -592,6 +640,61 @@ mod tests {
             ]]),
             vertex_times: None,
             properties: vec![],
+        }
+    }
+
+    #[test]
+    fn categorical_columns_use_dictionary_encoding() {
+        let layer = ColumnarLayer {
+            name: "cars".into(),
+            feature_ids: vec![1, 2, 3, 4, 5],
+            start_times: vec![0; 5],
+            end_times: vec![1; 5],
+            geometry: GeometryColumn::Point(vec![[0.0, 0.0]; 5]),
+            vertex_times: None,
+            properties: vec![(
+                "kind".into(),
+                PropertyColumn::Categorical(vec![
+                    Some("car".into()),
+                    Some("bus".into()),
+                    Some("car".into()),
+                    None,
+                    Some("car".into()),
+                ]),
+            )],
+        };
+        let ipc = encode_layer(&layer).unwrap();
+        let batch = decode_layer(&ipc).unwrap();
+        let field = batch.schema().field_with_name("kind").unwrap().clone();
+        match field.data_type() {
+            DataType::Dictionary(k, v) => {
+                assert_eq!(k.as_ref(), &DataType::UInt16);
+                assert_eq!(v.as_ref(), &DataType::Utf8);
+            }
+            other => panic!("expected Dictionary<UInt16, Utf8>, got {other:?}"),
+        }
+
+        let col = batch
+            .column_by_name("kind")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt16Type>>()
+            .unwrap();
+        let values = col
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        // First-seen order: "car" then "bus".
+        let mut categories: Vec<&str> = (0..values.len()).map(|i| values.value(i)).collect();
+        categories.sort();
+        assert_eq!(categories, vec!["bus", "car"]);
+
+        // The 4th row is null; others reference one of the two slots.
+        assert!(col.is_null(3));
+        let keys = col.keys();
+        for i in [0usize, 1, 2, 4] {
+            assert!(keys.value(i) < values.len() as u16);
         }
     }
 
