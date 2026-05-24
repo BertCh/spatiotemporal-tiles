@@ -92,6 +92,7 @@ fn streaming_pipeline_bounds_peak_rss_for_5m_features() {
         clip_min_vertices: 2,
         simplify: false,
         simplify_max_zoom: 14,
+        pre_tessellate: false,
     };
 
     let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();

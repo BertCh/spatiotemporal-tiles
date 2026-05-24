@@ -28,7 +28,8 @@ use crate::error::{Error, Result};
 use crate::types::GeometryType;
 use arrow::array::{
     Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float64Array, Int64Array, Int64Builder,
-    ListArray, ListBuilder, RecordBatch, StringArray, UInt16Array, UInt16Builder, UInt64Array,
+    ListArray, ListBuilder, RecordBatch, StringArray, UInt16Array, UInt16Builder, UInt32Builder,
+    UInt64Array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, UInt16Type};
@@ -114,6 +115,17 @@ pub struct ColumnarLayer {
     /// Optional per-vertex timestamps (Unix ms). When present, length equals
     /// the feature count and each inner vec matches that feature's vertex count.
     pub vertex_times: Option<Vec<Vec<i64>>>,
+    /// Optional pre-baked triangle indices for polygon features (MLT-style).
+    ///
+    /// When present, `triangles.len() == feature_count` and each inner vec is
+    /// the flat triangle-index list (groups of 3 vertex indices) produced by
+    /// earcut at build time. Indices are LOCAL to the feature: they reference
+    /// positions within that feature's own ring coordinates, so the renderer
+    /// only needs to add the feature's `startIndex` to each one.
+    ///
+    /// Only meaningful for `GeometryColumn::Polygon`. Encoders that set this
+    /// on a non-polygon layer will have it dropped at encode time.
+    pub triangles: Option<Vec<Vec<u32>>>,
     /// Property columns, keyed by name. Each column has one value per feature.
     pub properties: Vec<(String, PropertyColumn)>,
 }
@@ -142,6 +154,9 @@ impl ColumnarLayer {
         if let Some(vt) = &self.vertex_times {
             check("vertex_times", vt.len())?;
         }
+        if let Some(tri) = &self.triangles {
+            check("triangles", tri.len())?;
+        }
         for (name, col) in &self.properties {
             let len = match col {
                 PropertyColumn::Numeric(v) => v.len(),
@@ -150,6 +165,44 @@ impl ColumnarLayer {
             check(&format!("property '{}'", name), len)?;
         }
         Ok(())
+    }
+}
+
+/// Schema-metadata key set on layers that carry pre-baked triangle indices.
+pub const TRIANGLES_METADATA_KEY: &str = "stt:has_triangles";
+
+/// Tessellate one polygon feature (a list of rings) using earcut. Returns the
+/// flat triangle index list — each triple of indices is one triangle, indices
+/// are LOCAL (relative to the start of the feature's coordinate run, where
+/// the exterior ring sits first followed by every hole).
+///
+/// Returns an empty vec for degenerate inputs (no exterior ring, <3 vertices).
+pub fn tessellate_polygon(rings: &[Vec<Coord>]) -> Vec<u32> {
+    if rings.is_empty() {
+        return Vec::new();
+    }
+    // Flatten coords into the [x0, y0, x1, y1, ...] format earcutr expects.
+    let mut flat: Vec<f64> = Vec::with_capacity(rings.iter().map(|r| r.len()).sum::<usize>() * 2);
+    // Hole offsets are vertex indices (not coord-pair indices) where each
+    // hole begins. The first hole starts after the exterior ring.
+    let mut hole_indices: Vec<usize> = Vec::with_capacity(rings.len().saturating_sub(1));
+    let mut running = 0usize;
+    for (i, ring) in rings.iter().enumerate() {
+        if i > 0 {
+            hole_indices.push(running);
+        }
+        for [x, y] in ring {
+            flat.push(*x);
+            flat.push(*y);
+        }
+        running += ring.len();
+    }
+    if running < 3 {
+        return Vec::new();
+    }
+    match earcutr::earcut(&flat, &hole_indices, 2) {
+        Ok(tris) => tris.into_iter().map(|i| i as u32).collect(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -419,6 +472,35 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
         vertex_time_encoding = vt_col.encoding;
     }
 
+    // Pre-baked triangle indices (MLT-style). Only emitted for polygon
+    // layers; for any other geometry kind the column is silently dropped so
+    // an over-eager builder can't poison a point/line layer with stale data.
+    let has_triangles = matches!(layer.geometry, GeometryColumn::Polygon(_))
+        && layer
+            .triangles
+            .as_ref()
+            .map(|t| t.iter().any(|f| !f.is_empty()))
+            .unwrap_or(false);
+    if has_triangles {
+        let tri = layer.triangles.as_ref().unwrap();
+        let mut builder = ListBuilder::new(UInt32Builder::new());
+        for feature in tri {
+            for &idx in feature {
+                builder.values().append_value(idx);
+            }
+            // Always append a (possibly empty) list — readers expect one
+            // entry per feature.
+            builder.append(true);
+        }
+        let array: ArrayRef = Arc::new(builder.finish());
+        fields.push(Arc::new(Field::new(
+            "triangles",
+            array.data_type().clone(),
+            false,
+        )));
+        columns.push(array);
+    }
+
     for (name, col) in &layer.properties {
         match col {
             PropertyColumn::Numeric(values) => {
@@ -460,6 +542,9 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
     if let Some((origin, step)) = vertex_time_encoding {
         schema_meta.insert(VERTEX_TIME_ORIGIN_KEY.to_string(), origin.to_string());
         schema_meta.insert(VERTEX_TIME_STEP_KEY.to_string(), step.to_string());
+    }
+    if has_triangles {
+        schema_meta.insert(TRIANGLES_METADATA_KEY.to_string(), "true".to_string());
     }
     let schema = Arc::new(Schema::new(fields).with_metadata(schema_meta));
 
@@ -594,6 +679,7 @@ mod tests {
                 [-122.6, 37.9],
             ]),
             vertex_times: None,
+            triangles: None,
             properties: vec![
                 (
                     "speed".to_string(),
@@ -622,6 +708,7 @@ mod tests {
                 vec![[5.0, 5.0], [6.0, 6.0]],
             ]),
             vertex_times: Some(vec![vec![0, 25, 50], vec![100, 200]]),
+            triangles: None,
             properties: vec![],
         }
     }
@@ -639,6 +726,7 @@ mod tests {
                 vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]],
             ]]),
             vertex_times: None,
+            triangles: None,
             properties: vec![],
         }
     }
@@ -652,6 +740,7 @@ mod tests {
             end_times: vec![1; 5],
             geometry: GeometryColumn::Point(vec![[0.0, 0.0]; 5]),
             vertex_times: None,
+            triangles: None,
             properties: vec![(
                 "kind".into(),
                 PropertyColumn::Categorical(vec![
@@ -809,6 +898,7 @@ mod tests {
             // still keeps them inside u16 — the encoder picks step≈1.5e6
             // ms. We assert round-trip precision is bounded by step/2.
             vertex_times: Some(vec![vec![0, 100_000_000_000]]),
+            triangles: None,
             properties: vec![],
         };
         let ipc = encode_layer(&layer).unwrap();
@@ -880,6 +970,120 @@ mod tests {
                 .map(String::as_str),
             Some("points")
         );
+    }
+
+    #[test]
+    fn tessellate_polygon_emits_two_triangles_for_a_square() {
+        // A simple closed square (5 verts, last duplicates first) earcuts into
+        // exactly 2 triangles, 6 indices in [0, 3].
+        let ring: Vec<Coord> = vec![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [0.0, 1.0],
+            [0.0, 0.0],
+        ];
+        let tris = tessellate_polygon(&[ring]);
+        assert_eq!(tris.len(), 6);
+        for &i in &tris {
+            assert!(i < 5);
+        }
+    }
+
+    #[test]
+    fn tessellate_polygon_handles_a_hole() {
+        // 4x4 square with a 1x1 hole — earcut should still produce a valid
+        // tessellation. Index count is implementation-dependent but must be a
+        // multiple of 3 and reference valid vertex indices.
+        let exterior: Vec<Coord> =
+            vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]];
+        let hole: Vec<Coord> =
+            vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]];
+        let tris = tessellate_polygon(&[exterior, hole]);
+        assert!(tris.len() >= 6);
+        assert_eq!(tris.len() % 3, 0);
+        for &i in &tris {
+            assert!(i < 10);
+        }
+    }
+
+    #[test]
+    fn tessellate_polygon_handles_degenerate_input() {
+        // No rings → empty result, not a panic.
+        assert!(tessellate_polygon(&[]).is_empty());
+        // Single 2-vert ring is below the 3-vertex minimum.
+        let degenerate: Vec<Coord> = vec![[0.0, 0.0], [1.0, 1.0]];
+        assert!(tessellate_polygon(&[degenerate]).is_empty());
+    }
+
+    #[test]
+    fn polygon_layer_with_triangles_roundtrips() {
+        let exterior: Vec<Coord> =
+            vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]];
+        let tris = tessellate_polygon(&[exterior.clone()]);
+        assert_eq!(tris.len(), 6);
+        let layer = ColumnarLayer {
+            name: "zones".into(),
+            feature_ids: vec![42],
+            start_times: vec![0],
+            end_times: vec![1000],
+            geometry: GeometryColumn::Polygon(vec![vec![exterior]]),
+            vertex_times: None,
+            triangles: Some(vec![tris.clone()]),
+            properties: vec![],
+        };
+        let ipc = encode_layer(&layer).unwrap();
+        let batch = decode_layer(&ipc).unwrap();
+
+        // Schema metadata advertises the sidecar.
+        assert_eq!(
+            batch
+                .schema()
+                .metadata()
+                .get(TRIANGLES_METADATA_KEY)
+                .map(String::as_str),
+            Some("true")
+        );
+        // Column exists with the expected shape.
+        let col = batch
+            .column_by_name("triangles")
+            .expect("triangles column present")
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("triangles is a List");
+        assert_eq!(col.len(), 1);
+        let first = col.value(0);
+        let values: &arrow::array::UInt32Array = first
+            .as_any()
+            .downcast_ref::<arrow::array::UInt32Array>()
+            .expect("triangle values are UInt32");
+        assert_eq!(values.values().to_vec(), tris);
+    }
+
+    #[test]
+    fn polygon_layer_without_triangles_skips_the_metadata_key() {
+        // Backwards-compat guarantee: a v3 polygon layer that was NOT built
+        // with pre-tessellation must not carry the metadata flag — otherwise
+        // a reader would expect a column that isn't there.
+        let layer = sample_polygon_layer();
+        let ipc = encode_layer(&layer).unwrap();
+        let batch = decode_layer(&ipc).unwrap();
+        assert!(!batch.schema().metadata().contains_key(TRIANGLES_METADATA_KEY));
+        assert!(batch.column_by_name("triangles").is_none());
+    }
+
+    #[test]
+    fn non_polygon_layer_drops_stray_triangles() {
+        // A producer that mistakenly attaches `triangles` to a point or line
+        // layer must not poison the wire format. The encoder silently drops
+        // the column so the metadata key never appears.
+        let mut layer = sample_point_layer();
+        // Add a bogus per-feature triangle list. The encoder must ignore it.
+        layer.triangles = Some(vec![vec![0, 1, 2]; layer.feature_ids.len()]);
+        let ipc = encode_layer(&layer).unwrap();
+        let batch = decode_layer(&ipc).unwrap();
+        assert!(!batch.schema().metadata().contains_key(TRIANGLES_METADATA_KEY));
+        assert!(batch.column_by_name("triangles").is_none());
     }
 
     #[test]

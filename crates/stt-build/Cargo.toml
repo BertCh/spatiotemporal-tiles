@@ -26,6 +26,7 @@ geojson.workspace = true
 geo.workspace = true
 geo-types.workspace = true
 geozero.workspace = true
+earcutr.workspace = true
 rayon.workspace = true
 crossbeam.workspace = true
 clap.workspace = true

@@ -29,6 +29,9 @@ geojson = { version = "0.24", features = ["geo-types"] }
 wkt = "0.10"
 geo-traits = "0.2"
 
+# Polygon tessellation (pre-baked triangle indices, MLT-style)
+earcutr = "0.5"
+
 # GeoArrow/GeoParquet ecosystem
 geoarrow = { version = "0.6", default-features = false }
 arrow = { version = "54", default-features = false, features = ["chrono-tz", "ipc"] }

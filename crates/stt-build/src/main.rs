@@ -164,6 +164,13 @@ struct Args {
     /// `summary` already.
     #[arg(long, default_value = "summary")]
     summary_layer: String,
+
+    /// Pre-tessellate polygon features at build time and store the resulting
+    /// earcut triangle indices in a sidecar column. Lets renderers skip CPU
+    /// tessellation on tile arrival — wins scale with polygon vertex count.
+    /// Adds ~4 bytes per triangle index to the tile payload.
+    #[arg(long)]
+    pre_tessellate: bool,
 }
 
 fn main() -> Result<()> {
@@ -225,6 +232,7 @@ fn main() -> Result<()> {
             clip_min_vertices: args.clip_min_vertices,
             simplify: args.simplify,
             simplify_max_zoom: args.simplify_max_zoom,
+            pre_tessellate: args.pre_tessellate,
         };
         let mut writer = stt_core::Archive::create(&args.output, compression)?;
         let mut bounds_lon = (f64::MAX, f64::MIN);
@@ -391,7 +399,12 @@ fn main() -> Result<()> {
         clip_min_vertices: args.clip_min_vertices,
         simplify: args.simplify,
         simplify_max_zoom: args.simplify_max_zoom,
+        pre_tessellate: args.pre_tessellate,
     };
+
+    if args.pre_tessellate {
+        info!("Pre-tessellation enabled (triangle indices written alongside polygon geometry)");
+    }
 
     let mut writer = stt_core::Archive::create(&args.output, compression)?;
 
