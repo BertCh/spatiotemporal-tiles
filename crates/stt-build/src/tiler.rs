@@ -74,6 +74,13 @@ pub struct TileConfig {
     /// `triangles` sidecar column — letting the renderer skip its own CPU
     /// tessellation at tile-arrival time.
     pub pre_tessellate: bool,
+    /// Optional temporal LOD pyramid. When non-empty, the build emits an
+    /// extra aggregate tile per (zoom, spatial cell, lod-bucket) using the
+    /// LOD level's `bucket_ms` instead of the base `temporal_bucket_ms`.
+    /// Each level applies up to (and including) `max_zoom_level`. Levels
+    /// MUST be sorted by ascending bucket size and every bucket MUST be a
+    /// multiple of the base bucket.
+    pub temporal_lod: Vec<stt_core::metadata::TemporalLodLevel>,
 }
 
 impl Default for TileConfig {
@@ -88,6 +95,7 @@ impl Default for TileConfig {
             simplify: false,
             simplify_max_zoom: 14,
             pre_tessellate: false,
+            temporal_lod: Vec::new(),
         }
     }
 }
@@ -100,6 +108,30 @@ impl TileConfig {
             pre_tessellate: self.pre_tessellate,
         }
     }
+}
+
+impl TileConfig {
+    /// Return the LOD level that applies at `zoom`, if any. Mirrors
+    /// `stt_core::metadata::Metadata::temporal_lod_for_zoom` — the coarsest
+    /// applicable level wins.
+    pub fn lod_for_zoom(&self, zoom: u8) -> Option<&stt_core::metadata::TemporalLodLevel> {
+        self.temporal_lod
+            .iter()
+            .filter(|l| zoom <= l.max_zoom_level)
+            .max_by_key(|l| l.bucket_ms)
+    }
+}
+
+/// A generated tile tagged with the temporal-LOD bucket it represents.
+///
+/// `bucket_ms == None` means "base tile" (use the archive's
+/// `temporal_bucket_ms`). `Some(b)` means this is an aggregate tile produced
+/// for an LOD level; the writer records `b` in the directory so the reader
+/// can dispatch on bucket size at lookup time.
+#[derive(Debug)]
+pub struct LodTaggedTile {
+    pub tile: GeneratedTile,
+    pub temporal_bucket_ms: Option<u64>,
 }
 
 /// A feature assigned to a tile — either an original feature or a clipped
@@ -124,6 +156,138 @@ impl<'a> TileFeature<'a> {
             TileFeature::Clipped(s) => s.end_time,
         }
     }
+}
+
+/// Generate every tile into memory across all configured zoom levels,
+/// returning base tiles + LOD aggregate tiles tagged with their bucket size.
+///
+/// The base tiles are tagged `Some(config.temporal_bucket_ms)` so the
+/// writer can record the bucket size on every directory entry — that's
+/// what makes the reader's LOD dispatch possible without ambiguity at the
+/// `(z, x, y, t)` lookup level.
+///
+/// LOD tiles are emitted alongside base tiles at the same spatial cell;
+/// each LOD level produces one tile per (zoom, cell, bucket-of-that-level).
+pub fn generate_tiles_with_lod(
+    features: &[ParsedFeature],
+    config: &TileConfig,
+    workers: usize,
+) -> Result<Vec<LodTaggedTile>> {
+    validate_lod(config)?;
+    let base = generate_tiles(features, config, workers)?;
+    let mut out: Vec<LodTaggedTile> = base
+        .into_iter()
+        .map(|tile| LodTaggedTile {
+            tile,
+            temporal_bucket_ms: Some(config.temporal_bucket_ms),
+        })
+        .collect();
+    if !config.temporal_lod.is_empty() {
+        let pool = build_pool(workers)?;
+        pool.install(|| -> Result<()> {
+            for level in &config.temporal_lod {
+                let lod_tiles = generate_lod_level(features, level, config)?;
+                tracing::info!(
+                    "temporal LOD level bucket={}ms max_zoom={}: {} tiles",
+                    level.bucket_ms,
+                    level.max_zoom_level,
+                    lod_tiles.len()
+                );
+                for tile in lod_tiles {
+                    out.push(LodTaggedTile {
+                        tile,
+                        temporal_bucket_ms: Some(level.bucket_ms),
+                    });
+                }
+            }
+            Ok(())
+        })?;
+    }
+    Ok(out)
+}
+
+/// Emit aggregate tiles for one temporal LOD level.
+///
+/// The aggregator follows the spatial-summary pattern: features are placed
+/// onto the spatial tile grid, then *re-bucketed by the LOD's bucket size*
+/// rather than the base. Each (zoom, spatial cell, lod_bucket) becomes one
+/// aggregate tile. Within a tile the existing layer builder handles the
+/// per-cell aggregation (sum/mean/count fall out of the regrouping for
+/// numeric properties).
+///
+/// The scaffold *re-bucketes only* — feature-level simplification (collapse
+/// 1000 points per cell into 50 means) is left as a follow-up; the format
+/// already supports it because the per-tile aggregator is plugged in here.
+fn generate_lod_level(
+    features: &[ParsedFeature],
+    level: &stt_core::metadata::TemporalLodLevel,
+    base_config: &TileConfig,
+) -> Result<Vec<GeneratedTile>> {
+    // Reuse the base tile config but override the temporal bucket size for
+    // this level, and clamp the zoom range to the level's reach. Clipping +
+    // simplification stays on so trajectories that span the LOD bucket are
+    // still decomposed cell-by-cell.
+    let lod_config = TileConfig {
+        temporal_bucket_ms: level.bucket_ms,
+        max_zoom: base_config.max_zoom.min(level.max_zoom_level),
+        temporal_lod: Vec::new(), // do NOT recurse
+        ..base_config.clone()
+    };
+    if lod_config.max_zoom < lod_config.min_zoom {
+        // The LOD level's max_zoom_level falls below the archive's min_zoom;
+        // nothing to emit (no spatial zoom in range).
+        return Ok(Vec::new());
+    }
+    let clip_config = clip_config_from(&lod_config);
+    let total_clipped = AtomicUsize::new(0);
+    let total_original = AtomicUsize::new(0);
+    let mut all = Vec::new();
+    for zoom in lod_config.min_zoom..=lod_config.max_zoom {
+        let tiles = process_zoom_level(
+            features,
+            zoom,
+            &lod_config,
+            &clip_config,
+            &total_clipped,
+            &total_original,
+        )?;
+        all.extend(tiles);
+    }
+    Ok(all)
+}
+
+/// Validate every level against the archive's base bucket. Mirrors the
+/// invariants enforced by `Metadata::with_temporal_lod` so a TileConfig
+/// built independently can't slip a bad pyramid past the type checker.
+fn validate_lod(config: &TileConfig) -> Result<()> {
+    if config.temporal_lod.is_empty() {
+        return Ok(());
+    }
+    let base = config.temporal_bucket_ms;
+    anyhow::ensure!(base > 0, "temporal_bucket_ms must be > 0 when using LOD");
+    let mut prev: Option<u64> = None;
+    for (i, level) in config.temporal_lod.iter().enumerate() {
+        anyhow::ensure!(
+            level.bucket_ms > base,
+            "temporal_lod[{i}].bucket_ms ({}) must be > base bucket ({})",
+            level.bucket_ms,
+            base
+        );
+        anyhow::ensure!(
+            level.bucket_ms % base == 0,
+            "temporal_lod[{i}].bucket_ms ({}) must be a multiple of base ({})",
+            level.bucket_ms,
+            base
+        );
+        if let Some(p) = prev {
+            anyhow::ensure!(
+                level.bucket_ms > p,
+                "temporal_lod must be sorted by ascending bucket_ms"
+            );
+        }
+        prev = Some(level.bucket_ms);
+    }
+    Ok(())
 }
 
 /// Generate every tile into memory (one zoom level processed at a time).
@@ -390,6 +554,35 @@ impl TileWriter for stt_core::archive::ArchiveWriter {
             tile.time_start,
             tile.time_end,
             tile.feature_count(),
+            &payload,
+        )?;
+        Ok(())
+    }
+}
+
+/// Sink that also forwards the per-tile temporal bucket size.
+pub trait LodTileWriter {
+    /// Persist one tile, tagging the directory entry with `temporal_bucket_ms`.
+    fn write_lod_tile(
+        &mut self,
+        tile: &GeneratedTile,
+        temporal_bucket_ms: Option<u64>,
+    ) -> Result<()>;
+}
+
+impl LodTileWriter for stt_core::archive::ArchiveWriter {
+    fn write_lod_tile(
+        &mut self,
+        tile: &GeneratedTile,
+        temporal_bucket_ms: Option<u64>,
+    ) -> Result<()> {
+        let payload = encode_tile(&tile.layers)?;
+        self.add_tile_with_bucket(
+            &tile.id,
+            tile.time_start,
+            tile.time_end,
+            tile.feature_count(),
+            temporal_bucket_ms,
             &payload,
         )?;
         Ok(())
@@ -930,5 +1123,162 @@ mod tests {
         let entry = reader.entries()[0].clone();
         let layers = reader.read_layers(&entry).unwrap();
         assert!(layers[0].batch.column_by_name("vertex_time").is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // Temporal LOD aggregator
+    // ------------------------------------------------------------------
+
+    use stt_core::metadata::TemporalLodLevel;
+
+    #[test]
+    fn lod_aggregator_emits_base_plus_per_level_tiles() {
+        // 72 hourly points starting at a midnight boundary so they fall
+        // into exactly 3 contiguous daily buckets. With base bucket = 1h
+        // and an LOD level at 1d:
+        //   - the base path produces 72 tiles per zoom (one per hour),
+        //   - the LOD path collapses each day's hourly tiles into a single
+        //     daily tile per zoom.
+        let hour = 3_600_000u64;
+        let day = 24 * hour;
+        // 1700006400000 = 2023-11-14 00:00:00 UTC — exact day boundary.
+        let day_aligned = 1_700_006_400_000u64;
+        assert_eq!(day_aligned % day, 0);
+        let mut features = Vec::new();
+        for hour_idx in 0..72u64 {
+            features.push(point(-122.45, 37.75, day_aligned + hour_idx * hour));
+        }
+        let config = TileConfig {
+            min_zoom: 8,
+            max_zoom: 9,
+            layer_name: "default".to_string(),
+            temporal_bucket_ms: hour,
+            clip_trajectories: false,
+            temporal_lod: vec![TemporalLodLevel {
+                bucket_ms: day,
+                max_zoom_level: 9,
+            }],
+            ..TileConfig::default()
+        };
+        let tagged = generate_tiles_with_lod(&features, &config, 1).unwrap();
+        let base: Vec<&LodTaggedTile> = tagged
+            .iter()
+            .filter(|t| t.temporal_bucket_ms == Some(hour))
+            .collect();
+        let lod: Vec<&LodTaggedTile> = tagged
+            .iter()
+            .filter(|t| t.temporal_bucket_ms == Some(day))
+            .collect();
+        // 72 hourly buckets × 2 zooms.
+        assert_eq!(base.len(), 72 * 2);
+        // 3 daily buckets × 2 zooms.
+        assert_eq!(lod.len(), 3 * 2);
+        // Every emitted tile carries some bucket tag (None is never produced
+        // by the LOD writer path).
+        assert!(tagged.iter().all(|t| t.temporal_bucket_ms.is_some()));
+    }
+
+    #[test]
+    fn lod_aggregator_skips_zooms_above_max_zoom_level() {
+        let hour = 3_600_000u64;
+        let day = 24 * hour;
+        let features = vec![point(0.0, 0.0, 1_000_000_000)];
+        let config = TileConfig {
+            min_zoom: 0,
+            max_zoom: 10,
+            layer_name: "default".to_string(),
+            temporal_bucket_ms: hour,
+            clip_trajectories: false,
+            temporal_lod: vec![TemporalLodLevel {
+                bucket_ms: day,
+                max_zoom_level: 4,
+            }],
+            ..TileConfig::default()
+        };
+        let tagged = generate_tiles_with_lod(&features, &config, 1).unwrap();
+        let lod: Vec<u8> = tagged
+            .iter()
+            .filter(|t| t.temporal_bucket_ms == Some(day))
+            .map(|t| t.tile.id.z)
+            .collect();
+        // Every LOD tile sits at z<=4 (the level's max_zoom_level).
+        assert!(!lod.is_empty());
+        assert!(lod.iter().all(|&z| z <= 4));
+        // Base tiles still cover the full 0..=10 zoom range.
+        let base_zooms: std::collections::BTreeSet<u8> = tagged
+            .iter()
+            .filter(|t| t.temporal_bucket_ms == Some(hour))
+            .map(|t| t.tile.id.z)
+            .collect();
+        assert_eq!(base_zooms, (0..=10).collect());
+    }
+
+    #[test]
+    fn lod_aggregator_rejects_non_multiple_bucket() {
+        let config = TileConfig {
+            temporal_bucket_ms: 3_600_000,
+            temporal_lod: vec![TemporalLodLevel {
+                bucket_ms: 3_600_000 + 1, // not a multiple
+                max_zoom_level: 6,
+            }],
+            ..TileConfig::default()
+        };
+        let err = generate_tiles_with_lod(&[], &config, 1).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("multiple"), "got: {msg}");
+    }
+
+    #[test]
+    fn lod_aggregator_rejects_unsorted_levels() {
+        let config = TileConfig {
+            temporal_bucket_ms: 3_600_000,
+            temporal_lod: vec![
+                TemporalLodLevel { bucket_ms: 24 * 3_600_000, max_zoom_level: 6 },
+                TemporalLodLevel { bucket_ms: 2 * 3_600_000, max_zoom_level: 6 },
+            ],
+            ..TileConfig::default()
+        };
+        assert!(generate_tiles_with_lod(&[], &config, 1).is_err());
+    }
+
+    #[test]
+    fn lod_tiles_carry_bucket_size_through_archive_round_trip() {
+        // Full pipeline: build LOD-tagged tiles, write them with
+        // LodTileWriter, read back, and confirm every directory entry's
+        // temporal_bucket_ms matches the level that produced it.
+        let hour = 3_600_000u64;
+        let day = 24 * hour;
+        let features: Vec<ParsedFeature> = (0..48u64)
+            .map(|h| point(-122.45, 37.75, 1_700_000_000_000 + h * hour))
+            .collect();
+        let config = TileConfig {
+            min_zoom: 8,
+            max_zoom: 9,
+            layer_name: "default".to_string(),
+            temporal_bucket_ms: hour,
+            clip_trajectories: false,
+            temporal_lod: vec![TemporalLodLevel { bucket_ms: day, max_zoom_level: 9 }],
+            ..TileConfig::default()
+        };
+        let tagged = generate_tiles_with_lod(&features, &config, 1).unwrap();
+
+        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let mut writer = Archive::create(&path, Compression::Gzip).unwrap();
+        for t in &tagged {
+            writer.write_lod_tile(&t.tile, t.temporal_bucket_ms).unwrap();
+        }
+        let metadata = stt_core::metadata::Metadata::new("lod")
+            .with_temporal_bucket_ms(hour)
+            .with_temporal_lod(vec![TemporalLodLevel { bucket_ms: day, max_zoom_level: 9 }])
+            .unwrap();
+        writer.finalize(&metadata).unwrap();
+
+        let reader = ArchiveReader::open(&path).unwrap();
+        let buckets: std::collections::BTreeSet<Option<u64>> =
+            reader.entries().iter().map(|e| e.temporal_bucket_ms).collect();
+        // The on-disk index distinguishes base + LOD bucket sizes.
+        assert!(buckets.contains(&Some(hour)));
+        assert!(buckets.contains(&Some(day)));
+        assert!(!buckets.contains(&None));
     }
 }
