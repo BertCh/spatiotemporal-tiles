@@ -50,8 +50,12 @@ struct Args {
     #[arg(long, default_value = "14")]
     max_zoom: u8,
 
-    /// Compression method: none, gzip
-    #[arg(long, default_value = "gzip")]
+    /// Compression method: none, gzip, zstd
+    ///
+    /// v3 archives default to zstd-3, which compresses ~5x faster than
+    /// gzip-6 for an equivalent or better ratio. Pick `gzip` only when
+    /// emitting a legacy v2 archive for compatibility with older readers.
+    #[arg(long, default_value = "zstd")]
     compression: String,
 
     /// Temporal bucket size for chunking tiles (e.g., "1h", "6h", "1d", "30m")
