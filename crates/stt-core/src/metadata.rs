@@ -7,6 +7,28 @@ use crate::types::{BoundingBox, TimeRange};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// One level of a temporal LOD pyramid.
+///
+/// At any tile-zoom-level `z` such that `z <= max_zoom_level`, a client that
+/// is currently displaying a time range too wide to render the base
+/// `temporal_bucket_ms` tiles efficiently can fetch coarser tiles from this
+/// level instead. Each level uses `bucket_ms` as its temporal bucket size
+/// (which must be a multiple of the archive's base `temporal_bucket_ms`).
+///
+/// Levels in `Metadata::temporal_lod` are *sorted by ascending bucket size*
+/// — i.e. finest level first, coarsest last. The reader picks the largest
+/// `max_zoom_level` whose level still applies at the current tile zoom.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemporalLodLevel {
+    /// Temporal bucket size in milliseconds for tiles at this level.
+    /// Must be a strict multiple of the archive's base `temporal_bucket_ms`.
+    pub bucket_ms: u64,
+    /// Inclusive upper bound on the spatial zoom level where this LOD applies.
+    /// At zoom `<= max_zoom_level`, the client may opt into this level's
+    /// coarser tiles in place of the base-bucket tiles.
+    pub max_zoom_level: u8,
+}
+
 /// Archive metadata.
 ///
 /// Stored in the archive as UTF-8 JSON — small, human-inspectable, and
@@ -38,6 +60,18 @@ pub struct Metadata {
     /// Temporal bucket size in milliseconds for tile chunking
     /// Tiles are organized into fixed temporal intervals (e.g., 3600000 = 1 hour)
     pub temporal_bucket_ms: u64,
+
+    /// Optional temporal LOD pyramid.
+    ///
+    /// When present, the archive carries aggregate tiles at coarser temporal
+    /// granularities in addition to the base `temporal_bucket_ms` tiles. A
+    /// reader animating decades of data at "year scale" can fetch tiles from
+    /// the matching LOD level instead of streaming per-hour base tiles.
+    ///
+    /// Serialised as the JSON field `temporal_lod`. Field-default + serde's
+    /// `skip_serializing_if` keeps older archive metadata round-trip-stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_lod: Option<Vec<TemporalLodLevel>>,
 }
 
 impl Default for Metadata {
@@ -60,6 +94,7 @@ impl Default for Metadata {
             layers: vec!["default".to_string()],
             properties: HashMap::new(),
             temporal_bucket_ms: 3600 * 1000, // 1 hour default
+            temporal_lod: None,
         }
     }
 }
@@ -110,6 +145,30 @@ impl Metadata {
         self
     }
 
+    /// Attach a temporal LOD pyramid.
+    ///
+    /// Each level's `bucket_ms` MUST be a strict multiple of the archive's
+    /// base `temporal_bucket_ms` and MUST be strictly greater than it; levels
+    /// MUST be sorted by ascending `bucket_ms`. Returns `Err` if the input
+    /// breaks any of those invariants — the build pipeline relies on them
+    /// when re-bucketing features into LOD aggregates.
+    pub fn with_temporal_lod(mut self, levels: Vec<TemporalLodLevel>) -> Result<Self> {
+        validate_temporal_lod(self.temporal_bucket_ms, &levels)?;
+        self.temporal_lod = if levels.is_empty() { None } else { Some(levels) };
+        Ok(self)
+    }
+
+    /// Return the LOD level that applies at `zoom`, if any. The largest
+    /// matching `bucket_ms` (coarsest level) wins — at a global zoom, you
+    /// want the coarsest available aggregate, not the finest.
+    pub fn temporal_lod_for_zoom(&self, zoom: u8) -> Option<&TemporalLodLevel> {
+        let levels = self.temporal_lod.as_ref()?;
+        levels
+            .iter()
+            .filter(|l| zoom <= l.max_zoom_level)
+            .max_by_key(|l| l.bucket_ms)
+    }
+
     /// Add a custom property
     pub fn with_property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.properties.insert(key.into(), value.into());
@@ -127,6 +186,46 @@ impl Metadata {
         serde_json::from_slice(bytes)
             .map_err(|e| Error::InvalidArchive(format!("metadata JSON decode failed: {e}")))
     }
+}
+
+/// Verify the LOD invariants: ascending bucket order, multiples of the base
+/// bucket, strictly coarser than base, distinct bucket sizes.
+fn validate_temporal_lod(base_bucket_ms: u64, levels: &[TemporalLodLevel]) -> Result<()> {
+    if base_bucket_ms == 0 {
+        return Err(Error::Other(
+            "temporal_bucket_ms must be non-zero when declaring a LOD pyramid".into(),
+        ));
+    }
+    let mut prev: Option<u64> = None;
+    for (i, level) in levels.iter().enumerate() {
+        if level.bucket_ms == 0 {
+            return Err(Error::Other(format!(
+                "temporal_lod[{i}].bucket_ms must be non-zero"
+            )));
+        }
+        if level.bucket_ms <= base_bucket_ms {
+            return Err(Error::Other(format!(
+                "temporal_lod[{i}].bucket_ms ({}) must be > base bucket ({})",
+                level.bucket_ms, base_bucket_ms
+            )));
+        }
+        if level.bucket_ms % base_bucket_ms != 0 {
+            return Err(Error::Other(format!(
+                "temporal_lod[{i}].bucket_ms ({}) must be a multiple of base bucket ({})",
+                level.bucket_ms, base_bucket_ms
+            )));
+        }
+        if let Some(p) = prev {
+            if level.bucket_ms <= p {
+                return Err(Error::Other(format!(
+                    "temporal_lod must be sorted by ascending bucket_ms; got {} after {}",
+                    level.bucket_ms, p
+                )));
+            }
+        }
+        prev = Some(level.bucket_ms);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -162,5 +261,138 @@ mod tests {
         assert_eq!(metadata.min_zoom, 0);
         assert_eq!(metadata.max_zoom, 14);
         assert_eq!(metadata.properties.get("key"), Some(&"value".to_string()));
+    }
+
+    // ------------------------------------------------------------------
+    // temporal_lod
+    // ------------------------------------------------------------------
+
+    fn hour() -> u64 {
+        3_600_000
+    }
+    fn day() -> u64 {
+        24 * hour()
+    }
+    fn thirty_days() -> u64 {
+        30 * day()
+    }
+
+    #[test]
+    fn temporal_lod_roundtrips_through_json() {
+        let levels = vec![
+            TemporalLodLevel {
+                bucket_ms: day(),
+                max_zoom_level: 8,
+            },
+            TemporalLodLevel {
+                bucket_ms: thirty_days(),
+                max_zoom_level: 4,
+            },
+        ];
+        let metadata = Metadata::new("lod")
+            .with_temporal_bucket_ms(hour())
+            .with_temporal_lod(levels.clone())
+            .unwrap();
+        let bytes = metadata.to_json_bytes().unwrap();
+        let decoded = Metadata::from_json_bytes(&bytes).unwrap();
+        assert_eq!(decoded.temporal_lod.as_deref(), Some(levels.as_slice()));
+    }
+
+    #[test]
+    fn temporal_lod_field_omitted_when_unset() {
+        // Older readers that don't know about temporal_lod must still parse
+        // a freshly-written archive; the field is skipped when None.
+        let metadata = Metadata::new("no-lod").with_temporal_bucket_ms(hour());
+        let s = String::from_utf8(metadata.to_json_bytes().unwrap()).unwrap();
+        assert!(!s.contains("temporal_lod"), "got: {s}");
+    }
+
+    #[test]
+    fn temporal_lod_missing_field_decodes_back_compat() {
+        // A v3 archive built before this feature has no `temporal_lod` key
+        // in its metadata JSON; the new field must default to None.
+        let legacy = r#"{
+            "name": "legacy",
+            "description": "",
+            "attribution": "",
+            "bounds": {"min_lon": -180, "min_lat": -85, "max_lon": 180, "max_lat": 85},
+            "time_range": {"start": 0, "end": 1},
+            "min_zoom": 0,
+            "max_zoom": 14,
+            "tile_count": 0,
+            "feature_count": 0,
+            "layers": ["default"],
+            "properties": {},
+            "temporal_bucket_ms": 3600000
+        }"#;
+        let m = Metadata::from_json_bytes(legacy.as_bytes()).unwrap();
+        assert!(m.temporal_lod.is_none());
+    }
+
+    #[test]
+    fn temporal_lod_rejects_non_multiple_bucket() {
+        let res = Metadata::new("bad").with_temporal_bucket_ms(hour()).with_temporal_lod(vec![
+            TemporalLodLevel { bucket_ms: hour() + 7, max_zoom_level: 5 },
+        ]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn temporal_lod_rejects_bucket_smaller_than_or_equal_to_base() {
+        let res = Metadata::new("bad")
+            .with_temporal_bucket_ms(day())
+            .with_temporal_lod(vec![TemporalLodLevel { bucket_ms: hour(), max_zoom_level: 5 }]);
+        assert!(res.is_err());
+
+        let res = Metadata::new("bad")
+            .with_temporal_bucket_ms(hour())
+            .with_temporal_lod(vec![TemporalLodLevel { bucket_ms: hour(), max_zoom_level: 5 }]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn temporal_lod_rejects_unsorted_levels() {
+        let res = Metadata::new("bad").with_temporal_bucket_ms(hour()).with_temporal_lod(vec![
+            TemporalLodLevel { bucket_ms: thirty_days(), max_zoom_level: 4 },
+            TemporalLodLevel { bucket_ms: day(), max_zoom_level: 8 },
+        ]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn temporal_lod_for_zoom_picks_coarsest_applicable() {
+        let m = Metadata::new("lod")
+            .with_temporal_bucket_ms(hour())
+            .with_temporal_lod(vec![
+                TemporalLodLevel { bucket_ms: day(), max_zoom_level: 8 },
+                TemporalLodLevel { bucket_ms: thirty_days(), max_zoom_level: 4 },
+            ])
+            .unwrap();
+        // Very-zoomed-out: both levels apply, pick the coarser (30d).
+        assert_eq!(
+            m.temporal_lod_for_zoom(0).map(|l| l.bucket_ms),
+            Some(thirty_days())
+        );
+        // Mid zoom: only the day level applies.
+        assert_eq!(m.temporal_lod_for_zoom(6).map(|l| l.bucket_ms), Some(day()));
+        // High zoom: no LOD — fall back to base bucket.
+        assert!(m.temporal_lod_for_zoom(12).is_none());
+    }
+
+    #[test]
+    fn temporal_lod_for_zoom_is_none_when_unset() {
+        let m = Metadata::new("plain").with_temporal_bucket_ms(hour());
+        assert!(m.temporal_lod_for_zoom(0).is_none());
+    }
+
+    #[test]
+    fn temporal_lod_empty_vec_clears_to_none() {
+        // Passing an empty list is treated as "no LOD" rather than an error,
+        // so callers can compute the level set unconditionally.
+        let m = Metadata::new("empty")
+            .with_temporal_bucket_ms(hour())
+            .with_temporal_lod(vec![])
+            .unwrap();
+        assert!(m.temporal_lod.is_none());
     }
 }

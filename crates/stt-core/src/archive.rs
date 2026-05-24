@@ -81,6 +81,14 @@ pub struct TileEntry {
     /// extended to 64 bits; in v2 it is the leading 64 bits of a blake3
     /// digest (which is also the dedup key on the write side).
     pub content_hash: u64,
+    /// Temporal bucket size in milliseconds this tile occupies.
+    ///
+    /// `None` for tiles read from an archive that predates the temporal-LOD
+    /// scaffold; readers fall back to the archive-level
+    /// `Metadata::temporal_bucket_ms` in that case. New v3 archives written
+    /// after the scaffold landed always populate it — base tiles record the
+    /// archive's base bucket size; LOD tiles record their coarser bucket.
+    pub temporal_bucket_ms: Option<u64>,
 }
 
 impl TileEntry {
@@ -227,8 +235,14 @@ fn index_schema_v2() -> Arc<Schema> {
 
 /// Directory schema for v3 archives. Replaces the 8-byte blake3 prefix with
 /// a 4-byte CRC32C tag (no dedup, just integrity).
-fn index_schema_v3() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
+///
+/// When `with_temporal_bucket` is `true`, a nullable `temporal_bucket_ms`
+/// column is appended — populated by the temporal-LOD scaffold so a reader
+/// can pick the right per-tile bucket size when the archive ships an LOD
+/// pyramid. Older v3 archives produced before that scaffold don't have the
+/// column; the reader handles either shape.
+fn index_schema_v3(with_temporal_bucket: bool) -> Arc<Schema> {
+    let mut fields = vec![
         Field::new("zoom", DataType::UInt8, false),
         Field::new("x", DataType::UInt32, false),
         Field::new("y", DataType::UInt32, false),
@@ -240,12 +254,23 @@ fn index_schema_v3() -> Arc<Schema> {
         Field::new("feature_count", DataType::UInt32, false),
         Field::new("hilbert", DataType::UInt64, false),
         Field::new("crc32c", DataType::UInt32, false),
-    ]))
+    ];
+    if with_temporal_bucket {
+        // Nullable so an archive that mixes LOD-aware and legacy rows (the
+        // append-merge case) doesn't have to retro-fill the column.
+        fields.push(Field::new("temporal_bucket_ms", DataType::UInt64, true));
+    }
+    Arc::new(Schema::new(fields))
 }
 
 fn encode_index(entries: &[TileEntry], version: u8) -> Result<Vec<u8>> {
+    // Emit the `temporal_bucket_ms` column only when at least one row has it
+    // set. Vanilla archives written before the temporal-LOD scaffold stay
+    // byte-identical (11-column index); LOD archives carry the extra column.
+    let with_temporal_bucket =
+        version == 3 && entries.iter().any(|e| e.temporal_bucket_ms.is_some());
     let schema = if version == 3 {
-        index_schema_v3()
+        index_schema_v3(with_temporal_bucket)
     } else {
         index_schema_v2()
     };
@@ -261,7 +286,7 @@ fn encode_index(entries: &[TileEntry], version: u8) -> Result<Vec<u8>> {
     let feature_count = Arc::new(UInt32Array::from(entries.iter().map(|e| e.feature_count).collect::<Vec<_>>())) as ArrayRef;
     let hilbert = Arc::new(UInt64Array::from(entries.iter().map(|e| e.hilbert).collect::<Vec<_>>())) as ArrayRef;
 
-    let columns: Vec<ArrayRef> = if version == 3 {
+    let mut columns: Vec<ArrayRef> = if version == 3 {
         let crc = Arc::new(UInt32Array::from(
             entries.iter().map(|e| e.content_hash as u32).collect::<Vec<_>>(),
         )) as ArrayRef;
@@ -272,6 +297,12 @@ fn encode_index(entries: &[TileEntry], version: u8) -> Result<Vec<u8>> {
         )) as ArrayRef;
         vec![zoom, x, y, time_start, time_end, offset, length, uncompressed, feature_count, hilbert, hash]
     };
+    if with_temporal_bucket {
+        let bucket_ms = Arc::new(UInt64Array::from(
+            entries.iter().map(|e| e.temporal_bucket_ms).collect::<Vec<Option<u64>>>(),
+        )) as ArrayRef;
+        columns.push(bucket_ms);
+    }
 
     let batch = RecordBatch::try_new(schema.clone(), columns)
         .map_err(|e| Error::Other(format!("failed to build index batch: {e}")))?;
@@ -332,6 +363,12 @@ fn decode_index(bytes: &[u8], version: u8) -> Result<Vec<TileEntry>> {
         let crc_u32 = batch
             .column_by_name("crc32c")
             .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+        // Optional per-tile temporal bucket size — present only when the
+        // archive ships a temporal LOD pyramid. Older v3 archives just
+        // have no column; we surface `None` to the caller in that case.
+        let bucket_u64 = batch
+            .column_by_name("temporal_bucket_ms")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
 
         for i in 0..batch.num_rows() {
             let content_hash = if let Some(arr) = hash_u64 {
@@ -346,6 +383,10 @@ fn decode_index(bytes: &[u8], version: u8) -> Result<Vec<TileEntry>> {
                 return Err(Error::InvalidArchive("v2 index missing content_hash".into()));
             };
 
+            let temporal_bucket_ms = bucket_u64.and_then(|arr| {
+                if arr.is_null(i) { None } else { Some(arr.value(i)) }
+            });
+
             entries.push(TileEntry {
                 zoom: zoom.value(i),
                 x: x.value(i),
@@ -358,6 +399,7 @@ fn decode_index(bytes: &[u8], version: u8) -> Result<Vec<TileEntry>> {
                 feature_count: feature_count.value(i),
                 hilbert: hilbert.value(i),
                 content_hash,
+                temporal_bucket_ms,
             });
         }
     }
@@ -767,6 +809,26 @@ impl ArchiveWriter {
         feature_count: u32,
         payload: &[u8],
     ) -> Result<()> {
+        self.add_tile_with_bucket(id, time_start, time_end, feature_count, None, payload)
+    }
+
+    /// Add a tile, tagging the directory entry with the temporal bucket
+    /// size it represents.
+    ///
+    /// Use this overload when emitting temporal LOD aggregate tiles so the
+    /// reader can dispatch on `bucket_ms`. Pass `None` to leave the column
+    /// unset (the call collapses to [`Self::add_tile`]). Passing `Some(b)`
+    /// in a v2 archive is silently ignored — v2 archives don't carry the
+    /// column, so the LOD scaffold is v3-only.
+    pub fn add_tile_with_bucket(
+        &mut self,
+        id: &TileId,
+        time_start: i64,
+        time_end: i64,
+        feature_count: u32,
+        temporal_bucket_ms: Option<u64>,
+        payload: &[u8],
+    ) -> Result<()> {
         let uncompressed_size = payload.len() as u32;
         let compressed = compression::compress(payload, self.compression)?;
 
@@ -796,6 +858,10 @@ impl ArchiveWriter {
             (offset, length, hash)
         };
 
+        // v2 archives never write the bucket column; force-clear it so a
+        // round-trip preserves bit-identical v2 indices.
+        let bucket = if self.version >= 3 { temporal_bucket_ms } else { None };
+
         self.entries.push(TileEntry {
             zoom: id.z,
             x: id.x,
@@ -808,6 +874,7 @@ impl ArchiveWriter {
             feature_count,
             hilbert: id.hilbert_index(),
             content_hash: hash_value,
+            temporal_bucket_ms: bucket,
         });
         Ok(())
     }
@@ -1053,6 +1120,7 @@ mod tests {
                     feature_count: 0,
                     hilbert: 0,
                     content_hash: 0,
+                    temporal_bucket_ms: None,
                 });
             }
         }
@@ -1081,6 +1149,79 @@ mod tests {
         // Before-everything and after-everything queries return empty.
         assert!(lookup.at(-1).is_empty());
         assert!(lookup.at(bucket * 1_000_000).is_empty());
+    }
+
+    /// Backwards compat: a v3 archive that never tagged its tiles with a
+    /// temporal bucket size (every entry's `temporal_bucket_ms` is `None`)
+    /// must not emit the optional column. Vanilla archives stay byte-stable
+    /// across the LOD scaffold rollout.
+    #[test]
+    fn v3_index_omits_bucket_column_for_legacy_tiles() {
+        let path = NamedTempFile::new().unwrap().into_temp_path();
+        let mut writer = ArchiveWriter::create(&path, Compression::None).unwrap();
+        let payload = crate::arrow_tile::encode_tile(&[point_layer("default", vec![1], 1000)]).unwrap();
+        writer.add_tile(&TileId::new(5, 0, 0, 1000), 1000, 2000, 1, &payload).unwrap();
+        writer.finalize(&crate::metadata::Metadata::new("plain")).unwrap();
+
+        let reader = ArchiveReader::open(&path).unwrap();
+        // Round-trip: the column is absent on the wire, so the entry parses
+        // back with `temporal_bucket_ms: None`.
+        assert!(reader.entries()[0].temporal_bucket_ms.is_none());
+
+        // Inspect the raw index buffer: the field is genuinely absent (this
+        // is the wire-compat guarantee).
+        let header = reader.header();
+        let mut file = std::fs::File::open(&path).unwrap();
+        file.seek(SeekFrom::Start(header.index_offset)).unwrap();
+        let mut index_bytes = vec![0u8; header.index_length as usize];
+        file.read_exact(&mut index_bytes).unwrap();
+        let stream = StreamReader::try_new(index_bytes.as_slice(), None).unwrap();
+        let mut found_field = false;
+        for batch in stream {
+            let batch = batch.unwrap();
+            if batch.schema().column_with_name("temporal_bucket_ms").is_some() {
+                found_field = true;
+            }
+        }
+        assert!(!found_field, "vanilla v3 index leaked the LOD column");
+    }
+
+    /// Temporal LOD scaffold: tagged tiles round-trip through the v3 index
+    /// with the per-tile bucket size preserved.
+    #[test]
+    fn v3_index_carries_bucket_column_for_lod_tagged_tiles() {
+        let path = NamedTempFile::new().unwrap().into_temp_path();
+        let mut writer = ArchiveWriter::create(&path, Compression::None).unwrap();
+        let payload = crate::arrow_tile::encode_tile(&[point_layer("default", vec![1], 1000)]).unwrap();
+        // Two tiles at the same spatial cell, different LOD levels.
+        let base = 3_600_000u64; // 1h
+        let lod = 24 * base; // 1d
+        writer
+            .add_tile_with_bucket(
+                &TileId::new(5, 0, 0, 1000),
+                1000,
+                1000 + base as i64,
+                1,
+                Some(base),
+                &payload,
+            )
+            .unwrap();
+        writer
+            .add_tile_with_bucket(
+                &TileId::new(5, 0, 0, 1000),
+                1000,
+                1000 + lod as i64,
+                1,
+                Some(lod),
+                &payload,
+            )
+            .unwrap();
+        writer.finalize(&crate::metadata::Metadata::new("lod")).unwrap();
+
+        let reader = ArchiveReader::open(&path).unwrap();
+        let buckets: Vec<Option<u64>> =
+            reader.entries().iter().map(|e| e.temporal_bucket_ms).collect();
+        assert_eq!(buckets, vec![Some(base), Some(lod)]);
     }
 
     #[test]
