@@ -115,30 +115,36 @@ pub fn generate_tiles(
     config: &TileConfig,
     workers: usize,
 ) -> Result<Vec<GeneratedTile>> {
-    init_thread_pool(workers);
+    let pool = build_pool(workers)?;
     let clip_config = clip_config_from(config);
     let total_clipped = AtomicUsize::new(0);
     let total_original = AtomicUsize::new(0);
     let mut all = Vec::new();
 
-    for zoom in config.min_zoom..=config.max_zoom {
-        let start = std::time::Instant::now();
-        let tiles = process_zoom_level(
-            features,
-            zoom,
-            config,
-            &clip_config,
-            &total_clipped,
-            &total_original,
-        )?;
-        tracing::info!(
-            "zoom {}: {} tiles in {:.1}s",
-            zoom,
-            tiles.len(),
-            start.elapsed().as_secs_f64()
-        );
-        all.extend(tiles);
-    }
+    // Install the scoped pool for the duration of the build. Anything inside
+    // `pool.install(...)` that hits a rayon parallel-iterator runs there
+    // rather than the (possibly already-initialised) global pool.
+    pool.install(|| -> Result<()> {
+        for zoom in config.min_zoom..=config.max_zoom {
+            let start = std::time::Instant::now();
+            let tiles = process_zoom_level(
+                features,
+                zoom,
+                config,
+                &clip_config,
+                &total_clipped,
+                &total_original,
+            )?;
+            tracing::info!(
+                "zoom {}: {} tiles in {:.1}s",
+                zoom,
+                tiles.len(),
+                start.elapsed().as_secs_f64()
+            );
+            all.extend(tiles);
+        }
+        Ok(())
+    })?;
     Ok(all)
 }
 
@@ -150,33 +156,36 @@ pub fn generate_tiles_streaming<W: TileWriter + Send>(
     writer: &mut W,
     workers: usize,
 ) -> Result<TileStats> {
-    init_thread_pool(workers);
+    let pool = build_pool(workers)?;
     let clip_config = clip_config_from(config);
     let total_clipped = AtomicUsize::new(0);
     let total_original = AtomicUsize::new(0);
     let mut total_tiles = 0;
 
-    for zoom in config.min_zoom..=config.max_zoom {
-        let start = std::time::Instant::now();
-        let tiles = process_zoom_level(
-            features,
-            zoom,
-            config,
-            &clip_config,
-            &total_clipped,
-            &total_original,
-        )?;
-        for tile in &tiles {
-            writer.write_tile(tile)?;
+    pool.install(|| -> Result<()> {
+        for zoom in config.min_zoom..=config.max_zoom {
+            let start = std::time::Instant::now();
+            let tiles = process_zoom_level(
+                features,
+                zoom,
+                config,
+                &clip_config,
+                &total_clipped,
+                &total_original,
+            )?;
+            for tile in &tiles {
+                writer.write_tile(tile)?;
+            }
+            total_tiles += tiles.len();
+            tracing::info!(
+                "zoom {}: {} tiles written in {:.1}s",
+                zoom,
+                tiles.len(),
+                start.elapsed().as_secs_f64()
+            );
         }
-        total_tiles += tiles.len();
-        tracing::info!(
-            "zoom {}: {} tiles written in {:.1}s",
-            zoom,
-            tiles.len(),
-            start.elapsed().as_secs_f64()
-        );
-    }
+        Ok(())
+    })?;
 
     Ok(TileStats {
         total_tiles,
@@ -185,11 +194,20 @@ pub fn generate_tiles_streaming<W: TileWriter + Send>(
     })
 }
 
-fn init_thread_pool(workers: usize) {
+/// Build a rayon thread pool scoped to a single build run.
+///
+/// The previous implementation called `build_global()` and silently swallowed
+/// the error if some other caller (or a previous build in the same process)
+/// had already initialised the global pool, so `--workers N` was effectively
+/// ignored after the first run. This builds a fresh local pool so the worker
+/// count is always honoured.
+fn build_pool(workers: usize) -> Result<rayon::ThreadPool> {
+    let threads = workers.max(1);
     rayon::ThreadPoolBuilder::new()
-        .num_threads(workers)
-        .build_global()
-        .ok();
+        .num_threads(threads)
+        .thread_name(|i| format!("stt-build-{i}"))
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build rayon pool: {e}"))
 }
 
 fn clip_config_from(config: &TileConfig) -> ClipConfig {
