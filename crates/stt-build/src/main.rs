@@ -2,13 +2,8 @@
 //!
 //! This tool converts GeoParquet files into optimized STT archives for web visualization.
 
-mod clip;
-mod columnar;
-mod input;
-mod simplify;
-mod tiler;
-
-use tiler::TileWriter;
+use stt_build::{input, tiler};
+use stt_build::tiler::TileWriter;
 
 use anyhow::{Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser};
@@ -104,6 +99,13 @@ struct Args {
     #[arg(long)]
     streaming: bool,
 
+    /// Enable the new Arrow-native streaming pipeline. Reads Parquet record
+    /// batches lazily, partitions into per-tile accumulators, and emits
+    /// tiles directly to the archive — peak RSS bounded by one batch plus
+    /// the active tile-spill budget. Required for >10 GB inputs.
+    #[arg(long)]
+    streaming_arrow: bool,
+
     /// Enable line simplification for lower zoom levels (reduces memory and improves performance)
     #[arg(long)]
     simplify: bool,
@@ -161,6 +163,134 @@ fn main() -> Result<()> {
     // Parse compression
     let compression = parse_compression(&args.compression)?;
 
+    let strictness = if args.strict_times {
+        input::InputStrictness::Strict
+    } else {
+        input::InputStrictness::Warn
+    };
+
+    // --streaming-arrow: the new Arrow-native streaming pipeline. Reads
+    // record batches lazily, builds per-tile accumulators, and writes
+    // tiles directly without ever holding the full feature set in RAM.
+    // The legacy path below keeps the small-dataset behaviour identical
+    // to v2.
+    if args.streaming_arrow {
+        info!("Using streaming-Arrow pipeline (bounded RAM)...");
+        let temporal_bucket_ms = parse_duration(&args.temporal_bucket)?;
+        let tile_config = tiler::TileConfig {
+            min_zoom: args.min_zoom,
+            max_zoom: args.max_zoom,
+            layer_name: args.layer.clone(),
+            temporal_bucket_ms,
+            clip_trajectories: !args.no_clip,
+            clip_min_vertices: args.clip_min_vertices,
+            simplify: args.simplify,
+            simplify_max_zoom: args.simplify_max_zoom,
+        };
+        let mut writer = stt_core::Archive::create(&args.output, compression)?;
+        let mut bounds_lon = (f64::MAX, f64::MIN);
+        let mut bounds_lat = (f64::MAX, f64::MIN);
+        let mut time_range = (u64::MAX, 0u64);
+        let mut feature_count: u64 = 0;
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<input::ParsedFeature>>>(2);
+        // Producer: stream parquet -> channel.
+        let input_path = args.input.clone();
+        let time_field = args.time_field.clone();
+        let end_time_field = args.end_time_field.clone();
+        let time_format = args.time_format.clone();
+        let handle = std::thread::spawn(move || {
+            let tx_clone = tx.clone();
+            let res = input::stream_features(
+                &input_path,
+                &time_field,
+                end_time_field.as_deref(),
+                &time_format,
+                strictness,
+                |batch| {
+                    tx_clone
+                        .send(Ok(batch))
+                        .map_err(|e| anyhow::anyhow!("channel closed: {e}"))?;
+                    Ok(())
+                },
+            );
+            if let Err(e) = res {
+                let _ = tx.send(Err(e));
+            }
+        });
+
+        // Consumer: drive the streaming tiler and update bounds inline.
+        let iter = std::iter::from_fn(|| rx.recv().ok()).map(|res| {
+            res.map(|batch| {
+                feature_count += batch.len() as u64;
+                for f in &batch {
+                    bounds_lon.0 = bounds_lon.0.min(f.lon);
+                    bounds_lon.1 = bounds_lon.1.max(f.lon);
+                    bounds_lat.0 = bounds_lat.0.min(f.lat);
+                    bounds_lat.1 = bounds_lat.1.max(f.lat);
+                    time_range.0 = time_range.0.min(f.timestamp);
+                    time_range.1 = time_range
+                        .1
+                        .max(f.end_timestamp.unwrap_or(f.timestamp));
+                }
+                batch
+            })
+        });
+
+        let stats = tiler::build_streaming_from_batches(
+            iter,
+            &tile_config,
+            &mut writer,
+            args.workers,
+            // 64 MB per-tile spill budget by default. Bigger = fewer flushes
+            // (better compression ratio) but more RAM in flight.
+            64 * 1024 * 1024,
+        )?;
+        handle.join().ok();
+
+        info!(
+            "streaming: {} tiles ({} clipped, {} originals) from {} features",
+            stats.total_tiles, stats.clipped_segments, stats.original_features, feature_count
+        );
+
+        let bounds = if feature_count == 0 {
+            stt_core::types::BoundingBox::new(-180.0, -90.0, 180.0, 90.0)
+        } else {
+            stt_core::types::BoundingBox::new(
+                bounds_lon.0,
+                bounds_lat.0,
+                bounds_lon.1,
+                bounds_lat.1,
+            )
+        };
+        let trange = if feature_count == 0 {
+            stt_core::types::TimeRange::new(0, 0)
+        } else {
+            stt_core::types::TimeRange::new(time_range.0, time_range.1)
+        };
+        let metadata = stt_core::metadata::Metadata::new(args.name.unwrap_or_else(|| {
+            args.input
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        }))
+        .with_description(args.description.unwrap_or_default())
+        .with_attribution(args.attribution.unwrap_or_default())
+        .with_bounds(bounds)
+        .with_time_range(trange)
+        .with_zoom_levels(args.min_zoom, args.max_zoom)
+        .with_temporal_bucket_ms(temporal_bucket_ms);
+        writer.finalize(&metadata)?;
+        info!(
+            "Archive written successfully to {} ({} tiles, {} features)",
+            args.output.display(),
+            stats.total_tiles,
+            feature_count
+        );
+        return Ok(());
+    }
+
     // Step 1: Load all features into memory
     info!("Loading input data...");
     let pb = ProgressBar::new_spinner();
@@ -170,12 +300,6 @@ fn main() -> Result<()> {
             .unwrap(),
     );
     pb.set_message("Reading input file...");
-
-    let strictness = if args.strict_times {
-        input::InputStrictness::Strict
-    } else {
-        input::InputStrictness::Warn
-    };
 
     let features = input::load_features(
         &args.input,

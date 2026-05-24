@@ -46,99 +46,161 @@ pub fn load_features(
     time_format: &str,
     strictness: InputStrictness,
 ) -> Result<Vec<ParsedFeature>> {
-    // Open the Parquet file
+    let mut features = Vec::new();
+    let mut row_count = 0usize;
+    stream_features(path, time_field, end_time_field, time_format, strictness, |batch| {
+        row_count += batch.len();
+        features.extend(batch);
+        if row_count.is_multiple_of(100_000) {
+            tracing::info!("Loaded {} features...", row_count);
+        }
+        Ok(())
+    })?;
+    tracing::info!("Loaded {} total features", features.len());
+    Ok(features)
+}
+
+/// Stream a GeoParquet input one record batch at a time, invoking
+/// `on_batch` with the materialised `ParsedFeature`s for that batch.
+///
+/// Peak memory is bounded by one Parquet batch (typically 1–8k rows) rather
+/// than the entire input. This is the entry point for the streaming build
+/// pipeline; downstream tilers must not retain references into prior
+/// batches across calls.
+///
+/// `on_batch` may consume or discard the batch; the function returns when
+/// the input is exhausted or when `on_batch` returns an error.
+pub fn stream_features<F>(
+    path: &Path,
+    time_field: &str,
+    end_time_field: Option<&str>,
+    time_format: &str,
+    strictness: InputStrictness,
+    mut on_batch: F,
+) -> Result<()>
+where
+    F: FnMut(Vec<ParsedFeature>) -> Result<()>,
+{
     let file = File::open(path).context("Failed to open GeoParquet file")?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let schema = builder.schema().clone();
-    
-    // Find geometry column
+
     let geom_col_name = find_geometry_column(&schema)?;
-    
-    // Find time columns
-    let time_col_idx = schema.fields().iter().position(|f| f.name() == time_field)
+    let time_col_idx = schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == time_field)
         .ok_or_else(|| anyhow::anyhow!("Time field '{}' not found", time_field))?;
     let end_time_col_idx = end_time_field
         .and_then(|field| schema.fields().iter().position(|f| f.name() == field));
-    
+
     let reader = builder.build()?;
-    
-    let mut features = Vec::new();
-    let mut row_count = 0;
-    
-    for batch_result in reader {
-        let batch = batch_result.context("Failed to read Parquet batch")?;
-        
-        // Extract geometries and timestamps
-        let geometries = extract_geometries_from_batch(&batch, &geom_col_name)?;
-        let timestamps =
-            extract_timestamps_from_batch(&batch, time_col_idx, time_format, strictness)?;
-        let end_timestamps = end_time_col_idx
-            .map(|idx| extract_timestamps_from_batch(&batch, idx, time_format, strictness))
-            .transpose()?;
-        
-        for i in 0..batch.num_rows() {
-            let (geometry, lon, lat) = geometries.get(i).cloned()
-                .ok_or_else(|| anyhow::anyhow!("Missing geometry at row {}", row_count + i))?;
-            let timestamp = timestamps.get(i).copied()
-                .ok_or_else(|| anyhow::anyhow!("Missing timestamp at row {}", row_count + i))?;
-            let end_timestamp = end_timestamps.as_ref()
-                .and_then(|ts| ts.get(i).copied());
-            
-            // Build properties from other columns
-            let mut properties = serde_json::Map::new();
-            for (col_idx, field) in schema.fields().iter().enumerate() {
-                let col_name = field.name();
-                if col_name == &geom_col_name 
-                    || col_name == time_field 
-                    || end_time_field.map(|f| col_name == f).unwrap_or(false)
-                    || col_name == "lon" || col_name == "lat"
-                    || col_name == "longitude" || col_name == "latitude"
-                    || col_name == "x" || col_name == "y"
-                {
-                    continue;
-                }
-                
-                if let Some(value) = extract_property_value(&batch, col_idx, i) {
-                    properties.insert(col_name.clone(), value);
-                }
-            }
-            
-            // Properties are stored exactly once, in an Arc, so the clipper
-            // can share them across segments with no per-segment clone. The
-            // GeoJSON feature carries no properties — the build pipeline
-            // reads `shared_properties`.
-            let shared_properties = if properties.is_empty() {
+
+    // Property column indices computed once.
+    let property_cols: Vec<usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, field)| {
+            let name = field.name();
+            let is_meta = name == &geom_col_name
+                || name == time_field
+                || end_time_field.map(|f| name == f).unwrap_or(false)
+                || matches!(name.as_str(), "lon" | "lat" | "longitude" | "latitude" | "x" | "y");
+            if is_meta {
                 None
             } else {
-                Some(Arc::new(properties))
-            };
+                Some(idx)
+            }
+        })
+        .collect();
 
-            let feature = Feature {
-                bbox: None,
-                geometry: Some(geometry),
-                id: None,
-                properties: None,
-                foreign_members: None,
-            };
-            
-            features.push(ParsedFeature {
-                geojson: feature,
-                shared_properties,
-                timestamp,
-                end_timestamp,
-                lon,
-                lat,
-            });
-        }
-        
+    let mut row_count = 0usize;
+    for batch_result in reader {
+        let batch = batch_result.context("Failed to read Parquet batch")?;
+        let parsed = parse_batch(
+            &batch,
+            &schema,
+            &geom_col_name,
+            time_col_idx,
+            end_time_col_idx,
+            &property_cols,
+            time_format,
+            strictness,
+            row_count,
+        )?;
         row_count += batch.num_rows();
-        
-        if row_count % 100_000 == 0 {
-            tracing::info!("Loaded {} features...", row_count);
-        }
+        on_batch(parsed)?;
     }
-    
-    tracing::info!("Loaded {} total features", features.len());
+    Ok(())
+}
+
+/// Materialise one record batch into a `Vec<ParsedFeature>` without holding
+/// any other batches in memory. Pulled out of `stream_features` so the
+/// streaming loop and the eager `load_features` share one definition.
+#[allow(clippy::too_many_arguments)]
+fn parse_batch(
+    batch: &arrow::record_batch::RecordBatch,
+    schema: &arrow::datatypes::Schema,
+    geom_col_name: &str,
+    time_col_idx: usize,
+    end_time_col_idx: Option<usize>,
+    property_cols: &[usize],
+    time_format: &str,
+    strictness: InputStrictness,
+    row_offset: usize,
+) -> Result<Vec<ParsedFeature>> {
+    let geometries = extract_geometries_from_batch(batch, geom_col_name)?;
+    let timestamps =
+        extract_timestamps_from_batch(batch, time_col_idx, time_format, strictness)?;
+    let end_timestamps = end_time_col_idx
+        .map(|idx| extract_timestamps_from_batch(batch, idx, time_format, strictness))
+        .transpose()?;
+
+    let mut features = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        let (geometry, lon, lat) = geometries
+            .get(i)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Missing geometry at row {}", row_offset + i))?;
+        let timestamp = timestamps
+            .get(i)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Missing timestamp at row {}", row_offset + i))?;
+        let end_timestamp = end_timestamps.as_ref().and_then(|ts| ts.get(i).copied());
+
+        // Build properties from non-meta columns. We only materialise this
+        // map when the row actually has property values; an empty map is
+        // dropped so empty rows pay no allocation.
+        let mut properties = serde_json::Map::new();
+        for &col_idx in property_cols {
+            if let Some(value) = extract_property_value(batch, col_idx, i) {
+                let name = schema.field(col_idx).name();
+                properties.insert(name.clone(), value);
+            }
+        }
+        let shared_properties = if properties.is_empty() {
+            None
+        } else {
+            Some(Arc::new(properties))
+        };
+
+        let feature = Feature {
+            bbox: None,
+            geometry: Some(geometry),
+            id: None,
+            properties: None,
+            foreign_members: None,
+        };
+        features.push(ParsedFeature {
+            geojson: feature,
+            shared_properties,
+            timestamp,
+            end_timestamp,
+            lon,
+            lat,
+        });
+    }
     Ok(features)
 }
 
