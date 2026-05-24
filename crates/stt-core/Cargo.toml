@@ -23,6 +23,7 @@ tracing.workspace = true
 wkt.workspace = true
 chrono.workspace = true
 blake3.workspace = true
+crc32c.workspace = true
 
 # Apache Arrow: tile payloads are Arrow IPC, the archive index is an Arrow table
 arrow = { workspace = true }

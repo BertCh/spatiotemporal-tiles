@@ -57,6 +57,58 @@ fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>> {
     zstd::stream::decode_all(data).map_err(|e| Error::Decompression(e.to_string()))
 }
 
+/// Compress a payload with zstd using an optional pre-shared dictionary.
+///
+/// When `dict` is `Some`, the encoder primes itself with the dictionary
+/// before compressing — the decoder needs the same dictionary to round-trip.
+pub fn compress_zstd_with_dict(data: &[u8], dict: Option<&[u8]>) -> Result<Vec<u8>> {
+    let Some(dict) = dict else {
+        return compress_zstd(data);
+    };
+    let mut out = Vec::with_capacity(data.len() / 2 + 64);
+    let mut encoder = zstd::stream::Encoder::with_dictionary(&mut out, ZSTD_LEVEL, dict)
+        .map_err(|e| Error::Compression(e.to_string()))?;
+    use std::io::Write;
+    encoder
+        .write_all(data)
+        .map_err(|e| Error::Compression(e.to_string()))?;
+    encoder
+        .finish()
+        .map_err(|e| Error::Compression(e.to_string()))?;
+    Ok(out)
+}
+
+/// Decompress zstd data, applying a pre-shared dictionary when supplied.
+pub fn decompress_zstd_with_dict(data: &[u8], dict: Option<&[u8]>) -> Result<Vec<u8>> {
+    let Some(dict) = dict else {
+        return decompress_zstd(data);
+    };
+    let mut decoder = zstd::stream::Decoder::with_dictionary(data, dict)
+        .map_err(|e| Error::Decompression(e.to_string()))?;
+    let mut out = Vec::new();
+    use std::io::Read as _;
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| Error::Decompression(e.to_string()))?;
+    Ok(out)
+}
+
+/// Train a zstd dictionary from a sample of payloads.
+///
+/// Returns `None` when the sample is too small for zstd's dictionary builder
+/// to produce a useful dictionary; callers should treat this as "ship without
+/// a dictionary" rather than an error.
+pub fn train_zstd_dictionary(samples: &[Vec<u8>], max_size: usize) -> Option<Vec<u8>> {
+    if samples.is_empty() {
+        return None;
+    }
+    let sample_slices: Vec<&[u8]> = samples.iter().map(|s| s.as_slice()).collect();
+    match zstd::dict::from_samples(&sample_slices, max_size) {
+        Ok(dict) if !dict.is_empty() => Some(dict),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

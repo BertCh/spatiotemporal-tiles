@@ -51,6 +51,9 @@ hilbert_2d = "1.0"
 # Cryptographic hashing
 blake3 = "1.5"
 
+# CRC32C integrity tag (SIMD-accelerated, replaces blake3 for v3 archives)
+crc32c = "0.6"
+
 # Parallel processing
 rayon = "1.10"
 crossbeam = "0.8"
