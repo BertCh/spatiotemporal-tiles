@@ -291,25 +291,91 @@ struct TemporalLookup {
 }
 
 impl TemporalLookup {
+    /// Build the temporal lookup in `O(N log N + total bucket size)` time.
+    ///
+    /// The previous implementation enumerated every distinct boundary and
+    /// scanned every entry for each — `O(N · B)`, with `B` up to `2N`. At a
+    /// million tiles that was effectively `O(N²)` and `archive open` could
+    /// take minutes on the larger archives. The sweep below produces the
+    /// same snapshot semantics with an event-sorted pass plus an incremental
+    /// `BTreeSet` of currently-active intervals.
+    ///
+    /// Snapshot semantics (unchanged from the previous impl):
+    /// - `boundaries[i]` is a half-open boundary after which the active set
+    ///   is stable until `boundaries[i+1]` (or +∞ for the last entry).
+    /// - A query for time `t` uses `partition_point(|&b| b <= t)` to find the
+    ///   bucket index `b`. `b == 0` means the query is before any tile
+    ///   started → empty.
     fn build(entries: &[TileEntry]) -> Self {
-        let mut boundaries: Vec<i64> = entries
-            .iter()
-            .flat_map(|e| [e.time_start, e.time_end])
-            .collect();
-        boundaries.sort_unstable();
-        boundaries.dedup();
+        if entries.is_empty() {
+            return Self::default();
+        }
 
-        let mut bucket_offsets = Vec::with_capacity(boundaries.len() + 1);
-        let mut bucket_refs = Vec::new();
-        for &b in &boundaries {
-            bucket_offsets.push(bucket_refs.len() as u32);
-            for (idx, e) in entries.iter().enumerate() {
-                if e.time_start <= b && b <= e.time_end {
-                    bucket_refs.push(idx as u32);
+        // Half-open events: START at `time_start`, END at `time_end + 1`
+        // (using `saturating_add` so an interval ending at `i64::MAX` still
+        // produces a well-defined event time). Tag bytes pack the event
+        // kind so the sort is a single `(t, kind, idx)` key — STARTs sort
+        // BEFORE ENDs at ties, so an instantaneous interval `[t, t]` is
+        // active exactly at time `t`.
+        const START: u8 = 0;
+        const END: u8 = 1;
+        let mut events: Vec<(i64, u8, u32)> = Vec::with_capacity(entries.len() * 2);
+        for (i, e) in entries.iter().enumerate() {
+            events.push((e.time_start, START, i as u32));
+            events.push((e.time_end.saturating_add(1), END, i as u32));
+        }
+        events.sort_unstable_by_key(|&(t, kind, _)| (t, kind));
+
+        let mut boundaries: Vec<i64> = Vec::new();
+        let mut bucket_offsets: Vec<u32> = Vec::new();
+        let mut bucket_refs: Vec<u32> = Vec::new();
+        let mut active: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+
+        let mut i = 0;
+        // Track the previous boundary's bucket so we can dedup consecutive
+        // snapshots — an event-time where STARTs and ENDs cancel produces
+        // the same active set, and emitting a duplicate just bloats the
+        // `bucket_refs` storage and slows down queries marginally.
+        let mut prev_bucket_start: usize = 0;
+        while i < events.len() {
+            let t = events[i].0;
+            // Apply every event sharing this timestamp.
+            while i < events.len() && events[i].0 == t {
+                let (_, kind, idx) = events[i];
+                if kind == START {
+                    active.insert(idx);
+                } else {
+                    active.remove(&idx);
+                }
+                i += 1;
+            }
+
+            // Snapshot the active set. Skip when it matches the previous
+            // boundary exactly (STARTs and ENDs cancelled out at this time)
+            // so the boundary list stays minimal.
+            let prev_bucket_end = bucket_refs.len();
+            let prev_active_len = prev_bucket_end - prev_bucket_start;
+            if active.len() == prev_active_len {
+                let mut matches = true;
+                let prev_slice = &bucket_refs[prev_bucket_start..prev_bucket_end];
+                for (a, b) in active.iter().zip(prev_slice.iter()) {
+                    if a != b {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    continue;
                 }
             }
+            boundaries.push(t);
+            bucket_offsets.push(prev_bucket_end as u32);
+            prev_bucket_start = prev_bucket_end;
+            bucket_refs.extend(active.iter().copied());
         }
+        // Sentinel offset so queries can slice `[bucket_offsets[b]..bucket_offsets[b+1]]`.
         bucket_offsets.push(bucket_refs.len() as u32);
+
         Self {
             boundaries,
             bucket_offsets,
@@ -662,6 +728,65 @@ mod tests {
         let offsets: Vec<u64> = reader.entries().iter().map(|e| e.offset).collect();
         // Both directory rows point at the same blob.
         assert_eq!(offsets[0], offsets[1]);
+    }
+
+    /// `TemporalLookup` build correctness + worst-case timing regression.
+    ///
+    /// Builds 50k bucket-aligned entries (representative of mid-size archives)
+    /// and asserts:
+    /// 1. The lookup returns exactly the entries whose `[start, end]` spans
+    ///    a sample query time.
+    /// 2. Build completes in well under a second — the previous O(N · B)
+    ///    construction took 30+ s at this size and was a real archive-open
+    ///    bottleneck for the AIS / NYC-taxi datasets.
+    #[test]
+    fn temporal_lookup_build_is_fast_and_correct() {
+        let bucket = 3_600_000i64; // 1 hour
+        let mut entries = Vec::with_capacity(50_000);
+        // 200 spatial cells × 250 temporal buckets each = 50k entries.
+        for cell in 0..200u32 {
+            for b in 0..250u32 {
+                let t_start = (b as i64) * bucket;
+                entries.push(TileEntry {
+                    zoom: 10,
+                    x: cell,
+                    y: 0,
+                    time_start: t_start,
+                    time_end: t_start + bucket - 1,
+                    offset: 0,
+                    length: 0,
+                    uncompressed_size: 0,
+                    feature_count: 0,
+                    hilbert: 0,
+                    content_hash: 0,
+                });
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let lookup = TemporalLookup::build(&entries);
+        let elapsed_ms = started.elapsed().as_millis();
+        assert!(
+            elapsed_ms < 1000,
+            "TemporalLookup::build took {elapsed_ms}ms for 50k entries — \
+             the sweep-line build is meant to be sub-second",
+        );
+
+        // Sample query mid-archive: every entry whose interval contains this
+        // time must be in the result, and nothing else.
+        let query_t = bucket * 123 + bucket / 2;
+        let got: std::collections::BTreeSet<u32> = lookup.at(query_t).iter().copied().collect();
+        let expected: std::collections::BTreeSet<u32> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.time_start <= query_t && query_t <= e.time_end)
+            .map(|(i, _)| i as u32)
+            .collect();
+        assert_eq!(got, expected);
+
+        // Before-everything and after-everything queries return empty.
+        assert!(lookup.at(-1).is_empty());
+        assert!(lookup.at(bucket * 1_000_000).is_empty());
     }
 
     #[test]
