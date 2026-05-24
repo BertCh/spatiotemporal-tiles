@@ -32,6 +32,13 @@ pub struct Args {
     /// Skip stt-build step (just output GeoJSON/CSV)
     #[arg(long)]
     pub skip_build: bool,
+
+    /// Emit a server-aggregated summary tier alongside the raw tier.
+    /// The summary tier renders 100K+ events as ~hundreds of H3 hex bins
+    /// — the only practical way to visualise 100M+ point datasets in real
+    /// time.
+    #[arg(long)]
+    pub summary_tier: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,14 +176,30 @@ pub fn run(args: Args) -> Result<()> {
 
     // Build STT if output is .stt
     if args.output.extension().map(|e| e == "stt").unwrap_or(false) && !args.skip_build {
-        common::run_stt_build(
-            &intermediate_path,
-            &args.output,
-            "timestamp",
-            0,
-            10,
-            "gzip",
-        )?;
+        let summary = if args.summary_tier {
+            // Aggregate the same magnitude column the raw layer uses for
+            // radius, so the summary tier can drive a "biggest quake in
+            // this hex" overlay or a count heatmap from one archive.
+            Some(common::SttBuildSummaryOptions {
+                scheme: "h3".to_string(),
+                min_zoom: Some(0),
+                max_zoom: Some(4),
+                columns: "magnitude:mean,magnitude:max".to_string(),
+            })
+        } else {
+            None
+        };
+        common::run_stt_build_with_full_options(common::SttBuildOptions {
+            input: intermediate_path.clone(),
+            output: args.output.clone(),
+            time_field: "timestamp".to_string(),
+            end_time_field: None,
+            min_zoom: 0,
+            max_zoom: 10,
+            compression: "zstd".to_string(),
+            temporal_bucket: None,
+            summary,
+        })?;
 
         // Clean up intermediate file
         let _ = std::fs::remove_file(&intermediate_path);

@@ -927,41 +927,97 @@ pub fn run_stt_build_with_options(
     compression: &str,
     temporal_bucket: Option<&str>,
 ) -> Result<()> {
+    run_stt_build_with_full_options(SttBuildOptions {
+        input: input.to_path_buf(),
+        output: output.to_path_buf(),
+        time_field: time_field.to_string(),
+        end_time_field: end_time_field.map(str::to_string),
+        min_zoom,
+        max_zoom,
+        compression: compression.to_string(),
+        temporal_bucket: temporal_bucket.map(str::to_string),
+        summary: None,
+    })
+}
+
+/// Optional summary-tier knobs forwarded to `stt-build --summary-tier`.
+#[derive(Debug, Clone)]
+pub struct SttBuildSummaryOptions {
+    /// e.g. `"h3"` (only h3 implemented today).
+    pub scheme: String,
+    /// `--summary-min-zoom`. `None` defaults to the archive's min-zoom.
+    pub min_zoom: Option<u8>,
+    /// `--summary-max-zoom`. `None` defaults to min-zoom + 4.
+    pub max_zoom: Option<u8>,
+    /// Comma-separated `name:agg` list. e.g. `magnitude:mean,magnitude:max`.
+    pub columns: String,
+}
+
+/// All knobs `run_stt_build_*` can pass to the underlying CLI. Use this
+/// instead of the positional helpers when you need the summary tier.
+#[derive(Debug, Clone)]
+pub struct SttBuildOptions {
+    pub input: std::path::PathBuf,
+    pub output: std::path::PathBuf,
+    pub time_field: String,
+    pub end_time_field: Option<String>,
+    pub min_zoom: u8,
+    pub max_zoom: u8,
+    pub compression: String,
+    pub temporal_bucket: Option<String>,
+    pub summary: Option<SttBuildSummaryOptions>,
+}
+
+/// Single entry point that drives the stt-build CLI with every option,
+/// including the optional summary tier.
+pub fn run_stt_build_with_full_options(opts: SttBuildOptions) -> Result<()> {
     use std::process::Command;
 
     println!("\n📦 Building STT archive...");
 
     let stt_build_path = find_stt_build_binary();
-    
+
     let mut cmd = Command::new(&stt_build_path);
     cmd.arg("--input")
-        .arg(input)
+        .arg(&opts.input)
         .arg("--output")
-        .arg(output)
+        .arg(&opts.output)
         .arg("--time-field")
-        .arg(time_field);
-    
-    if let Some(end_field) = end_time_field {
+        .arg(&opts.time_field);
+
+    if let Some(end_field) = &opts.end_time_field {
         cmd.arg("--end-time-field").arg(end_field);
     }
-    
+
     cmd.arg("--min-zoom")
-        .arg(min_zoom.to_string())
+        .arg(opts.min_zoom.to_string())
         .arg("--max-zoom")
-        .arg(max_zoom.to_string())
+        .arg(opts.max_zoom.to_string())
         .arg("--compression")
-        .arg(compression);
-    
-    // Add temporal bucket if specified
-    if let Some(bucket) = temporal_bucket {
+        .arg(&opts.compression);
+
+    if let Some(bucket) = &opts.temporal_bucket {
         cmd.arg("--temporal-bucket").arg(bucket);
+    }
+
+    if let Some(sm) = &opts.summary {
+        cmd.arg("--summary-tier").arg(&sm.scheme);
+        if let Some(z) = sm.min_zoom {
+            cmd.arg("--summary-min-zoom").arg(z.to_string());
+        }
+        if let Some(z) = sm.max_zoom {
+            cmd.arg("--summary-max-zoom").arg(z.to_string());
+        }
+        if !sm.columns.is_empty() {
+            cmd.arg("--summary-columns").arg(&sm.columns);
+        }
     }
 
     let status = cmd.status();
 
     match status {
         Ok(s) if s.success() => {
-            println!("✅ STT archive created: {}", output.display());
+            println!("✅ STT archive created: {}", opts.output.display());
             Ok(())
         }
         Ok(s) => {
