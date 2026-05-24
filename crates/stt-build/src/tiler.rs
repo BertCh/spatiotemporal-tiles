@@ -2,7 +2,9 @@
 //! temporally, and emit Arrow [`ColumnarLayer`]s per tile.
 
 use crate::clip::{clip_trajectory, is_clippable_trajectory, ClipConfig, ClippedSegment};
-use crate::columnar::{build_layer_from_segments, build_layers_from_features};
+use crate::columnar::{
+    build_layer_from_segments, build_layers_from_features_with, ColumnarOptions,
+};
 use crate::input::ParsedFeature;
 use anyhow::Result;
 use rayon::prelude::*;
@@ -68,6 +70,10 @@ pub struct TileConfig {
     pub simplify: bool,
     /// Highest zoom that still receives simplification.
     pub simplify_max_zoom: u8,
+    /// When true, polygon layers carry pre-baked earcut triangle indices in a
+    /// `triangles` sidecar column — letting the renderer skip its own CPU
+    /// tessellation at tile-arrival time.
+    pub pre_tessellate: bool,
 }
 
 impl Default for TileConfig {
@@ -81,6 +87,17 @@ impl Default for TileConfig {
             clip_min_vertices: 2,
             simplify: false,
             simplify_max_zoom: 14,
+            pre_tessellate: false,
+        }
+    }
+}
+
+impl TileConfig {
+    /// Project to the lower-level `ColumnarOptions` consumed by the columnar
+    /// builders. Keeps `tiler` from leaking columnar-level concerns.
+    fn columnar_options(&self) -> ColumnarOptions {
+        ColumnarOptions {
+            pre_tessellate: self.pre_tessellate,
         }
     }
 }
@@ -346,7 +363,11 @@ fn build_tile(
         } else {
             format!("{}_originals", config.layer_name)
         };
-        layers.extend(build_layers_from_features(&originals, &base)?);
+        layers.extend(build_layers_from_features_with(
+            &originals,
+            &base,
+            config.columnar_options(),
+        )?);
     }
 
     if layers.is_empty() {
@@ -657,7 +678,11 @@ fn flush_bucket<W: TileWriter>(
         } else {
             format!("{}_originals", config.layer_name)
         };
-        layers.extend(crate::columnar::build_layers_from_features(&originals, &base)?);
+        layers.extend(crate::columnar::build_layers_from_features_with(
+            &originals,
+            &base,
+            config.columnar_options(),
+        )?);
     }
     if layers.is_empty() {
         return Ok(());

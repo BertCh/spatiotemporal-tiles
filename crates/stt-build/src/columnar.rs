@@ -8,15 +8,38 @@ use crate::clip::ClippedSegment;
 use crate::input::ParsedFeature;
 use anyhow::Result;
 use std::collections::BTreeMap;
-use stt_core::arrow_tile::{ColumnarLayer, Coord, GeometryColumn, PropertyColumn};
+use stt_core::arrow_tile::{
+    tessellate_polygon, ColumnarLayer, Coord, GeometryColumn, PropertyColumn,
+};
 use stt_core::types::GeometryType;
+
+/// Per-tile build options that influence the columnar layout (independent of
+/// the tile-level partitioning logic the tiler owns).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ColumnarOptions {
+    /// When true, polygon layers will carry pre-baked earcut triangle indices
+    /// in a `triangles` sidecar column — letting the renderer skip its own
+    /// CPU-side tessellation on tile arrival (MLT-style).
+    pub pre_tessellate: bool,
+}
 
 /// Build layers from a set of features sharing a tile. Features are grouped by
 /// geometry type — a single layer holds exactly one geometry kind, so a tile
 /// with mixed points and polygons yields one layer per kind.
+///
+/// Convenience wrapper for callers that don't care about extra build knobs.
 pub fn build_layers_from_features(
     features: &[&ParsedFeature],
     layer_name: &str,
+) -> Result<Vec<ColumnarLayer>> {
+    build_layers_from_features_with(features, layer_name, ColumnarOptions::default())
+}
+
+/// Build layers from features with explicit build options.
+pub fn build_layers_from_features_with(
+    features: &[&ParsedFeature],
+    layer_name: &str,
+    opts: ColumnarOptions,
 ) -> Result<Vec<ColumnarLayer>> {
     if features.is_empty() {
         return Ok(vec![]);
@@ -58,7 +81,7 @@ pub fn build_layers_from_features(
         layers.push(build_line_layer(&lines, name_for("lines"))?);
     }
     if !polygons.is_empty() {
-        layers.push(build_polygon_layer(&polygons, name_for("polygons"))?);
+        layers.push(build_polygon_layer(&polygons, name_for("polygons"), opts)?);
     }
     Ok(layers)
 }
@@ -109,6 +132,7 @@ pub fn build_layer_from_segments(
         end_times,
         geometry: GeometryColumn::LineString(geometry),
         vertex_times: Some(vertex_times),
+        triangles: None,
         properties: props.finish(),
     })
 }
@@ -127,6 +151,7 @@ fn build_point_layer(features: &[&ParsedFeature], name: String) -> Result<Column
         end_times: end,
         geometry: GeometryColumn::Point(geometry),
         vertex_times: None,
+        triangles: None,
         properties: props,
     })
 }
@@ -161,16 +186,33 @@ fn build_line_layer(features: &[&ParsedFeature], name: String) -> Result<Columna
         // Only attach per-vertex times if at least one feature has a real
         // duration — otherwise they carry no information.
         vertex_times: any_duration.then_some(vertex_times),
+        triangles: None,
         properties: props,
     })
 }
 
-fn build_polygon_layer(features: &[&ParsedFeature], name: String) -> Result<ColumnarLayer> {
+fn build_polygon_layer(
+    features: &[&ParsedFeature],
+    name: String,
+    opts: ColumnarOptions,
+) -> Result<ColumnarLayer> {
     let (ids, start, end, props) = common_columns(features);
     let mut geometry: Vec<Vec<Vec<Coord>>> = Vec::with_capacity(features.len());
     for f in features {
         geometry.push(extract_polygon_rings(f)?);
     }
+    // Build the optional triangle index sidecar by running earcut over each
+    // feature's rings. The same coords feed both the geometry column and the
+    // tessellator — indices are local to the feature.
+    let triangles = if opts.pre_tessellate {
+        let mut tris: Vec<Vec<u32>> = Vec::with_capacity(geometry.len());
+        for rings in &geometry {
+            tris.push(tessellate_polygon(rings));
+        }
+        Some(tris)
+    } else {
+        None
+    };
     Ok(ColumnarLayer {
         name,
         feature_ids: ids,
@@ -178,6 +220,7 @@ fn build_polygon_layer(features: &[&ParsedFeature], name: String) -> Result<Colu
         end_times: end,
         geometry: GeometryColumn::Polygon(geometry),
         vertex_times: None,
+        triangles,
         properties: props,
     })
 }
@@ -568,5 +611,66 @@ mod tests {
         let refs = vec![&line];
         let layers = build_layers_from_features(&refs, "default").unwrap();
         assert!(layers[0].vertex_times.is_none());
+    }
+
+    /// Build a square polygon feature for the pre-tessellation tests.
+    fn polygon_feature(corner: [f64; 2], size: f64) -> ParsedFeature {
+        let [x, y] = corner;
+        let ring: Vec<Vec<f64>> = vec![
+            vec![x, y],
+            vec![x + size, y],
+            vec![x + size, y + size],
+            vec![x, y + size],
+            vec![x, y], // closing vertex
+        ];
+        ParsedFeature {
+            geojson: Feature {
+                bbox: None,
+                geometry: Some(Geometry::new(GeomValue::Polygon(vec![ring]))),
+                id: None,
+                properties: None,
+                foreign_members: None,
+            },
+            shared_properties: None,
+            timestamp: 1000,
+            end_timestamp: None,
+            lon: x,
+            lat: y,
+        }
+    }
+
+    #[test]
+    fn polygon_layer_omits_triangles_by_default() {
+        let p = polygon_feature([0.0, 0.0], 1.0);
+        let refs = vec![&p];
+        let layers = build_layers_from_features(&refs, "default").unwrap();
+        assert_eq!(layers.len(), 1);
+        assert!(layers[0].triangles.is_none());
+    }
+
+    #[test]
+    fn pre_tessellate_option_bakes_triangle_indices_per_feature() {
+        let p1 = polygon_feature([0.0, 0.0], 1.0);
+        let p2 = polygon_feature([5.0, 5.0], 2.0);
+        let refs = vec![&p1, &p2];
+        let layers = build_layers_from_features_with(
+            &refs,
+            "default",
+            ColumnarOptions { pre_tessellate: true },
+        )
+        .unwrap();
+        assert_eq!(layers.len(), 1);
+        let tri = layers[0]
+            .triangles
+            .as_ref()
+            .expect("triangles populated when pre_tessellate is on");
+        assert_eq!(tri.len(), 2);
+        // Each square produces exactly two triangles → 6 indices.
+        assert_eq!(tri[0].len(), 6);
+        assert_eq!(tri[1].len(), 6);
+        // Indices reference the 5 coords of that feature's exterior ring.
+        for &i in &tri[0] {
+            assert!(i < 5);
+        }
     }
 }
