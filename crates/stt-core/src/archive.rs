@@ -917,6 +917,101 @@ mod tests {
         assert!(reader.read_payload(&entry).is_err());
     }
 
+    /// Build a small but representative tile (point + categorical + path
+     /// with per-vertex times) and assert that the v3 archive is at least
+     /// 40% smaller than the v2 equivalent. The shrink is the combined
+     /// effect of zstd-3 over gzip-6, u16-delta vertex times, dictionary
+     /// categoricals, and the CRC32C column on the directory.
+    #[test]
+    fn v3_archives_are_substantially_smaller_than_v2() {
+        use crate::arrow_tile::{ColumnarLayer, GeometryColumn, PropertyColumn};
+
+        // 16 path-like layers per tile across 32 tiles. Each layer has
+        // 64 features with ~16 vertices and a categorical "kind".
+        let kinds = ["bike", "car", "scooter", "bus"];
+        let make_tile = |seed: u64| -> Vec<u8> {
+            let mut layers = Vec::new();
+            for layer_i in 0..16u64 {
+                let n = 64usize;
+                let mut feature_ids = Vec::with_capacity(n);
+                let mut start_times = Vec::with_capacity(n);
+                let mut end_times = Vec::with_capacity(n);
+                let mut paths: Vec<Vec<[f64; 2]>> = Vec::with_capacity(n);
+                let mut vertex_times: Vec<Vec<i64>> = Vec::with_capacity(n);
+                let mut kind_col: Vec<Option<String>> = Vec::with_capacity(n);
+                for i in 0..n {
+                    feature_ids.push(seed * 1000 + layer_i * 100 + i as u64);
+                    let t0 = (i as i64) * 1000;
+                    start_times.push(t0);
+                    end_times.push(t0 + 1000);
+                    let vertices: Vec<[f64; 2]> = (0..16)
+                        .map(|j| {
+                            [
+                                -122.4 + (i as f64) * 0.001 + (j as f64) * 0.0001,
+                                37.7 + (layer_i as f64) * 0.001 + (j as f64) * 0.0001,
+                            ]
+                        })
+                        .collect();
+                    let times: Vec<i64> = (0..16).map(|j| t0 + j * 60).collect();
+                    paths.push(vertices);
+                    vertex_times.push(times);
+                    kind_col.push(Some(kinds[(i + layer_i as usize) % kinds.len()].to_string()));
+                }
+                layers.push(ColumnarLayer {
+                    name: format!("layer_{layer_i}"),
+                    feature_ids,
+                    start_times,
+                    end_times,
+                    geometry: GeometryColumn::LineString(paths),
+                    vertex_times: Some(vertex_times),
+                    properties: vec![("kind".into(), PropertyColumn::Categorical(kind_col))],
+                });
+            }
+            crate::arrow_tile::encode_tile(&layers).unwrap()
+        };
+
+        let build_archive = |path: &std::path::Path, version: u8| -> u64 {
+            let mut writer = if version == 2 {
+                ArchiveWriter::create_v2(path, Compression::Gzip).unwrap()
+            } else {
+                ArchiveWriter::create(path, Compression::Zstd).unwrap()
+            };
+            for seed in 0..32u64 {
+                let payload = make_tile(seed);
+                writer
+                    .add_tile(
+                        &TileId::new(8, seed as u32, 0, 0),
+                        0,
+                        1_000_000,
+                        64 * 16,
+                        &payload,
+                    )
+                    .unwrap();
+            }
+            writer
+                .finalize(&crate::metadata::Metadata::new("size-comparison"))
+                .unwrap();
+            std::fs::metadata(path).unwrap().len()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let v2_size = build_archive(&dir.path().join("v2.stt"), 2);
+        let v3_size = build_archive(&dir.path().join("v3.stt"), 3);
+
+        let ratio = v3_size as f64 / v2_size as f64;
+        eprintln!(
+            "v3 archive shrink: v2={} bytes, v3={} bytes, ratio={:.3}",
+            v2_size, v3_size, ratio
+        );
+        assert!(
+            ratio <= 0.60,
+            "expected v3 archive to be at most 60% the size of v2, got ratio={:.3} (v2={}, v3={})",
+            ratio,
+            v2_size,
+            v3_size
+        );
+    }
+
     #[test]
     fn v3_dictionary_slot_roundtrips() {
         let path = NamedTempFile::new().unwrap().into_temp_path();
