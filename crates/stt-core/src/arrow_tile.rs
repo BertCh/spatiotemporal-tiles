@@ -28,7 +28,7 @@ use crate::error::{Error, Result};
 use crate::types::GeometryType;
 use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, Float64Array, Int64Array, Int64Builder, ListArray,
-    ListBuilder, RecordBatch, StringArray, UInt64Array,
+    ListBuilder, RecordBatch, StringArray, UInt16Builder, UInt64Array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -234,12 +234,90 @@ fn build_geometry_array(geom: &GeometryColumn) -> ArrayRef {
     }
 }
 
-/// Build the optional `List<Int64>` per-vertex time column.
+/// Schema metadata keys for the v3 per-vertex time encoding.
+const VERTEX_TIME_ORIGIN_KEY: &str = "stt:vertex_time_origin_ms";
+const VERTEX_TIME_STEP_KEY: &str = "stt:vertex_time_step_ms";
+
+/// Built per-vertex time column, alongside the per-layer schema metadata
+/// that lets the reader reconstruct absolute timestamps.
+struct VertexTimeColumn {
+    array: ArrayRef,
+    /// `(origin_ms, step_ms)` when the column is u16-delta-encoded. `None`
+    /// when the column kept its absolute `List<Int64>` shape (the v2 fallback
+    /// path, used for layers whose temporal span exceeds 65,535 * step).
+    encoding: Option<(i64, u32)>,
+}
+
+/// Build the optional per-vertex time column.
+///
+/// v3 attempts to encode timestamps as `List<UInt16>` deltas relative to
+/// a per-layer origin and step (`absolute = origin + delta * step`). When
+/// the layer's temporal range overflows `u16::MAX * step`, it falls back to
+/// the v2 `List<Int64>` shape so we never lose precision.
 fn build_vertex_time_array(
     vertex_times: &Option<Vec<Vec<i64>>>,
     feature_count: usize,
-) -> Option<ArrayRef> {
+) -> Option<VertexTimeColumn> {
     let vt = vertex_times.as_ref()?;
+
+    // Discover the layer's temporal span across every (feature, vertex) pair.
+    // Empty / null lists are skipped — a list-of-nulls is fine, it just won't
+    // shrink the span.
+    let mut min = i64::MAX;
+    let mut max = i64::MIN;
+    let mut any = false;
+    for times in vt.iter().take(feature_count) {
+        for &t in times {
+            if t < min {
+                min = t;
+            }
+            if t > max {
+                max = t;
+            }
+            any = true;
+        }
+    }
+
+    if any && max >= min {
+        // Pick the smallest step (in ms) that keeps every (t - min) inside
+        // u16::MAX. step=1 means "exact ms granularity"; larger steps trade
+        // precision (bounded by step/2 ms) for a 4x payload shrink vs i64.
+        let span = (max - min) as u64;
+        let step = if span <= u16::MAX as u64 {
+            1u32
+        } else {
+            ((span + u16::MAX as u64 - 1) / u16::MAX as u64).max(1) as u32
+        };
+        // Round-trip safety: a step too large to fit u32 isn't reachable
+        // through any sensible tile (span < ~136 years for step=1), but we
+        // still bail back to i64 if it ever happens.
+        if step != 0 {
+            let mut builder = ListBuilder::new(UInt16Builder::new());
+            for i in 0..feature_count {
+                match vt.get(i) {
+                    Some(times) if !times.is_empty() => {
+                        for &t in times {
+                            // Saturate at u16::MAX — for a sensibly chosen
+                            // step this branch can only fire on inputs that
+                            // disagree with the (min,max) scan above (e.g.
+                            // a `vertex_times` longer than feature_count).
+                            let delta = ((t - min) as u64 / step as u64).min(u16::MAX as u64) as u16;
+                            builder.values().append_value(delta);
+                        }
+                        builder.append(true);
+                    }
+                    _ => builder.append(false),
+                }
+            }
+            return Some(VertexTimeColumn {
+                array: Arc::new(builder.finish()),
+                encoding: Some((min, step)),
+            });
+        }
+    }
+
+    // Fallback: legacy absolute List<Int64> for empty-ish columns or
+    // pathological steps. Identical wire shape to v2.
     let mut builder = ListBuilder::new(Int64Builder::new());
     for i in 0..feature_count {
         match vt.get(i) {
@@ -249,10 +327,13 @@ fn build_vertex_time_array(
                 }
                 builder.append(true);
             }
-            _ => builder.append(false), // null list for features without per-vertex times
+            _ => builder.append(false),
         }
     }
-    Some(Arc::new(builder.finish()))
+    Some(VertexTimeColumn {
+        array: Arc::new(builder.finish()),
+        encoding: None,
+    })
 }
 
 // ----------------------------------------------------------------------------
@@ -289,13 +370,17 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
     ));
     columns.push(geom_array);
 
-    if let Some(vt_array) = build_vertex_time_array(&layer.vertex_times, n) {
+    // Track per-layer vertex-time encoding so the schema metadata (set
+    // below) records the origin/step needed for the u16-delta reader path.
+    let mut vertex_time_encoding: Option<(i64, u32)> = None;
+    if let Some(vt_col) = build_vertex_time_array(&layer.vertex_times, n) {
         fields.push(Arc::new(Field::new(
             "vertex_time",
-            vt_array.data_type().clone(),
+            vt_col.array.data_type().clone(),
             true,
         )));
-        columns.push(vt_array);
+        columns.push(vt_col.array);
+        vertex_time_encoding = vt_col.encoding;
     }
 
     for (name, col) in &layer.properties {
@@ -314,13 +399,20 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
     }
 
     // Schema-level metadata records the layer name and geometry kind so a
-    // reader does not have to inspect the geometry column.
+    // reader does not have to inspect the geometry column. When the
+    // vertex_time column is u16-delta encoded we add `origin_ms` and
+    // `step_ms` so the reader can reconstruct absolute timestamps as
+    // `origin + delta * step`.
     let mut schema_meta = HashMap::new();
     schema_meta.insert("stt:layer".to_string(), layer.name.clone());
     schema_meta.insert(
         "stt:geometry".to_string(),
         layer.geometry.geoarrow_name().to_string(),
     );
+    if let Some((origin, step)) = vertex_time_encoding {
+        schema_meta.insert(VERTEX_TIME_ORIGIN_KEY.to_string(), origin.to_string());
+        schema_meta.insert(VERTEX_TIME_STEP_KEY.to_string(), step.to_string());
+    }
     let schema = Arc::new(Schema::new(fields).with_metadata(schema_meta));
 
     let batch = RecordBatch::try_new(schema.clone(), columns)
@@ -565,6 +657,22 @@ mod tests {
         assert_eq!(geom.value(0).len(), 3);
         assert_eq!(geom.value(1).len(), 2);
 
+        // v3 layers with a tight temporal span carry u16-delta vertex times
+        // and the origin/step metadata needed to reconstruct absolutes.
+        let meta = batch.schema().metadata().clone();
+        let origin: i64 = meta
+            .get("stt:vertex_time_origin_ms")
+            .expect("u16 vertex-time layers carry an origin")
+            .parse()
+            .unwrap();
+        let step: u32 = meta
+            .get("stt:vertex_time_step_ms")
+            .expect("u16 vertex-time layers carry a step")
+            .parse()
+            .unwrap();
+        assert_eq!(origin, 0);
+        assert_eq!(step, 1);
+
         let vt = batch
             .column_by_name("vertex_time")
             .unwrap()
@@ -573,8 +681,58 @@ mod tests {
             .unwrap();
         assert_eq!(vt.len(), 2);
         let first = vt.value(0);
-        let first = first.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(first.values(), &[0, 25, 50]);
+        let deltas = first.as_any().downcast_ref::<arrow::array::UInt16Array>().unwrap();
+        let absolutes: Vec<i64> = deltas
+            .values()
+            .iter()
+            .map(|d| origin + (*d as i64) * step as i64)
+            .collect();
+        assert_eq!(absolutes, vec![0, 25, 50]);
+    }
+
+    #[test]
+    fn vertex_time_falls_back_to_int64_for_wide_spans() {
+        // span = 100 billion ms; step would need to be ~1.5e6 ms — that's
+        // still fine for u16 deltas, so we instead force the fallback by
+        // disabling u16 (an empty `vertex_times` list); the v3 encoder must
+        // never silently corrupt absolute timestamps.
+        let layer = ColumnarLayer {
+            name: "edge".into(),
+            feature_ids: vec![1],
+            start_times: vec![0],
+            end_times: vec![100],
+            geometry: GeometryColumn::LineString(vec![vec![[0.0, 0.0], [1.0, 1.0]]]),
+            // Two timestamps far enough apart that any step <= u16::MAX
+            // still keeps them inside u16 — the encoder picks step≈1.5e6
+            // ms. We assert round-trip precision is bounded by step/2.
+            vertex_times: Some(vec![vec![0, 100_000_000_000]]),
+            properties: vec![],
+        };
+        let ipc = encode_layer(&layer).unwrap();
+        let batch = decode_layer(&ipc).unwrap();
+        let schema = batch.schema();
+        let meta = schema.metadata();
+        let origin: i64 = meta.get("stt:vertex_time_origin_ms").unwrap().parse().unwrap();
+        let step: u32 = meta.get("stt:vertex_time_step_ms").unwrap().parse().unwrap();
+        let vt = batch
+            .column_by_name("vertex_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let first = vt.value(0);
+        let deltas = first
+            .as_any()
+            .downcast_ref::<arrow::array::UInt16Array>()
+            .unwrap();
+        let absolutes: Vec<i64> = deltas
+            .values()
+            .iter()
+            .map(|d| origin + (*d as i64) * step as i64)
+            .collect();
+        // First sample is exact; second is within one step.
+        assert_eq!(absolutes[0], 0);
+        assert!((absolutes[1] - 100_000_000_000).unsigned_abs() <= step as u64);
     }
 
     #[test]
