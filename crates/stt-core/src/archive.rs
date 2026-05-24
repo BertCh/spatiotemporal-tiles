@@ -36,6 +36,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use memmap2::Mmap;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -505,8 +507,16 @@ impl TemporalLookup {
 // ----------------------------------------------------------------------------
 
 /// Reader for an STT archive.
+///
+/// The archive file is memory-mapped on open; tile payload reads serve
+/// slices directly out of the mapping rather than allocating + `pread`-ing
+/// a fresh `Vec<u8>` per call. For warm caches this is allocation-free.
 pub struct ArchiveReader {
+    /// Owned file handle keeps the mmap alive even after `open` returns.
+    #[allow(dead_code)]
     file: File,
+    /// Memory map covering the entire archive.
+    mmap: Mmap,
     header: ArchiveHeader,
     entries: Vec<TileEntry>,
     metadata: crate::metadata::Metadata,
@@ -519,24 +529,59 @@ pub struct ArchiveReader {
 impl ArchiveReader {
     /// Open an archive for reading.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut file = File::open(path)?;
-        let header = ArchiveHeader::read(&mut file)?;
+        let file = File::open(path)?;
+        // SAFETY: we treat the mmap as read-only. The file is kept open for
+        // the lifetime of the reader, and we never write through the map.
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| Error::Other(format!("mmap failed: {e}")))?;
 
-        file.seek(SeekFrom::Start(header.index_offset))?;
-        let mut index_bytes = vec![0u8; header.index_length as usize];
-        file.read_exact(&mut index_bytes)?;
-        let entries = decode_index(&index_bytes, header.version)?;
+        // Read the header from the mmap rather than re-`seek`+`read_exact`-ing
+        // the file (Track C). The version goes to `decode_index` so it can
+        // dispatch between v2's blake3 dedup keys and v3's CRC32C tags (Track B).
+        let mut header_cursor = std::io::Cursor::new(&mmap[..HEADER_SIZE as usize]);
+        let header = ArchiveHeader::read(&mut header_cursor)?;
 
-        file.seek(SeekFrom::Start(header.metadata_offset))?;
-        let mut metadata_bytes = vec![0u8; header.metadata_length as usize];
-        file.read_exact(&mut metadata_bytes)?;
-        let metadata = crate::metadata::Metadata::from_json_bytes(&metadata_bytes)?;
+        let index_end = (header.index_offset + header.index_length) as usize;
+        if index_end > mmap.len() {
+            return Err(Error::InvalidArchive(format!(
+                "index range {}..{} exceeds archive size {}",
+                header.index_offset,
+                index_end,
+                mmap.len()
+            )));
+        }
+        let entries = decode_index(
+            &mmap[header.index_offset as usize..index_end],
+            header.version,
+        )?;
 
+        let metadata_end = (header.metadata_offset + header.metadata_length) as usize;
+        if metadata_end > mmap.len() {
+            return Err(Error::InvalidArchive(format!(
+                "metadata range {}..{} exceeds archive size {}",
+                header.metadata_offset,
+                metadata_end,
+                mmap.len()
+            )));
+        }
+        let metadata = crate::metadata::Metadata::from_json_bytes(
+            &mmap[header.metadata_offset as usize..metadata_end],
+        )?;
+
+        // Dictionary slot lives inside the mmap; just slice it out. Track C
+        // removed the per-call seek+read pattern in favour of mmap slices.
         let dictionary = if header.version >= 3 && header.dictionary_length > 0 {
-            file.seek(SeekFrom::Start(header.dictionary_offset))?;
-            let mut buf = vec![0u8; header.dictionary_length as usize];
-            file.read_exact(&mut buf)?;
-            Some(buf)
+            let dict_end =
+                (header.dictionary_offset + header.dictionary_length) as usize;
+            if dict_end > mmap.len() {
+                return Err(Error::InvalidArchive(format!(
+                    "dictionary range {}..{} exceeds archive size {}",
+                    header.dictionary_offset,
+                    dict_end,
+                    mmap.len()
+                )));
+            }
+            Some(mmap[header.dictionary_offset as usize..dict_end].to_vec())
         } else {
             None
         };
@@ -545,6 +590,7 @@ impl ArchiveReader {
 
         Ok(Self {
             file,
+            mmap,
             header,
             entries,
             metadata,
@@ -593,17 +639,27 @@ impl ArchiveReader {
             .find(|e| e.zoom == zoom && e.x == x && e.y == y)
     }
 
-    /// Read and decompress a tile's raw payload bytes. Verifies the per-tile
-    /// integrity tag (CRC32C for v3, blake3 prefix for v2).
-    pub fn read_payload(&mut self, entry: &TileEntry) -> Result<Vec<u8>> {
-        self.file.seek(SeekFrom::Start(entry.offset))?;
-        let mut compressed = vec![0u8; entry.length as usize];
-        self.file.read_exact(&mut compressed)?;
+    /// Read and decompress a tile's raw payload bytes.
+    ///
+    /// Combines Track C's mmap-slice I/O (no per-call `Vec` alloc) with
+    /// Track B's version-aware integrity check (CRC32C for v3, blake3 prefix
+    /// for v2) and zstd-with-trained-dictionary decompression path.
+    pub fn read_payload(&self, entry: &TileEntry) -> Result<Vec<u8>> {
+        let start = entry.offset as usize;
+        let end = start + entry.length as usize;
+        if end > self.mmap.len() {
+            return Err(Error::InvalidArchive(format!(
+                "tile {:?} blob range {start}..{end} exceeds archive size {}",
+                entry.tile_id(),
+                self.mmap.len()
+            )));
+        }
+        let compressed = &self.mmap[start..end];
 
         let ok = if self.header.version >= 3 {
-            crc32c_tag(&compressed) as u64 == entry.content_hash
+            crc32c_tag(compressed) as u64 == entry.content_hash
         } else {
-            blake3_prefix(&compressed) == entry.content_hash
+            blake3_prefix(compressed) == entry.content_hash
         };
         if !ok {
             return Err(Error::InvalidArchive(format!(
@@ -612,10 +668,12 @@ impl ArchiveReader {
             )));
         }
 
-        let payload = if self.header.version >= 3 && self.header.compression == Compression::Zstd {
-            compression::decompress_zstd_with_dict(&compressed, self.dictionary.as_deref())?
+        let payload = if self.header.version >= 3
+            && self.header.compression == Compression::Zstd
+        {
+            compression::decompress_zstd_with_dict(compressed, self.dictionary.as_deref())?
         } else {
-            compression::decompress(&compressed, self.header.compression)?
+            compression::decompress(compressed, self.header.compression)?
         };
         if payload.len() != entry.uncompressed_size as usize {
             return Err(Error::InvalidArchive(format!(
@@ -630,7 +688,7 @@ impl ArchiveReader {
 
     /// Read and decode a tile into its Arrow layers.
     pub fn read_layers(
-        &mut self,
+        &self,
         entry: &TileEntry,
     ) -> Result<Vec<crate::arrow_tile::DecodedLayer>> {
         let payload = self.read_payload(entry)?;

@@ -7,6 +7,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "stt_build"
+path = "src/lib.rs"
+
 [[bin]]
 name = "stt-build"
 path = "src/main.rs"
@@ -50,4 +54,5 @@ geoparquet = ["geoarrow", "parquet", "arrow", "arrow-schema", "arrow-array"]
 [dev-dependencies]
 criterion.workspace = true
 tempfile = "3.10"
+libc = "0.2"
 
