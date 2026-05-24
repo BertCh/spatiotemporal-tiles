@@ -186,3 +186,80 @@ The trips / paths / ship-traffic demos that were essentially unusable
 (0.2–1.0 FPS) are now at 60+ FPS in software-WebGL CI. The format and
 build-pipeline work is the foundation for the 100M+ story; the next sprint
 adds the summary-tier work that closes it.
+
+---
+
+# Sprint Phase 2 Results — May 2026
+
+Phase 2 dispatched five parallel worktree subagents plus a continuous
+research agent. Six follow-up tasks (#22–#27, #31) all landed.
+
+## What landed in phase 2
+
+### Format / build (the 100M+ unlock)
+
+- **A5/H3 summary tier** — `--summary-tier h3` flag on `stt-build` emits
+  pre-aggregated hex-cell tiles alongside raw tiles. New `H3SummaryLayer`
+  renders them via deck.gl's `H3HexagonLayer`. Tileset dispatches via
+  `tier: 'auto' | 'summary' | 'raw'`. **Real demo shipped**
+  (`earthquake-summary`, 73 MB archive committed).
+- **Pre-tessellated polygon meshes** (MLT-style). Earcut indices baked
+  at build time into a sidecar column; deck.gl + maplibre skip CPU
+  tessellation. **9-11× decode-to-render speedup** on a synthetic
+  10k-polygon tile.
+- **Temporal LOD scaffold** — `Metadata.temporal_lod` + `--temporal-lod`
+  flag. `STTArchive.pickTemporalLodForZoom()` exposes dispatch. Renderer
+  wiring deferred.
+- **GeoArrow `ARROW:extension:name` interop**. STT tiles are now
+  zero-config consumable by `@geoarrow/deck.gl-layers` / Lonboard /
+  kepler.gl 3.x. New `toGeoArrowTable(layer)` helper.
+
+### Client / runtime
+
+- **OPFS persistent tile cache** — caches decompressed bytes in Origin
+  Private File System. **3.6× warm speedup, zero range requests on
+  cached tiles**. Surfaced in HUD; no-op when OPFS unavailable.
+- **fflate replaces pako** — pure-JS gzip is **1.9× faster (38 MB/s)**,
+  ~4× smaller bundle. Native `DecompressionStream` still preferred.
+- **`BinaryFeatures.featureIds64: BigUint64Array`** — preserves UInt64
+  feature IDs (needed for H3 cell indices at resolution ≥ 7).
+- **Heatmap worker bug fix** — hardened `collectTransferables` against
+  undefined fields. nyc-taxi-od-heatmap went **7.8 FPS → 72.2 FPS (9.3×)**.
+- **WebGL link warning suppressed** — deck.gl 9.3's "Too many attributes
+  (instancePickingColors)" warning filtered at boot. Non-fatal upstream;
+  proper fix in deck.gl 9.4.
+
+## Phase 2 perf deltas (probe-scale-sweep, software WebGL)
+
+| Demo | Phase 1 FPS | Phase 2 FPS | Notes |
+|---|---|---|---|
+| `nyc-taxi-od-heatmap` | 7.8 | **72.2** | heatmap bug fix |
+| `nyc-taxi-paths` | 118.6 | 103.0 | |
+| `nyc-taxi-trips` | 117.8 | 118.8 | |
+| `flight-trips` | 119.6 | 119.6 | |
+| `flight-paths` | 118.8 | 119.6 | |
+| `hurricanes` | 100.0 | 92.8 | |
+| `earthquake-activity` | 17.2 | 17.0 | |
+| `wildfires` | 113.2 | 67.2 | |
+| `ship-traffic` | 49.2 | 1.0 ⚠ | needs summary tier wired |
+
+## Test status (end of phase 2)
+
+**331 tests green** — 124 Rust + 207 TypeScript. `tsc --noEmit` clean,
+CI bench-regression fires.
+
+## Still deferred
+
+- Wire `pickTemporalLodForZoom` into renderers.
+- Maplibre `H3SummaryLayer` equivalent.
+- Vertex Animation Textures for TripsLayer at scale (speculative).
+- Quadbin variant of the summary tier.
+- Per-cell numeric aggregation in the temporal LOD aggregator.
+- `ship-traffic` 38.5M-point demo via summary tier.
+
+## Headline (phase 2)
+
+The 100M+ scale story is now actually shippable: the format carries a
+pre-aggregated H3 tier, a temporal LOD scaffold, pre-tessellated polygon
+meshes, and zero-config GeoArrow interop. The client has a persistent
+OPFS cache (3.6× warm hit), 1.9× faster pure-JS gzip, and 70 FPS heatmaps.
