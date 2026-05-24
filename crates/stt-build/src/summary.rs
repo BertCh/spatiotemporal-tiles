@@ -339,6 +339,10 @@ fn build_summary_layer(
         geometry: GeometryColumn::Point(centroids),
         vertex_times: None,
         properties,
+        // Summary tiles are always point centroids — no polygons to
+        // tessellate, so the sidecar column added by the pre-tessellate
+        // track is irrelevant.
+        triangles: None,
     }
 }
 
