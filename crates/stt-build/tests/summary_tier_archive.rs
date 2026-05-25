@@ -29,6 +29,7 @@ fn point(lon: f64, lat: f64, ts: u64, mag: f64) -> ParsedFeature {
         shared_properties: props,
         timestamp: ts,
         end_timestamp: None,
+        vertex_timestamps: None,
         lon,
         lat,
     }

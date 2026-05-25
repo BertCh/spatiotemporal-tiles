@@ -125,11 +125,33 @@ struct OsrmRoute {
     duration: f64,
     #[allow(dead_code)]
     distance: f64,
+    /// Present when the request includes `annotations=duration,distance`.
+    /// Contains per-leg (segment) durations/distances along the route.
+    /// `legs[i].annotation.duration[j]` is the OSRM-estimated seconds to
+    /// traverse the j-th edge in leg i — reflects road class / speed limit,
+    /// so highway runs are short and urban-grid blocks are long.
+    #[serde(default)]
+    legs: Vec<OsrmLeg>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OsrmGeometry {
     coordinates: Vec<Vec<f64>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OsrmLeg {
+    #[serde(default)]
+    annotation: Option<OsrmAnnotation>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OsrmAnnotation {
+    #[serde(default)]
+    duration: Vec<f64>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    distance: Vec<f64>,
 }
 
 const NYC_MIN_LON: f64 = -74.05;
@@ -176,18 +198,18 @@ pub fn run(args: Args) -> Result<()> {
         return build_stt_from_intermediate(&args, intermediate_file);
     }
 
-    // Determine intermediate output format (prefer Parquet for efficiency)
+    // Determine intermediate output format. stt-build only accepts
+    // GeoParquet (.parquet/.geoparquet), so both paths-mode and points-mode
+    // write Parquet. The GeoJSON intermediate is kept around only for
+    // `--output foo.geojson` invocations where the user explicitly asks for
+    // GeoJSON (no stt-build step).
     let intermediate_path = if args.output.extension().map(|e| e == "stt").unwrap_or(false) {
-        if args.paths {
-            args.output.with_extension("parquet")
-        } else {
-            args.output.with_extension("geojson")
-        }
+        args.output.with_extension("parquet")
     } else {
         args.output.clone()
     };
-    
-    let use_parquet = args.paths && common::is_parquet_output(&intermediate_path);
+
+    let use_parquet = common::is_parquet_output(&intermediate_path);
     
     println!("📋 Configuration:");
     println!("   Output:        {}", args.output.display());
@@ -294,8 +316,21 @@ pub fn run(args: Args) -> Result<()> {
         } else {
             generate_paths_geojson(&trips, &args, &intermediate_path)?;
         }
+    } else if use_parquet {
+        generate_trajectories_parquet(&trips, &args, &intermediate_path)?;
     } else {
-        generate_trajectories_geojson(&trips, &args, &intermediate_path)?;
+        // Points-mode GeoJSON output was removed alongside the points→parquet
+        // rewrite: stt-build only consumes GeoParquet now, and the legacy
+        // GeoJSON path silently produced unbuilt intermediates. Surface that
+        // clearly rather than writing a file no downstream tool reads.
+        return Err(anyhow!(
+            "Points-mode (--output {}) only supports .stt or .parquet outputs. \
+             Use `--output …{}.parquet` then run stt-build, or `--output …{}.stt` \
+             to get both in one step.",
+            args.output.display(),
+            args.output.file_stem().and_then(|s| s.to_str()).unwrap_or("nyc-rideshare"),
+            args.output.file_stem().and_then(|s| s.to_str()).unwrap_or("nyc-rideshare"),
+        ));
     }
 
     // Verify intermediate file was created
@@ -363,7 +398,10 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
             .arg("--end-time-field").arg("end_timestamp")
             .arg("--min-zoom").arg("10")
             .arg("--max-zoom").arg("16")
-            .arg("--compression").arg("gzip")
+            // v3 default — zstd compresses ~5× faster than gzip-6 for an
+            // equivalent or better ratio, and the v3 reader decodes ~3.3×
+            // faster (per Sprint 2026-05 phase-1 measurements).
+            .arg("--compression").arg("zstd")
             .arg("--temporal-bucket").arg(&args.temporal_bucket)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
@@ -384,7 +422,7 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
             None,
             10,
             16,
-            "gzip",
+            "zstd",
             Some(&args.temporal_bucket),
         )?;
     }
@@ -834,8 +872,14 @@ fn check_osrm_connectivity(osrm_url: &str) -> Result<()> {
 }
 
 fn get_osrm_route(osrm_url: &str, from_lon: f64, from_lat: f64, to_lon: f64, to_lat: f64) -> Result<Option<OsrmRoute>> {
+    // `annotations=duration,distance` returns per-leg per-edge durations so
+    // we can compute real per-vertex timestamps that reflect street class
+    // (highway vs. urban grid). Without this OSRM still returns the full
+    // polyline but with no per-edge timing, forcing us to distribute the
+    // trip duration uniformly by distance → "flash" artifacts on long
+    // segments in the animated-trips renderer.
     let url = format!(
-        "{}/route/v1/driving/{:.6},{:.6};{:.6},{:.6}?overview=full&geometries=geojson",
+        "{}/route/v1/driving/{:.6},{:.6};{:.6},{:.6}?overview=full&geometries=geojson&annotations=duration,distance",
         osrm_url, from_lon, from_lat, to_lon, to_lat
     );
 
@@ -849,6 +893,63 @@ fn get_osrm_route(osrm_url: &str, from_lon: f64, from_lat: f64, to_lon: f64, to_
     Ok(body.routes.and_then(|mut r| r.pop()))
 }
 
+/// Compute true per-vertex absolute timestamps from OSRM annotation data.
+///
+/// OSRM's `annotations=duration` returns one duration per edge (between
+/// consecutive overview coordinates). We accumulate them to get a per-vertex
+/// absolute timestamp, then rescale to land exactly on the trip's recorded
+/// pickup→dropoff window — OSRM's predicted total duration usually differs
+/// from the actual TLC trip duration by ±10-30%, but the *shape* of the
+/// per-edge distribution (which edges are fast, which are slow) is what
+/// drives the per-segment-speed effect we want.
+///
+/// Returns `None` if the annotation arrays are missing or have the wrong
+/// length, in which case the caller falls back to even-distance
+/// interpolation in stt-build.
+fn vertex_timestamps_from_route(
+    route: &OsrmRoute,
+    start_ms: i64,
+    end_ms: i64,
+) -> Option<Vec<i64>> {
+    let coords = &route.geometry.coordinates;
+    if coords.len() < 2 || end_ms <= start_ms {
+        return None;
+    }
+
+    // Collect per-edge durations from all legs. For a single-leg request
+    // (one source → one destination) there is exactly one leg whose
+    // annotation.duration has `coords.len() - 1` entries.
+    let mut edge_durations: Vec<f64> = Vec::with_capacity(coords.len().saturating_sub(1));
+    for leg in &route.legs {
+        if let Some(ann) = &leg.annotation {
+            edge_durations.extend(ann.duration.iter().copied());
+        }
+    }
+    if edge_durations.len() != coords.len() - 1 {
+        return None;
+    }
+    let total: f64 = edge_durations.iter().sum();
+    if total <= 0.0 {
+        return None;
+    }
+
+    let trip_duration_ms = (end_ms - start_ms) as f64;
+    let mut acc = 0.0f64;
+    let mut out: Vec<i64> = Vec::with_capacity(coords.len());
+    out.push(start_ms);
+    for &d in &edge_durations {
+        acc += d;
+        let frac = acc / total;
+        // Rescale onto the trip's recorded time window so endpoints are exact.
+        out.push(start_ms + (frac * trip_duration_ms) as i64);
+    }
+    // Replace last to guarantee exact end_ms (avoids cumulative rounding drift).
+    if let Some(last) = out.last_mut() {
+        *last = end_ms;
+    }
+    Some(out)
+}
+
 fn interpolate_route(
     route: &OsrmRoute,
     start_time: DateTime<Utc>,
@@ -859,12 +960,27 @@ fn interpolate_route(
     if coords.is_empty() {
         return vec![];
     }
-
     let total_duration = end_time.signed_duration_since(start_time).num_seconds() as f64;
+    if total_duration <= 0.0 {
+        return vec![];
+    }
 
+    let start_ms = start_time.timestamp_millis();
+    let end_ms = end_time.timestamp_millis();
+
+    // Prefer per-segment timing from OSRM `annotations=duration` when present
+    // — places sample points using the real street-class speed distribution
+    // (highway sweeps fast, urban grid creeps slow). Falls back to the legacy
+    // uniform-by-distance behaviour when annotations aren't available.
+    if let Some(vertex_times) = vertex_timestamps_from_route(route, start_ms, end_ms) {
+        return interpolate_route_with_vertex_times(coords, &vertex_times, interval_secs);
+    }
+
+    // Fallback: uniform-by-distance interpolation (constant average speed
+    // across the full polyline). Preserves the prior behaviour for any
+    // future OSRM build that omits annotations.
     let mut cumulative_distances: Vec<f64> = vec![0.0];
     let mut total_distance = 0.0;
-
     for i in 1..coords.len() {
         let dist = common::haversine_distance(
             coords[i - 1][1], coords[i - 1][0],
@@ -873,7 +989,6 @@ fn interpolate_route(
         total_distance += dist;
         cumulative_distances.push(total_distance);
     }
-
     if total_distance == 0.0 {
         return vec![];
     }
@@ -915,8 +1030,64 @@ fn interpolate_route(
     points
 }
 
-fn generate_trajectories_geojson(trips: &[Trip], args: &Args, output: &PathBuf) -> Result<()> {
-    println!("\n🚀 Generating trajectories...");
+/// Walk the polyline in TIME (one sample per `interval_secs`), using
+/// `vertex_times` (absolute Unix-ms, one per coord) as the time→space
+/// mapping. Per-segment speed implied by OSRM annotations determines how
+/// far each tick moves.
+fn interpolate_route_with_vertex_times(
+    coords: &[Vec<f64>],
+    vertex_times: &[i64],
+    interval_secs: u32,
+) -> Vec<(f64, f64, DateTime<Utc>)> {
+    let n = coords.len();
+    if n < 2 || vertex_times.len() != n || interval_secs == 0 {
+        return vec![];
+    }
+    let start_ms = vertex_times[0];
+    let end_ms = vertex_times[n - 1];
+    if end_ms <= start_ms {
+        return vec![];
+    }
+    let total_ms = (end_ms - start_ms) as f64;
+    let interval_ms = (interval_secs as i64) * 1_000;
+    let n_steps = ((total_ms / interval_ms as f64).ceil() as i64).max(1);
+
+    let mut out = Vec::with_capacity(n_steps as usize + 1);
+    // Two-pointer walk: segment cursor advances monotonically with ticks.
+    let mut seg = 0usize;
+    for k in 0..=n_steps {
+        let dt = ((k * interval_ms) as f64).min(total_ms);
+        let ts = start_ms + dt as i64;
+        while seg + 1 < n && vertex_times[seg + 1] < ts {
+            seg += 1;
+        }
+        if seg + 1 >= n {
+            seg = n - 2;
+        }
+        let t0 = vertex_times[seg];
+        let t1 = vertex_times[seg + 1];
+        let span = (t1 - t0) as f64;
+        let local = if span > 0.0 { (ts - t0) as f64 / span } else { 0.0 };
+        let a = &coords[seg];
+        let b = &coords[seg + 1];
+        let lon = a[0] + (b[0] - a[0]) * local;
+        let lat = a[1] + (b[1] - a[1]) * local;
+        let ts_dt = chrono::DateTime::<Utc>::from_timestamp_millis(ts).unwrap_or(start_time_anchor(start_ms));
+        out.push((lon, lat, ts_dt));
+    }
+    out
+}
+
+/// `from_timestamp_millis` returns `Option`; unwrap it via a tiny anchor
+/// fallback so the interpolator stays `Vec<(...)>` rather than `Result`.
+fn start_time_anchor(start_ms: i64) -> DateTime<Utc> {
+    chrono::DateTime::<Utc>::from_timestamp_millis(start_ms).unwrap_or_else(Utc::now)
+}
+
+fn generate_trajectories_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Result<()> {
+    use common::{PointRecord, PropertyColumn, PropertyKind, StreamingParquetWriter};
+
+    println!("\n🚀 Generating trajectories (Parquet)...");
 
     let pb = ProgressBar::new(trips.len() as u64);
     pb.set_style(
@@ -925,8 +1096,21 @@ fn generate_trajectories_geojson(trips: &[Trip], args: &Args, output: &PathBuf) 
             .progress_chars("=>-"),
     );
 
-    let mut features = Vec::new();
-    let mut failed_routes = 0;
+    // Typed property columns so stt-build's downstream property inference
+    // sees numerics as numerics (passenger_count/trip_distance/fare_amount)
+    // and status as a string category. Mirrors the schema the old GeoJSON
+    // path produced after going through stt-build's type inference.
+    let property_columns = vec![
+        PropertyColumn { name: "trip_id".into(), kind: PropertyKind::Numeric },
+        PropertyColumn { name: "passenger_count".into(), kind: PropertyKind::Numeric },
+        PropertyColumn { name: "trip_distance".into(), kind: PropertyKind::Numeric },
+        PropertyColumn { name: "fare_amount".into(), kind: PropertyKind::Numeric },
+        PropertyColumn { name: "status".into(), kind: PropertyKind::String },
+    ];
+    let mut writer = StreamingParquetWriter::with_columns(output, property_columns)?;
+
+    let mut failed_routes = 0usize;
+    let mut total_points = 0usize;
 
     for (trip_id, trip) in trips.iter().enumerate() {
         let points = if args.skip_routing {
@@ -953,36 +1137,40 @@ fn generate_trajectories_geojson(trips: &[Trip], args: &Args, output: &PathBuf) 
             }
         };
 
+        let last_idx = points.len().saturating_sub(1);
         for (i, (lon, lat, timestamp)) in points.iter().enumerate() {
-            let mut properties = Map::new();
-            properties.insert("trip_id".to_string(), json!(trip_id));
-            properties.insert("passenger_count".to_string(), json!(trip.passenger_count));
-            properties.insert("trip_distance".to_string(), json!(trip.trip_distance));
-            properties.insert("fare_amount".to_string(), json!(trip.fare_amount));
-
             let status = if i == 0 {
                 "pickup"
-            } else if i == points.len() - 1 {
+            } else if i == last_idx {
                 "dropoff"
             } else {
                 "enroute"
             };
-            properties.insert("status".to_string(), json!(status));
+            let mut properties = Map::new();
+            properties.insert("trip_id".into(), json!(trip_id));
+            properties.insert("passenger_count".into(), json!(trip.passenger_count));
+            properties.insert("trip_distance".into(), json!(trip.trip_distance));
+            properties.insert("fare_amount".into(), json!(trip.fare_amount));
+            properties.insert("status".into(), json!(status));
 
-            let feature = common::create_point_feature(*lon, *lat, *timestamp, properties);
-            features.push(feature);
+            writer.write_point(&PointRecord {
+                lon: *lon,
+                lat: *lat,
+                timestamp_ms: timestamp.timestamp_millis(),
+                properties,
+            })?;
+            total_points += 1;
         }
-
         pb.inc(1);
     }
 
+    let rows = writer.finish()?;
     pb.finish_and_clear();
-    println!("📊 Generated {} trajectory points", features.len());
+    println!("📊 Generated {} trajectory points (wrote {} rows)", total_points, rows);
     if failed_routes > 0 {
         println!("⚠️  {} trips used fallback routing", failed_routes);
     }
 
-    common::write_geojson(features, output)?;
     Ok(())
 }
 
@@ -1076,30 +1264,38 @@ fn generate_paths_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
     let skip_routing = args.skip_routing;
     let total_trips = trips.len();
     
-    // Process trips in parallel batches for better throughput
+    // Process trips in parallel batches for better throughput.
+    // Per-trip result carries the optional per-vertex absolute timestamps
+    // derived from OSRM's `annotations=duration`. `None` means stt-build
+    // will fall back to uniform-by-distance interpolation (legacy behaviour).
+    type TripResult = (usize, Trip, Vec<[f64; 2]>, Option<Vec<i64>>);
     let batch_size = 5000;
-    let mut all_results: Vec<(usize, Trip, Vec<[f64; 2]>)> = Vec::with_capacity(trips.len());
+    let mut all_results: Vec<TripResult> = Vec::with_capacity(trips.len());
     let start_time = Instant::now();
-    
+    let mut annotated_routes: usize = 0;
+
     let num_batches = (trips.len() + batch_size - 1) / batch_size;
     println!("   Processing {} batches of {} trips each\n", num_batches, batch_size);
-    
+
     for (batch_idx, batch_start) in (0..trips.len()).step_by(batch_size).enumerate() {
         let batch_end = std::cmp::min(batch_start + batch_size, trips.len());
         let batch = &trips[batch_start..batch_end];
         let batch_start_time = Instant::now();
-        
+
         // Process batch in parallel
-        let batch_results: Vec<(usize, Trip, Vec<[f64; 2]>)> = batch
+        let batch_results: Vec<TripResult> = batch
             .par_iter()
             .enumerate()
             .map(|(i, trip)| {
                 let trip_id = batch_start + i;
-                let coords: Vec<[f64; 2]> = if skip_routing {
-                    vec![
-                        [trip.pickup_lon, trip.pickup_lat],
-                        [trip.dropoff_lon, trip.dropoff_lat],
-                    ]
+                let (coords, vertex_times): (Vec<[f64; 2]>, Option<Vec<i64>>) = if skip_routing {
+                    (
+                        vec![
+                            [trip.pickup_lon, trip.pickup_lat],
+                            [trip.dropoff_lon, trip.dropoff_lat],
+                        ],
+                        None,
+                    )
                 } else {
                     match get_osrm_route_pooled(
                         &osrm_url,
@@ -1107,21 +1303,37 @@ fn generate_paths_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
                         trip.dropoff_lon, trip.dropoff_lat,
                     ) {
                         Ok(Some(route)) => {
-                            route.geometry.coordinates.iter().map(|c| [c[0], c[1]]).collect()
+                            let coords: Vec<[f64; 2]> = route
+                                .geometry
+                                .coordinates
+                                .iter()
+                                .map(|c| [c[0], c[1]])
+                                .collect();
+                            let vt = vertex_timestamps_from_route(
+                                &route,
+                                trip.pickup_time.timestamp_millis(),
+                                trip.dropoff_time.timestamp_millis(),
+                            );
+                            (coords, vt)
                         }
                         Ok(None) | Err(_) => {
                             failed_routes.fetch_add(1, Ordering::Relaxed);
-                            vec![
-                                [trip.pickup_lon, trip.pickup_lat],
-                                [trip.dropoff_lon, trip.dropoff_lat],
-                            ]
+                            (
+                                vec![
+                                    [trip.pickup_lon, trip.pickup_lat],
+                                    [trip.dropoff_lon, trip.dropoff_lat],
+                                ],
+                                None,
+                            )
                         }
                     }
                 };
                 processed.fetch_add(1, Ordering::Relaxed);
-                (trip_id, trip.clone(), coords)
+                (trip_id, trip.clone(), coords, vertex_times)
             })
             .collect();
+
+        annotated_routes += batch_results.iter().filter(|r| r.3.is_some()).count();
         
         all_results.extend(batch_results);
         
@@ -1156,7 +1368,7 @@ fn generate_paths_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
     let mut writer = StreamingLineStringParquetWriter::new(output, property_columns)?;
     
     let mut total_coords = 0;
-    for (trip_id, trip, coords) in all_results {
+    for (trip_id, trip, coords, vertex_times) in all_results {
         if coords.len() < 2 {
             continue;
         }
@@ -1169,12 +1381,19 @@ fn generate_paths_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
         properties.insert("trip_distance".to_string(), json!(trip.trip_distance));
         properties.insert("fare_amount".to_string(), json!(trip.fare_amount));
 
-        let record = LineStringRecord::new(
+        let mut record = LineStringRecord::new(
             coords,
             trip.pickup_time,
             Some(trip.dropoff_time),
             properties,
         );
+        // Only attach when length matches; defensive — vertex_timestamps_from_route
+        // already enforces this, but a mismatch would silently corrupt timing.
+        if let Some(vt) = vertex_times {
+            if vt.len() == record.coordinates.len() {
+                record.vertex_timestamps_ms = Some(vt);
+            }
+        }
 
         writer.write_linestring(&record)?;
     }
@@ -1183,6 +1402,12 @@ fn generate_paths_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
     let failed = failed_routes.load(Ordering::Relaxed);
     println!("✓ GeoParquet (LineString) written successfully ({} rows)", count);
     println!("📊 Generated {} path features with {} total coordinates", count, total_coords);
+    println!(
+        "📊 OSRM annotations captured for {}/{} trips ({:.1}%)",
+        annotated_routes,
+        trips.len(),
+        100.0 * annotated_routes as f64 / trips.len().max(1) as f64
+    );
     if failed > 0 {
         println!("⚠️  {} trips used fallback routing", failed);
     }
@@ -1205,7 +1430,7 @@ fn get_osrm_route_pooled(osrm_url: &str, from_lon: f64, from_lat: f64, to_lon: f
     }
     
     let url = format!(
-        "{}/route/v1/driving/{:.6},{:.6};{:.6},{:.6}?overview=full&geometries=geojson",
+        "{}/route/v1/driving/{:.6},{:.6};{:.6},{:.6}?overview=full&geometries=geojson&annotations=duration,distance",
         osrm_url, from_lon, from_lat, to_lon, to_lat
     );
 

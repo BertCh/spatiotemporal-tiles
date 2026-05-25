@@ -291,7 +291,7 @@ pub fn run(args: Args) -> Result<()> {
                 Some("end_timestamp"),
                 0,
                 10,
-                "gzip",
+                "zstd",
             )?;
         } else {
             common::run_stt_build(
@@ -300,7 +300,7 @@ pub fn run(args: Args) -> Result<()> {
                 "timestamp",
                 0,
                 10,
-                "gzip",
+                "zstd",
             )?;
         }
 

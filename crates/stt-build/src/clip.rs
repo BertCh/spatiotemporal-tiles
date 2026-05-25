@@ -682,6 +682,12 @@ pub fn clip_trajectory(
     end_time: u64,
     zoom: u8,
     config: &ClipConfig,
+    // Optional producer-supplied per-vertex absolute Unix-ms timestamps.
+    // Used in place of uniform-by-distance interpolation when available
+    // AND the post-simplify vertex count still matches. Simplification can
+    // drop vertices, so we fall back to distance-interpolation in that case
+    // to avoid splatting the wrong timestamp onto the wrong vertex.
+    supplied_vertex_times: Option<&[u64]>,
 ) -> Vec<ClippedSegment> {
     // Extract coordinates
     let geometry = match &feature.geometry {
@@ -693,6 +699,7 @@ pub fn clip_trajectory(
         Some(c) => c,
         None => return vec![],
     };
+    let original_vertex_count = coords.len();
 
     // Skip if too few vertices
     if coords.len() < config.min_vertices {
@@ -711,8 +718,17 @@ pub fn clip_trajectory(
         return vec![];
     }
 
-    // Compute per-vertex timestamps
-    let timestamps = compute_vertex_timestamps(&coords, start_time, end_time);
+    // Compute per-vertex timestamps. Prefer supplied times when present and
+    // alignment was preserved through simplification.
+    let simplification_preserved_alignment = coords.len() == original_vertex_count;
+    let timestamps: Vec<u64> = match supplied_vertex_times {
+        Some(supplied)
+            if simplification_preserved_alignment && supplied.len() == coords.len() =>
+        {
+            supplied.to_vec()
+        }
+        _ => compute_vertex_timestamps(&coords, start_time, end_time),
+    };
 
     // Compute bounding box for quick rejection
     let (min_lon, min_lat, max_lon, max_lat) = compute_bbox(&coords);
@@ -871,7 +887,7 @@ mod tests {
         ]);
 
         let config = ClipConfig::default();
-        let segments = clip_trajectory(&feature, None, 0, 1000, 10, &config);
+        let segments = clip_trajectory(&feature, None, 0, 1000, 10, &config, None);
 
         // Should produce at least one segment
         assert!(!segments.is_empty());
@@ -893,7 +909,7 @@ mod tests {
         ]);
 
         let config = ClipConfig::default();
-        let segments = clip_trajectory(&feature, None, 0, 10000, 12, &config);
+        let segments = clip_trajectory(&feature, None, 0, 10000, 12, &config, None);
 
         // At zoom 12, this should cross at least 2 tiles
         assert!(
@@ -956,7 +972,7 @@ mod tests {
         };
 
         // Trajectory spanning 5 seconds (should create at least 2 temporal slices)
-        let segments = clip_trajectory(&feature, None, 0, 5000, 10, &config);
+        let segments = clip_trajectory(&feature, None, 0, 5000, 10, &config, None);
 
         // Should have at least one segment
         assert!(!segments.is_empty());

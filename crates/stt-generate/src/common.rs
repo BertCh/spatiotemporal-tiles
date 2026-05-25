@@ -1,7 +1,7 @@
 //! Common utilities for data generation
 
 use anyhow::Result;
-use arrow::array::{ArrayRef, Float64Builder, StringBuilder, TimestampMillisecondBuilder};
+use arrow::array::{ArrayRef, Float64Builder, ListBuilder, StringBuilder, TimestampMillisecondBuilder};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -596,6 +596,11 @@ pub struct LineStringRecord {
     pub coordinates: Vec<[f64; 2]>,
     pub timestamp_ms: i64,
     pub end_timestamp_ms: Option<i64>,
+    /// Optional per-vertex absolute Unix-ms timestamps. When present, must
+    /// be the same length as `coordinates`. Consumed by stt-build to bypass
+    /// its uniform-by-distance interpolation and produce real per-segment
+    /// timing (e.g. from OSRM `annotations=duration`).
+    pub vertex_timestamps_ms: Option<Vec<i64>>,
     pub properties: Map<String, JsonValue>,
 }
 
@@ -610,6 +615,7 @@ impl LineStringRecord {
             coordinates,
             timestamp_ms: timestamp.timestamp_millis(),
             end_timestamp_ms: end_timestamp.map(|t| t.timestamp_millis()),
+            vertex_timestamps_ms: None,
             properties,
         }
     }
@@ -620,13 +626,17 @@ pub struct StreamingLineStringParquetWriter {
     writer: ArrowWriter<File>,
     schema: Arc<Schema>,
     property_columns: Vec<String>,
-    
+
     // Batch builders
     geometry_builder: arrow::array::BinaryBuilder,
     timestamp_builder: TimestampMillisecondBuilder,
     end_timestamp_builder: TimestampMillisecondBuilder,
+    /// Per-vertex absolute Unix-ms timestamps (one list per row, nullable).
+    /// `Timestamp(Millisecond, "UTC")` child so downstream readers can rely
+    /// on the type without a numeric→time coercion.
+    vertex_timestamps_builder: ListBuilder<TimestampMillisecondBuilder>,
     property_builders: Vec<StringBuilder>,
-    
+
     batch_size: usize,
     current_batch_size: usize,
     total_rows: usize,
@@ -638,30 +648,53 @@ impl StreamingLineStringParquetWriter {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Build schema: geometry (WKB), timestamp, end_timestamp, then properties
+        // The list child is `Timestamp(Millisecond, None)` to match what
+        // `TimestampMillisecondBuilder.finish()` actually produces — tagging
+        // the field with `Some("UTC")` while the builder stays tz-less
+        // tripped a runtime mismatch panic at flush time. Values are still
+        // absolute Unix-ms; downstream stt-build reads them tz-agnostic.
+        let vertex_time_field = Field::new(
+            "item",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        );
+
+        // Build schema: geometry (WKB), timestamp, end_timestamp,
+        // vertex_timestamps (optional list), then properties.
         let mut fields = vec![
             Field::new("geometry", DataType::Binary, false),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), false),
             Field::new("end_timestamp", DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), true),
+            Field::new(
+                "vertex_timestamps",
+                DataType::List(Arc::new(vertex_time_field.clone())),
+                true,
+            ),
         ];
-        
+
         for col in &property_columns {
             fields.push(Field::new(col, DataType::Utf8, true));
         }
-        
+
         let schema = Arc::new(Schema::new(fields));
-        
+
         let file = File::create(output_path)?;
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(Default::default()))
             .build();
-        
+
         let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
-        
+
         let batch_size = 100_000;
         let property_builders: Vec<StringBuilder> = property_columns.iter()
             .map(|_| StringBuilder::with_capacity(batch_size, batch_size * 32))
             .collect();
+
+        // The inner timestamp values stay in i64 storage; we attach the
+        // timezone at flush time.
+        let vertex_timestamps_builder =
+            ListBuilder::new(TimestampMillisecondBuilder::with_capacity(batch_size * 32))
+                .with_field(Arc::new(vertex_time_field));
 
         Ok(Self {
             writer,
@@ -670,6 +703,7 @@ impl StreamingLineStringParquetWriter {
             geometry_builder: arrow::array::BinaryBuilder::with_capacity(batch_size, batch_size * 256),
             timestamp_builder: TimestampMillisecondBuilder::with_capacity(batch_size),
             end_timestamp_builder: TimestampMillisecondBuilder::with_capacity(batch_size),
+            vertex_timestamps_builder,
             property_builders,
             batch_size,
             current_batch_size: 0,
@@ -681,27 +715,43 @@ impl StreamingLineStringParquetWriter {
         let wkb = encode_wkb_linestring(&record.coordinates);
         self.geometry_builder.append_value(&wkb);
         self.timestamp_builder.append_value(record.timestamp_ms);
-        
+
         if let Some(end_ts) = record.end_timestamp_ms {
             self.end_timestamp_builder.append_value(end_ts);
         } else {
             self.end_timestamp_builder.append_null();
         }
-        
+
+        match &record.vertex_timestamps_ms {
+            Some(vt) if vt.len() == record.coordinates.len() => {
+                let inner = self.vertex_timestamps_builder.values();
+                for &t in vt {
+                    inner.append_value(t);
+                }
+                self.vertex_timestamps_builder.append(true);
+            }
+            _ => {
+                // Either absent or a length mismatch — leave null so stt-build
+                // falls back to even-distance interpolation. A mismatch is
+                // silently dropped; callers should validate before writing.
+                self.vertex_timestamps_builder.append(false);
+            }
+        }
+
         for (i, col) in self.property_columns.iter().enumerate() {
             let value = record.properties.get(col)
                 .map(|v| json_value_to_string(v))
                 .unwrap_or_default();
             self.property_builders[i].append_value(&value);
         }
-        
+
         self.current_batch_size += 1;
         self.total_rows += 1;
-        
+
         if self.current_batch_size >= self.batch_size {
             self.flush_batch()?;
         }
-        
+
         Ok(())
     }
 
@@ -714,15 +764,16 @@ impl StreamingLineStringParquetWriter {
             Arc::new(self.geometry_builder.finish()),
             Arc::new(self.timestamp_builder.finish().with_timezone("UTC")),
             Arc::new(self.end_timestamp_builder.finish().with_timezone("UTC")),
+            Arc::new(self.vertex_timestamps_builder.finish()),
         ];
-        
+
         for builder in &mut self.property_builders {
             columns.push(Arc::new(builder.finish()));
         }
-        
+
         let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
         self.writer.write(&batch)?;
-        
+
         self.current_batch_size = 0;
         Ok(())
     }
@@ -937,6 +988,7 @@ pub fn run_stt_build_with_options(
         compression: compression.to_string(),
         temporal_bucket: temporal_bucket.map(str::to_string),
         summary: None,
+        min_features_per_tile: None,
     })
 }
 
@@ -966,6 +1018,11 @@ pub struct SttBuildOptions {
     pub compression: String,
     pub temporal_bucket: Option<String>,
     pub summary: Option<SttBuildSummaryOptions>,
+    /// Forwarded to `stt-build --min-features-per-tile`. Use for globally
+    /// sparse point datasets where deep-zoom single-feature tiles are pure
+    /// overhead. `None` keeps the stt-build default of 1 (write all
+    /// non-empty tiles).
+    pub min_features_per_tile: Option<u32>,
 }
 
 /// Single entry point that drives the stt-build CLI with every option,
@@ -998,6 +1055,10 @@ pub fn run_stt_build_with_full_options(opts: SttBuildOptions) -> Result<()> {
 
     if let Some(bucket) = &opts.temporal_bucket {
         cmd.arg("--temporal-bucket").arg(bucket);
+    }
+
+    if let Some(n) = opts.min_features_per_tile {
+        cmd.arg("--min-features-per-tile").arg(n.to_string());
     }
 
     if let Some(sm) = &opts.summary {

@@ -7,6 +7,7 @@ pub mod earthquakes;
 pub mod flights;
 pub mod hurricanes;
 pub mod nyc_rideshare;
+pub mod nyc_taxi_points;
 pub mod satellites;
 pub mod wildfires;
 

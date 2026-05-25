@@ -81,6 +81,13 @@ pub struct TileConfig {
     /// MUST be sorted by ascending bucket size and every bucket MUST be a
     /// multiple of the base bucket.
     pub temporal_lod: Vec<stt_core::metadata::TemporalLodLevel>,
+    /// Drop tiles whose feature_count is below this threshold. Default 1
+    /// (write every non-empty tile). For globally sparse point datasets, a
+    /// threshold like 2 skips the long tail of single-feature deep-zoom
+    /// tiles where per-tile Arrow IPC + zstd-frame overhead dominates the
+    /// payload. The renderer relies on the tileset's parent-fallback
+    /// strategy to surface those features at shallower zooms.
+    pub min_features_per_tile: u32,
 }
 
 impl Default for TileConfig {
@@ -96,6 +103,7 @@ impl Default for TileConfig {
             simplify_max_zoom: 14,
             pre_tessellate: false,
             temporal_lod: Vec::new(),
+            min_features_per_tile: 1,
         }
     }
 }
@@ -354,13 +362,20 @@ pub fn generate_tiles_streaming<W: TileWriter + Send>(
                 &total_clipped,
                 &total_original,
             )?;
+            let min_features = config.min_features_per_tile.max(1);
+            let mut written = 0usize;
             for tile in &tiles {
+                if tile.feature_count() < min_features {
+                    continue;
+                }
                 writer.write_tile(tile)?;
+                written += 1;
             }
-            total_tiles += tiles.len();
+            total_tiles += written;
             tracing::info!(
-                "zoom {}: {} tiles written in {:.1}s",
+                "zoom {}: {} tiles written (of {} generated) in {:.1}s",
                 zoom,
+                written,
                 tiles.len(),
                 start.elapsed().as_secs_f64()
             );
@@ -425,6 +440,7 @@ fn process_zoom_level(
                     feature.end_timestamp.unwrap_or(feature.timestamp),
                     zoom,
                     clip_config,
+                    feature.vertex_timestamps.as_deref(),
                 );
                 if segments.is_empty() {
                     total_original.fetch_add(1, Ordering::Relaxed);
@@ -721,6 +737,7 @@ where
                         feature.end_timestamp.unwrap_or(feature.timestamp),
                         zoom,
                         &clip_config,
+                        feature.vertex_timestamps.as_deref(),
                     );
                     if segments.is_empty() {
                         let (x, y) = projection::lonlat_to_tile(feature.lon, feature.lat, zoom)
@@ -886,6 +903,9 @@ fn flush_bucket<W: TileWriter>(
         time_end: time_end as i64,
         layers,
     };
+    if tile.feature_count() < config.min_features_per_tile.max(1) {
+        return Ok(());
+    }
     writer.write_tile(&tile)?;
     *total_tiles += 1;
     Ok(())
@@ -915,6 +935,7 @@ mod tests {
             shared_properties: props,
             timestamp: ts,
             end_timestamp: None,
+            vertex_timestamps: None,
             lon,
             lat,
         }
@@ -937,6 +958,7 @@ mod tests {
             shared_properties: None,
             timestamp: start,
             end_timestamp: Some(end),
+            vertex_timestamps: None,
             lon: first[0],
             lat: first[1],
         }

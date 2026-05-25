@@ -162,12 +162,41 @@ fn build_line_layer(features: &[&ParsedFeature], name: String) -> Result<Columna
     let mut geometry: Vec<Vec<Coord>> = Vec::with_capacity(features.len());
     let mut vertex_times: Vec<Vec<i64>> = Vec::with_capacity(features.len());
     let mut any_duration = false;
+    let mut length_mismatch_warned = false;
 
     for f in features {
         let coords = extract_line_coords(f)?;
-        // Synthesise per-vertex times by distance when the feature has a
-        // duration; otherwise every vertex shares the feature start time.
-        let times = if let Some(end_ts) = f.end_timestamp {
+        // Priority for per-vertex times, in order:
+        //   1. Producer-supplied `vertex_timestamps` (e.g. OSRM annotations) —
+        //      real per-segment timing reflecting street class.
+        //   2. Distance-interpolated from start..end when a duration exists.
+        //   3. Flat: every vertex shares the feature start time.
+        // The supplied path is rejected if its length doesn't match the
+        // geometry's vertex count (logged once per build to surface bad
+        // producers rather than silently corrupting the timing).
+        let times = if let Some(supplied) = f.vertex_timestamps.as_ref() {
+            if supplied.len() == coords.len() {
+                any_duration = true;
+                supplied.iter().map(|&t| t as i64).collect()
+            } else {
+                if !length_mismatch_warned {
+                    tracing::warn!(
+                        "vertex_timestamps length {} != coord count {} for a line \
+                         feature; falling back to distance interpolation (further \
+                         mismatches in this build will be silent)",
+                        supplied.len(),
+                        coords.len()
+                    );
+                    length_mismatch_warned = true;
+                }
+                if let Some(end_ts) = f.end_timestamp {
+                    any_duration = true;
+                    interpolate_vertex_times(&coords, f.timestamp, end_ts)
+                } else {
+                    vec![f.timestamp as i64; coords.len()]
+                }
+            }
+        } else if let Some(end_ts) = f.end_timestamp {
             any_duration = true;
             interpolate_vertex_times(&coords, f.timestamp, end_ts)
         } else {
@@ -529,6 +558,7 @@ mod tests {
                 .map(|m| std::sync::Arc::new(m.clone())),
             timestamp: 1000,
             end_timestamp: None,
+            vertex_timestamps: None,
             lon,
             lat,
         }
@@ -547,6 +577,7 @@ mod tests {
             shared_properties: None,
             timestamp: start,
             end_timestamp: end,
+            vertex_timestamps: None,
             lon: coords[0][0],
             lat: coords[0][1],
         }
@@ -634,6 +665,7 @@ mod tests {
             shared_properties: None,
             timestamp: 1000,
             end_timestamp: None,
+            vertex_timestamps: None,
             lon: x,
             lat: y,
         }

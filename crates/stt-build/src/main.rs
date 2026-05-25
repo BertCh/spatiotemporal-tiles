@@ -183,6 +183,15 @@ struct Args {
     /// Adds ~4 bytes per triangle index to the tile payload.
     #[arg(long)]
     pre_tessellate: bool,
+
+    /// Drop tiles whose feature count is below this threshold. Default 1
+    /// (write every non-empty tile). For globally sparse point datasets,
+    /// raising this to 2-5 skips the long tail of single-feature deep-zoom
+    /// tiles where the Arrow IPC + compression overhead dwarfs the payload.
+    /// The TS reader's parent-fallback (`refinementStrategy: 'best-available'`)
+    /// surfaces the skipped features from their parent tile.
+    #[arg(long, default_value = "1")]
+    min_features_per_tile: u32,
 }
 
 fn main() -> Result<()> {
@@ -258,6 +267,7 @@ fn main() -> Result<()> {
             pre_tessellate: args.pre_tessellate,
             // Temporal LOD only wired in the non-streaming branch below.
             temporal_lod: Vec::new(),
+            min_features_per_tile: args.min_features_per_tile,
         };
         let mut writer = stt_core::Archive::create(&args.output, compression)?;
         let mut bounds_lon = (f64::MAX, f64::MIN);
@@ -442,6 +452,7 @@ fn main() -> Result<()> {
         simplify_max_zoom: args.simplify_max_zoom,
         pre_tessellate: args.pre_tessellate,
         temporal_lod: temporal_lod.clone(),
+        min_features_per_tile: args.min_features_per_tile,
     };
 
     if args.pre_tessellate {
@@ -472,12 +483,27 @@ fn main() -> Result<()> {
                 .unwrap()
                 .progress_chars("##-"),
         );
+        let min_features = args.min_features_per_tile.max(1);
+        let mut written = 0usize;
         for tagged in &tiles {
+            if tagged.tile.feature_count() < min_features {
+                pb.inc(1);
+                continue;
+            }
             writer.write_lod_tile(&tagged.tile, tagged.temporal_bucket_ms)?;
+            written += 1;
             pb.inc(1);
         }
         pb.finish_with_message("Tiles written");
-        tiles.len()
+        if written != tiles.len() {
+            info!(
+                "Skipped {} tiles below --min-features-per-tile={} ({} written)",
+                tiles.len() - written,
+                min_features,
+                written
+            );
+        }
+        written
     } else if args.streaming {
         // Streaming mode: write tiles as each zoom level completes
         info!("Using streaming mode (lower memory usage)...");
@@ -507,13 +533,28 @@ fn main() -> Result<()> {
                 .progress_chars("##-"),
         );
 
+        let min_features = args.min_features_per_tile.max(1);
+        let mut written = 0usize;
         for tile in &tiles {
+            if tile.feature_count() < min_features {
+                pb.inc(1);
+                continue;
+            }
             writer.write_tile(tile)?;
+            written += 1;
             pb.inc(1);
         }
 
         pb.finish_with_message("Tiles written");
-        tiles.len()
+        if written != tiles.len() {
+            info!(
+                "Skipped {} tiles below --min-features-per-tile={} ({} written)",
+                tiles.len() - written,
+                min_features,
+                written
+            );
+        }
+        written
     };
 
     // Step 4b: Optional summary tier (server-aggregated cells).

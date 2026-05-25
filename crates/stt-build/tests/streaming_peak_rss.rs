@@ -94,6 +94,7 @@ fn streaming_pipeline_bounds_peak_rss_for_5m_features() {
         simplify_max_zoom: 14,
         pre_tessellate: false,
         temporal_lod: Vec::new(),
+        min_features_per_tile: 1,
     };
 
     let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
@@ -152,6 +153,7 @@ fn synth_point(lon: f64, lat: f64, ts: u64) -> stt_build::input::ParsedFeature {
         shared_properties: None,
         timestamp: ts,
         end_timestamp: None,
+        vertex_timestamps: None,
         lon,
         lat,
     }

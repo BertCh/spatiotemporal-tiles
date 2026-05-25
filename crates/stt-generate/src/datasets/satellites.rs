@@ -201,7 +201,7 @@ pub fn run(args: Args) -> Result<()> {
             Some("end_time"), // Include end time for proper time range filtering
             0,
             6, // Lower max zoom for global satellite data
-            "gzip",
+            "zstd",
         )?;
 
         // Clean up intermediate file

@@ -1,7 +1,7 @@
 //! GeoParquet input parsing and feature loading
 
 use anyhow::{Context, Result};
-use arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampMillisecondArray, TimestampMicrosecondArray};
+use arrow::array::{Array, Float64Array, Int64Array, ListArray, StringArray, TimestampMillisecondArray, TimestampMicrosecondArray};
 use arrow::datatypes::DataType;
 use geojson::{Feature, Geometry, Value as GeomValue};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -22,6 +22,15 @@ pub struct ParsedFeature {
     pub timestamp: u64,
     /// End timestamp for features with time ranges (if provided)
     pub end_timestamp: Option<u64>,
+    /// Optional per-vertex absolute Unix-ms timestamps for LineString
+    /// geometries. When present, the line-layer builder uses these directly
+    /// instead of interpolating uniformly by distance — lets the producer
+    /// pass real per-segment timing (e.g. OSRM `annotations=duration`)
+    /// through to the GPU.
+    ///
+    /// MUST be the same length as the geometry's coord count when set;
+    /// length-mismatched values are dropped at the reader (logged once).
+    pub vertex_timestamps: Option<Vec<u64>>,
     pub lon: f64,
     pub lat: f64,
 }
@@ -94,6 +103,12 @@ where
     let end_time_col_idx = end_time_field
         .and_then(|field| schema.fields().iter().position(|f| f.name() == field));
 
+    // Optional per-vertex timestamps column (List<Timestamp> or List<Int64>).
+    // Producers that have real per-segment timing (e.g. nyc-rideshare with
+    // OSRM annotations) populate this; absence falls back to legacy
+    // uniform-by-distance interpolation in columnar.rs.
+    let vertex_times_col_idx = schema.fields().iter().position(|f| f.name() == "vertex_timestamps");
+
     let reader = builder.build()?;
 
     // Property column indices computed once.
@@ -106,6 +121,7 @@ where
             let is_meta = name == &geom_col_name
                 || name == time_field
                 || end_time_field.map(|f| name == f).unwrap_or(false)
+                || name == "vertex_timestamps"
                 || matches!(name.as_str(), "lon" | "lat" | "longitude" | "latitude" | "x" | "y");
             if is_meta {
                 None
@@ -124,6 +140,7 @@ where
             &geom_col_name,
             time_col_idx,
             end_time_col_idx,
+            vertex_times_col_idx,
             &property_cols,
             time_format,
             strictness,
@@ -145,6 +162,7 @@ fn parse_batch(
     geom_col_name: &str,
     time_col_idx: usize,
     end_time_col_idx: Option<usize>,
+    vertex_times_col_idx: Option<usize>,
     property_cols: &[usize],
     time_format: &str,
     strictness: InputStrictness,
@@ -155,6 +173,9 @@ fn parse_batch(
         extract_timestamps_from_batch(batch, time_col_idx, time_format, strictness)?;
     let end_timestamps = end_time_col_idx
         .map(|idx| extract_timestamps_from_batch(batch, idx, time_format, strictness))
+        .transpose()?;
+    let vertex_times = vertex_times_col_idx
+        .map(|idx| extract_vertex_timestamps_from_batch(batch, idx))
         .transpose()?;
 
     let mut features = Vec::with_capacity(batch.num_rows());
@@ -168,6 +189,9 @@ fn parse_batch(
             .copied()
             .ok_or_else(|| anyhow::anyhow!("Missing timestamp at row {}", row_offset + i))?;
         let end_timestamp = end_timestamps.as_ref().and_then(|ts| ts.get(i).copied());
+        let row_vertex_times = vertex_times
+            .as_ref()
+            .and_then(|v| v.get(i).cloned().flatten());
 
         // Build properties from non-meta columns. We only materialise this
         // map when the row actually has property values; an empty map is
@@ -197,11 +221,57 @@ fn parse_batch(
             shared_properties,
             timestamp,
             end_timestamp,
+            vertex_timestamps: row_vertex_times,
             lon,
             lat,
         });
     }
     Ok(features)
+}
+
+/// Extract optional per-row vertex-timestamp lists from a `vertex_timestamps`
+/// column. Tolerates both `List<Timestamp(Millisecond)>` and `List<Int64>`
+/// children (ms in either case). Null rows return `None` for that slot;
+/// non-list columns return an error.
+fn extract_vertex_timestamps_from_batch(
+    batch: &arrow::record_batch::RecordBatch,
+    col_idx: usize,
+) -> Result<Vec<Option<Vec<u64>>>> {
+    let column = batch.column(col_idx);
+    let list = column
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow::anyhow!("vertex_timestamps column is not a List array"))?;
+
+    let mut out: Vec<Option<Vec<u64>>> = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        if !list.is_valid(row) {
+            out.push(None);
+            continue;
+        }
+        let values = list.value(row);
+        // The child can be either a TimestampMillisecondArray (preferred —
+        // self-describing) or a plain Int64Array (fallback for callers that
+        // wrote raw integers). Both store ms-since-epoch.
+        let row_times: Vec<u64> = if let Some(ts) =
+            values.as_any().downcast_ref::<TimestampMillisecondArray>()
+        {
+            (0..ts.len())
+                .map(|i| if ts.is_valid(i) { ts.value(i) as u64 } else { 0 })
+                .collect()
+        } else if let Some(ints) = values.as_any().downcast_ref::<Int64Array>() {
+            (0..ints.len())
+                .map(|i| if ints.is_valid(i) { ints.value(i) as u64 } else { 0 })
+                .collect()
+        } else {
+            anyhow::bail!(
+                "vertex_timestamps child must be Timestamp(Millisecond) or Int64; got {:?}",
+                values.data_type()
+            );
+        };
+        out.push(Some(row_times));
+    }
+    Ok(out)
 }
 
 /// Calculate spatial and temporal bounds from features

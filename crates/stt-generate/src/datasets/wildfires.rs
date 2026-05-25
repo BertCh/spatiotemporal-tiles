@@ -257,7 +257,7 @@ pub fn run(args: Args) -> Result<()> {
             "timestamp",
             3,
             12,
-            "gzip",
+            "zstd",
         )?;
 
         // Clean up intermediate file

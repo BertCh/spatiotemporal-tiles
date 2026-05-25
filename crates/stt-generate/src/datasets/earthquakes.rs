@@ -197,7 +197,21 @@ pub fn run(args: Args) -> Result<()> {
             min_zoom: 0,
             max_zoom: 10,
             compression: "zstd".to_string(),
-            temporal_bucket: None,
+            // 1d buckets: M4.0+ earthquakes are sparse globally (~50/day), so
+            // the stt-build default of 1h produced ~350K nearly-empty index
+            // entries (21 MB directory for an 87 MB archive) and a slow first
+            // load + janky pan/zoom. Daily buckets cut the index ~24x and
+            // still leave ~30 buckets inside the showcase's 30-day animation
+            // window.
+            temporal_bucket: Some("1d".to_string()),
+            // Skip single-feature tiles. Globally sparse points produce a
+            // long tail of 1-feature deep-zoom tiles whose Arrow IPC + zstd
+            // overhead dominates the payload (at z=10, 93% of tiles held
+            // exactly 1 feature, each ~790 bytes for ~85 bytes of data).
+            // The reader's parent-fallback surfaces the same features from
+            // their shallower-zoom ancestors — visually identical for point
+            // markers that scale by magnitude in pixels.
+            min_features_per_tile: Some(2),
             summary,
         })?;
 

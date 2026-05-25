@@ -426,6 +426,7 @@ mod tests {
             shared_properties: props,
             timestamp: ts,
             end_timestamp: None,
+            vertex_timestamps: None,
             lon,
             lat,
         }
