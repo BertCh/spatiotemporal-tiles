@@ -290,6 +290,38 @@ fn main() -> Result<()> {
     // The legacy path below keeps the small-dataset behaviour identical
     // to v2.
     if args.streaming_arrow {
+        // The streaming pipeline finalizes the archive before the in-memory
+        // path's summary-tier / heatmap-domain / raster / metadata-output
+        // passes run, so silently honouring those flags here would drop them.
+        // Refuse the combination with a clear error rather than producing an
+        // archive that's quietly missing the requested features. (Wiring these
+        // passes into the streaming finalize is tracked as a follow-up; until
+        // then use the in-memory pipeline for these features.)
+        let mut unsupported: Vec<&str> = Vec::new();
+        if args.summary_tier.is_some() {
+            unsupported.push("--summary-tier");
+        }
+        if args.heatmap_weight.is_some() {
+            unsupported.push("--heatmap-weight");
+        }
+        if args.heatmap_class.is_some() {
+            unsupported.push("--heatmap-class");
+        }
+        if args.heatmap_raster.is_some() {
+            unsupported.push("--heatmap-raster");
+        }
+        if args.metadata_output.is_some() {
+            unsupported.push("--metadata-output");
+        }
+        if !unsupported.is_empty() {
+            anyhow::bail!(
+                "--streaming-arrow does not yet support {} (the streaming pipeline \
+                 finalizes before those passes run). Re-run without --streaming-arrow \
+                 to use {}, or drop the flag(s) to stream.",
+                unsupported.join(", "),
+                unsupported.join(", "),
+            );
+        }
         info!("Using streaming-Arrow pipeline (bounded RAM)...");
         let temporal_bucket_ms = parse_duration(&args.temporal_bucket)?;
         let temporal_lod = match args.temporal_lod.as_deref() {

@@ -6,10 +6,10 @@
 //! Performance: Uses Rayon for parallel satellite propagation
 
 use crate::common;
+use crate::common::{LineStringRecord, StreamingLineStringParquetWriter};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use clap::Parser;
-use geojson::Feature;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde_json::{json, Map};
@@ -25,6 +25,21 @@ const CELESTRAK_ACTIVE_URL: &str = "https://celestrak.org/NORAD/elements/gp.php?
 
 /// Earth radius in km (WGS84)
 const EARTH_RADIUS_KM: f64 = 6378.137;
+
+/// Property columns carried through to the STT archive (string-typed in the
+/// LineString GeoParquet writer). `timestamp` / `end_timestamp` are the
+/// record's time fields and are intentionally not listed here.
+const SATELLITE_PROPERTY_COLUMNS: &[&str] = &[
+    "object_name",
+    "norad_id",
+    "intl_designator",
+    "orbit_type",
+    "altitude",
+    "inclination",
+    "eccentricity",
+    "mean_motion",
+    "segment",
+];
 
 #[derive(Parser, Debug)]
 #[command(about = "Generate satellite orbit data from CelesTrak TLE")]
@@ -175,30 +190,42 @@ pub fn run(args: Args) -> Result<()> {
     println!("   Step: {} seconds", args.step_seconds);
     println!("   Duration: {} hours", args.duration_hours);
 
-    // Determine output format
-    let intermediate_path = if args.output.extension().map(|e| e == "stt").unwrap_or(false) {
-        args.output.with_extension("geojson")
+    // stt-build only accepts GeoParquet input (the GeoJSON path was retired in
+    // the Arrow migration), so write a Parquet intermediate when the final
+    // output is an .stt archive; otherwise honour the requested extension.
+    let build_stt = args.output.extension().map(|e| e == "stt").unwrap_or(false) && !args.skip_build;
+    let intermediate_path = if build_stt {
+        args.output.with_extension("parquet")
     } else {
         args.output.clone()
     };
 
-    // Propagate orbits and generate features
+    // Propagate orbits and generate per-segment LineString records
     println!("\n🌍 Propagating satellite orbits...");
-    let features = propagate_orbits(&elements_list, start_time, end_time, step)?;
+    let records = propagate_orbits(&elements_list, start_time, end_time, step)?;
 
-    println!("\n✓ Generated {} orbit trajectories", features.len());
+    println!("\n✓ Generated {} orbit trajectories", records.len());
 
-    // Write output
+    // Write the GeoParquet intermediate.
     println!("\n💾 Writing output...");
-    common::write_geojson(features, &intermediate_path)?;
+    let property_columns: Vec<String> = SATELLITE_PROPERTY_COLUMNS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut writer = StreamingLineStringParquetWriter::new(&intermediate_path, property_columns)?;
+    for record in &records {
+        writer.write_linestring(record)?;
+    }
+    writer.finish()?;
 
-    // Build STT if output is .stt
-    if args.output.extension().map(|e| e == "stt").unwrap_or(false) && !args.skip_build {
+    // Build STT if requested. The LineString Parquet writer names its time
+    // columns `timestamp` / `end_timestamp`.
+    if build_stt {
         common::run_stt_build_with_end_time(
             &intermediate_path,
             &args.output,
             "timestamp",
-            Some("end_time"), // Include end time for proper time range filtering
+            Some("end_timestamp"),
             0,
             6, // Lower max zoom for global satellite data
             "zstd",
@@ -241,7 +268,7 @@ fn propagate_orbits(
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
     step: Duration,
-) -> Result<Vec<Feature>> {
+) -> Result<Vec<LineStringRecord>> {
     let pb = ProgressBar::new(elements_list.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -254,11 +281,11 @@ fn propagate_orbits(
     let failed = AtomicUsize::new(0);
 
     // Process satellites in parallel using Rayon
-    let features: Vec<Feature> = elements_list
+    let features: Vec<LineStringRecord> = elements_list
         .par_iter()
         .flat_map(|elements| {
             pb.inc(1);
-            
+
             match propagate_single_satellite(elements, start_time, end_time, step) {
                 Ok(segment_features) if !segment_features.is_empty() => {
                     successful.fetch_add(1, Ordering::Relaxed);
@@ -300,7 +327,7 @@ fn propagate_single_satellite(
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
     step: Duration,
-) -> Result<Vec<Feature>> {
+) -> Result<Vec<LineStringRecord>> {
     // Create propagation constants
     let constants = match Constants::from_elements(elements) {
         Ok(c) => c,
@@ -380,28 +407,31 @@ fn propagate_single_satellite(
     // Split path at large longitude jumps (antimeridian crossings, polar passes)
     let segments = split_at_discontinuities(&positions);
     
-    // Create a separate feature for each segment with proper timestamps
-    let mut features = Vec::new();
-    
+    // Create a separate LineString record for each segment with proper timestamps
+    let mut records = Vec::new();
+
     for (seg_idx, segment) in segments.iter().enumerate() {
         if segment.len() < 2 {
             continue;
         }
-        
+
         // Get segment's actual time range
         let seg_start = segment.first().unwrap().0;
         let seg_end = segment.last().unwrap().0;
-        
-        // Create 3D coordinates array [lon, lat, altitude_meters]
-        let coordinates: Vec<Vec<f64>> = segment.iter()
-            .map(|(_, lon, lat, alt)| vec![*lon, *lat, *alt])
+
+        // The STT format stores 2D interleaved [lon, lat]; altitude is dropped
+        // at the build seam regardless of input, so emit 2D coordinates here.
+        let coordinates: Vec<[f64; 2]> = segment
+            .iter()
+            .map(|(_, lon, lat, _alt)| [*lon, *lat])
             .collect();
-        
+
         // Calculate average altitude for the segment (for properties)
-        let avg_altitude: f64 = segment.iter().map(|(_, _, _, alt)| alt).sum::<f64>() 
+        let avg_altitude: f64 = segment.iter().map(|(_, _, _, alt)| alt).sum::<f64>()
             / segment.len() as f64;
 
-        // Build properties with segment's time range
+        // Build properties (string-typed in the Parquet writer). `timestamp` /
+        // `end_timestamp` are carried by the record's time fields, not here.
         let mut properties = Map::new();
         properties.insert("object_name".to_string(), json!(elements.object_name.clone().unwrap_or_default()));
         properties.insert("norad_id".to_string(), json!(elements.norad_id));
@@ -413,25 +443,16 @@ fn propagate_single_satellite(
         properties.insert("eccentricity".to_string(), json!(elements.eccentricity));
         properties.insert("mean_motion".to_string(), json!(elements.mean_motion));
         properties.insert("segment".to_string(), json!(seg_idx));
-        
-        // Use segment's actual start and end time for proper animation
-        properties.insert("timestamp".to_string(), json!(seg_start.to_rfc3339()));
-        properties.insert("end_time".to_string(), json!(seg_end.to_rfc3339()));
 
-        // Create feature with unique ID for each segment
-        let feature_id = (elements.norad_id as i64) * 1000 + (seg_idx as i64);
-        let feature = Feature {
-            bbox: None,
-            geometry: Some(geojson::Geometry::new(geojson::Value::LineString(coordinates))),
-            id: Some(geojson::feature::Id::Number(feature_id.into())),
-            properties: Some(properties),
-            foreign_members: None,
-        };
-        
-        features.push(feature);
+        records.push(LineStringRecord::new(
+            coordinates,
+            seg_start,
+            Some(seg_end),
+            properties,
+        ));
     }
 
-    Ok(features)
+    Ok(records)
 }
 
 /// Split positions into segments only at antimeridian crossings

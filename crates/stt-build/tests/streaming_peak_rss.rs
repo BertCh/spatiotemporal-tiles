@@ -10,8 +10,12 @@
 //!    that's well below the eager-pipeline cost of holding 5 M `ParsedFeature`s
 //!    in a `Vec` (estimated ~1.5 GB just for the carrier; see input.rs).
 //!
-//! The brief asks for <2 GB peak RSS on a 5 M-feature run. We assert <1.5 GB
-//! to leave headroom for the test harness itself and rayon worker stacks.
+//! The brief asks for <2 GB peak RSS on a 5 M-feature run; the heavy test
+//! below asserts a 2 GB cap and is `#[ignore]`d (run it explicitly or in a
+//! nightly job). A smaller, deterministic functional variant
+//! (`streaming_pipeline_runs_and_emits_tiles`) runs by default so the
+//! streaming path is exercised on every `cargo test` without the multi-GB
+//! cost or RSS-measurement flakiness.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -136,6 +140,70 @@ fn streaming_pipeline_bounds_peak_rss_for_5m_features() {
             "peak RSS {} bytes exceeds 2 GB cap",
             rss_after
         );
+    }
+}
+
+/// Default-running variant: a modest 300 k-feature stream that exercises the
+/// full producer/consumer streaming path on every `cargo test`. It does not
+/// attempt to prove the multi-GB RSS bound (that needs the 5 M run above);
+/// it guards against the streaming pipeline regressing/breaking and applies a
+/// generous absolute-RSS sanity cap when RSS is measurable.
+#[test]
+fn streaming_pipeline_runs_and_emits_tiles() {
+    use stt_build::tiler::{build_streaming_from_batches, TileConfig};
+    use stt_core::archive::Archive;
+    use stt_core::metadata::Metadata;
+    use stt_core::types::Compression;
+
+    const TOTAL: usize = 300_000;
+    const BATCH: usize = 4096;
+
+    let mut produced: usize = 0;
+    let iter = std::iter::from_fn(|| {
+        if produced >= TOTAL {
+            return None;
+        }
+        let n = BATCH.min(TOTAL - produced);
+        let mut batch = Vec::with_capacity(n);
+        for i in 0..n {
+            let r = (produced + i) as f64;
+            let lon = -180.0 + (r * 0.000_07) % 360.0;
+            let lat = -60.0 + (r * 0.000_03) % 120.0;
+            let ts = 1_600_000_000_000u64 + ((produced + i) as u64 % 24) * 3_600_000;
+            batch.push(synth_point(lon, lat, ts));
+        }
+        produced += n;
+        Some(Ok(batch))
+    });
+
+    let config = TileConfig {
+        min_zoom: 4,
+        max_zoom: 6,
+        layer_name: "default".to_string(),
+        temporal_bucket_ms: 24 * 3_600_000,
+        clip_trajectories: false,
+        clip_min_vertices: 2,
+        simplify: false,
+        simplify_max_zoom: 14,
+        pre_tessellate: false,
+        temporal_lod: Vec::new(),
+        min_features_per_tile: 1,
+    };
+
+    let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let mut writer = Archive::create(&path, Compression::Gzip).unwrap();
+    let stats =
+        build_streaming_from_batches(iter, &config, &mut writer, 4, 4 * 1024 * 1024).unwrap();
+    writer.finalize(&Metadata::new("rss-test-small")).unwrap();
+
+    assert!(stats.total_tiles > 0, "expected non-zero tile count");
+    let rss_after = peak_rss_bytes();
+    if rss_after > 0 {
+        // Very generous: 300 k synthetic points + tile buffers are well under
+        // this even with allocator slack and rayon stacks. Catches a gross
+        // unbounded-accumulation regression without RSS-measurement flakiness.
+        let cap = 1_536u64 * 1024 * 1024;
+        assert!(rss_after < cap, "peak RSS {rss_after} bytes exceeds 1.5 GB cap");
     }
 }
 

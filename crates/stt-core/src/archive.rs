@@ -892,6 +892,12 @@ impl ArchiveWriter {
     ///
     /// The dictionary slot is a v3-only feature: passing a dictionary on a
     /// v2 archive is an error (v2 has no on-disk slot for it).
+    ///
+    /// WARNING: the TypeScript reader (`@stt/core`) decodes zstd tiles with
+    /// `fzstd`, which has no dictionary API and will refuse to open an archive
+    /// whose `dictionary_length > 0`. Do not emit dictionary archives for
+    /// browser consumption until a dictionary-capable zstd decoder is wired in
+    /// `packages/core/src/compression.ts`. The Rust reader handles them fine.
     pub fn finalize_with_dictionary(
         mut self,
         metadata: &crate::metadata::Metadata,
