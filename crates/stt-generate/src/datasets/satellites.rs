@@ -536,9 +536,17 @@ fn calculate_gmst(time: DateTime<Utc>) -> f64 {
         (year, month)
     };
 
+    // Gregorian-calendar correction (Meeus, Astronomical Algorithms). Without
+    // this term the Julian Date is ~13 days too large for modern dates, which
+    // threw GMST off by ~14° and placed every satellite ~14° wrong in
+    // longitude. A = floor(Y/100); B = 2 - A + floor(A/4).
+    let a = (y / 100.0).floor();
+    let b = 2.0 - a + (a / 4.0).floor();
+
     let jd = (365.25 * (y + 4716.0)).floor()
         + (30.6001 * (m + 1.0)).floor()
         + day
+        + b
         + (hour + minute / 60.0 + second / 3600.0) / 24.0
         - 1524.5;
 
