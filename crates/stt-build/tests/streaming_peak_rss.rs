@@ -40,7 +40,6 @@ fn peak_rss_bytes() -> u64 {
 #[test]
 #[ignore] // Run with `cargo test --release --test streaming_peak_rss -- --ignored`
 fn streaming_pipeline_bounds_peak_rss_for_5m_features() {
-    use stt_build::input::ParsedFeature;
     use stt_build::tiler::{build_streaming_from_batches, TileConfig};
     use stt_core::archive::Archive;
     use stt_core::metadata::Metadata;

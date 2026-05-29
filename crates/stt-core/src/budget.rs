@@ -4,6 +4,7 @@
 //! by intelligently dropping less important features.
 
 use crate::tile::Feature;
+#[cfg(test)]
 use crate::types::GeometryType;
 
 /// Feature importance scorer

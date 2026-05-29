@@ -8,7 +8,7 @@
 //! advanced transformations between different coordinate systems.
 
 use crate::error::{Error, Result};
-use geo_types::{Coord, Point};
+use geo_types::Point;
 
 #[cfg(feature = "projection")]
 use proj::Proj;

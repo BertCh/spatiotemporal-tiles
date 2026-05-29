@@ -177,6 +177,19 @@ struct Args {
     #[arg(long, default_value = "summary")]
     summary_layer: String,
 
+    /// Number of fine-grained sub-buckets PER tile-temporal-bucket. Default
+    /// 1 = legacy single-count behaviour. When > 1, each summary cell row
+    /// carries N extra `bucket_<i>` numeric columns — counts of features
+    /// observed within each `(bucket_ms / N)`-wide sub-window. The
+    /// renderer can animate through these via a `currentSubBucket`
+    /// uniform with zero data re-upload between frames.
+    ///
+    /// Recommended: 12-30 for hour-bucketed archives (one column per 2-5
+    /// minutes). Tile size grows ~`N * 6 bytes per cell`; cap at 32 to
+    /// keep deep-zoom tiles tractable.
+    #[arg(long, default_value = "1")]
+    summary_sub_buckets: u32,
+
     /// Pre-tessellate polygon features at build time and store the resulting
     /// earcut triangle indices in a sidecar column. Lets renderers skip CPU
     /// tessellation on tile arrival — wins scale with polygon vertex count.
@@ -192,6 +205,41 @@ struct Args {
     /// surfaces the skipped features from their parent tile.
     #[arg(long, default_value = "1")]
     min_features_per_tile: u32,
+
+    /// Feature property used to drive the HeatmapLayer's per-splat weight.
+    /// When set, the build computes the property's [min, 95th percentile]
+    /// across all features and bakes it into the archive metadata as the
+    /// default heatmap-domain. The renderer reads it on archive open and
+    /// pins `colorDomain` — no runtime GPU readback, ramp stays stable
+    /// across tile churn.
+    ///
+    /// 95p (not absolute max) protects against single-outlier dimming —
+    /// one M9.5 quake shouldn't make the rest of the dataset invisible.
+    #[arg(long)]
+    heatmap_weight: Option<String>,
+
+    /// Categorical property whose values become per-class heatmap entries.
+    /// When combined with --heatmap-weight, the build emits one domain
+    /// entry per unique categorical value (up to 8). The renderer's
+    /// `channels` spec is keyed on these ids so a stacked heatmap can
+    /// pull per-class domains by id.
+    ///
+    /// Without --heatmap-weight, the per-class entries report constant
+    /// [0, 1] (sufficient for the un-weighted gaussian-peak case).
+    #[arg(long)]
+    heatmap_class: Option<String>,
+
+    /// Emit a pre-rasterized density-grid tier (Phase D). Format
+    /// `WxH` (e.g. `128x128`). At low zooms, one textured quad per tile
+    /// renders in constant per-frame time regardless of feature count —
+    /// the only practical path for 100M+ datasets at zoom ≤ 6.
+    ///
+    /// **NOTE (scaffold)**: this flag currently RECORDS intent in archive
+    /// metadata only. The actual tile rasterization + sidecar payload is
+    /// deferred to a follow-up. The CLI surface + metadata schema land
+    /// here so downstream consumers can plan against the contract.
+    #[arg(long)]
+    heatmap_raster: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -608,6 +656,7 @@ fn main() -> Result<()> {
             temporal_bucket_ms,
             columns: cols,
             layer_name: args.summary_layer.clone(),
+            sub_buckets: args.summary_sub_buckets.max(1),
         };
 
         info!(
@@ -642,6 +691,36 @@ fn main() -> Result<()> {
         metadata = metadata
             .with_temporal_lod(temporal_lod.clone())
             .with_context(|| "temporal LOD validation failed")?;
+    }
+    if let Some(domain) = compute_heatmap_domain(
+        &features,
+        args.heatmap_weight.as_deref(),
+        args.heatmap_class.as_deref(),
+    ) {
+        info!(
+            "Heatmap domain: {} class entries — first: {} → [{:.3}, {:.3}]",
+            domain.classes.len(),
+            domain.classes.first().map(|c| c.id.as_str()).unwrap_or("?"),
+            domain.classes.first().map(|c| c.min).unwrap_or(0.0),
+            domain.classes.first().map(|c| c.max).unwrap_or(1.0),
+        );
+        metadata = metadata.with_heatmap_domain(domain);
+    }
+
+    // Raster tier metadata scaffold (Phase D). Records intent only — the
+    // sidecar tile generation lands in a follow-up. Documented as
+    // declared-but-not-emitted in the field's comment.
+    if let Some(spec) = args.heatmap_raster.as_deref() {
+        match parse_raster_spec(spec, args.min_zoom, args.heatmap_class.as_deref()) {
+            Ok(tier) => {
+                info!(
+                    "Raster tier (scaffold): {}×{} × {} channels, zooms {}..={} (sidecar generation TODO)",
+                    tier.width, tier.height, tier.channels, tier.min_zoom, tier.max_zoom,
+                );
+                metadata = metadata.with_raster_tier(tier);
+            }
+            Err(e) => warn!("--heatmap-raster ignored: {e}"),
+        }
     }
 
     writer.finalize(&metadata)?;
@@ -680,6 +759,150 @@ fn main() -> Result<()> {
     info!("Total features: {}", features.len());
 
     Ok(())
+}
+
+/// Parse a `--heatmap-raster WxH` spec into a [`RasterTier`] descriptor.
+/// Honours `min_zoom` from the build config and gates raster output to
+/// the bottom 5 zooms (raster value drops off fast — by zoom 6 the
+/// per-tile cell count makes the hex summary tier more accurate).
+fn parse_raster_spec(
+    spec: &str,
+    base_min_zoom: u8,
+    heatmap_class: Option<&str>,
+) -> anyhow::Result<stt_core::metadata::RasterTier> {
+    let (w_s, h_s) = spec
+        .split_once('x')
+        .or_else(|| spec.split_once('X'))
+        .ok_or_else(|| anyhow::anyhow!("expected `WxH` (e.g. `128x128`)"))?;
+    let width: u16 = w_s
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid raster width: {w_s}"))?;
+    let height: u16 = h_s
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid raster height: {h_s}"))?;
+    if width == 0 || height == 0 || width > 1024 || height > 1024 {
+        anyhow::bail!("raster dims {width}×{height} out of range (1..=1024 per side)");
+    }
+    // Default to 1 channel; --heatmap-class would let us bump to N at
+    // bake time once the rasterizer wires per-class accumulators.
+    let (channels, class_ids) = match heatmap_class {
+        Some(_) => (1u8, vec!["default".to_string()]),
+        None => (1u8, vec!["default".to_string()]),
+    };
+    Ok(stt_core::metadata::RasterTier {
+        min_zoom: base_min_zoom,
+        max_zoom: base_min_zoom + 4,
+        width,
+        height,
+        channels,
+        class_ids,
+        layer_name: "density_raster".to_string(),
+    })
+}
+
+/// Compute the build-time HeatmapLayer intensity domain for the archive.
+///
+/// Returns `None` when there's nothing useful to bake (no `--heatmap-weight`
+/// AND no `--heatmap-class`). The default un-weighted gaussian-peak case is
+/// just `[0, 1]` per channel — the renderer hard-codes that fallback so we
+/// don't bother emitting it.
+///
+/// When `weight_prop` is set, the property's min and 95th-percentile across
+/// all features form the class domain. 95p (not absolute max) protects the
+/// ramp from single-outlier dimming.
+///
+/// When `class_prop` is set, the build emits ONE class entry per unique
+/// categorical value (capped at 8 to bound metadata size). Each entry's
+/// min/max is computed over features that carry that class value.
+fn compute_heatmap_domain(
+    features: &[input::ParsedFeature],
+    weight_prop: Option<&str>,
+    class_prop: Option<&str>,
+) -> Option<stt_core::metadata::HeatmapDomain> {
+    if weight_prop.is_none() && class_prop.is_none() {
+        return None;
+    }
+    use stt_core::metadata::{HeatmapClassDomain, HeatmapDomain};
+
+    fn extract_f64(f: &input::ParsedFeature, name: &str) -> Option<f64> {
+        f.shared_properties
+            .as_deref()?
+            .get(name)
+            .and_then(|v| v.as_f64())
+    }
+    fn extract_str(f: &input::ParsedFeature, name: &str) -> Option<String> {
+        f.shared_properties
+            .as_deref()?
+            .get(name)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+    fn p95(mut values: Vec<f64>) -> (f64, f64) {
+        if values.is_empty() {
+            return (0.0, 1.0);
+        }
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let min = values[0];
+        let idx = ((values.len() as f64 * 0.95).floor() as usize)
+            .min(values.len() - 1);
+        let max = values[idx];
+        (min, max)
+    }
+
+    let classes = if let Some(cls) = class_prop {
+        // Per-class domain. Group features by the categorical value.
+        let mut groups: std::collections::BTreeMap<String, Vec<f64>> =
+            std::collections::BTreeMap::new();
+        for f in features {
+            let Some(class_val) = extract_str(f, cls) else {
+                continue;
+            };
+            // Cap on group count to keep metadata bounded.
+            if groups.len() >= 8 && !groups.contains_key(&class_val) {
+                continue;
+            }
+            let bucket = groups.entry(class_val).or_default();
+            if let Some(w) = weight_prop.and_then(|p| extract_f64(f, p)) {
+                bucket.push(w);
+            } else {
+                // Un-weighted: count of "present" so min/p95 trivially map to
+                // [0, 1] post-aggregation. Push the gaussian-peak value.
+                bucket.push(1.0);
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(id, values)| {
+                let (min, max) = p95(values);
+                HeatmapClassDomain {
+                    id,
+                    min,
+                    max,
+                    property: weight_prop.map(str::to_string),
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        // No class split — one "default" entry.
+        let values: Vec<f64> = match weight_prop {
+            Some(p) => features.iter().filter_map(|f| extract_f64(f, p)).collect(),
+            None => vec![1.0],
+        };
+        let (min, max) = p95(values);
+        vec![HeatmapClassDomain {
+            id: "default".to_string(),
+            min,
+            max,
+            property: weight_prop.map(str::to_string),
+        }]
+    };
+
+    if classes.is_empty() {
+        return None;
+    }
+    Some(HeatmapDomain { classes })
 }
 
 /// Run stt-optimize over the input and fold its recommendations into `args`

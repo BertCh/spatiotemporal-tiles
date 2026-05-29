@@ -62,8 +62,6 @@ struct UsgsProperties {
     mag: f64,
     place: String,
     time: i64,
-    #[serde(default)]
-    depth: Option<f64>,
     #[serde(rename = "type")]
     event_type: String,
     title: String,

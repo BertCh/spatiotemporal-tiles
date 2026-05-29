@@ -37,7 +37,6 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use memmap2::Mmap;
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;

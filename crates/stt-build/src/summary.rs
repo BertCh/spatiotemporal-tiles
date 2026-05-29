@@ -46,6 +46,12 @@ pub struct SummaryConfig {
     pub columns: Vec<SummaryColumn>,
     /// Layer name carried in the emitted tile frames. Defaults to "summary".
     pub layer_name: String,
+    /// Number of fine-grained sub-buckets PER tile-temporal-bucket. When
+    /// > 1, each cell carries N additional `bucket_<i>` numeric columns
+    /// (one count per sub-bucket). The renderer animates time by changing
+    /// a uniform that indexes the array — zero re-upload between frames
+    /// inside a tile. Default 1 = legacy single-count behaviour.
+    pub sub_buckets: u32,
 }
 
 impl SummaryConfig {
@@ -69,6 +75,7 @@ impl SummaryConfig {
             cell_resolution_per_zoom: resolutions,
             columns: self.columns.clone(),
             layer_name: self.layer_name.clone(),
+            sub_buckets: self.sub_buckets.max(1),
         }
     }
 }
@@ -106,6 +113,11 @@ struct CellAggregate {
     /// Indexed by the SOURCE column name rather than the aggregation entry
     /// to avoid recomputing the same sum twice.
     sources: HashMap<String, Accumulator>,
+    /// Per-sub-bucket counts. Length = SummaryConfig.sub_buckets. The
+    /// rendered animation walks this array to drive the per-cell fill
+    /// colour via a uniform sub-bucket index — zero data re-upload
+    /// between frames inside a tile. Empty when sub_buckets == 1.
+    sub_bucket_counts: Vec<u32>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -152,6 +164,12 @@ pub fn build_summary_tier<W: TileWriter>(
     writer: &mut W,
 ) -> Result<usize> {
     let bucket_ms = config.temporal_bucket_ms.max(1);
+    let sub_buckets = config.sub_buckets.max(1) as usize;
+    let sub_bucket_ms = if sub_buckets > 1 {
+        (bucket_ms as usize / sub_buckets).max(1) as u64
+    } else {
+        bucket_ms
+    };
     let mut total = 0usize;
 
     for zoom in config.min_zoom..=config.max_zoom {
@@ -182,6 +200,17 @@ pub fn build_summary_tier<W: TileWriter>(
                 .or_default();
             let agg = bucket.entry(cell_id).or_default();
 
+            if sub_buckets > 1 {
+                if agg.sub_bucket_counts.is_empty() {
+                    agg.sub_bucket_counts = vec![0u32; sub_buckets];
+                }
+                // Index within this outer bucket.
+                let sub_idx = (((feature.timestamp - bucket_start) / sub_bucket_ms)
+                    as usize)
+                    .min(sub_buckets - 1);
+                agg.sub_bucket_counts[sub_idx] = agg.sub_bucket_counts[sub_idx]
+                    .saturating_add(1);
+            }
             agg.count += 1;
             let t = feature.timestamp as i64;
             let t_end = feature.end_timestamp.unwrap_or(feature.timestamp) as i64;
@@ -322,6 +351,36 @@ fn build_summary_layer(
 
     let mut properties: Vec<(String, PropertyColumn)> = Vec::new();
     properties.push(("count".to_string(), PropertyColumn::Numeric(counts)));
+
+    // Per-sub-bucket numeric columns (Phase C). When sub_buckets > 1, each
+    // cell row carries N additional `bucket_<i>` columns with the count
+    // observed in that fine-grained sub-bucket. The renderer reads them as
+    // standard numericProps and indexes via a `currentSubBucket` uniform —
+    // animation through time inside an outer-bucket tile is one shader
+    // uniform update, no data re-upload.
+    let sub_bucket_n = entries
+        .iter()
+        .map(|(_, a)| a.sub_bucket_counts.len())
+        .max()
+        .unwrap_or(0);
+    if sub_bucket_n > 0 {
+        for sub_idx in 0..sub_bucket_n {
+            let mut col_vals: Vec<Option<f64>> = Vec::with_capacity(entries.len());
+            for (_, agg) in &entries {
+                let v = agg
+                    .sub_bucket_counts
+                    .get(sub_idx)
+                    .copied()
+                    .unwrap_or(0) as f64;
+                col_vals.push(Some(v));
+            }
+            properties.push((
+                format!("bucket_{}", sub_idx),
+                PropertyColumn::Numeric(col_vals),
+            ));
+        }
+    }
+
     for (i, col) in columns.iter().enumerate() {
         if matches!(col.agg, SummaryAggregation::Count) {
             // Already emitted as the implicit `count` column.
@@ -498,6 +557,7 @@ mod tests {
                 },
             ],
             layer_name: "summary".into(),
+            sub_buckets: 1,
         };
 
         let mut writer = CollectingWriter { tiles: Vec::new() };
@@ -529,6 +589,51 @@ mod tests {
     }
 
     #[test]
+    fn build_summary_tier_emits_per_sub_bucket_columns_when_configured() {
+        // 6 features spread across the same hour, hitting different
+        // sub-bucket slots — sub-buckets must split the hour evenly.
+        let mut features = Vec::new();
+        let bucket_ms: u64 = 60 * 60 * 1000; // 1 hour
+        let sub_buckets: u32 = 6; // 10 min per sub
+        let sub_ms = bucket_ms / sub_buckets as u64;
+        for i in 0..sub_buckets {
+            features.push(point(
+                -122.45,
+                37.77,
+                1_000_000_000_000 + (i as u64 * sub_ms),
+                5.0,
+            ));
+        }
+        let config = SummaryConfig {
+            scheme: SummaryScheme::H3,
+            min_zoom: 5,
+            max_zoom: 5,
+            temporal_bucket_ms: bucket_ms,
+            columns: vec![],
+            layer_name: "summary".into(),
+            sub_buckets,
+        };
+        let mut writer = CollectingWriter { tiles: Vec::new() };
+        let n = build_summary_tier(&features, &config, &mut writer).unwrap();
+        assert!(n > 0);
+        // Every tile carries `bucket_0..bucket_5` numeric columns.
+        for tile in &writer.tiles {
+            let names: Vec<&str> = tile.layers[0]
+                .properties
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
+            for i in 0..sub_buckets {
+                assert!(
+                    names.contains(&format!("bucket_{}", i).as_str()),
+                    "tile missing bucket_{}: {names:?}",
+                    i
+                );
+            }
+        }
+    }
+
+    #[test]
     fn to_tier_emits_one_resolution_per_zoom() {
         let config = SummaryConfig {
             scheme: SummaryScheme::H3,
@@ -537,6 +642,7 @@ mod tests {
             temporal_bucket_ms: 3_600_000,
             columns: vec![],
             layer_name: "summary".into(),
+            sub_buckets: 1,
         };
         let tier = config.to_tier();
         assert_eq!(tier.cell_resolution_per_zoom, vec![0, 1, 2, 3, 4]);

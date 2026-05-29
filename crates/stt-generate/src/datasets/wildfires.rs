@@ -80,8 +80,6 @@ struct ArcGISAttributes {
     feature_category: Option<String>,
     #[serde(rename = "IRWINID")]
     irwin_id: Option<String>,
-    #[serde(rename = "MAP_METHOD")]
-    map_method: Option<String>,
 }
 
 fn deserialize_flex_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>

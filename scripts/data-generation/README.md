@@ -59,10 +59,16 @@ stt-generate nyc-rideshare --download 2016-01 --max-trips 10000 --output nyc.stt
 
 ## Custom Data
 
-For data not covered by built-in datasets, use `stt-build` directly:
+For data not covered by built-in datasets, use `stt-build` directly.
+`stt-build` accepts **GeoParquet only** — convert other formats first
+(`ogr2ogr -f Parquet out.parquet in.geojson`, or see the
+[Python guide](../../docs/guides/python.md)):
 
 ```bash
-stt-build --input my-data.geojson --output my-data.stt --time-field timestamp
+stt-build \
+  --input my-data.parquet --output my-data.stt \
+  --time-field timestamp --time-format unix-ms \
+  --auto
 ```
 
 ## Data Files

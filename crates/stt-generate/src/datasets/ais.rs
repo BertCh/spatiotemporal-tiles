@@ -381,7 +381,6 @@ fn process_ais_files(
 
     let mut vessel_last_time: HashMap<String, i64> = HashMap::new();
     let mut total_records = 0;
-    let mut filtered_records = 0;
     let mut unique_vessels = HashSet::new();
 
     let property_columns = vec![
@@ -466,7 +465,6 @@ fn process_ais_files(
                 if record.lat < min_lat || record.lat > max_lat
                     || record.lon < min_lon || record.lon > max_lon
                 {
-                    filtered_records += 1;
                     continue;
                 }
             }

@@ -81,6 +81,7 @@ fn raw_plus_summary_tier_roundtrips_through_archive() {
         temporal_bucket_ms: 3_600_000,
         columns: cols,
         layer_name: "summary".to_string(),
+        sub_buckets: 1,
     };
     let n_summary = build_summary_tier(&features, &summary_config, &mut writer).unwrap();
     assert!(n_summary > 0, "summary tier produced no tiles");

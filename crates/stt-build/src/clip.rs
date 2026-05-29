@@ -15,7 +15,6 @@ use crate::input::SharedProperties;
 use crate::simplify::simplify_for_zoom;
 use geojson::{Feature, Geometry, Value as GeomValue};
 use std::collections::HashSet;
-use stt_core::projection;
 
 /// A clipped segment of a trajectory assigned to a specific tile
 #[derive(Debug, Clone)]
@@ -116,11 +115,6 @@ impl TileBounds {
         }
     }
 
-    /// Check if a point is inside the bounds
-    fn contains(&self, lon: f64, lat: f64) -> bool {
-        lon >= self.min_lon && lon <= self.max_lon && lat >= self.min_lat && lat <= self.max_lat
-    }
-
     /// Check if bounds intersect with a bounding box
     fn intersects(&self, min_lon: f64, min_lat: f64, max_lon: f64, max_lat: f64) -> bool {
         self.min_lon <= max_lon
@@ -145,59 +139,6 @@ fn compute_bbox(coords: &[(f64, f64, f64)]) -> (f64, f64, f64, f64) {
     }
 
     (min_lon, min_lat, max_lon, max_lat)
-}
-
-/// Get all tiles that a bounding box intersects at a given zoom level.
-///
-/// Kept for the rare non-trajectory bbox path; trajectory clipping now uses
-/// [`tiles_along_trajectory`], a per-segment supercover line that enumerates
-/// only the tiles the path actually crosses.
-#[allow(dead_code)]
-fn tiles_intersecting_bbox(
-    min_lon: f64,
-    min_lat: f64,
-    max_lon: f64,
-    max_lat: f64,
-    zoom: u8,
-) -> Vec<(u32, u32)> {
-    // Clamp to valid lat range for Web Mercator
-    let min_lat = min_lat.max(-85.0511);
-    let max_lat = max_lat.min(85.0511);
-    let min_lon = min_lon.max(-180.0);
-    let max_lon = max_lon.min(180.0);
-
-    // Get corner tiles
-    let (min_x, max_y) = projection::lonlat_to_tile(min_lon, min_lat, zoom).unwrap_or((0, 0));
-    let (max_x, min_y) = projection::lonlat_to_tile(max_lon, max_lat, zoom).unwrap_or((0, 0));
-
-    let n = 1u32 << zoom;
-
-    // X ranges to cover. Normally a single [min_x, max_x] range, but a bbox
-    // that crosses the antimeridian (±180°) has min_x > max_x. In that case
-    // the X axis wraps, so split into two ranges: [min_x, n-1] and [0, max_x].
-    // Without this split, `min_x..=max_x` is empty and the feature is dropped.
-    let x_ranges: Vec<(u32, u32)> = if min_x <= max_x {
-        vec![(min_x, max_x)]
-    } else {
-        tracing::debug!(
-            "bbox crosses antimeridian (min_x={}, max_x={}, zoom={}); \
-             splitting X tile range into two wrapped ranges",
-            min_x,
-            max_x,
-            zoom
-        );
-        vec![(min_x, n - 1), (0, max_x)]
-    };
-
-    let mut tiles = Vec::new();
-    for (xs, xe) in x_ranges {
-        for x in xs..=xe {
-            for y in min_y..=max_y {
-                tiles.push((x, y));
-            }
-        }
-    }
-    tiles
 }
 
 /// Convert a WGS84 (lon, lat) point to continuous Web Mercator tile-space
@@ -1053,48 +994,6 @@ mod tests {
             assert!(*x < n && *y < n, "tile ({x},{y}) out of bounds for zoom 5");
         }
         assert!(!tiles.is_empty());
-    }
-
-    #[test]
-    fn supercover_beats_bbox_for_long_trajectory() {
-        // Synthetic ~continental trajectory: SF -> NYC -> Miami sampled
-        // densely. At zoom 14 the bbox enumerates the entire rectangle
-        // (~tens of thousands of tiles); supercover should be O(touched).
-        let mut coords = Vec::new();
-        let waypoints = [
-            (-122.42, 37.77),
-            (-104.99, 39.74),
-            (-87.65, 41.85),
-            (-74.00, 40.71),
-            (-80.19, 25.76),
-        ];
-        // Densely sample 250 points per leg (1000 total) to mimic AIS-density.
-        for win in waypoints.windows(2) {
-            let (a, b) = (win[0], win[1]);
-            for s in 0..250 {
-                let t = s as f64 / 250.0;
-                coords.push((a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1), 0.0));
-            }
-        }
-        coords.push((-80.19, 25.76, 0.0));
-
-        let (min_lon, min_lat, max_lon, max_lat) = compute_bbox(&coords);
-        let bbox_count = tiles_intersecting_bbox(min_lon, min_lat, max_lon, max_lat, 14).len();
-        let super_count = tiles_along_trajectory(&coords, 14).len();
-
-        // At zoom 14 the bbox of SF->Miami is on the order of ~10^5+ tiles,
-        // while the path itself touches a few thousand. The brief asks for
-        // >100x; assert a conservative 50x to keep the test robust on small
-        // synthetic paths, plus an absolute bound that's wildly comfortable.
-        assert!(
-            super_count * 50 < bbox_count,
-            "expected >=50x speedup; bbox={bbox_count} super={super_count}"
-        );
-        assert!(super_count > 0);
-        eprintln!(
-            "supercover speedup: bbox={bbox_count} super={super_count} ratio={:.1}x",
-            bbox_count as f64 / super_count.max(1) as f64
-        );
     }
 
     #[test]

@@ -45,6 +45,18 @@ pub struct SummaryTier {
     pub columns: Vec<SummaryColumn>,
     #[serde(default = "default_summary_layer_name")]
     pub layer_name: String,
+    /// Number of fine-grained sub-buckets per outer time-bucket emitted
+    /// at build time. `1` (or absent) = legacy single-count behaviour.
+    /// When > 1, each cell row carries N additional numeric columns named
+    /// `bucket_0`..`bucket_<N-1>` and the renderer animates inside a tile
+    /// by switching which column drives the per-cell colour — zero data
+    /// re-upload between frames.
+    #[serde(default = "default_sub_buckets")]
+    pub sub_buckets: u32,
+}
+
+fn default_sub_buckets() -> u32 {
+    1
 }
 
 fn default_summary_layer_name() -> String {
@@ -75,6 +87,82 @@ impl SummaryTier {
                 *self.cell_resolution_per_zoom.last().unwrap()
             })
     }
+}
+
+/// Description of an optional pre-rasterized density-grid tier.
+///
+/// At very low zooms a per-tile RGBA density raster (~64-256 wide per side)
+/// renders a planet-scale point dataset in constant per-frame time: one
+/// textured quad per visible tile + one palette LUT lookup, regardless of
+/// the underlying feature count. This is the only practical path for
+/// 100M+ datasets at zoom ≤ 6 — pre-aggregating into hex/quadbin cells
+/// works in the middle zooms but the cell count itself starts to dominate
+/// at planet scale, while a 256×256 raster is fixed-cost.
+///
+/// The tier emits one tile per (zoom, x, y, time-bucket). Tile payloads
+/// carry an extra `density_raster` layer with a `FixedSizeList<UInt16,
+/// width*height*channels>` column — up to 4 categorical classes pack into
+/// the RGBA channels.
+///
+/// **Build wiring is TODO** as of this scaffold — the metadata + CLI flag
+/// are in place to lock down the contract; raster generation lands in a
+/// dedicated follow-up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RasterTier {
+    /// Inclusive minimum zoom level at which raster tiles are emitted.
+    pub min_zoom: u8,
+    /// Inclusive maximum zoom level at which raster tiles are emitted.
+    pub max_zoom: u8,
+    /// Width of each density raster, in pixels.
+    pub width: u16,
+    /// Height of each density raster, in pixels.
+    pub height: u16,
+    /// Number of RGBA channels used (1..=4). One class per channel.
+    pub channels: u8,
+    /// Per-channel class ids (ordered to match channel index 0..channels-1).
+    /// Used by the renderer to bind a `colorRange` to each channel.
+    pub class_ids: Vec<String>,
+    /// Layer name carried in the emitted raster-tile frames. Defaults to
+    /// `density_raster`.
+    #[serde(default = "default_raster_layer_name")]
+    pub layer_name: String,
+}
+
+fn default_raster_layer_name() -> String {
+    "density_raster".to_string()
+}
+
+/// Bake-time per-class intensity domain for the GPU-splat HeatmapLayer.
+///
+/// The HeatmapLayer maps `(weight × gaussian_falloff × intensity)` through a
+/// palette LUT. Without a pinned domain the renderer would either bake `[0,1]`
+/// in (saturating immediately when `weightProperty` carries large values like
+/// earthquake magnitudes) or trigger a runtime GPU readback to auto-detect
+/// the max. Computing the domain at build time gives the renderer a stable
+/// ramp with zero runtime cost.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeatmapClassDomain {
+    /// Class id — `"default"` for the un-classified single-channel mode,
+    /// otherwise matches the FE channel id (typically a categorical value).
+    pub id: String,
+    /// Inclusive minimum splat intensity for this class.
+    pub min: f64,
+    /// Inclusive maximum splat intensity for this class. For the
+    /// un-weighted default this is 1.0 (the gaussian peak). For a
+    /// weight-property-driven layer this is the 95th-percentile weight
+    /// across all features (95p is more visually useful than absolute max,
+    /// which lets a single outlier dim the whole ramp).
+    pub max: f64,
+    /// Source weight property the domain was computed from, if any.
+    /// `None` = constant unit weight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub property: Option<String>,
+}
+
+/// Container for the build-time HeatmapLayer domain metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeatmapDomain {
+    pub classes: Vec<HeatmapClassDomain>,
 }
 
 /// One level of a temporal LOD pyramid (orthogonal to the summary tier above).
@@ -134,6 +222,20 @@ pub struct Metadata {
     /// can fetch coarser tiles instead of streaming per-hour base tiles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporal_lod: Option<Vec<TemporalLodLevel>>,
+
+    /// Optional bake-time HeatmapLayer intensity domains. When set, the
+    /// renderer's HeatmapLayer skips its runtime `colorDomain` default of
+    /// `[0, 1]` and uses these per-class entries instead — vital when the
+    /// configured `weightProperty` carries values far outside that range
+    /// (earthquake magnitudes, AIS speed, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heatmap_domain: Option<HeatmapDomain>,
+
+    /// Optional pre-rasterized density-grid tier. The lowest-zoom path for
+    /// 100M+ point datasets — per-frame cost is independent of feature
+    /// count. See [`RasterTier`] for details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raster_tier: Option<RasterTier>,
 }
 
 impl Default for Metadata {
@@ -158,6 +260,8 @@ impl Default for Metadata {
             temporal_bucket_ms: 3600 * 1000, // 1 hour default
             summary_tier: None,
             temporal_lod: None,
+            heatmap_domain: None,
+            raster_tier: None,
         }
     }
 }
@@ -241,6 +345,18 @@ impl Metadata {
     /// Attach an aggregated summary-tier descriptor.
     pub fn with_summary_tier(mut self, tier: SummaryTier) -> Self {
         self.summary_tier = Some(tier);
+        self
+    }
+
+    /// Attach a bake-time HeatmapLayer intensity-domain block.
+    pub fn with_heatmap_domain(mut self, domain: HeatmapDomain) -> Self {
+        self.heatmap_domain = Some(domain);
+        self
+    }
+
+    /// Attach a pre-rasterized density-tier descriptor.
+    pub fn with_raster_tier(mut self, tier: RasterTier) -> Self {
+        self.raster_tier = Some(tier);
         self
     }
 
@@ -335,6 +451,7 @@ mod tests {
                 },
             ],
             layer_name: "summary".to_string(),
+            sub_buckets: 1,
         };
         let metadata = Metadata::new("summary-test").with_summary_tier(tier.clone());
         let bytes = metadata.to_json_bytes().unwrap();
@@ -348,6 +465,68 @@ mod tests {
         assert_eq!(dt.resolution_for_zoom(2), 2);
         // Out-of-range zooms clamp to the endpoints.
         assert_eq!(dt.resolution_for_zoom(10), 4);
+    }
+
+    #[test]
+    fn test_raster_tier_roundtrip() {
+        let tier = RasterTier {
+            min_zoom: 0,
+            max_zoom: 5,
+            width: 128,
+            height: 128,
+            channels: 2,
+            class_ids: vec!["pickup".to_string(), "dropoff".to_string()],
+            layer_name: "density_raster".to_string(),
+        };
+        let metadata = Metadata::new("raster-test").with_raster_tier(tier.clone());
+        let bytes = metadata.to_json_bytes().unwrap();
+        let decoded = Metadata::from_json_bytes(&bytes).unwrap();
+        let d = decoded.raster_tier.unwrap();
+        assert_eq!(d, tier);
+    }
+
+    #[test]
+    fn test_raster_tier_field_omitted_when_unset() {
+        let metadata = Metadata::new("no-raster");
+        let s = String::from_utf8(metadata.to_json_bytes().unwrap()).unwrap();
+        assert!(!s.contains("raster_tier"), "got: {s}");
+    }
+
+    #[test]
+    fn test_heatmap_domain_roundtrip() {
+        let domain = HeatmapDomain {
+            classes: vec![
+                HeatmapClassDomain {
+                    id: "pickup".to_string(),
+                    min: 0.0,
+                    max: 7.5,
+                    property: Some("intensity".to_string()),
+                },
+                HeatmapClassDomain {
+                    id: "dropoff".to_string(),
+                    min: 0.0,
+                    max: 9.0,
+                    property: None,
+                },
+            ],
+        };
+        let metadata = Metadata::new("heat-test").with_heatmap_domain(domain.clone());
+        let bytes = metadata.to_json_bytes().unwrap();
+        let decoded = Metadata::from_json_bytes(&bytes).unwrap();
+        let d = decoded.heatmap_domain.unwrap();
+        assert_eq!(d.classes.len(), 2);
+        assert_eq!(d.classes[0].id, "pickup");
+        assert_eq!(d.classes[0].max, 7.5);
+        assert_eq!(d.classes[0].property.as_deref(), Some("intensity"));
+        assert_eq!(d.classes[1].id, "dropoff");
+        assert_eq!(d.classes[1].property, None);
+    }
+
+    #[test]
+    fn test_heatmap_domain_field_omitted_when_unset() {
+        let metadata = Metadata::new("no-heat");
+        let s = String::from_utf8(metadata.to_json_bytes().unwrap()).unwrap();
+        assert!(!s.contains("heatmap_domain"), "got: {s}");
     }
 
     #[test]

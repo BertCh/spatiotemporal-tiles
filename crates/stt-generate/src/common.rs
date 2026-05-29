@@ -4,7 +4,7 @@ use anyhow::Result;
 use arrow::array::{ArrayRef, Float64Builder, ListBuilder, StringBuilder, TimestampMillisecondBuilder};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use csv::Writer as CsvWriter;
 use geojson::{Feature, FeatureCollection, GeoJson, Geometry, Value};
 use parquet::arrow::ArrowWriter;
@@ -379,62 +379,11 @@ impl StreamingParquetWriter {
     }
 }
 
-/// Write point records to GeoParquet file
-pub fn write_geoparquet(records: Vec<PointRecord>, output_path: &Path, property_columns: Vec<String>) -> Result<()> {
-    println!("💾 Writing {} records to {:?}", records.len(), output_path);
-    
-    let mut writer = StreamingParquetWriter::new(output_path, property_columns)?;
-    
-    for record in &records {
-        writer.write_point(record)?;
-    }
-    
-    writer.finish()?;
-    Ok(())
-}
-
 /// Determine output format based on file extension
 pub fn is_parquet_output(path: &Path) -> bool {
     path.extension()
         .map(|ext| ext.eq_ignore_ascii_case("parquet") || ext.eq_ignore_ascii_case("geoparquet"))
         .unwrap_or(false)
-}
-
-/// Parse date string in YYYY-MM-DD format
-pub fn parse_date(date_str: &str) -> Result<NaiveDate> {
-    Ok(NaiveDate::parse_from_str(date_str, "%Y-%m-%d")?)
-}
-
-/// Convert NaiveDate to DateTime<Utc>
-pub fn date_to_datetime(date: NaiveDate) -> DateTime<Utc> {
-    DateTime::from_naive_utc_and_offset(date.and_hms_opt(0, 0, 0).unwrap(), Utc)
-}
-
-/// Unzip a file
-pub fn unzip_file(zip_path: &Path, output_dir: &Path) -> Result<()> {
-    use zip::ZipArchive;
-
-    let file = File::open(zip_path)?;
-    let mut archive = ZipArchive::new(file)?;
-
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let outpath = output_dir.join(file.name());
-
-        if file.name().ends_with('/') {
-            std::fs::create_dir_all(&outpath)?;
-        } else {
-            if let Some(p) = outpath.parent() {
-                if !p.exists() {
-                    std::fs::create_dir_all(p)?;
-                }
-            }
-            let mut outfile = File::create(&outpath)?;
-            std::io::copy(&mut file, &mut outfile)?;
-        }
-    }
-
-    Ok(())
 }
 
 /// Streaming CSV writer for point data
@@ -532,16 +481,6 @@ fn json_value_to_string(value: &JsonValue) -> String {
 // ============================================================================
 // WKB Encoding for GeoParquet
 // ============================================================================
-
-/// Encode a Point as WKB (Well-Known Binary)
-pub fn encode_wkb_point(lon: f64, lat: f64) -> Vec<u8> {
-    let mut wkb = Vec::with_capacity(21);
-    wkb.push(1); // Little-endian
-    wkb.extend_from_slice(&1u32.to_le_bytes()); // Point type
-    wkb.extend_from_slice(&lon.to_le_bytes());
-    wkb.extend_from_slice(&lat.to_le_bytes());
-    wkb
-}
 
 /// Encode a LineString as WKB (Well-Known Binary)
 /// coordinates: vec of [lon, lat] pairs
@@ -783,10 +722,6 @@ impl StreamingLineStringParquetWriter {
         self.writer.close()?;
         println!("✓ GeoParquet (LineString) written successfully ({} rows)", self.total_rows);
         Ok(self.total_rows)
-    }
-
-    pub fn row_count(&self) -> usize {
-        self.total_rows
     }
 }
 

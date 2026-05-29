@@ -5,11 +5,9 @@
 
 use crate::common::{self, LineStringRecord, StreamingLineStringParquetWriter};
 use anyhow::{anyhow, Context, Result};
-use arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
-use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rand::seq::SliceRandom;
 use rand::Rng;
 use serde::Deserialize;
@@ -122,9 +120,6 @@ struct OsrmRouteResponse {
 #[derive(Debug, Deserialize)]
 struct OsrmRoute {
     geometry: OsrmGeometry,
-    duration: f64,
-    #[allow(dead_code)]
-    distance: f64,
     /// Present when the request includes `annotations=duration,distance`.
     /// Contains per-leg (segment) durations/distances along the route.
     /// `legs[i].annotation.duration[j]` is the OSRM-estimated seconds to
@@ -607,130 +602,6 @@ fn download_tlc_data(month: &str, verbose: bool) -> Result<PathBuf> {
     println!("   📁 Saved to: {}", output_path.display());
     
     Ok(output_path)
-}
-
-/// Parse TLC Parquet file (the new format TLC provides)
-fn parse_tlc_parquet(path: &PathBuf, args: &Args) -> Result<Vec<Trip>> {
-    let file = File::open(path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let reader = builder.build()?;
-    
-    let mut trips = Vec::new();
-    let max_duration_secs = args.max_duration_minutes as i64 * 60;
-    
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")?
-    );
-    pb.set_message("Reading Parquet data...");
-    
-    for batch_result in reader {
-        let batch = batch_result?;
-        
-        // Try to get pickup/dropoff coordinate columns (pre-July 2016 data)
-        let pickup_lon = batch.column_by_name("pickup_longitude")
-            .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
-        let pickup_lat = batch.column_by_name("pickup_latitude")
-            .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
-        let dropoff_lon = batch.column_by_name("dropoff_longitude")
-            .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
-        let dropoff_lat = batch.column_by_name("dropoff_latitude")
-            .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
-        
-        // Check if we have coordinates
-        let (pickup_lon, pickup_lat, dropoff_lon, dropoff_lat) = match (pickup_lon, pickup_lat, dropoff_lon, dropoff_lat) {
-            (Some(plon), Some(plat), Some(dlon), Some(dlat)) => (plon, plat, dlon, dlat),
-            _ => {
-                pb.finish_with_message("No coordinate columns found in data (try a date before July 2016)");
-                return Err(anyhow!("This Parquet file doesn't have lat/long coordinates. TLC data after June 2016 uses location IDs instead. Use --download 2016-01 through 2016-06."));
-            }
-        };
-        
-        // Get timestamp columns - try different possible column names
-        let pickup_time_col = batch.column_by_name("tpep_pickup_datetime")
-            .or_else(|| batch.column_by_name("pickup_datetime"));
-        let dropoff_time_col = batch.column_by_name("tpep_dropoff_datetime")
-            .or_else(|| batch.column_by_name("dropoff_datetime"));
-        
-        let (pickup_times, dropoff_times) = match (pickup_time_col, dropoff_time_col) {
-            (Some(pt), Some(dt)) => (pt, dt),
-            _ => continue,
-        };
-        
-        // Get optional columns
-        let passenger_count = batch.column_by_name("passenger_count")
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-        let trip_distance = batch.column_by_name("trip_distance")
-            .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
-        let fare_amount = batch.column_by_name("fare_amount")
-            .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
-        
-        for i in 0..batch.num_rows() {
-            // Get coordinates
-            let plon = pickup_lon.value(i);
-            let plat = pickup_lat.value(i);
-            let dlon = dropoff_lon.value(i);
-            let dlat = dropoff_lat.value(i);
-            
-            // Skip invalid coordinates
-            if plon == 0.0 || plat == 0.0 || dlon == 0.0 || dlat == 0.0 {
-                continue;
-            }
-            if !is_in_nyc(plon, plat) || !is_in_nyc(dlon, dlat) {
-                continue;
-            }
-            
-            // Parse timestamps (TLC uses timestamp microseconds)
-            let pickup_time = if let Some(ts_arr) = pickup_times.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-                let micros = ts_arr.value(i);
-                Utc.timestamp_opt(micros / 1_000_000, ((micros % 1_000_000) * 1000) as u32).single()
-            } else {
-                None
-            };
-            
-            let dropoff_time = if let Some(ts_arr) = dropoff_times.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-                let micros = ts_arr.value(i);
-                Utc.timestamp_opt(micros / 1_000_000, ((micros % 1_000_000) * 1000) as u32).single()
-            } else {
-                None
-            };
-            
-            let (pickup_time, dropoff_time) = match (pickup_time, dropoff_time) {
-                (Some(pt), Some(dt)) => (pt, dt),
-                _ => continue,
-            };
-            
-            // Filter by duration
-            let duration = dropoff_time.signed_duration_since(pickup_time);
-            if duration.num_seconds() > max_duration_secs || duration.num_seconds() < 60 {
-                continue;
-            }
-            
-            // Filter by distance
-            let estimated_distance = common::haversine_distance(plat, plon, dlat, dlon);
-            if estimated_distance < args.min_distance_meters {
-                continue;
-            }
-            
-            trips.push(Trip {
-                pickup_time,
-                dropoff_time,
-                pickup_lon: plon,
-                pickup_lat: plat,
-                dropoff_lon: dlon,
-                dropoff_lat: dlat,
-                passenger_count: passenger_count.map(|c| c.value(i) as u8).unwrap_or(1),
-                trip_distance: trip_distance.map(|c| c.value(i)).unwrap_or(0.0),
-                fare_amount: fare_amount.map(|c| c.value(i)).unwrap_or(0.0),
-            });
-        }
-        
-        pb.set_message(format!("Found {} valid trips...", trips.len()));
-    }
-    
-    pb.finish_and_clear();
-    Ok(trips)
 }
 
 fn parse_tlc_csv(path: &PathBuf, args: &Args) -> Result<Vec<Trip>> {

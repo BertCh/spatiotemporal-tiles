@@ -4,7 +4,7 @@
 
 use crate::common::{self, LineStringRecord, PointRecord, StreamingLineStringParquetWriter, StreamingParquetWriter};
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
+use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 use clap::Parser;
 use csv::ReaderBuilder;
 use flate2::read::GzDecoder;
@@ -510,13 +510,12 @@ fn process_csv(
     Ok(())
 }
 
-/// A flight position with timestamp and altitude
+/// A flight position with timestamp
 #[derive(Debug, Clone)]
 struct FlightPosition {
     time: i64,
     lon: f64,
     lat: f64,
-    altitude_m: f64, // Altitude in meters for 3D paths
     callsign: Option<String>,
 }
 
@@ -588,9 +587,6 @@ fn process_csv_paths(
             }
         }
 
-        // Get altitude in meters (baroaltitude is in meters in OpenSky data)
-        let altitude_m = record.baroaltitude.unwrap_or(0.0);
-
         let positions = aircraft_positions
             .entry(record.icao24.clone())
             .or_insert_with(BTreeMap::new);
@@ -598,13 +594,12 @@ fn process_csv_paths(
         // Use time as key to handle duplicates - only keep one position per second
         // Apply sampling - only keep positions at sample_seconds intervals
         let sample_key = record.time / sample_seconds * sample_seconds;
-        
+
         if !positions.contains_key(&sample_key) {
             positions.insert(sample_key, FlightPosition {
                 time: record.time,
                 lon,
                 lat,
-                altitude_m,
                 callsign: record.callsign.clone(),
             });
         }
@@ -621,7 +616,6 @@ fn process_csv_paths(
     ];
     let mut writer = StreamingLineStringParquetWriter::new(output, property_columns)?;
 
-    let mut total_segments = 0;
     let mut total_points = 0;
 
     let pb = ProgressBar::new(aircraft_positions.len() as u64);
@@ -683,7 +677,6 @@ fn process_csv_paths(
             );
 
             writer.write_linestring(&record)?;
-            total_segments += 1;
             total_points += segment.len();
         }
 
