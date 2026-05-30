@@ -202,6 +202,8 @@ pub fn run(args: Args) -> Result<()> {
             // still leave ~30 buckets inside the showcase's 30-day animation
             // window.
             temporal_bucket: Some("1d".to_string()),
+            temporal_lod: None,
+            summary_sub_buckets: None,
             // Skip single-feature tiles. Globally sparse points produce a
             // long tail of 1-feature deep-zoom tiles whose Arrow IPC + zstd
             // overhead dominates the payload (at z=10, 93% of tiles held

@@ -41,6 +41,19 @@ use std::sync::Arc;
 /// GeoArrow extension-name metadata key.
 const GEOARROW_EXT_KEY: &str = "ARROW:extension:name";
 
+/// GeoArrow extension-*metadata* key — the sibling of [`GEOARROW_EXT_KEY`] that
+/// carries the per-geometry-type JSON metadata (CRS, edge interpretation, ...).
+const GEOARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
+
+/// CRS advertised on every geometry field.
+///
+/// STT stores interleaved `[lon, lat]` in WGS84, i.e. **OGC:CRS84** (the GeoJSON
+/// longitude-first axis order) — *not* `EPSG:4326`, which strict readers treat as
+/// lat/lon. Emitting it as a GeoArrow `authority_code` makes every tile
+/// self-describing to GDAL / GeoPandas / lonboard / QGIS; without it those
+/// readers fall back to "unknown CRS" even though the geometry is plain lon/lat.
+const GEOARROW_CRS_METADATA: &str = r#"{"crs":"OGC:CRS84","crs_type":"authority_code"}"#;
+
 /// A single coordinate pair (lon, lat) in WGS84 degrees.
 pub type Coord = [f64; 2];
 
@@ -296,11 +309,16 @@ const VERTEX_TIME_STEP_KEY: &str = "stt:vertex_time_step_ms";
 /// inserted into the dictionary); strings are deduplicated in first-seen
 /// order so the on-disk Arrow dictionary is stable across runs.
 ///
-/// Saturates at u16::MAX categories — additional unique strings beyond
-/// that limit collapse to the last seen index. In practice STT
-/// categorical columns top out in the low hundreds; this cap exists to
-/// keep the on-disk key width bounded.
-fn build_dictionary_indices(values: &[Option<String>]) -> (Vec<Option<u16>>, Vec<String>) {
+/// Errors if a column has more than `u16::MAX` distinct values, which the
+/// `UInt16` key space cannot address. In practice STT categorical columns top
+/// out in the low hundreds, so this only fires on pathological input (e.g. a
+/// per-feature unique id mistaken for a category). Erroring is deliberate: the
+/// previous behaviour silently collapsed every overflowing value to a single
+/// index, mislabeling features without a trace. A producer that genuinely needs
+/// >65k distinct strings should split the column or widen the key type.
+fn build_dictionary_indices(
+    values: &[Option<String>],
+) -> Result<(Vec<Option<u16>>, Vec<String>)> {
     let mut categories: Vec<String> = Vec::new();
     let mut lookup: HashMap<String, u16> = HashMap::new();
     let mut indices: Vec<Option<u16>> = Vec::with_capacity(values.len());
@@ -315,16 +333,18 @@ fn build_dictionary_indices(values: &[Option<String>]) -> (Vec<Option<u16>>, Vec
                     lookup.insert(s.clone(), idx);
                     indices.push(Some(idx));
                 } else {
-                    // Overflow: reuse the last index. A producer that
-                    // genuinely needs >65k unique strings should split the
-                    // column into multiple categorical fields.
-                    indices.push(Some(u16::MAX - 1));
+                    return Err(Error::Other(format!(
+                        "categorical column has more than {} distinct values, which a \
+                         Dictionary<UInt16, Utf8> key cannot address; split the column \
+                         into multiple categorical fields or widen the key type",
+                        u16::MAX
+                    )));
                 }
             }
             None => indices.push(None),
         }
     }
-    (indices, categories)
+    Ok((indices, categories))
 }
 
 /// Built per-vertex time column, alongside the per-layer schema metadata
@@ -453,6 +473,11 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
         GEOARROW_EXT_KEY.to_string(),
         layer.geometry.geoarrow_name().to_string(),
     );
+    // Advertise the CRS so the tile is self-describing to GeoArrow consumers.
+    geom_meta.insert(
+        GEOARROW_EXT_META_KEY.to_string(),
+        GEOARROW_CRS_METADATA.to_string(),
+    );
     fields.push(Arc::new(
         Field::new("geometry", geom_array.data_type().clone(), false)
             .with_metadata(geom_meta),
@@ -511,7 +536,7 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
                 // Build a Dictionary<UInt16, Utf8>: deduplicate strings once
                 // here so the TS reader can lift the dictionary table out of
                 // the Arrow batch directly instead of rebuilding it per tile.
-                let (indices, categories) = build_dictionary_indices(values);
+                let (indices, categories) = build_dictionary_indices(values)?;
                 let key_type = DataType::UInt16;
                 let value_type = DataType::Utf8;
                 let dict_type = DataType::Dictionary(Box::new(key_type), Box::new(value_type));
@@ -784,6 +809,51 @@ mod tests {
         let keys = col.keys();
         for i in [0usize, 1, 2, 4] {
             assert!(keys.value(i) < values.len() as u16);
+        }
+    }
+
+    #[test]
+    fn categorical_overflow_errors_instead_of_corrupting() {
+        // A column whose distinct-value count exceeds the UInt16 dictionary
+        // key space must be rejected, not silently collapsed onto one index.
+        let n = u16::MAX as usize + 1; // 65_536 distinct strings
+        let kinds: Vec<Option<String>> = (0..n).map(|i| Some(format!("c{i}"))).collect();
+        let layer = ColumnarLayer {
+            name: "huge".into(),
+            feature_ids: (0..n as u64).collect(),
+            start_times: vec![0; n],
+            end_times: vec![1; n],
+            geometry: GeometryColumn::Point(vec![[0.0, 0.0]; n]),
+            vertex_times: None,
+            triangles: None,
+            properties: vec![("kind".into(), PropertyColumn::Categorical(kinds))],
+        };
+        let err = encode_layer(&layer).expect_err("overflowing dictionary must error");
+        assert!(
+            err.to_string().contains("distinct values"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn geometry_field_advertises_crs_metadata() {
+        // Every geometry field carries the GeoArrow extension *name* and the
+        // CRS in extension *metadata*, so external GeoArrow readers see WGS84
+        // lon/lat (OGC:CRS84) rather than an unknown CRS.
+        for layer in [sample_point_layer(), sample_line_layer(), sample_polygon_layer()] {
+            let ipc = encode_layer(&layer).unwrap();
+            let batch = decode_layer(&ipc).unwrap();
+            let field = batch.schema().field_with_name("geometry").unwrap().clone();
+            let meta = field.metadata();
+            assert_eq!(
+                meta.get(GEOARROW_EXT_KEY).map(String::as_str),
+                Some(layer.geometry.geoarrow_name())
+            );
+            let crs = meta
+                .get(GEOARROW_EXT_META_KEY)
+                .expect("geometry field must carry ARROW:extension:metadata");
+            assert!(crs.contains("OGC:CRS84"), "crs metadata was: {crs}");
+            assert!(crs.contains("crs_type"), "crs metadata was: {crs}");
         }
     }
 

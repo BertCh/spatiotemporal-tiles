@@ -227,7 +227,12 @@ pub fn run(args: Args) -> Result<()> {
             "timestamp",
             Some("end_timestamp"),
             0,
-            6, // Lower max zoom for global satellite data
+            // The satellite demos render at a fixed global zoom 0 (zoomOverride
+            // + useGlobalBounds), so z4-6 tiles were never requested yet
+            // dominated the archive (the global orbit lines fan out into
+            // thousands of high-zoom tiles → an 8.6 GB file at z6). Cap at z3:
+            // the demo is visually identical and the archive shrinks ~50x.
+            3,
             "zstd",
         )?;
 

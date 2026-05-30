@@ -1820,6 +1820,15 @@ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
 name = "memmap2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83faa42c0a078c393f6b29d5db232d8be22776a891f8f56e5284faee4a20b327"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "memmap2"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "744133e4a0e0a658e1374cf3bf8e415c4052a15a111acd372764c55b4177d490"
@@ -2076,6 +2085,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "osmpbf"
+version = "0.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d689d6e9f254bbd63893ce00a27147e41fe94bf3abca70f85b5345afb3cb728"
+dependencies = [
+ "byteorder",
+ "flate2",
+ "memmap2 0.5.10",
+ "protobuf",
+ "protobuf-codegen",
+ "rayon",
+]
+
+[[package]]
 name = "parquet"
 version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2292,6 +2315,66 @@ dependencies = [
  "flate2",
  "pkg-config",
  "tar",
+]
+
+[[package]]
+name = "protobuf"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d65a1d4ddae7d8b5de68153b48f6aa3bba8cb002b243dbdbc55a5afbc98f99f4"
+dependencies = [
+ "once_cell",
+ "protobuf-support",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "protobuf-codegen"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d3976825c0014bbd2f3b34f0001876604fe87e0c86cd8fa54251530f1544ace"
+dependencies = [
+ "anyhow",
+ "once_cell",
+ "protobuf",
+ "protobuf-parse",
+ "regex",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "protobuf-parse"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4aeaa1f2460f1d348eeaeed86aea999ce98c1bded6f089ff8514c9d9dbdc973"
+dependencies = [
+ "anyhow",
+ "indexmap",
+ "log",
+ "protobuf",
+ "protobuf-support",
+ "tempfile",
+ "thiserror 1.0.69",
+ "which",
+]
+
+[[package]]
+name = "protobuf-support"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.36.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7649a7b4df05aed9ea7ec6f628c67c9953a43869b8bc50929569b2999d443fe"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -2808,7 +2891,7 @@ dependencies = [
  "geo",
  "geo-types",
  "hilbert_2d",
- "memmap2",
+ "memmap2 0.9.9",
  "proj",
  "serde",
  "serde_json",
@@ -2825,6 +2908,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "bzip2",
  "chrono",
  "clap",
  "csv",
@@ -2833,7 +2917,9 @@ dependencies = [
  "geo-types",
  "geojson",
  "indicatif",
+ "osmpbf",
  "parquet",
+ "quick-xml",
  "rand",
  "rayon",
  "reqwest",

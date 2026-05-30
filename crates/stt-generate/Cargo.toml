@@ -39,6 +39,14 @@ parquet = { version = "54", default-features = false, features = ["arrow", "flat
 arrow = { version = "54", default-features = false, features = ["chrono-tz"] }
 urlencoding = "2.1"
 
+# OSM editing-history generator (`osm-edits` subcommand)
+# osmpbf reads full-history `.osh.pbf` extracts (exposes per-version
+# version()/visible()/milli_timestamp(), so we can pick first-version "creation"
+# events). bzip2 + quick-xml stream the public `changesets-latest.osm.bz2` dump.
+osmpbf = "0.3"
+bzip2 = "0.4"
+quick-xml = "0.36"
+
 [dev-dependencies]
 tempfile = "3.10"
 

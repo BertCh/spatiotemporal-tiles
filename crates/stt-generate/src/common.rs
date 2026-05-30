@@ -922,7 +922,9 @@ pub fn run_stt_build_with_options(
         max_zoom,
         compression: compression.to_string(),
         temporal_bucket: temporal_bucket.map(str::to_string),
+        temporal_lod: None,
         summary: None,
+        summary_sub_buckets: None,
         min_features_per_tile: None,
     })
 }
@@ -952,7 +954,17 @@ pub struct SttBuildOptions {
     pub max_zoom: u8,
     pub compression: String,
     pub temporal_bucket: Option<String>,
+    /// Forwarded to `stt-build --temporal-lod`. Coarser-bucket pyramid spec
+    /// (e.g. `"30d,365d"` or `"30d@12,365d@8"`). Each entry must be a multiple
+    /// of `temporal_bucket`. `None` skips the LOD pyramid. Use for multi-year
+    /// datasets so low zooms animate at coarse time resolution.
+    pub temporal_lod: Option<String>,
     pub summary: Option<SttBuildSummaryOptions>,
+    /// Forwarded to `stt-build --summary-sub-buckets`. Splits each summary-tier
+    /// temporal bucket into N `bucket_<i>` count sub-columns so the renderer can
+    /// animate intra-bucket with no data re-upload. `None` keeps the default 1.
+    /// Only meaningful when `summary` is set.
+    pub summary_sub_buckets: Option<u32>,
     /// Forwarded to `stt-build --min-features-per-tile`. Use for globally
     /// sparse point datasets where deep-zoom single-feature tiles are pure
     /// overhead. `None` keeps the stt-build default of 1 (write all
@@ -992,6 +1004,10 @@ pub fn run_stt_build_with_full_options(opts: SttBuildOptions) -> Result<()> {
         cmd.arg("--temporal-bucket").arg(bucket);
     }
 
+    if let Some(lod) = &opts.temporal_lod {
+        cmd.arg("--temporal-lod").arg(lod);
+    }
+
     if let Some(n) = opts.min_features_per_tile {
         cmd.arg("--min-features-per-tile").arg(n.to_string());
     }
@@ -1006,6 +1022,9 @@ pub fn run_stt_build_with_full_options(opts: SttBuildOptions) -> Result<()> {
         }
         if !sm.columns.is_empty() {
             cmd.arg("--summary-columns").arg(&sm.columns);
+        }
+        if let Some(n) = opts.summary_sub_buckets {
+            cmd.arg("--summary-sub-buckets").arg(n.to_string());
         }
     }
 

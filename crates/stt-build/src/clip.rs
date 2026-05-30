@@ -671,52 +671,79 @@ pub fn clip_trajectory(
         _ => compute_vertex_timestamps(&coords, start_time, end_time),
     };
 
-    // Compute bounding box for quick rejection
-    let (min_lon, min_lat, max_lon, max_lat) = compute_bbox(&coords);
-
-    // Per-segment supercover enumeration of touched tiles. At continental
-    // scales this collapses a 10k-tile bbox sweep to ~hundreds of real
-    // crossings, which is the single biggest win for very long trajectories.
-    let touched = tiles_along_trajectory(&coords, zoom);
-
     let mut segments = Vec::new();
 
-    // `touched` is already deduplicated; iterate it directly.
-    for (tile_x, tile_y) in touched {
-        let tile_bounds = TileBounds::from_tile(tile_x, tile_y, zoom);
-        let buffered_bounds = tile_bounds.with_buffer(config.buffer_degrees);
-
-        // Quick rejection: check if feature bbox intersects tile
-        if !buffered_bounds.intersects(min_lon, min_lat, max_lon, max_lat) {
+    // Antimeridian safety: split the polyline wherever two consecutive
+    // vertices differ in longitude by more than 180°, and clip each run
+    // independently. Such a pair straddles the dateline — the shorter path
+    // wraps across ±180°, but `lonlat_to_world_tile` clamps lon to [-180,180]
+    // and `supercover_segment` walks a *straight* line in that clamped tile
+    // space, sweeping the long way across the whole map and baking a
+    // globe-spanning sliver into every tile column the edge crosses. Splitting
+    // here guarantees no segment ever contains such an edge, regardless of
+    // whether the upstream generator split its tracks correctly. The common
+    // case is a single run spanning the whole trajectory (no crossing), which
+    // does exactly the same work as before.
+    let mut run_start = 0usize;
+    for split in 1..=coords.len() {
+        let at_end = split == coords.len();
+        let crosses_antimeridian =
+            !at_end && (coords[split].0 - coords[split - 1].0).abs() > 180.0;
+        if !(at_end || crosses_antimeridian) {
+            continue;
+        }
+        let run_coords = &coords[run_start..split];
+        let run_times = &timestamps[run_start..split];
+        run_start = split;
+        if run_coords.len() < 2 {
             continue;
         }
 
-        // Clip to this tile
-        if let Some((clipped_coords, clipped_times)) =
-            clip_trajectory_to_tile(&coords, &timestamps, &buffered_bounds)
-        {
-            let seg_start_time = *clipped_times.first().unwrap();
-            let seg_end_time = *clipped_times.last().unwrap();
+        // Compute bounding box for quick rejection (per run).
+        let (min_lon, min_lat, max_lon, max_lat) = compute_bbox(run_coords);
 
-            let segment = ClippedSegment {
-                tile_x,
-                tile_y,
-                zoom,
-                coordinates: clipped_coords,
-                timestamps: clipped_times,
-                start_time: seg_start_time,
-                end_time: seg_end_time,
-                // Use Arc::clone for zero-copy property sharing
-                properties: shared_properties.clone(),
-                feature_id: feature.id.clone(),
-            };
+        // Per-segment supercover enumeration of touched tiles. At continental
+        // scales this collapses a 10k-tile bbox sweep to ~hundreds of real
+        // crossings, which is the single biggest win for very long trajectories.
+        let touched = tiles_along_trajectory(run_coords, zoom);
 
-            // Apply temporal slicing if configured
-            if let Some(granularity) = config.temporal_granularity_ms {
-                let sliced = slice_segment_temporally(segment, granularity);
-                segments.extend(sliced);
-            } else {
-                segments.push(segment);
+        // `touched` is already deduplicated; iterate it directly.
+        for (tile_x, tile_y) in touched {
+            let tile_bounds = TileBounds::from_tile(tile_x, tile_y, zoom);
+            let buffered_bounds = tile_bounds.with_buffer(config.buffer_degrees);
+
+            // Quick rejection: check if feature bbox intersects tile
+            if !buffered_bounds.intersects(min_lon, min_lat, max_lon, max_lat) {
+                continue;
+            }
+
+            // Clip to this tile
+            if let Some((clipped_coords, clipped_times)) =
+                clip_trajectory_to_tile(run_coords, run_times, &buffered_bounds)
+            {
+                let seg_start_time = *clipped_times.first().unwrap();
+                let seg_end_time = *clipped_times.last().unwrap();
+
+                let segment = ClippedSegment {
+                    tile_x,
+                    tile_y,
+                    zoom,
+                    coordinates: clipped_coords,
+                    timestamps: clipped_times,
+                    start_time: seg_start_time,
+                    end_time: seg_end_time,
+                    // Use Arc::clone for zero-copy property sharing
+                    properties: shared_properties.clone(),
+                    feature_id: feature.id.clone(),
+                };
+
+                // Apply temporal slicing if configured
+                if let Some(granularity) = config.temporal_granularity_ms {
+                    let sliced = slice_segment_temporally(segment, granularity);
+                    segments.extend(sliced);
+                } else {
+                    segments.push(segment);
+                }
             }
         }
     }
@@ -864,6 +891,53 @@ mod tests {
             assert!(seg.start_time <= seg.end_time);
             assert!(seg.coordinates.len() >= 2);
         }
+    }
+
+    #[test]
+    fn test_clip_trajectory_splits_at_antimeridian() {
+        // A track that straddles the antimeridian with vertices well away from
+        // ±180° on each side (-170° → +165°). The old "both within 10° of the
+        // dateline" generator test missed exactly this shape, and the tiler
+        // would then sweep a straight line the long way across the whole map,
+        // baking a globe-spanning sliver into every tile column. The clipper
+        // must split such an edge so no output segment contains a |Δlon| > 180°
+        // jump.
+        let feature = make_linestring_feature(vec![
+            vec![-163.0, 40.0],
+            vec![-170.0, 41.0], // last point before the dateline (west side)
+            vec![165.0, 42.0],  // first point after the dateline (east side)
+            vec![170.0, 43.0],
+        ]);
+
+        let config = ClipConfig::default();
+        // Zoom 0: the whole world is a single tile, so nothing is clipped at a
+        // tile boundary — the antimeridian split is the only thing that can
+        // prevent the artifact here.
+        let segments = clip_trajectory(&feature, None, 0, 3000, 0, &config, None);
+
+        assert!(!segments.is_empty(), "expected at least one segment");
+        for seg in &segments {
+            for w in seg.coordinates.windows(2) {
+                let dlon = (w[1].0 - w[0].0).abs();
+                assert!(
+                    dlon <= 180.0,
+                    "segment edge spans {dlon}° of longitude — antimeridian \
+                     split failed (coords: {:?})",
+                    seg.coordinates
+                );
+            }
+        }
+        // The two halves should land on opposite sides of the dateline.
+        let has_west = segments
+            .iter()
+            .any(|s| s.coordinates.iter().all(|c| c.0 < 0.0));
+        let has_east = segments
+            .iter()
+            .any(|s| s.coordinates.iter().all(|c| c.0 > 0.0));
+        assert!(
+            has_west && has_east,
+            "expected runs on both sides of the dateline, got {segments:?}"
+        );
     }
 
     #[test]
