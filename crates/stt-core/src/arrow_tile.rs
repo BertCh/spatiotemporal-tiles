@@ -14,6 +14,7 @@
 //! | `end_time`    | `Int64`                                 | Unix ms, absolute             |
 //! | `geometry`    | GeoArrow point / linestring / polygon   | interleaved f64 lon/lat       |
 //! | `vertex_time` | `List<Int64>` (nullable)                | per-vertex Unix ms (optional) |
+//! | `vertex_value`| `List<Float32>` (nullable)              | per-vertex scalar, e.g. SST (optional) |
 //! | `<property>`  | `Float64` or `Dictionary<UInt16,Utf8>`   | one column per property       |
 //!
 //! All layers in one tile are concatenated with a tiny frame so a tile can
@@ -27,9 +28,9 @@
 use crate::error::{Error, Result};
 use crate::types::GeometryType;
 use arrow::array::{
-    Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float64Array, Int64Array, Int64Builder,
-    ListArray, ListBuilder, RecordBatch, StringArray, UInt16Array, UInt16Builder, UInt32Builder,
-    UInt64Array,
+    Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Builder,
+    Float64Array, Int64Array, Int64Builder, ListArray, ListBuilder, RecordBatch, StringArray,
+    UInt16Array, UInt16Builder, UInt32Builder, UInt64Array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, UInt16Type};
@@ -128,6 +129,11 @@ pub struct ColumnarLayer {
     /// Optional per-vertex timestamps (Unix ms). When present, length equals
     /// the feature count and each inner vec matches that feature's vertex count.
     pub vertex_times: Option<Vec<Vec<i64>>>,
+    /// Optional per-vertex scalar values (producer-defined; e.g. sea-surface
+    /// temperature for the ocean-drifter dataset). When present, length equals
+    /// the feature count and each inner vec matches that feature's vertex count.
+    /// `NaN` marks a vertex with no value; renderers map it to a fallback color.
+    pub vertex_values: Option<Vec<Vec<f32>>>,
     /// Optional pre-baked triangle indices for polygon features (MLT-style).
     ///
     /// When present, `triangles.len() == feature_count` and each inner vec is
@@ -166,6 +172,9 @@ impl ColumnarLayer {
         check("geometry", self.geometry.len())?;
         if let Some(vt) = &self.vertex_times {
             check("vertex_times", vt.len())?;
+        }
+        if let Some(vv) = &self.vertex_values {
+            check("vertex_values", vv.len())?;
         }
         if let Some(tri) = &self.triangles {
             check("triangles", tri.len())?;
@@ -445,6 +454,37 @@ fn build_vertex_time_array(
     })
 }
 
+/// Build the optional per-vertex scalar column as a nullable `List<Float32>`.
+///
+/// Unlike `vertex_time`, there's no delta/origin/step encoding — the values are
+/// producer-defined scalars (e.g. sea-surface temperature) with a small range
+/// where f32 precision is ample. A feature with no per-vertex values appends a
+/// null list; `NaN` entries within a list mark individual vertices with no value.
+/// Returns `None` when no feature carries any value, so the column is omitted.
+fn build_vertex_value_array(
+    vertex_values: &Option<Vec<Vec<f32>>>,
+    feature_count: usize,
+) -> Option<ArrayRef> {
+    let vv = vertex_values.as_ref()?;
+    let any = vv.iter().take(feature_count).any(|v| !v.is_empty());
+    if !any {
+        return None;
+    }
+    let mut builder = ListBuilder::new(Float32Builder::new());
+    for i in 0..feature_count {
+        match vv.get(i) {
+            Some(values) if !values.is_empty() => {
+                for &v in values {
+                    builder.values().append_value(v);
+                }
+                builder.append(true);
+            }
+            _ => builder.append(false),
+        }
+    }
+    Some(Arc::new(builder.finish()))
+}
+
 // ----------------------------------------------------------------------------
 // Encoding
 // ----------------------------------------------------------------------------
@@ -495,6 +535,17 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
         )));
         columns.push(vt_col.array);
         vertex_time_encoding = vt_col.encoding;
+    }
+
+    // Optional per-vertex scalar column (e.g. sea-surface temperature),
+    // aligned 1:1 with the geometry vertices like `vertex_time`.
+    if let Some(vv_array) = build_vertex_value_array(&layer.vertex_values, n) {
+        fields.push(Arc::new(Field::new(
+            "vertex_value",
+            vv_array.data_type().clone(),
+            true,
+        )));
+        columns.push(vv_array);
     }
 
     // Pre-baked triangle indices (MLT-style). Only emitted for polygon
@@ -704,6 +755,7 @@ mod tests {
                 [-122.6, 37.9],
             ]),
             vertex_times: None,
+            vertex_values: None,
             triangles: None,
             properties: vec![
                 (
@@ -733,6 +785,7 @@ mod tests {
                 vec![[5.0, 5.0], [6.0, 6.0]],
             ]),
             vertex_times: Some(vec![vec![0, 25, 50], vec![100, 200]]),
+            vertex_values: None,
             triangles: None,
             properties: vec![],
         }
@@ -751,6 +804,7 @@ mod tests {
                 vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]],
             ]]),
             vertex_times: None,
+            vertex_values: None,
             triangles: None,
             properties: vec![],
         }
@@ -765,6 +819,7 @@ mod tests {
             end_times: vec![1; 5],
             geometry: GeometryColumn::Point(vec![[0.0, 0.0]; 5]),
             vertex_times: None,
+            vertex_values: None,
             triangles: None,
             properties: vec![(
                 "kind".into(),
@@ -825,6 +880,7 @@ mod tests {
             end_times: vec![1; n],
             geometry: GeometryColumn::Point(vec![[0.0, 0.0]; n]),
             vertex_times: None,
+            vertex_values: None,
             triangles: None,
             properties: vec![("kind".into(), PropertyColumn::Categorical(kinds))],
         };
@@ -953,6 +1009,44 @@ mod tests {
     }
 
     #[test]
+    fn line_layer_roundtrips_with_vertex_values() {
+        // Per-vertex scalars (e.g. SST) ride a nullable List<Float32> aligned
+        // with the geometry vertices. A NaN entry marks a vertex with no value.
+        let layer = ColumnarLayer {
+            name: "drift".into(),
+            feature_ids: vec![1, 2],
+            start_times: vec![0, 0],
+            end_times: vec![100, 100],
+            geometry: GeometryColumn::LineString(vec![
+                vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]],
+                vec![[3.0, 3.0], [4.0, 4.0]],
+            ]),
+            vertex_times: None,
+            vertex_values: Some(vec![vec![5.0, f32::NAN, 27.5], vec![12.0, 13.0]]),
+            triangles: None,
+            properties: vec![],
+        };
+        let ipc = encode_layer(&layer).unwrap();
+        let batch = decode_layer(&ipc).unwrap();
+
+        let vv = batch
+            .column_by_name("vertex_value")
+            .expect("layers with per-vertex values carry a vertex_value column")
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(vv.len(), 2);
+        let first = vv.value(0);
+        let vals = first.as_any().downcast_ref::<arrow::array::Float32Array>().unwrap();
+        assert_eq!(vals.value(0), 5.0);
+        assert!(vals.value(1).is_nan());
+        assert_eq!(vals.value(2), 27.5);
+        let second = vv.value(1);
+        let vals2 = second.as_any().downcast_ref::<arrow::array::Float32Array>().unwrap();
+        assert_eq!(vals2.values(), &[12.0, 13.0]);
+    }
+
+    #[test]
     fn vertex_time_falls_back_to_int64_for_wide_spans() {
         // span = 100 billion ms; step would need to be ~1.5e6 ms — that's
         // still fine for u16 deltas, so we instead force the fallback by
@@ -968,6 +1062,7 @@ mod tests {
             // still keeps them inside u16 — the encoder picks step≈1.5e6
             // ms. We assert round-trip precision is bounded by step/2.
             vertex_times: Some(vec![vec![0, 100_000_000_000]]),
+            vertex_values: None,
             triangles: None,
             properties: vec![],
         };
@@ -1099,6 +1194,7 @@ mod tests {
             end_times: vec![1000],
             geometry: GeometryColumn::Polygon(vec![vec![exterior]]),
             vertex_times: None,
+            vertex_values: None,
             triangles: Some(vec![tris.clone()]),
             properties: vec![],
         };

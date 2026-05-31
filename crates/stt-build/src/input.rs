@@ -1,7 +1,7 @@
 //! GeoParquet input parsing and feature loading
 
 use anyhow::{Context, Result};
-use arrow::array::{Array, Float64Array, Int64Array, ListArray, StringArray, TimestampMillisecondArray, TimestampMicrosecondArray};
+use arrow::array::{Array, Float32Array, Float64Array, Int64Array, ListArray, StringArray, TimestampMillisecondArray, TimestampMicrosecondArray};
 use arrow::datatypes::DataType;
 use geojson::{Feature, Geometry, Value as GeomValue};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -31,6 +31,11 @@ pub struct ParsedFeature {
     /// MUST be the same length as the geometry's coord count when set;
     /// length-mismatched values are dropped at the reader (logged once).
     pub vertex_timestamps: Option<Vec<u64>>,
+    /// Optional per-vertex scalar values (producer-defined; e.g. sea-surface
+    /// temperature for the ocean-drifter dataset). Same length contract as
+    /// `vertex_timestamps`; flows through clipping and into the tile's
+    /// `vertex_value` column so renderers can color the line by it.
+    pub vertex_values: Option<Vec<f32>>,
     pub lon: f64,
     pub lat: f64,
 }
@@ -109,6 +114,11 @@ where
     // uniform-by-distance interpolation in columnar.rs.
     let vertex_times_col_idx = schema.fields().iter().position(|f| f.name() == "vertex_timestamps");
 
+    // Optional per-vertex scalar column (List<Float32> or List<Float64>),
+    // e.g. sea-surface temperature for the ocean-drifter dataset. Aligned with
+    // the geometry vertices like `vertex_timestamps`.
+    let vertex_values_col_idx = schema.fields().iter().position(|f| f.name() == "vertex_values");
+
     let reader = builder.build()?;
 
     // Property column indices computed once.
@@ -122,6 +132,7 @@ where
                 || name == time_field
                 || end_time_field.map(|f| name == f).unwrap_or(false)
                 || name == "vertex_timestamps"
+                || name == "vertex_values"
                 || matches!(name.as_str(), "lon" | "lat" | "longitude" | "latitude" | "x" | "y");
             if is_meta {
                 None
@@ -141,6 +152,7 @@ where
             time_col_idx,
             end_time_col_idx,
             vertex_times_col_idx,
+            vertex_values_col_idx,
             &property_cols,
             time_format,
             strictness,
@@ -163,6 +175,7 @@ fn parse_batch(
     time_col_idx: usize,
     end_time_col_idx: Option<usize>,
     vertex_times_col_idx: Option<usize>,
+    vertex_values_col_idx: Option<usize>,
     property_cols: &[usize],
     time_format: &str,
     strictness: InputStrictness,
@@ -177,6 +190,9 @@ fn parse_batch(
     let vertex_times = vertex_times_col_idx
         .map(|idx| extract_vertex_timestamps_from_batch(batch, idx))
         .transpose()?;
+    let vertex_values = vertex_values_col_idx
+        .map(|idx| extract_vertex_values_from_batch(batch, idx))
+        .transpose()?;
 
     let mut features = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
@@ -190,6 +206,9 @@ fn parse_batch(
             .ok_or_else(|| anyhow::anyhow!("Missing timestamp at row {}", row_offset + i))?;
         let end_timestamp = end_timestamps.as_ref().and_then(|ts| ts.get(i).copied());
         let row_vertex_times = vertex_times
+            .as_ref()
+            .and_then(|v| v.get(i).cloned().flatten());
+        let row_vertex_values = vertex_values
             .as_ref()
             .and_then(|v| v.get(i).cloned().flatten());
 
@@ -222,6 +241,7 @@ fn parse_batch(
             timestamp,
             end_timestamp,
             vertex_timestamps: row_vertex_times,
+            vertex_values: row_vertex_values,
             lon,
             lat,
         });
@@ -274,6 +294,48 @@ fn extract_vertex_timestamps_from_batch(
     Ok(out)
 }
 
+/// Extract optional per-row vertex-scalar lists from a `vertex_values` column.
+/// Tolerates `List<Float32>` and `List<Float64>` children. Null rows return
+/// `None` for that slot; null entries within a list become `NaN` so the
+/// per-vertex alignment is preserved. Non-list columns return an error.
+fn extract_vertex_values_from_batch(
+    batch: &arrow::record_batch::RecordBatch,
+    col_idx: usize,
+) -> Result<Vec<Option<Vec<f32>>>> {
+    let column = batch.column(col_idx);
+    let list = column
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow::anyhow!("vertex_values column is not a List array"))?;
+
+    let mut out: Vec<Option<Vec<f32>>> = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        if !list.is_valid(row) {
+            out.push(None);
+            continue;
+        }
+        let values = list.value(row);
+        let row_vals: Vec<f32> = if let Some(f32s) =
+            values.as_any().downcast_ref::<Float32Array>()
+        {
+            (0..f32s.len())
+                .map(|i| if f32s.is_valid(i) { f32s.value(i) } else { f32::NAN })
+                .collect()
+        } else if let Some(f64s) = values.as_any().downcast_ref::<Float64Array>() {
+            (0..f64s.len())
+                .map(|i| if f64s.is_valid(i) { f64s.value(i) as f32 } else { f32::NAN })
+                .collect()
+        } else {
+            anyhow::bail!(
+                "vertex_values child must be Float32 or Float64; got {:?}",
+                values.data_type()
+            );
+        };
+        out.push(Some(row_vals));
+    }
+    Ok(out)
+}
+
 /// Calculate spatial and temporal bounds from features
 pub fn calculate_bounds(features: &[ParsedFeature]) -> Result<(BoundingBox, TimeRange)> {
     if features.is_empty() {
@@ -283,20 +345,54 @@ pub fn calculate_bounds(features: &[ParsedFeature]) -> Result<(BoundingBox, Time
         ));
     }
 
+    // Time range spans every row — a row whose geometry failed to parse may
+    // still carry a valid timestamp.
+    let mut min_time = u64::MAX;
+    let mut max_time = u64::MIN;
+    for f in features {
+        min_time = min_time.min(f.timestamp);
+        max_time = max_time.max(f.end_timestamp.unwrap_or(f.timestamp));
+    }
+
+    // Spatial bounds exclude the null-island sentinel. Geometry parse failures
+    // and null lon/lat are coerced to exactly (0.0, 0.0) upstream; including
+    // them would let a single bad row widen the archive bbox to the whole
+    // globe (and make the showcase open zoomed all the way out). Real data at
+    // precisely (0,0) to full f64 precision is effectively never legitimate.
     let mut min_lon = f64::MAX;
     let mut max_lon = f64::MIN;
     let mut min_lat = f64::MAX;
     let mut max_lat = f64::MIN;
-    let mut min_time = u64::MAX;
-    let mut max_time = u64::MIN;
-
+    let mut counted = 0usize;
+    let mut skipped_null_island = 0usize;
     for f in features {
+        if f.lon == 0.0 && f.lat == 0.0 {
+            skipped_null_island += 1;
+            continue;
+        }
         min_lon = min_lon.min(f.lon);
         max_lon = max_lon.max(f.lon);
         min_lat = min_lat.min(f.lat);
         max_lat = max_lat.max(f.lat);
-        min_time = min_time.min(f.timestamp);
-        max_time = max_time.max(f.end_timestamp.unwrap_or(f.timestamp));
+        counted += 1;
+    }
+
+    if counted == 0 {
+        // Degenerate: every feature sits at the sentinel (e.g. a dataset that
+        // genuinely straddles null island, or one that is entirely malformed).
+        // Fall back to the raw extent rather than return an inside-out bbox.
+        for f in features {
+            min_lon = min_lon.min(f.lon);
+            max_lon = max_lon.max(f.lon);
+            min_lat = min_lat.min(f.lat);
+            max_lat = max_lat.max(f.lat);
+        }
+    } else if skipped_null_island > 0 {
+        tracing::warn!(
+            "excluded {} null-island (0,0) feature(s) from archive bounds \
+             (likely coerced bad/missing geometry)",
+            skipped_null_island
+        );
     }
 
     Ok((

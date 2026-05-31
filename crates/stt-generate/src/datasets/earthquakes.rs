@@ -128,6 +128,7 @@ pub fn run(args: Args) -> Result<()> {
         None
     };
 
+    let mut skipped_bad_time = 0usize;
     for year in start_year..=end_year {
         let year_start = format!("{}-01-01", year);
         let year_end = format!("{}-12-31", year);
@@ -145,7 +146,10 @@ pub fn run(args: Args) -> Result<()> {
         println!("   ✓ Fetched {} earthquakes", data.features.len());
 
         for usgs_feature in data.features {
-            let (lon, lat, timestamp, properties) = extract_usgs_data(usgs_feature)?;
+            let Some((lon, lat, timestamp, properties)) = extract_usgs_data(usgs_feature)? else {
+                skipped_bad_time += 1;
+                continue;
+            };
 
             if let Some(ref mut writer) = parquet_writer {
                 let record = PointRecord::new(lon, lat, timestamp, properties);
@@ -157,6 +161,13 @@ pub fn run(args: Args) -> Result<()> {
                 all_features.push(feature);
             }
         }
+    }
+
+    if skipped_bad_time > 0 {
+        println!(
+            "   ⚠️  Skipped {} earthquake(s) with an out-of-range timestamp",
+            skipped_bad_time
+        );
     }
 
     let total_count = if let Some(writer) = parquet_writer.take() {
@@ -224,13 +235,18 @@ pub fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-fn extract_usgs_data(usgs: UsgsFeature) -> Result<(f64, f64, DateTime<Utc>, Map<String, serde_json::Value>)> {
+/// Returns `None` (instead of fabricating `Utc::now()`) when the USGS record
+/// carries an out-of-range epoch — a corrupt record placed at "today" would
+/// land far outside the advertised timeRange and contaminate the temporal
+/// index. The caller skips and counts these.
+fn extract_usgs_data(usgs: UsgsFeature) -> Result<Option<(f64, f64, DateTime<Utc>, Map<String, serde_json::Value>)>> {
     let lon = usgs.geometry.coordinates[0];
     let lat = usgs.geometry.coordinates[1];
     let depth = usgs.geometry.coordinates.get(2).copied().unwrap_or(0.0);
 
-    let timestamp = DateTime::from_timestamp_millis(usgs.properties.time)
-        .unwrap_or_else(|| Utc::now());
+    let Some(timestamp) = DateTime::from_timestamp_millis(usgs.properties.time) else {
+        return Ok(None);
+    };
 
     let mut properties = Map::new();
     properties.insert("magnitude".to_string(), json!(usgs.properties.mag));
@@ -243,7 +259,7 @@ fn extract_usgs_data(usgs: UsgsFeature) -> Result<(f64, f64, DateTime<Utc>, Map<
     // the palette order (BTreeMap keys stay sorted through stt-build).
     properties.insert("mag_band".to_string(), json!(mag_band(usgs.properties.mag)));
 
-    Ok((lon, lat, timestamp, properties))
+    Ok(Some((lon, lat, timestamp, properties)))
 }
 
 /// Bucket magnitude into legend-aligned bands. Bands are zero-padded to keep

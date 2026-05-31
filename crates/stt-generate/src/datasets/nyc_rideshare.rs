@@ -3,7 +3,7 @@
 //! Uses historical NYC TLC data (pre-2017 with actual lat/long coordinates)
 //! and routes trips through OSRM for realistic trajectories.
 
-use crate::common::{self, LineStringRecord, StreamingLineStringParquetWriter};
+use crate::common::{self, LineStringRecord, PropertyColumn, StreamingLineStringParquetWriter};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use clap::Parser;
@@ -378,49 +378,24 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
     println!("   Temporal bucket: {}", args.temporal_bucket);
     println!();
 
-    if end_time_field.is_some() {
-        // For paths, we need to use stt-build with end-time-field
-        use std::process::{Command, Stdio};
-        
-        // Find stt-build binary
-        let stt_build = common::find_stt_build_binary();
-        println!("   Using stt-build: {}", stt_build.display());
-        
-        let mut cmd = Command::new(&stt_build);
-        cmd.arg("--input").arg(intermediate_path)
-            .arg("--output").arg(&args.output)
-            .arg("--time-field").arg(time_field)
-            .arg("--end-time-field").arg("end_timestamp")
-            .arg("--min-zoom").arg("10")
-            .arg("--max-zoom").arg("16")
-            // v3 default — zstd compresses ~5× faster than gzip-6 for an
-            // equivalent or better ratio, and the v3 reader decodes ~3.3×
-            // faster (per Sprint 2026-05 phase-1 measurements).
-            .arg("--compression").arg("zstd")
-            .arg("--temporal-bucket").arg(&args.temporal_bucket)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-
-        log_verbose!(args.verbose, "Running: {:?}", cmd);
-        
-        println!();
-        let status = cmd.status()?;
-        if !status.success() {
-            return Err(anyhow!("stt-build failed with exit code: {:?}", status.code()));
-        }
-        println!("\n   ✓ STT archive created successfully");
-    } else {
-        common::run_stt_build_with_options(
-            intermediate_path,
-            &args.output,
-            time_field,
-            None,
-            10,
-            16,
-            "zstd",
-            Some(&args.temporal_bucket),
-        )?;
-    }
+    // Single shared entry point for both the points (no end-time) and paths
+    // (end_timestamp) builds. Previously the paths branch hand-rolled its own
+    // std::process::Command with a duplicated flag list — which could silently
+    // drift from the helper (and from the rest of the generators) as flags
+    // evolved. `end_time_field` is Some("end_timestamp") exactly when
+    // `args.paths`, so this is behaviour-identical to the old fork. The v3
+    // zstd default compresses ~5× faster than gzip-6 for an equivalent ratio
+    // and the v3 reader decodes ~3.3× faster (Sprint 2026-05 phase-1).
+    common::run_stt_build_with_options(
+        intermediate_path,
+        &args.output,
+        time_field,
+        end_time_field,
+        10,
+        16,
+        "zstd",
+        Some(&args.temporal_bucket),
+    )?;
 
     Ok(())
 }
@@ -1231,12 +1206,12 @@ fn generate_paths_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
 
     // Create streaming Parquet writer and write results sequentially
     let property_columns = vec![
-        "trip_id".to_string(),
-        "passenger_count".to_string(),
-        "trip_distance".to_string(),
-        "fare_amount".to_string(),
+        PropertyColumn::numeric("trip_id"),
+        PropertyColumn::numeric("passenger_count"),
+        PropertyColumn::numeric("trip_distance"),
+        PropertyColumn::numeric("fare_amount"),
     ];
-    let mut writer = StreamingLineStringParquetWriter::new(output, property_columns)?;
+    let mut writer = StreamingLineStringParquetWriter::with_columns(output, property_columns)?;
     
     let mut total_coords = 0;
     for (trip_id, trip, coords, vertex_times) in all_results {

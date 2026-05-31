@@ -6,7 +6,7 @@
 //! Performance: Uses Rayon for parallel satellite propagation
 
 use crate::common;
-use crate::common::{LineStringRecord, StreamingLineStringParquetWriter};
+use crate::common::{LineStringRecord, PropertyColumn, StreamingLineStringParquetWriter};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use clap::Parser;
@@ -25,21 +25,6 @@ const CELESTRAK_ACTIVE_URL: &str = "https://celestrak.org/NORAD/elements/gp.php?
 
 /// Earth radius in km (WGS84)
 const EARTH_RADIUS_KM: f64 = 6378.137;
-
-/// Property columns carried through to the STT archive (string-typed in the
-/// LineString GeoParquet writer). `timestamp` / `end_timestamp` are the
-/// record's time fields and are intentionally not listed here.
-const SATELLITE_PROPERTY_COLUMNS: &[&str] = &[
-    "object_name",
-    "norad_id",
-    "intl_designator",
-    "orbit_type",
-    "altitude",
-    "inclination",
-    "eccentricity",
-    "mean_motion",
-    "segment",
-];
 
 #[derive(Parser, Debug)]
 #[command(about = "Generate satellite orbit data from CelesTrak TLE")]
@@ -208,11 +193,18 @@ pub fn run(args: Args) -> Result<()> {
 
     // Write the GeoParquet intermediate.
     println!("\n💾 Writing output...");
-    let property_columns: Vec<String> = SATELLITE_PROPERTY_COLUMNS
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let mut writer = StreamingLineStringParquetWriter::new(&intermediate_path, property_columns)?;
+    let property_columns: Vec<PropertyColumn> = vec![
+        PropertyColumn::string("object_name"),
+        PropertyColumn::string("norad_id"),
+        PropertyColumn::string("intl_designator"),
+        PropertyColumn::string("orbit_type"),
+        PropertyColumn::numeric("altitude"),
+        PropertyColumn::numeric("inclination"),
+        PropertyColumn::numeric("eccentricity"),
+        PropertyColumn::numeric("mean_motion"),
+        PropertyColumn::numeric("segment"),
+    ];
+    let mut writer = StreamingLineStringParquetWriter::with_columns(&intermediate_path, property_columns)?;
     for record in &records {
         writer.write_linestring(record)?;
     }

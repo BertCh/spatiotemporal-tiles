@@ -2,7 +2,7 @@
 //!
 //! Data source: https://data-nifc.opendata.arcgis.com/
 
-use crate::common::{self, PolygonRecord, StreamingPolygonParquetWriter};
+use crate::common::{self, PolygonRecord, PropertyColumn, StreamingPolygonParquetWriter};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use clap::Parser;
@@ -500,17 +500,17 @@ fn fetch_wildfire_data_parquet(args: &Args, output: &PathBuf) -> Result<usize> {
 
     // Create streaming Parquet writer
     let property_columns = vec![
-        "name".to_string(),
-        "year".to_string(),
-        "acres".to_string(),
-        "agency".to_string(),
-        "unit_id".to_string(),
-        "fire_type".to_string(),
-        "irwin_id".to_string(),
-        "object_id".to_string(),
-        "severity".to_string(),
+        PropertyColumn::string("name"),
+        PropertyColumn::string("year"),
+        PropertyColumn::numeric("acres"),
+        PropertyColumn::string("agency"),
+        PropertyColumn::string("unit_id"),
+        PropertyColumn::string("fire_type"),
+        PropertyColumn::string("irwin_id"),
+        PropertyColumn::numeric("object_id"),
+        PropertyColumn::string("severity"),
     ];
-    let mut writer = StreamingPolygonParquetWriter::new(output, property_columns)?;
+    let mut writer = StreamingPolygonParquetWriter::with_columns(output, property_columns)?;
 
     let pb = ProgressBar::new(max_to_fetch as u64);
     pb.set_style(

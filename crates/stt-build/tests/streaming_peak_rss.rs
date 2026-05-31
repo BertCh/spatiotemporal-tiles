@@ -221,6 +221,7 @@ fn synth_point(lon: f64, lat: f64, ts: u64) -> stt_build::input::ParsedFeature {
         timestamp: ts,
         end_timestamp: None,
         vertex_timestamps: None,
+        vertex_values: None,
         lon,
         lat,
     }

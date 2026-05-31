@@ -27,6 +27,10 @@ pub struct ClippedSegment {
     pub coordinates: Vec<(f64, f64, f64)>, // (lon, lat, alt)
     /// Per-vertex timestamps for this segment
     pub timestamps: Vec<u64>,
+    /// Per-vertex scalar values for this segment (e.g. SST), aligned with
+    /// `coordinates`. Empty when the producer supplied none; `NaN` marks an
+    /// individual vertex with no value.
+    pub vertex_values: Vec<f32>,
     /// Start timestamp of this segment
     pub start_time: u64,
     /// End timestamp of this segment
@@ -352,6 +356,18 @@ fn interpolate_timestamp(time0: u64, time1: u64, t: f64) -> u64 {
     (time0 as f64 + t * duration) as u64
 }
 
+/// Interpolate a per-vertex scalar value along a line segment based on `t`.
+/// A `NaN` endpoint propagates to the interpolated value (no value → no color).
+fn interpolate_value(v0: f32, v1: f32, t: f64) -> f32 {
+    if t <= 0.0 {
+        return v0;
+    }
+    if t >= 1.0 {
+        return v1;
+    }
+    v0 + (t as f32) * (v1 - v0)
+}
+
 /// Extract 3D coordinates from a GeoJSON geometry
 fn extract_linestring_coords(geometry: &Geometry) -> Option<Vec<(f64, f64, f64)>> {
     match &geometry.value {
@@ -432,14 +448,16 @@ fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 fn clip_trajectory_to_tile(
     coords: &[(f64, f64, f64)],
     timestamps: &[u64],
+    values: &[f32],
     bounds: &TileBounds,
-) -> Option<(Vec<(f64, f64, f64)>, Vec<u64>)> {
+) -> Option<(Vec<(f64, f64, f64)>, Vec<u64>, Vec<f32>)> {
     if coords.len() < 2 {
         return None;
     }
 
     let mut clipped_coords: Vec<(f64, f64, f64)> = Vec::new();
     let mut clipped_times: Vec<u64> = Vec::new();
+    let mut clipped_values: Vec<f32> = Vec::new();
 
     // Process each line segment
     for i in 0..coords.len() - 1 {
@@ -447,6 +465,8 @@ fn clip_trajectory_to_tile(
         let (x1, y1, alt1) = coords[i + 1];
         let time0 = timestamps[i];
         let time1 = timestamps[i + 1];
+        let value0 = values[i];
+        let value1 = values[i + 1];
 
         // Check if segment intersects the tile
         if let Some((t0, t1)) = liang_barsky_clip(x0, y0, x1, y1, bounds) {
@@ -458,6 +478,7 @@ fn clip_trajectory_to_tile(
             };
             let start_alt = interpolate_alt(alt0, alt1, t0);
             let start_time = interpolate_timestamp(time0, time1, t0);
+            let start_value = interpolate_value(value0, value1, t0);
 
             // Calculate the clipped end point
             let (end_x, end_y) = if t1 < 1.0 {
@@ -467,6 +488,7 @@ fn clip_trajectory_to_tile(
             };
             let end_alt = interpolate_alt(alt0, alt1, t1);
             let end_time = interpolate_timestamp(time0, time1, t1);
+            let end_value = interpolate_value(value0, value1, t1);
 
             // Add start point if not a duplicate of last point
             let should_add_start = clipped_coords.is_empty()
@@ -476,18 +498,20 @@ fn clip_trajectory_to_tile(
             if should_add_start {
                 clipped_coords.push((start_x, start_y, start_alt));
                 clipped_times.push(start_time);
+                clipped_values.push(start_value);
             }
 
             // Add end point if different from start point
             if (end_x - start_x).abs() > 1e-9 || (end_y - start_y).abs() > 1e-9 {
                 clipped_coords.push((end_x, end_y, end_alt));
                 clipped_times.push(end_time);
+                clipped_values.push(end_value);
             }
         }
     }
 
     if clipped_coords.len() >= 2 {
-        Some((clipped_coords, clipped_times))
+        Some((clipped_coords, clipped_times, clipped_values))
     } else {
         None
     }
@@ -513,14 +537,19 @@ fn slice_segment_temporally(
         return vec![segment];
     }
 
+    // Carry per-vertex scalar values through the split only when the segment
+    // actually has them; an empty `vertex_values` means "no value channel".
+    let has_values = !segment.vertex_values.is_empty();
     let mut slices = Vec::new();
     let mut current_coords: Vec<(f64, f64, f64)> = Vec::new();
     let mut current_times: Vec<u64> = Vec::new();
+    let mut current_values: Vec<f32> = Vec::new();
     let mut current_chunk = start_chunk;
 
     for i in 0..segment.coordinates.len() {
         let coord = segment.coordinates[i];
         let time = segment.timestamps[i];
+        let value = if has_values { segment.vertex_values[i] } else { f32::NAN };
         let chunk = time / granularity_ms;
 
         // If we're crossing into a new chunk, finalize current slice and start new one
@@ -545,10 +574,18 @@ fn slice_segment_temporally(
                         prev_coord.1 + t * (coord.1 - prev_coord.1),
                         prev_coord.2 + t * (coord.2 - prev_coord.2),
                     );
+                    let boundary_value = if has_values {
+                        interpolate_value(segment.vertex_values[i - 1], value, t)
+                    } else {
+                        f32::NAN
+                    };
 
                     // Add boundary point to current slice
                     current_coords.push(boundary_coord);
                     current_times.push(boundary_time);
+                    if has_values {
+                        current_values.push(boundary_value);
+                    }
 
                     // Finalize current slice
                     if current_coords.len() >= 2 {
@@ -558,6 +595,11 @@ fn slice_segment_temporally(
                             zoom: segment.zoom,
                             coordinates: current_coords.clone(),
                             timestamps: current_times.clone(),
+                            vertex_values: if has_values {
+                                current_values.clone()
+                            } else {
+                                Vec::new()
+                            },
                             start_time: *current_times.first().unwrap(),
                             end_time: *current_times.last().unwrap(),
                             properties: segment.properties.clone(),
@@ -568,6 +610,11 @@ fn slice_segment_temporally(
                     // Start new slice with boundary point
                     current_coords = vec![boundary_coord];
                     current_times = vec![boundary_time];
+                    current_values = if has_values {
+                        vec![boundary_value]
+                    } else {
+                        Vec::new()
+                    };
                 }
             }
 
@@ -576,6 +623,9 @@ fn slice_segment_temporally(
 
         current_coords.push(coord);
         current_times.push(time);
+        if has_values {
+            current_values.push(value);
+        }
     }
 
     // Finalize last slice
@@ -586,6 +636,7 @@ fn slice_segment_temporally(
             zoom: segment.zoom,
             coordinates: current_coords,
             timestamps: current_times.clone(),
+            vertex_values: if has_values { current_values } else { Vec::new() },
             start_time: *current_times.first().unwrap(),
             end_time: *current_times.last().unwrap(),
             properties: segment.properties.clone(),
@@ -629,6 +680,11 @@ pub fn clip_trajectory(
     // drop vertices, so we fall back to distance-interpolation in that case
     // to avoid splatting the wrong timestamp onto the wrong vertex.
     supplied_vertex_times: Option<&[u64]>,
+    // Optional producer-supplied per-vertex scalar values (e.g. SST). Like
+    // `supplied_vertex_times`, accepted only when simplification preserved the
+    // vertex count and the supplied length matches; otherwise no value channel
+    // is emitted for this trajectory.
+    supplied_vertex_values: Option<&[f32]>,
 ) -> Vec<ClippedSegment> {
     // Extract coordinates
     let geometry = match &feature.geometry {
@@ -671,6 +727,21 @@ pub fn clip_trajectory(
         _ => compute_vertex_timestamps(&coords, start_time, end_time),
     };
 
+    // Per-vertex scalar values, aligned with `coords`. Accept the supplied
+    // values only when simplification preserved alignment and the length
+    // matches; otherwise this trajectory carries no value channel. `values` is
+    // always full-length (NaN-filled) so the clipper can index it uniformly;
+    // `has_values` decides whether the channel is emitted on each segment.
+    let has_values = matches!(
+        supplied_vertex_values,
+        Some(supplied) if simplification_preserved_alignment && supplied.len() == coords.len()
+    );
+    let values: Vec<f32> = if has_values {
+        supplied_vertex_values.unwrap().to_vec()
+    } else {
+        vec![f32::NAN; coords.len()]
+    };
+
     let mut segments = Vec::new();
 
     // Antimeridian safety: split the polyline wherever two consecutive
@@ -694,6 +765,7 @@ pub fn clip_trajectory(
         }
         let run_coords = &coords[run_start..split];
         let run_times = &timestamps[run_start..split];
+        let run_values = &values[run_start..split];
         run_start = split;
         if run_coords.len() < 2 {
             continue;
@@ -718,8 +790,8 @@ pub fn clip_trajectory(
             }
 
             // Clip to this tile
-            if let Some((clipped_coords, clipped_times)) =
-                clip_trajectory_to_tile(run_coords, run_times, &buffered_bounds)
+            if let Some((clipped_coords, clipped_times, clipped_values)) =
+                clip_trajectory_to_tile(run_coords, run_times, run_values, &buffered_bounds)
             {
                 let seg_start_time = *clipped_times.first().unwrap();
                 let seg_end_time = *clipped_times.last().unwrap();
@@ -730,6 +802,8 @@ pub fn clip_trajectory(
                     zoom,
                     coordinates: clipped_coords,
                     timestamps: clipped_times,
+                    // Drop the value channel for trajectories that carry none.
+                    vertex_values: if has_values { clipped_values } else { Vec::new() },
                     start_time: seg_start_time,
                     end_time: seg_end_time,
                     // Use Arc::clone for zero-copy property sharing
@@ -855,7 +929,7 @@ mod tests {
         ]);
 
         let config = ClipConfig::default();
-        let segments = clip_trajectory(&feature, None, 0, 1000, 10, &config, None);
+        let segments = clip_trajectory(&feature, None, 0, 1000, 10, &config, None, None);
 
         // Should produce at least one segment
         assert!(!segments.is_empty());
@@ -877,7 +951,7 @@ mod tests {
         ]);
 
         let config = ClipConfig::default();
-        let segments = clip_trajectory(&feature, None, 0, 10000, 12, &config, None);
+        let segments = clip_trajectory(&feature, None, 0, 10000, 12, &config, None, None);
 
         // At zoom 12, this should cross at least 2 tiles
         assert!(
@@ -913,7 +987,7 @@ mod tests {
         // Zoom 0: the whole world is a single tile, so nothing is clipped at a
         // tile boundary — the antimeridian split is the only thing that can
         // prevent the artifact here.
-        let segments = clip_trajectory(&feature, None, 0, 3000, 0, &config, None);
+        let segments = clip_trajectory(&feature, None, 0, 3000, 0, &config, None, None);
 
         assert!(!segments.is_empty(), "expected at least one segment");
         for seg in &segments {
@@ -987,7 +1061,7 @@ mod tests {
         };
 
         // Trajectory spanning 5 seconds (should create at least 2 temporal slices)
-        let segments = clip_trajectory(&feature, None, 0, 5000, 10, &config, None);
+        let segments = clip_trajectory(&feature, None, 0, 5000, 10, &config, None, None);
 
         // Should have at least one segment
         assert!(!segments.is_empty());

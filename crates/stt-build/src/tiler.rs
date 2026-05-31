@@ -441,6 +441,7 @@ fn process_zoom_level(
                     zoom,
                     clip_config,
                     feature.vertex_timestamps.as_deref(),
+                    feature.vertex_values.as_deref(),
                 );
                 if segments.is_empty() {
                     total_original.fetch_add(1, Ordering::Relaxed);
@@ -738,6 +739,7 @@ where
                         zoom,
                         &clip_config,
                         feature.vertex_timestamps.as_deref(),
+                        feature.vertex_values.as_deref(),
                     );
                     if segments.is_empty() {
                         let (x, y) = projection::lonlat_to_tile(feature.lon, feature.lat, zoom)
@@ -936,6 +938,7 @@ mod tests {
             timestamp: ts,
             end_timestamp: None,
             vertex_timestamps: None,
+            vertex_values: None,
             lon,
             lat,
         }
@@ -959,6 +962,7 @@ mod tests {
             timestamp: start,
             end_timestamp: Some(end),
             vertex_timestamps: None,
+            vertex_values: None,
             lon: first[0],
             lat: first[1],
         }

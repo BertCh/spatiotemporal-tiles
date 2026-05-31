@@ -2,7 +2,10 @@
 //!
 //! Data source: https://s3.opensky-network.org/data-samples/
 
-use crate::common::{self, LineStringRecord, PointRecord, StreamingLineStringParquetWriter, StreamingParquetWriter};
+use crate::common::{
+    self, LineStringRecord, PointRecord, PropertyColumn, StreamingLineStringParquetWriter,
+    StreamingParquetWriter,
+};
 use anyhow::{Context, Result};
 use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 use clap::Parser;
@@ -408,19 +411,24 @@ fn process_csv(
     let mut total_records = 0;
     let mut filtered_records = 0;
     let mut ground_filtered = 0;
+    let mut skipped_bad_time = 0usize;
     let mut unique_aircraft = HashSet::new();
 
-    // Use streaming Parquet writer for efficiency (~10x smaller than GeoJSON)
+    // Typed columns: the kinematic quantities are numeric so they survive
+    // stt-build's columnar inference and can drive numeric ramps — notably
+    // `altitude`, which the showcase reads as `elevationProperty`. icao24 /
+    // callsign / squawk are identifiers and stay categorical (squawk can have
+    // leading zeros; a sniff would wrongly promote it).
     let property_columns = vec![
-        "icao24".to_string(),
-        "callsign".to_string(),
-        "altitude".to_string(),
-        "speed".to_string(),
-        "heading".to_string(),
-        "vertical_rate".to_string(),
-        "squawk".to_string(),
+        PropertyColumn::string("icao24"),
+        PropertyColumn::string("callsign"),
+        PropertyColumn::numeric("altitude"),
+        PropertyColumn::numeric("speed"),
+        PropertyColumn::numeric("heading"),
+        PropertyColumn::numeric("vertical_rate"),
+        PropertyColumn::string("squawk"),
     ];
-    let mut writer = StreamingParquetWriter::new(output, property_columns)?;
+    let mut writer = StreamingParquetWriter::with_columns(output, property_columns)?;
 
     for result in csv_reader.deserialize() {
         total_records += 1;
@@ -462,7 +470,13 @@ fn process_csv(
         aircraft_last_time.insert(record.icao24.clone(), record.time);
         unique_aircraft.insert(record.icao24.clone());
 
-        let timestamp = Utc.timestamp_opt(record.time, 0).single().unwrap_or(Utc::now());
+        // Skip (don't fabricate now()) on an out-of-range epoch — a corrupt
+        // row placed at "today" would land outside the advertised window and
+        // contaminate the temporal index.
+        let Some(timestamp) = Utc.timestamp_opt(record.time, 0).single() else {
+            skipped_bad_time += 1;
+            continue;
+        };
 
         let mut properties = Map::new();
         properties.insert("icao24".to_string(), json!(record.icao24));
@@ -504,6 +518,9 @@ fn process_csv(
     println!("   Total records: {}", total_records);
     println!("   Ground filtered: {}", ground_filtered);
     println!("   Geographic filtered: {}", filtered_records);
+    if skipped_bad_time > 0 {
+        println!("   Skipped (bad timestamp): {}", skipped_bad_time);
+    }
     println!("   Final features: {}", final_count);
     println!("   Unique aircraft: {}", unique_aircraft.len());
 
@@ -610,11 +627,11 @@ fn process_csv_paths(
 
     // Create streaming LineString writer
     let property_columns = vec![
-        "icao24".to_string(),
-        "callsign".to_string(),
-        "segment_id".to_string(),
+        PropertyColumn::string("icao24"),
+        PropertyColumn::string("callsign"),
+        PropertyColumn::numeric("segment_id"),
     ];
-    let mut writer = StreamingLineStringParquetWriter::new(output, property_columns)?;
+    let mut writer = StreamingLineStringParquetWriter::with_columns(output, property_columns)?;
 
     let mut total_points = 0;
 
@@ -642,12 +659,14 @@ fn process_csv_paths(
                 continue;
             }
 
-            let start_time = Utc.timestamp_opt(segment.first().unwrap().time, 0)
-                .single()
-                .unwrap_or(Utc::now());
-            let end_time = Utc.timestamp_opt(segment.last().unwrap().time, 0)
-                .single()
-                .unwrap_or(Utc::now());
+            // Drop the segment (rather than fabricate now()) if either
+            // endpoint has an out-of-range epoch.
+            let (Some(start_time), Some(end_time)) = (
+                Utc.timestamp_opt(segment.first().unwrap().time, 0).single(),
+                Utc.timestamp_opt(segment.last().unwrap().time, 0).single(),
+            ) else {
+                continue;
+            };
 
             // Use the most common callsign in this segment
             let callsign = segment.iter()

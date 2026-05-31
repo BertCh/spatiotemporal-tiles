@@ -38,6 +38,7 @@ fn point_layer() -> ColumnarLayer {
             [-122.6, 37.9],
         ]),
         vertex_times: None,
+        vertex_values: None,
         triangles: None,
         properties: vec![
             (
@@ -68,6 +69,7 @@ fn line_layer() -> ColumnarLayer {
         ]),
         // A tight temporal span → u16-delta vertex-time encoding (per spec).
         vertex_times: Some(vec![vec![0, 25, 50], vec![100, 200]]),
+        vertex_values: None,
         triangles: None,
         properties: vec![],
     }
@@ -87,6 +89,7 @@ fn polygon_layer(triangles: Option<Vec<Vec<u32>>>) -> ColumnarLayer {
             [0.0, 0.0],
         ]]]),
         vertex_times: None,
+        vertex_values: None,
         triangles,
         properties: vec![],
     }

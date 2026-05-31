@@ -15,7 +15,7 @@
 //! coloured by taxonomic class (bird / mammal / fish / reptile / insect),
 //! resolved via the GBIF species-match API.
 
-use crate::common::{self, LineStringRecord, SttBuildOptions, StreamingLineStringParquetWriter};
+use crate::common::{self, LineStringRecord, PropertyColumn, SttBuildOptions, StreamingLineStringParquetWriter};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use clap::Parser;
@@ -31,9 +31,6 @@ use std::time::Duration;
 
 const GBIF_API: &str = "https://api.gbif.org/v1";
 const USER_AGENT: &str = "stt-generate/0.1 (spatiotemporal-tiles showcase)";
-
-const ANIMAL_PROPERTY_COLUMNS: &[&str] =
-    &["organism", "species", "taxon_group", "class", "dataset", "segment"];
 
 #[derive(Parser, Debug)]
 #[command(about = "Generate animal-migration trajectories from GBIF tracking datasets")]
@@ -147,8 +144,15 @@ pub fn run(args: Args) -> Result<()> {
     } else {
         args.output.clone()
     };
-    let cols: Vec<String> = ANIMAL_PROPERTY_COLUMNS.iter().map(|s| s.to_string()).collect();
-    let mut writer = StreamingLineStringParquetWriter::new(&intermediate, cols)?;
+    let cols: Vec<PropertyColumn> = vec![
+        PropertyColumn::string("organism"),
+        PropertyColumn::string("species"),
+        PropertyColumn::string("taxon_group"),
+        PropertyColumn::string("class"),
+        PropertyColumn::string("dataset"),
+        PropertyColumn::numeric("segment"),
+    ];
+    let mut writer = StreamingLineStringParquetWriter::with_columns(&intermediate, cols)?;
 
     // 3) Process each dataset → folded track segments.
     let pb = ProgressBar::new(datasets.len() as u64);

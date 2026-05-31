@@ -30,6 +30,7 @@ fn point(lon: f64, lat: f64, ts: u64, mag: f64) -> ParsedFeature {
         timestamp: ts,
         end_timestamp: None,
         vertex_timestamps: None,
+        vertex_values: None,
         lon,
         lat,
     }

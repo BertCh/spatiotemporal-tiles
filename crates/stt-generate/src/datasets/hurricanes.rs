@@ -2,7 +2,7 @@
 //!
 //! Data source: https://www.ncei.noaa.gov/products/international-best-track-archive
 
-use crate::common::{self, LineStringRecord, StreamingLineStringParquetWriter};
+use crate::common::{self, LineStringRecord, PropertyColumn, StreamingLineStringParquetWriter};
 use anyhow::Result;
 use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 use clap::Parser;
@@ -289,15 +289,15 @@ fn process_hurricane_data_parquet(path: &PathBuf, output: &PathBuf, args: &Args)
 
     // Create streaming Parquet writer
     let property_columns = vec![
-        "storm_id".to_string(),
-        "name".to_string(),
-        "wind_speed".to_string(),
-        "category".to_string(),
-        "status".to_string(),
-        "nature".to_string(),
-        "value".to_string(),
+        PropertyColumn::string("storm_id"),
+        PropertyColumn::string("name"),
+        PropertyColumn::numeric("wind_speed"),
+        PropertyColumn::numeric("category"),
+        PropertyColumn::string("status"),
+        PropertyColumn::string("nature"),
+        PropertyColumn::numeric("value"),
     ];
-    let mut writer = StreamingLineStringParquetWriter::new(output, property_columns)?;
+    let mut writer = StreamingLineStringParquetWriter::with_columns(output, property_columns)?;
 
     let mut processed_storms = 0;
 

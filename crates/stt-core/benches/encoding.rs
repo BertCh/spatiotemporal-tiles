@@ -19,6 +19,7 @@ fn point_layer(n: usize) -> ColumnarLayer {
                 .collect(),
         ),
         vertex_times: None,
+        vertex_values: None,
         triangles: None,
         properties: vec![
             (
@@ -56,6 +57,7 @@ fn line_layer(n: usize, verts: usize) -> ColumnarLayer {
                 .map(|_| (0..verts as i64).map(|v| v * 100).collect())
                 .collect(),
         ),
+        vertex_values: None,
         triangles: None,
         properties: vec![],
     }

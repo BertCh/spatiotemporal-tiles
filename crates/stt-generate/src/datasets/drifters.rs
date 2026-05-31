@@ -13,7 +13,7 @@
 //! read as bright ribbons peeling poleward.
 
 use crate::common::{
-    self, LineStringRecord, SttBuildOptions, StreamingLineStringParquetWriter,
+    self, LineStringRecord, PropertyColumn, SttBuildOptions, StreamingLineStringParquetWriter,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
@@ -28,11 +28,6 @@ use std::process::Command;
 
 const ERDDAP_BASE: &str =
     "https://data.pmel.noaa.gov/generic/erddap/tabledap/gdp_interpolated_drifter.csv";
-
-/// Property columns carried into the STT archive (string-typed by the
-/// LineString Parquet writer). `timestamp` / `end_timestamp` are the record's
-/// time fields and are not listed here.
-const DRIFTER_PROPERTY_COLUMNS: &[&str] = &["drifter_id", "wmo", "temp_band", "sst", "segment"];
 
 #[derive(Parser, Debug)]
 #[command(about = "Generate Global Drifter Program ocean-current trajectories")]
@@ -169,8 +164,14 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     println!("\n💾 Building track segments...");
-    let cols: Vec<String> = DRIFTER_PROPERTY_COLUMNS.iter().map(|s| s.to_string()).collect();
-    let mut writer = StreamingLineStringParquetWriter::new(&intermediate, cols)?;
+    let cols: Vec<PropertyColumn> = vec![
+        PropertyColumn::string("drifter_id"),
+        PropertyColumn::string("wmo"),
+        PropertyColumn::string("temp_band"),
+        PropertyColumn::numeric("sst"),
+        PropertyColumn::numeric("segment"),
+    ];
+    let mut writer = StreamingLineStringParquetWriter::with_columns(&intermediate, cols)?;
 
     let max_gap_ms = args.max_gap_hours * 3600 * 1000;
     let mut segment_count = 0usize;
@@ -198,20 +199,29 @@ pub fn run(args: Args) -> Result<()> {
                 Some(temps.iter().sum::<f64>() / temps.len() as f64)
             };
 
+            // Per-vertex SST drives the along-track color gradient. Gaps in the
+            // 6-hourly record are gap-filled (forward then backward) so every
+            // vertex has a value; a segment with no temps at all stays NaN
+            // (rendered gray). Aligned 1:1 with `coordinates`.
+            let vertex_temps = fill_vertex_temps(seg);
+
             let mut props = Map::new();
             props.insert("drifter_id".into(), json!(id));
             props.insert("wmo".into(), json!(wmo));
             props.insert("temp_band".into(), json!(temp_band(mean_temp)));
-            props.insert(
-                "sst".into(),
-                json!(mean_temp.map(|t| format!("{:.1}", t)).unwrap_or_default()),
-            );
+            // Store sst as a real number (rounded to 0.1 °C) so it survives
+            // columnar inference as Numeric and can drive a temperature ramp.
+            // Absent when unknown, so the column reads null rather than 0.
+            if let Some(t) = mean_temp {
+                props.insert("sst".into(), json!((t * 10.0).round() / 10.0));
+            }
             props.insert("segment".into(), json!(seg_idx));
 
             let start_t = ms_to_dt(vertex_ms[0]);
             let end_t = ms_to_dt(*vertex_ms.last().unwrap());
             let mut rec = LineStringRecord::new(coordinates, start_t, Some(end_t), props);
             rec.vertex_timestamps_ms = Some(vertex_ms);
+            rec.vertex_values = Some(vertex_temps);
             writer.write_linestring(&rec)?;
             segment_count += 1;
         }
@@ -371,6 +381,40 @@ fn parse_time_ms(s: &str) -> Option<i64> {
 
 fn ms_to_dt(ms: i64) -> DateTime<Utc> {
     Utc.timestamp_millis_opt(ms).single().unwrap_or_else(Utc::now)
+}
+
+/// Per-vertex SST (°C) aligned 1:1 with a segment's fixes, gap-filled so the
+/// along-track color gradient has a value at every vertex. Missing fixes take
+/// the nearest known temperature (forward fill, then backward fill for any
+/// leading gap); a segment with no temperatures at all stays all-`NaN`.
+fn fill_vertex_temps(seg: &[Fix]) -> Vec<f32> {
+    let mut out: Vec<f32> = seg
+        .iter()
+        .map(|f| f.temp.map(|t| t as f32).unwrap_or(f32::NAN))
+        .collect();
+    // Forward fill: carry the last known value into following gaps.
+    let mut last = f32::NAN;
+    for v in out.iter_mut() {
+        if v.is_nan() {
+            if !last.is_nan() {
+                *v = last;
+            }
+        } else {
+            last = *v;
+        }
+    }
+    // Backward fill: handle any leading gap before the first known value.
+    let mut next = f32::NAN;
+    for v in out.iter_mut().rev() {
+        if v.is_nan() {
+            if !next.is_nan() {
+                *v = next;
+            }
+        } else {
+            next = *v;
+        }
+    }
+    out
 }
 
 /// SST → categorical band driving the trip colour ramp.

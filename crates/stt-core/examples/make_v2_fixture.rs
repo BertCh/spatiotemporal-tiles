@@ -42,6 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect(),
         ),
         vertex_times: None,
+        vertex_values: None,
         triangles: None,
         properties: vec![
             (

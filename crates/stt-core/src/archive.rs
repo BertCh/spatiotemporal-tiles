@@ -986,6 +986,7 @@ mod tests {
             end_times: vec![t0 + 100; n],
             geometry: GeometryColumn::Point(vec![[-122.4, 37.7]; n]),
             vertex_times: None,
+            vertex_values: None,
             triangles: None,
             properties: vec![],
         }
@@ -1294,6 +1295,7 @@ mod tests {
                     end_times,
                     geometry: GeometryColumn::LineString(paths),
                     vertex_times: Some(vertex_times),
+                    vertex_values: None,
                     triangles: None,
                     properties: vec![("kind".into(), PropertyColumn::Categorical(kind_col))],
                 });

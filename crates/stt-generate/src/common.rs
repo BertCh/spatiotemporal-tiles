@@ -1,7 +1,7 @@
 //! Common utilities for data generation
 
 use anyhow::Result;
-use arrow::array::{ArrayRef, Float64Builder, ListBuilder, StringBuilder, TimestampMillisecondBuilder};
+use arrow::array::{ArrayRef, Float32Builder, Float64Builder, ListBuilder, StringBuilder, TimestampMillisecondBuilder};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
@@ -258,20 +258,13 @@ pub struct StreamingParquetWriter {
 }
 
 impl StreamingParquetWriter {
-    /// Create a writer with all-string property columns (legacy default).
-    ///
-    /// Prefer [`StreamingParquetWriter::with_columns`] when any property is
-    /// numeric — string-typed numerics survive parquet but are misclassified
-    /// downstream by stt-build's columnar property inference.
-    pub fn new(output_path: &Path, property_columns: Vec<String>) -> Result<Self> {
-        let columns = property_columns
-            .into_iter()
-            .map(PropertyColumn::string)
-            .collect();
-        Self::with_columns(output_path, columns)
-    }
-
     /// Create a writer with explicitly-typed property columns.
+    ///
+    /// Callers must declare each column's [`PropertyKind`]; there is no
+    /// all-string shortcut, because a number written into a Utf8 column is
+    /// misclassified as Categorical by stt-build's columnar inference and then
+    /// can't drive numeric color ramps / `radiusProperty` / elevation. Use
+    /// [`PropertyColumn::string`] explicitly for genuine string columns.
     pub fn with_columns(output_path: &Path, property_columns: Vec<PropertyColumn>) -> Result<Self> {
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -540,6 +533,11 @@ pub struct LineStringRecord {
     /// its uniform-by-distance interpolation and produce real per-segment
     /// timing (e.g. from OSRM `annotations=duration`).
     pub vertex_timestamps_ms: Option<Vec<i64>>,
+    /// Optional per-vertex scalar values (producer-defined; e.g. sea-surface
+    /// temperature). When present, must be the same length as `coordinates`.
+    /// Carried through stt-build into the tile's `vertex_value` column so
+    /// renderers can color the line by it.
+    pub vertex_values: Option<Vec<f32>>,
     pub properties: Map<String, JsonValue>,
 }
 
@@ -555,6 +553,7 @@ impl LineStringRecord {
             timestamp_ms: timestamp.timestamp_millis(),
             end_timestamp_ms: end_timestamp.map(|t| t.timestamp_millis()),
             vertex_timestamps_ms: None,
+            vertex_values: None,
             properties,
         }
     }
@@ -564,7 +563,7 @@ impl LineStringRecord {
 pub struct StreamingLineStringParquetWriter {
     writer: ArrowWriter<File>,
     schema: Arc<Schema>,
-    property_columns: Vec<String>,
+    property_columns: Vec<PropertyColumn>,
 
     // Batch builders
     geometry_builder: arrow::array::BinaryBuilder,
@@ -574,7 +573,9 @@ pub struct StreamingLineStringParquetWriter {
     /// `Timestamp(Millisecond, "UTC")` child so downstream readers can rely
     /// on the type without a numeric→time coercion.
     vertex_timestamps_builder: ListBuilder<TimestampMillisecondBuilder>,
-    property_builders: Vec<StringBuilder>,
+    /// Per-vertex scalar values (one list per row, nullable), `Float32` child.
+    vertex_values_builder: ListBuilder<Float32Builder>,
+    property_builders: Vec<PropertyBuilder>,
 
     batch_size: usize,
     current_batch_size: usize,
@@ -582,7 +583,16 @@ pub struct StreamingLineStringParquetWriter {
 }
 
 impl StreamingLineStringParquetWriter {
-    pub fn new(output_path: &Path, property_columns: Vec<String>) -> Result<Self> {
+    /// Create a writer with explicitly-typed property columns.
+    ///
+    /// Declare each column's [`PropertyKind`] — a number stored as Utf8 is
+    /// misclassified as Categorical by stt-build's columnar inference and
+    /// can't drive numeric color ramps / `radiusProperty` / elevation. Use
+    /// [`PropertyColumn::string`] explicitly for genuine string columns.
+    pub fn with_columns(
+        output_path: &Path,
+        property_columns: Vec<PropertyColumn>,
+    ) -> Result<Self> {
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -609,10 +619,19 @@ impl StreamingLineStringParquetWriter {
                 DataType::List(Arc::new(vertex_time_field.clone())),
                 true,
             ),
+            Field::new(
+                "vertex_values",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                true,
+            ),
         ];
 
         for col in &property_columns {
-            fields.push(Field::new(col, DataType::Utf8, true));
+            let dt = match col.kind {
+                PropertyKind::Numeric => DataType::Float64,
+                PropertyKind::String => DataType::Utf8,
+            };
+            fields.push(Field::new(&col.name, dt, true));
         }
 
         let schema = Arc::new(Schema::new(fields));
@@ -625,8 +644,9 @@ impl StreamingLineStringParquetWriter {
         let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
         let batch_size = 100_000;
-        let property_builders: Vec<StringBuilder> = property_columns.iter()
-            .map(|_| StringBuilder::with_capacity(batch_size, batch_size * 32))
+        let property_builders: Vec<PropertyBuilder> = property_columns
+            .iter()
+            .map(|c| PropertyBuilder::new(&c.kind, batch_size))
             .collect();
 
         // The inner timestamp values stay in i64 storage; we attach the
@@ -634,6 +654,10 @@ impl StreamingLineStringParquetWriter {
         let vertex_timestamps_builder =
             ListBuilder::new(TimestampMillisecondBuilder::with_capacity(batch_size * 32))
                 .with_field(Arc::new(vertex_time_field));
+
+        let vertex_values_builder =
+            ListBuilder::new(Float32Builder::with_capacity(batch_size * 32))
+                .with_field(Arc::new(Field::new("item", DataType::Float32, true)));
 
         Ok(Self {
             writer,
@@ -643,6 +667,7 @@ impl StreamingLineStringParquetWriter {
             timestamp_builder: TimestampMillisecondBuilder::with_capacity(batch_size),
             end_timestamp_builder: TimestampMillisecondBuilder::with_capacity(batch_size),
             vertex_timestamps_builder,
+            vertex_values_builder,
             property_builders,
             batch_size,
             current_batch_size: 0,
@@ -677,11 +702,24 @@ impl StreamingLineStringParquetWriter {
             }
         }
 
+        match &record.vertex_values {
+            Some(vv) if vv.len() == record.coordinates.len() => {
+                let inner = self.vertex_values_builder.values();
+                for &v in vv {
+                    inner.append_value(v);
+                }
+                self.vertex_values_builder.append(true);
+            }
+            _ => {
+                // Absent or length mismatch — leave null so no value channel
+                // is emitted for this row.
+                self.vertex_values_builder.append(false);
+            }
+        }
+
         for (i, col) in self.property_columns.iter().enumerate() {
-            let value = record.properties.get(col)
-                .map(|v| json_value_to_string(v))
-                .unwrap_or_default();
-            self.property_builders[i].append_value(&value);
+            let value = record.properties.get(&col.name);
+            self.property_builders[i].append(value);
         }
 
         self.current_batch_size += 1;
@@ -704,10 +742,11 @@ impl StreamingLineStringParquetWriter {
             Arc::new(self.timestamp_builder.finish().with_timezone("UTC")),
             Arc::new(self.end_timestamp_builder.finish().with_timezone("UTC")),
             Arc::new(self.vertex_timestamps_builder.finish()),
+            Arc::new(self.vertex_values_builder.finish()),
         ];
 
         for builder in &mut self.property_builders {
-            columns.push(Arc::new(builder.finish()));
+            columns.push(builder.finish());
         }
 
         let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
@@ -751,20 +790,28 @@ impl PolygonRecord {
 pub struct StreamingPolygonParquetWriter {
     writer: ArrowWriter<File>,
     schema: Arc<Schema>,
-    property_columns: Vec<String>,
-    
+    property_columns: Vec<PropertyColumn>,
+
     // Batch builders
     geometry_builder: arrow::array::BinaryBuilder,
     timestamp_builder: TimestampMillisecondBuilder,
-    property_builders: Vec<StringBuilder>,
-    
+    property_builders: Vec<PropertyBuilder>,
+
     batch_size: usize,
     current_batch_size: usize,
     total_rows: usize,
 }
 
 impl StreamingPolygonParquetWriter {
-    pub fn new(output_path: &Path, property_columns: Vec<String>) -> Result<Self> {
+    /// Create a writer with explicitly-typed property columns.
+    ///
+    /// Declare each column's [`PropertyKind`] — a number stored as Utf8 is
+    /// misclassified as Categorical by stt-build's columnar inference. Use
+    /// [`PropertyColumn::string`] explicitly for genuine string columns.
+    pub fn with_columns(
+        output_path: &Path,
+        property_columns: Vec<PropertyColumn>,
+    ) -> Result<Self> {
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -774,23 +821,28 @@ impl StreamingPolygonParquetWriter {
             Field::new("geometry", DataType::Binary, false),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), false),
         ];
-        
+
         for col in &property_columns {
-            fields.push(Field::new(col, DataType::Utf8, true));
+            let dt = match col.kind {
+                PropertyKind::Numeric => DataType::Float64,
+                PropertyKind::String => DataType::Utf8,
+            };
+            fields.push(Field::new(&col.name, dt, true));
         }
-        
+
         let schema = Arc::new(Schema::new(fields));
-        
+
         let file = File::create(output_path)?;
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(Default::default()))
             .build();
-        
+
         let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
-        
+
         let batch_size = 50_000; // Polygons are larger, use smaller batches
-        let property_builders: Vec<StringBuilder> = property_columns.iter()
-            .map(|_| StringBuilder::with_capacity(batch_size, batch_size * 32))
+        let property_builders: Vec<PropertyBuilder> = property_columns
+            .iter()
+            .map(|c| PropertyBuilder::new(&c.kind, batch_size))
             .collect();
 
         Ok(Self {
@@ -810,21 +862,19 @@ impl StreamingPolygonParquetWriter {
         let wkb = encode_wkb_polygon(&record.rings);
         self.geometry_builder.append_value(&wkb);
         self.timestamp_builder.append_value(record.timestamp_ms);
-        
+
         for (i, col) in self.property_columns.iter().enumerate() {
-            let value = record.properties.get(col)
-                .map(|v| json_value_to_string(v))
-                .unwrap_or_default();
-            self.property_builders[i].append_value(&value);
+            let value = record.properties.get(&col.name);
+            self.property_builders[i].append(value);
         }
-        
+
         self.current_batch_size += 1;
         self.total_rows += 1;
-        
+
         if self.current_batch_size >= self.batch_size {
             self.flush_batch()?;
         }
-        
+
         Ok(())
     }
 
@@ -837,9 +887,9 @@ impl StreamingPolygonParquetWriter {
             Arc::new(self.geometry_builder.finish()),
             Arc::new(self.timestamp_builder.finish().with_timezone("UTC")),
         ];
-        
+
         for builder in &mut self.property_builders {
-            columns.push(Arc::new(builder.finish()));
+            columns.push(builder.finish());
         }
         
         let batch = RecordBatch::try_new(self.schema.clone(), columns)?;

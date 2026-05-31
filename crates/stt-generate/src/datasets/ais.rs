@@ -8,7 +8,7 @@
 //!   stt-generate ais --start-date 2024-01-01 --end-date 2024-01-07 --output ais-week.stt
 //!   stt-generate ais --input existing.csv --output ais.stt
 
-use crate::common::{self, PointRecord, StreamingParquetWriter};
+use crate::common::{self, PointRecord, PropertyColumn, StreamingParquetWriter};
 use anyhow::{anyhow, Context, Result};
 use chrono::{NaiveDate, NaiveDateTime};
 use clap::Parser;
@@ -383,24 +383,26 @@ fn process_ais_files(
     let mut total_records = 0;
     let mut unique_vessels = HashSet::new();
 
-    let property_columns = vec![
-        "mmsi".to_string(),
-        "vessel_type".to_string(),
-        "speed".to_string(),
-        "course".to_string(),
-        "heading".to_string(),
-        "vessel_name".to_string(),
-        "length".to_string(),
-        "width".to_string(),
+    let typed_columns = vec![
+        PropertyColumn::string("mmsi"),
+        PropertyColumn::string("vessel_type"),
+        PropertyColumn::numeric("speed"),
+        PropertyColumn::numeric("course"),
+        PropertyColumn::numeric("heading"),
+        PropertyColumn::string("vessel_name"),
+        PropertyColumn::numeric("length"),
+        PropertyColumn::numeric("width"),
     ];
+    let property_column_names: Vec<String> =
+        typed_columns.iter().map(|c| c.name.clone()).collect();
 
     let mut parquet_writer = if use_parquet {
-        Some(StreamingParquetWriter::new(intermediate_path, property_columns.clone())?)
+        Some(StreamingParquetWriter::with_columns(intermediate_path, typed_columns.clone())?)
     } else {
         None
     };
     let mut csv_writer = if use_csv {
-        Some(common::StreamingCsvWriter::new(intermediate_path, property_columns)?)
+        Some(common::StreamingCsvWriter::new(intermediate_path, property_column_names)?)
     } else {
         None
     };

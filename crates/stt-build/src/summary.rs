@@ -233,9 +233,13 @@ pub fn build_summary_tier<W: TileWriter>(
                     if matches!(col.agg, SummaryAggregation::Count) {
                         continue;
                     }
-                    let v = props
-                        .get(&col.name)
-                        .and_then(|v| v.as_f64());
+                    // Read the source numeric robustly: a value that arrived
+                    // string-encoded (e.g. from a legacy all-string writer)
+                    // still aggregates instead of silently dropping to None.
+                    let v = props.get(&col.name).and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                    });
                     if let Some(v) = v {
                         agg.sources
                             .entry(col.name.clone())
@@ -397,6 +401,7 @@ fn build_summary_layer(
         end_times,
         geometry: GeometryColumn::Point(centroids),
         vertex_times: None,
+        vertex_values: None,
         properties,
         // Summary tiles are always point centroids — no polygons to
         // tessellate, so the sidecar column added by the pre-tessellate
@@ -486,6 +491,7 @@ mod tests {
             timestamp: ts,
             end_timestamp: None,
             vertex_timestamps: None,
+            vertex_values: None,
             lon,
             lat,
         }

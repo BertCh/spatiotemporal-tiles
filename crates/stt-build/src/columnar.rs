@@ -98,6 +98,8 @@ pub fn build_layer_from_segments(
     let mut end_times = Vec::with_capacity(n);
     let mut geometry: Vec<Vec<Coord>> = Vec::with_capacity(n);
     let mut vertex_times: Vec<Vec<i64>> = Vec::with_capacity(n);
+    let mut vertex_values: Vec<Vec<f32>> = Vec::with_capacity(n);
+    let mut any_values = false;
 
     let mut props = PropertyAccumulator::new();
 
@@ -115,8 +117,20 @@ pub fn build_layer_from_segments(
             let t = seg.timestamps.get(i).copied().unwrap_or(seg.start_time);
             times.push(t as i64);
         }
+
+        // Per-vertex scalar values (e.g. SST), aligned with coords. Missing
+        // entries become NaN so the column always has one value per vertex.
+        if !seg.vertex_values.is_empty() {
+            any_values = true;
+        }
+        let mut vals: Vec<f32> = Vec::with_capacity(coords.len());
+        for i in 0..coords.len() {
+            vals.push(seg.vertex_values.get(i).copied().unwrap_or(f32::NAN));
+        }
+
         geometry.push(coords);
         vertex_times.push(times);
+        vertex_values.push(vals);
 
         props.observe(seg.properties.as_deref());
     }
@@ -132,6 +146,8 @@ pub fn build_layer_from_segments(
         end_times,
         geometry: GeometryColumn::LineString(geometry),
         vertex_times: Some(vertex_times),
+        // Only attach per-vertex values if at least one segment carried them.
+        vertex_values: any_values.then_some(vertex_values),
         triangles: None,
         properties: props.finish(),
     })
@@ -151,6 +167,7 @@ fn build_point_layer(features: &[&ParsedFeature], name: String) -> Result<Column
         end_times: end,
         geometry: GeometryColumn::Point(geometry),
         vertex_times: None,
+        vertex_values: None,
         triangles: None,
         properties: props,
     })
@@ -161,7 +178,9 @@ fn build_line_layer(features: &[&ParsedFeature], name: String) -> Result<Columna
 
     let mut geometry: Vec<Vec<Coord>> = Vec::with_capacity(features.len());
     let mut vertex_times: Vec<Vec<i64>> = Vec::with_capacity(features.len());
+    let mut vertex_values: Vec<Vec<f32>> = Vec::with_capacity(features.len());
     let mut any_duration = false;
+    let mut any_values = false;
     let mut length_mismatch_warned = false;
 
     for f in features {
@@ -202,8 +221,19 @@ fn build_line_layer(features: &[&ParsedFeature], name: String) -> Result<Columna
         } else {
             vec![f.timestamp as i64; coords.len()]
         };
+        // Per-vertex scalar values (e.g. SST). Accepted only when the supplied
+        // length matches the geometry; otherwise NaN-filled (gray at render).
+        let vals: Vec<f32> = match f.vertex_values.as_ref() {
+            Some(supplied) if supplied.len() == coords.len() => {
+                any_values = true;
+                supplied.clone()
+            }
+            _ => vec![f32::NAN; coords.len()],
+        };
+
         geometry.push(coords);
         vertex_times.push(times);
+        vertex_values.push(vals);
     }
 
     Ok(ColumnarLayer {
@@ -215,6 +245,8 @@ fn build_line_layer(features: &[&ParsedFeature], name: String) -> Result<Columna
         // Only attach per-vertex times if at least one feature has a real
         // duration — otherwise they carry no information.
         vertex_times: any_duration.then_some(vertex_times),
+        // Likewise only attach per-vertex values if a feature supplied them.
+        vertex_values: any_values.then_some(vertex_values),
         triangles: None,
         properties: props,
     })
@@ -249,6 +281,7 @@ fn build_polygon_layer(
         end_times: end,
         geometry: GeometryColumn::Polygon(geometry),
         vertex_times: None,
+        vertex_values: None,
         triangles,
         properties: props,
     })
@@ -314,7 +347,14 @@ impl PropertyAccumulator {
                 if !self.categorical.contains_key(key) {
                     self.numeric.entry(key.clone()).or_default();
                 }
-            } else if value.is_string() && !self.numeric.contains_key(key) {
+            } else if (value.is_string() || value.is_boolean())
+                && !self.numeric.contains_key(key)
+            {
+                // Booleans are carried as a categorical "true"/"false" column.
+                // Without this branch they matched neither arm and were
+                // silently dropped from the tile. (A producer that wants to
+                // sum a flag should emit it as a numeric 0/1 column instead,
+                // since the summary tier aggregates via as_f64.)
                 self.categorical.entry(key.clone()).or_default();
             }
         }
@@ -330,10 +370,11 @@ impl PropertyAccumulator {
             col.push(v);
         }
         for (key, col) in self.categorical.iter_mut() {
-            let v = props
-                .and_then(|p| p.get(key))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            let v = props.and_then(|p| p.get(key)).and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            });
             col.push(v);
         }
     }
@@ -559,6 +600,7 @@ mod tests {
             timestamp: 1000,
             end_timestamp: None,
             vertex_timestamps: None,
+            vertex_values: None,
             lon,
             lat,
         }
@@ -578,6 +620,7 @@ mod tests {
             timestamp: start,
             end_timestamp: end,
             vertex_timestamps: None,
+            vertex_values: None,
             lon: coords[0][0],
             lat: coords[0][1],
         }
@@ -603,6 +646,57 @@ mod tests {
                 assert_eq!(v[1], None);
             }
             _ => panic!("kind should be categorical"),
+        }
+    }
+
+    #[test]
+    fn numeric_string_and_boolean_properties_are_classified() {
+        // Guards the columnar inference contract the typed writers rely on:
+        // numbers -> Numeric, strings -> Categorical, and booleans carried as
+        // Categorical "true"/"false" rather than silently dropped (the pre-fix
+        // behaviour matched neither arm in `observe`).
+        let f1 = point_feature(
+            -122.4,
+            37.7,
+            json!({ "altitude": 1000.0, "label": "alpha", "active": true }),
+        );
+        let f2 = point_feature(
+            -122.5,
+            37.8,
+            json!({ "altitude": 2000.0, "label": "beta", "active": false }),
+        );
+        let refs = vec![&f1, &f2];
+        let layers = build_layers_from_features(&refs, "default").unwrap();
+        let col = |name: &str| {
+            layers[0]
+                .properties
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, c)| c)
+        };
+
+        match col("altitude").expect("altitude column") {
+            PropertyColumn::Numeric(v) => {
+                assert_eq!(v[0], Some(1000.0));
+                assert_eq!(v[1], Some(2000.0));
+            }
+            _ => panic!("altitude should be numeric"),
+        }
+        match col("label").expect("label column") {
+            PropertyColumn::Categorical(v) => {
+                assert_eq!(v[0].as_deref(), Some("alpha"));
+                assert_eq!(v[1].as_deref(), Some("beta"));
+            }
+            _ => panic!("label should be categorical"),
+        }
+        // Regression guard: the boolean column must be present (not dropped)
+        // and carried as a "true"/"false" categorical.
+        match col("active").expect("boolean column must be present, not dropped") {
+            PropertyColumn::Categorical(v) => {
+                assert_eq!(v[0].as_deref(), Some("true"));
+                assert_eq!(v[1].as_deref(), Some("false"));
+            }
+            _ => panic!("boolean should be carried as categorical"),
         }
     }
 
@@ -666,6 +760,7 @@ mod tests {
             timestamp: 1000,
             end_timestamp: None,
             vertex_timestamps: None,
+            vertex_values: None,
             lon: x,
             lat: y,
         }
