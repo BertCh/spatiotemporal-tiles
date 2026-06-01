@@ -88,6 +88,18 @@ pub struct TileConfig {
     /// payload. The renderer relies on the tileset's parent-fallback
     /// strategy to surface those features at shallower zooms.
     pub min_features_per_tile: u32,
+    /// Use time-aware TD-TR (Synchronized Euclidean Distance) simplification
+    /// instead of plain spatial Visvalingam. Preserves per-vertex timing —
+    /// important for temporal LOD so zoomed-out playback keeps moving objects
+    /// in the right place at the right time.
+    pub time_aware_simplify: bool,
+    /// When set, replaces fixed `temporal_bucket_ms` chunking with adaptive
+    /// windows of ~this many features each: dense periods get fine time windows,
+    /// sparse periods coarse ones (the tippecanoe `--maximum-tile-features`
+    /// idea applied to the time axis). Each window becomes one tile with its own
+    /// `[time_start, time_end]`. In-memory path only (the streaming path keeps
+    /// fixed buckets).
+    pub adaptive_target_features: Option<u32>,
 }
 
 impl Default for TileConfig {
@@ -104,6 +116,8 @@ impl Default for TileConfig {
             pre_tessellate: false,
             temporal_lod: Vec::new(),
             min_features_per_tile: 1,
+            time_aware_simplify: false,
+            adaptive_target_features: None,
         }
     }
 }
@@ -410,9 +424,17 @@ fn clip_config_from(config: &TileConfig) -> ClipConfig {
     ClipConfig {
         min_vertices: config.clip_min_vertices,
         buffer_degrees: 0.001,
-        temporal_granularity_ms: Some(config.temporal_bucket_ms),
+        // With adaptive temporal windows there's no fixed grid to slice
+        // trajectories against, so disable fixed-bucket temporal slicing in that
+        // mode; segments are assigned to a window by their start time instead.
+        temporal_granularity_ms: if config.adaptive_target_features.is_some() {
+            None
+        } else {
+            Some(config.temporal_bucket_ms)
+        },
         simplify: config.simplify,
         simplify_max_zoom: config.simplify_max_zoom,
+        time_aware_simplify: config.time_aware_simplify,
     }
 }
 
@@ -475,7 +497,10 @@ fn process_zoom_level(
     let tiles: Vec<GeneratedTile> = spatial
         .into_par_iter()
         .flat_map(|((x, y), feats)| {
-            let buckets = chunk_by_temporal_bucket(feats, config.temporal_bucket_ms);
+            let buckets = match config.adaptive_target_features {
+                Some(target) => chunk_adaptive_by_count(feats, target),
+                None => chunk_by_temporal_bucket(feats, config.temporal_bucket_ms),
+            };
             let mut out = Vec::new();
             for (bucket_start, chunk) in buckets {
                 if chunk.is_empty() {
@@ -512,6 +537,41 @@ fn chunk_by_temporal_bucket(
         buckets.entry(bucket).or_default().push(f);
     }
     buckets.into_iter().collect()
+}
+
+/// Adaptive temporal chunking: partition a spatial cell's features into windows
+/// of ~`target` features each, ordered by time. Dense periods produce many fine
+/// windows, sparse periods few coarse ones. Each window's key is its first
+/// feature's timestamp; a window is never closed in the middle of a run of
+/// identical timestamps, so the per-window `(zoom, x, y, t)` keys stay distinct.
+/// Features sharing one exact timestamp in a cell are inseparable (they map to
+/// the same `(z, x, y, t)` key) and stay in a single window even past `target`.
+fn chunk_adaptive_by_count(
+    mut features: Vec<TileFeature>,
+    target: u32,
+) -> Vec<(u64, Vec<TileFeature>)> {
+    let target = target.max(1) as usize;
+    features.sort_by_key(|f| f.timestamp());
+    let mut out: Vec<(u64, Vec<TileFeature>)> = Vec::new();
+    let mut current: Vec<TileFeature> = Vec::new();
+    let mut current_start = 0u64;
+    for f in features {
+        if current.is_empty() {
+            current_start = f.timestamp();
+        } else if current.len() >= target
+            && f.timestamp() != current.last().unwrap().timestamp()
+        {
+            // Window is full and the next feature opens a new timestamp — close
+            // here so two windows can't share a start time (TileId collision).
+            out.push((current_start, std::mem::take(&mut current)));
+            current_start = f.timestamp();
+        }
+        current.push(f);
+    }
+    if !current.is_empty() {
+        out.push((current_start, current));
+    }
+    out
 }
 
 /// Build one tile's layers from a chunk of features.
@@ -1306,5 +1366,143 @@ mod tests {
         assert!(buckets.contains(&Some(hour)));
         assert!(buckets.contains(&Some(day)));
         assert!(!buckets.contains(&None));
+    }
+
+    // ------------------------------------------------------------------
+    // Temporal clipping into the base path (WS-4)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn base_path_temporally_clips_trajectory_into_buckets() {
+        // A trajectory whose timing spans two hourly buckets must split so each
+        // (tile, bucket) is self-contained: tiles appear in >=2 distinct
+        // temporal buckets. Without temporal clipping the whole trajectory would
+        // land in its start bucket only.
+        let hour = 3_600_000u64;
+        let coords: Vec<Vec<f64>> = (0..=20)
+            .map(|i| vec![-122.45 + i as f64 * 0.001, 37.75 + i as f64 * 0.0005])
+            .collect();
+        let first = coords[0].clone();
+        let feat = ParsedFeature {
+            geojson: Feature {
+                bbox: None,
+                geometry: Some(Geometry::new(GeomValue::LineString(coords))),
+                id: None,
+                properties: None,
+                foreign_members: None,
+            },
+            shared_properties: None,
+            timestamp: 0,
+            end_timestamp: Some(2 * hour),
+            vertex_timestamps: None,
+            vertex_values: None,
+            lon: first[0],
+            lat: first[1],
+        };
+        let config = TileConfig {
+            min_zoom: 12,
+            max_zoom: 12,
+            layer_name: "tracks".to_string(),
+            temporal_bucket_ms: hour,
+            clip_trajectories: true,
+            ..TileConfig::default()
+        };
+        let tiles = generate_tiles(&[feat], &config, 1).unwrap();
+        let h = hour as i64;
+        let buckets: std::collections::BTreeSet<i64> = tiles
+            .iter()
+            .map(|t| t.time_start - t.time_start.rem_euclid(h))
+            .collect();
+        assert!(
+            buckets.len() >= 2,
+            "trajectory should temporally clip into >=2 buckets, got {buckets:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Adaptive temporal chunking (WS-5)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn adaptive_temporal_chunking_sizes_windows_by_count() {
+        // 100 distinct-time points in one spatial cell. With target=10 the
+        // adaptive chunker yields ~10 windows (vs ~1 with a 1h bucket), each a
+        // self-contained tile with a distinct (z, x, y, t) key.
+        let features: Vec<ParsedFeature> = (0..100u64)
+            .map(|i| point(-122.45, 37.75, 1_700_000_000_000 + i * 60_000))
+            .collect();
+        let config = TileConfig {
+            min_zoom: 8,
+            max_zoom: 8,
+            layer_name: "default".to_string(),
+            temporal_bucket_ms: 3_600_000,
+            clip_trajectories: false,
+            adaptive_target_features: Some(10),
+            ..TileConfig::default()
+        };
+        let tiles = generate_tiles(&features, &config, 1).unwrap();
+
+        let total: usize = tiles.iter().map(|t| t.feature_count() as usize).sum();
+        assert_eq!(total, 100, "every feature must appear exactly once");
+        assert_eq!(tiles.len(), 10, "expected 10 windows of 10, got {}", tiles.len());
+
+        let keys: std::collections::BTreeSet<(u8, u32, u32, i64)> = tiles
+            .iter()
+            .map(|t| (t.id.z, t.id.x, t.id.y, t.time_start))
+            .collect();
+        assert_eq!(keys.len(), tiles.len(), "window keys must be distinct");
+        for t in &tiles {
+            assert!(t.feature_count() <= 11, "window over budget: {}", t.feature_count());
+        }
+    }
+
+    #[test]
+    fn adaptive_chunking_keeps_identical_timestamps_together() {
+        // Features sharing one exact timestamp in a cell map to the same
+        // (z, x, y, t) key, so they cannot be split into separate tiles — they
+        // stay in one window even past `target` (a documented constraint).
+        let features: Vec<ParsedFeature> = (0..50)
+            .map(|_| point(-122.45, 37.75, 1_700_000_000_000))
+            .collect();
+        let config = TileConfig {
+            min_zoom: 8,
+            max_zoom: 8,
+            layer_name: "default".to_string(),
+            temporal_bucket_ms: 3_600_000,
+            clip_trajectories: false,
+            adaptive_target_features: Some(10),
+            ..TileConfig::default()
+        };
+        let tiles = generate_tiles(&features, &config, 1).unwrap();
+        assert_eq!(tiles.len(), 1, "identical-timestamp features can't be split into tiles");
+        assert_eq!(tiles[0].feature_count(), 50);
+    }
+
+    // ------------------------------------------------------------------
+    // Time-aware (SED) simplification (WS-8)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn time_aware_simplify_builds_tiles() {
+        let feat = trajectory(0, 3_600_000);
+        let config = TileConfig {
+            min_zoom: 5,
+            max_zoom: 5,
+            layer_name: "tracks".to_string(),
+            temporal_bucket_ms: 3_600_000,
+            clip_trajectories: true,
+            simplify: true,
+            time_aware_simplify: true,
+            simplify_max_zoom: 14,
+            ..TileConfig::default()
+        };
+        let tiles = generate_tiles(&[feat], &config, 1).unwrap();
+        assert!(!tiles.is_empty(), "time-aware simplify should still produce tiles");
+        // Clipped trajectory layers carry per-vertex times (TD-TR preserved them).
+        for t in &tiles {
+            for l in &t.layers {
+                assert!(l.vertex_times.is_some(), "trajectory layer should carry vertex_times");
+            }
+        }
     }
 }

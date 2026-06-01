@@ -371,6 +371,85 @@ impl Metadata {
         serde_json::from_slice(bytes)
             .map_err(|e| Error::InvalidArchive(format!("metadata JSON decode failed: {e}")))
     }
+
+    /// Render a TileJSON 3.0 descriptor (with a STAC-style `temporal`
+    /// extension) for this archive.
+    ///
+    /// This is the self-describing, ecosystem-recognisable face of the archive:
+    /// MapLibre / Leaflet / OpenLayers understand the core TileJSON fields, and
+    /// the additive `temporal` block — an ISO-8601 `interval` à la STAC, plus
+    /// the bucket size/step and any LOD pyramid — carries the time dimension the
+    /// spatial-only standard lacks (unknown keys are ignored by existing
+    /// clients). `tile_url_template` is the `{z}/{x}/{y}/{t}` URL the host serves
+    /// tiles at; when `None`, a relative template is emitted.
+    pub fn to_tilejson(&self, tile_url_template: Option<&str>) -> serde_json::Value {
+        use serde_json::json;
+        let tiles = tile_url_template.unwrap_or("{z}/{x}/{y}/{t}");
+        let center_lon = (self.bounds.min_lon + self.bounds.max_lon) / 2.0;
+        let center_lat = (self.bounds.min_lat + self.bounds.max_lat) / 2.0;
+
+        let to_iso = |ms: u64| -> serde_json::Value {
+            // Guard the u64→i64 cast: a timestamp beyond i64::MAX ms (year ~292M)
+            // would wrap negative; surface it as a null open bound instead.
+            if ms > i64::MAX as u64 {
+                return serde_json::Value::Null;
+            }
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
+                .map(|dt| json!(dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)))
+                .unwrap_or(serde_json::Value::Null)
+        };
+
+        let vector_layers: Vec<serde_json::Value> = self
+            .layers
+            .iter()
+            .map(|name| {
+                json!({
+                    "id": name,
+                    "fields": {},
+                    "minzoom": self.min_zoom,
+                    "maxzoom": self.max_zoom,
+                })
+            })
+            .collect();
+
+        // STAC temporal extent: interval is an array of [start, end] pairs with
+        // `null` for an open end. We carry the bucket size + ISO-8601 step and
+        // any LOD pyramid as additive keys.
+        let mut temporal = json!({
+            "interval": [[to_iso(self.time_range.start), to_iso(self.time_range.end)]],
+            "bucket_ms": self.temporal_bucket_ms,
+        });
+        if let Some(step) = iso8601_duration(self.temporal_bucket_ms) {
+            temporal["step"] = json!(step);
+        }
+        if let Some(levels) = &self.temporal_lod {
+            temporal["lod"] = json!(levels
+                .iter()
+                .map(|l| json!({ "bucket_ms": l.bucket_ms, "max_zoom": l.max_zoom_level }))
+                .collect::<Vec<_>>());
+        }
+
+        json!({
+            "tilejson": "3.0.0",
+            "tiles": [tiles],
+            "name": self.name,
+            "description": self.description,
+            "attribution": self.attribution,
+            "scheme": "xyz",
+            "version": "1.0.0",
+            "minzoom": self.min_zoom,
+            "maxzoom": self.max_zoom,
+            "bounds": [
+                self.bounds.min_lon,
+                self.bounds.min_lat,
+                self.bounds.max_lon,
+                self.bounds.max_lat
+            ],
+            "center": [center_lon, center_lat, self.min_zoom],
+            "vector_layers": vector_layers,
+            "temporal": temporal,
+        })
+    }
 }
 
 /// Verify the LOD invariants: ascending bucket order, multiples of the base
@@ -411,6 +490,26 @@ fn validate_temporal_lod(base_bucket_ms: u64, levels: &[TemporalLodLevel]) -> Re
         prev = Some(level.bucket_ms);
     }
     Ok(())
+}
+
+/// Format a millisecond duration as an ISO-8601 duration string for the
+/// TileJSON `temporal.step` field (best-effort: days / hours / minutes /
+/// seconds). Returns `None` for a zero bucket.
+fn iso8601_duration(ms: u64) -> Option<String> {
+    if ms == 0 {
+        return None;
+    }
+    Some(if ms % 86_400_000 == 0 {
+        format!("P{}D", ms / 86_400_000)
+    } else if ms % 3_600_000 == 0 {
+        format!("PT{}H", ms / 3_600_000)
+    } else if ms % 60_000 == 0 {
+        format!("PT{}M", ms / 60_000)
+    } else if ms % 1000 == 0 {
+        format!("PT{}S", ms / 1000)
+    } else {
+        format!("PT{:.3}S", ms as f64 / 1000.0)
+    })
 }
 
 #[cfg(test)]
@@ -697,5 +796,56 @@ mod tests {
             .with_temporal_lod(vec![])
             .unwrap();
         assert!(m.temporal_lod.is_none());
+    }
+
+    #[test]
+    fn tilejson_descriptor_has_core_fields_and_temporal_extension() {
+        let m = Metadata::new("quakes")
+            .with_description("USGS earthquakes")
+            .with_attribution("USGS")
+            .with_zoom_levels(0, 10)
+            .with_temporal_bucket_ms(hour())
+            .with_time_range(TimeRange::new(1_700_000_000_000, 1_700_086_400_000))
+            .with_temporal_lod(vec![TemporalLodLevel {
+                bucket_ms: day(),
+                max_zoom_level: 6,
+            }])
+            .unwrap();
+        let tj = m.to_tilejson(Some("https://cdn/{z}/{x}/{y}/{t}.stt"));
+
+        // Core TileJSON 3.0 fields every web client recognises.
+        assert_eq!(tj["tilejson"], "3.0.0");
+        assert_eq!(tj["tiles"][0], "https://cdn/{z}/{x}/{y}/{t}.stt");
+        assert_eq!(tj["minzoom"], 0);
+        assert_eq!(tj["maxzoom"], 10);
+        assert_eq!(tj["scheme"], "xyz");
+        assert_eq!(tj["vector_layers"][0]["id"], "default");
+        assert_eq!(tj["bounds"].as_array().unwrap().len(), 4);
+
+        // Additive STAC-style temporal extension.
+        assert_eq!(tj["temporal"]["step"], "PT1H");
+        assert_eq!(tj["temporal"]["bucket_ms"], 3_600_000u64);
+        let interval = &tj["temporal"]["interval"][0];
+        assert!(interval[0].as_str().unwrap().starts_with("2023-11-"));
+        assert!(interval[1].is_string());
+        assert_eq!(tj["temporal"]["lod"][0]["bucket_ms"], day());
+    }
+
+    #[test]
+    fn iso8601_duration_formats_common_buckets() {
+        assert_eq!(iso8601_duration(hour()).as_deref(), Some("PT1H"));
+        assert_eq!(iso8601_duration(day()).as_deref(), Some("P1D"));
+        assert_eq!(iso8601_duration(60_000).as_deref(), Some("PT1M"));
+        assert_eq!(iso8601_duration(0), None);
+    }
+
+    #[test]
+    fn tilejson_time_beyond_i64_is_null_not_garbage() {
+        // A timestamp past i64::MAX ms must surface as a null open bound rather
+        // than wrapping to a negative (bogus) date.
+        let m = Metadata::new("x").with_time_range(TimeRange::new(u64::MAX, u64::MAX));
+        let tj = m.to_tilejson(None);
+        assert!(tj["temporal"]["interval"][0][0].is_null());
+        assert!(tj["temporal"]["interval"][0][1].is_null());
     }
 }

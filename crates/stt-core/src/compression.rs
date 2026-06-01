@@ -99,11 +99,20 @@ pub fn decompress_zstd_with_dict(data: &[u8], dict: Option<&[u8]>) -> Result<Vec
 /// to produce a useful dictionary; callers should treat this as "ship without
 /// a dictionary" rather than an error.
 pub fn train_zstd_dictionary(samples: &[Vec<u8>], max_size: usize) -> Option<Vec<u8>> {
+    let slices: Vec<&[u8]> = samples.iter().map(|s| s.as_slice()).collect();
+    train_zstd_dictionary_from_slices(&slices, max_size)
+}
+
+/// Train a zstd dictionary from borrowed payload slices (no cloning).
+///
+/// Same contract as [`train_zstd_dictionary`]: returns `None` when the sample
+/// is too small or too sparse for zstd's builder to produce a useful
+/// dictionary, so callers treat that as "ship without a dictionary".
+pub fn train_zstd_dictionary_from_slices(samples: &[&[u8]], max_size: usize) -> Option<Vec<u8>> {
     if samples.is_empty() {
         return None;
     }
-    let sample_slices: Vec<&[u8]> = samples.iter().map(|s| s.as_slice()).collect();
-    match zstd::dict::from_samples(&sample_slices, max_size) {
+    match zstd::dict::from_samples(samples, max_size) {
         Ok(dict) if !dict.is_empty() => Some(dict),
         _ => None,
     }

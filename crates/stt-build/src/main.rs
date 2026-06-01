@@ -130,6 +130,21 @@ struct Args {
     #[arg(long, default_value = "14")]
     simplify_max_zoom: u8,
 
+    /// Use time-aware TD-TR (Synchronized Euclidean Distance) simplification
+    /// instead of plain spatial Visvalingam. Preserves per-vertex timing so
+    /// zoomed-out trajectory playback keeps moving objects in the right place at
+    /// the right time. Takes effect together with `--simplify`.
+    #[arg(long)]
+    time_aware_simplify: bool,
+
+    /// Adaptive temporal chunking: instead of fixed `--temporal-bucket` windows,
+    /// partition each tile's features into windows of ~N features (dense periods
+    /// get fine time windows, sparse periods coarse ones) — the density-adaptive
+    /// analogue of tippecanoe's `--maximum-tile-features`. In-memory
+    /// (non-streaming) builds only.
+    #[arg(long)]
+    adaptive_temporal: Option<u32>,
+
     /// Fail the build on any row with a null or unparseable timestamp,
     /// rather than coercing it to Unix epoch 0 with a warning.
     #[arg(long)]
@@ -348,6 +363,10 @@ fn main() -> Result<()> {
             // Temporal LOD only wired in the non-streaming branch below.
             temporal_lod: Vec::new(),
             min_features_per_tile: args.min_features_per_tile,
+            time_aware_simplify: args.time_aware_simplify,
+            // Adaptive temporal chunking is an in-memory-only feature; the
+            // streaming path keeps fixed buckets, so this is ignored here.
+            adaptive_target_features: None,
         };
         let mut writer = stt_core::Archive::create(&args.output, compression)?;
         let mut bounds_lon = (f64::MAX, f64::MIN);
@@ -428,7 +447,12 @@ fn main() -> Result<()> {
         let trange = if feature_count == 0 {
             stt_core::types::TimeRange::new(0, 0)
         } else {
-            stt_core::types::TimeRange::new(time_range.0, time_range.1)
+            aligned_time_range(
+                stt_core::types::TimeRange::new(time_range.0, time_range.1),
+                temporal_bucket_ms,
+                &[],
+                false,
+            )
         };
         let metadata = stt_core::metadata::Metadata::new(args.name.unwrap_or_else(|| {
             args.input
@@ -533,6 +557,8 @@ fn main() -> Result<()> {
         pre_tessellate: args.pre_tessellate,
         temporal_lod: temporal_lod.clone(),
         min_features_per_tile: args.min_features_per_tile,
+        time_aware_simplify: args.time_aware_simplify,
+        adaptive_target_features: args.adaptive_temporal,
     };
 
     if args.pre_tessellate {
@@ -713,7 +739,12 @@ fn main() -> Result<()> {
     .with_description(args.description.unwrap_or_default())
     .with_attribution(args.attribution.unwrap_or_default())
     .with_bounds(bounds)
-    .with_time_range(time_range)
+    .with_time_range(aligned_time_range(
+        time_range,
+        temporal_bucket_ms,
+        &temporal_lod,
+        args.adaptive_temporal.is_some(),
+    ))
     .with_zoom_levels(args.min_zoom, args.max_zoom)
     .with_temporal_bucket_ms(temporal_bucket_ms);
     if let Some(tier) = summary_tier_descriptor {
@@ -980,6 +1011,31 @@ fn apply_auto_recommendations(matches: &ArgMatches, args: &mut Args) -> Result<(
         info!("    - {}", line);
     }
     Ok(())
+}
+
+/// Bucket-align the archive's start time down to the coarsest temporal bucket,
+/// so the metadata range actually bounds the (bucket-aligned) tile starts. In
+/// fixed-bucket mode a tile's `time_start` is `floor(t / bucket) * bucket`,
+/// which can sit up to one bucket before the first raw event; without this the
+/// validator (correctly) flags every first-bucket tile as out-of-range. In
+/// adaptive mode tiles start at real event times, so no alignment is applied.
+fn aligned_time_range(
+    tr: stt_core::types::TimeRange,
+    temporal_bucket_ms: u64,
+    temporal_lod: &[stt_core::metadata::TemporalLodLevel],
+    adaptive: bool,
+) -> stt_core::types::TimeRange {
+    if adaptive || temporal_bucket_ms == 0 {
+        return tr;
+    }
+    let coarsest = temporal_lod
+        .iter()
+        .map(|l| l.bucket_ms)
+        .max()
+        .unwrap_or(0)
+        .max(temporal_bucket_ms);
+    let start = (tr.start / coarsest) * coarsest;
+    stt_core::types::TimeRange::new(start, tr.end)
 }
 
 fn parse_compression(s: &str) -> Result<stt_core::types::Compression> {

@@ -1,57 +1,54 @@
 //! STT archive format — a single-file, range-request-friendly container.
 //!
-//! ## Layout (v3)
+//! ## Layout
 //!
 //! ```text
 //! [ 64-byte header ]
-//! [ tile blobs ... ]            zstd-compressed Arrow-IPC tile payloads
-//! [ dictionary    ]            optional zstd training dictionary
-//! [ index table   ]            Arrow IPC: one row per tile (the directory)
-//! [ metadata      ]            UTF-8 JSON
+//! [ tile blobs ... ]            compressed tile payloads (zstd, optionally
+//!                               against a shared dictionary; or gzip / none)
+//! [ dictionary    ]            optional shared zstd training dictionary
+//! [ directory     ]            the compact run-length tile index
+//! [ metadata      ]            UTF-8 JSON (also renders TileJSON 3.0 + STAC)
 //! ```
 //!
-//! The header records the byte ranges of the dictionary, index and metadata
-//! so a reader can fetch them with at most three HTTP range requests, then
-//! each tile with one more.
+//! The header records the byte ranges of the dictionary, directory and
+//! metadata so a reader can fetch them with at most three HTTP range requests,
+//! then each tile blob with one more.
 //!
-//! ## Versioning
+//! ## Format
 //!
-//! - `STT\x02` archives are gzip-only, blake3-64 content addressed, and use
-//!   a single 11-column directory.
-//! - `STT\x03` archives default to zstd-3, use CRC32C for integrity, and
-//!   carry the optional dictionary slot. The directory drops the dedup
-//!   `content_hash` column in favour of a 32-bit `crc32c` integrity tag.
-//!
-//! Both versions share the 64-byte header layout — v2 simply ignores the
-//! `dictionary_*` slots (which were reserved bytes in v2) on read.
+//! There is a single archive version, **v4** (`STT\x04`): blobs are integrity-
+//! tagged with CRC32C, the tile index is the compact columnar run-length
+//! [`crate::directory`], and a shared zstd dictionary slot is available. The
+//! legacy v2 (gzip/blake3) and v3 (Arrow-IPC index) formats have been removed —
+//! nothing is deployed, so archives regenerate from source.
 
 use crate::compression;
 use crate::error::{Error, Result};
 use crate::tile::TileId;
 use crate::types::Compression;
-use arrow::array::{
-    Array, ArrayRef, Int64Array, RecordBatch, UInt32Array, UInt64Array, UInt8Array,
-};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use memmap2::Mmap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::Arc;
 
-/// Magic prefix for v2 archives.
-const MAGIC_V2: &[u8; 4] = b"STT\x02";
-/// Magic prefix for v3 archives.
-const MAGIC_V3: &[u8; 4] = b"STT\x03";
+/// Magic prefix for STT archives: `"STT"` + the format version byte.
+const MAGIC: &[u8; 4] = b"STT\x04";
 
-/// Latest archive format version.
-pub const FORMAT_VERSION: u8 = 3;
+/// The one and only archive format version.
+pub const FORMAT_VERSION: u8 = 4;
 
 /// Fixed header size in bytes.
 const HEADER_SIZE: u64 = 64;
+
+/// Target size of the trained zstd dictionary. ~110 KB is zstd's typical sweet
+/// spot for corpora of many small, structurally-similar payloads (tiles).
+const DICT_MAX_SIZE: usize = 112 * 1024;
+/// Cap the dictionary-training sample so builds stay bounded on huge archives.
+const DICT_SAMPLE_MAX_TILES: usize = 8192;
+/// Byte cap on the dictionary-training sample.
+const DICT_SAMPLE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// One directory entry: where a tile lives and what it covers.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,17 +73,13 @@ pub struct TileEntry {
     pub feature_count: u32,
     /// Hilbert index of `(zoom, x, y)` — directory sort key.
     pub hilbert: u64,
-    /// Integrity tag for the compressed blob. In v3 this is a CRC32C zero-
-    /// extended to 64 bits; in v2 it is the leading 64 bits of a blake3
-    /// digest (which is also the dedup key on the write side).
-    pub content_hash: u64,
+    /// CRC32C integrity tag of the compressed blob.
+    pub crc32c: u32,
     /// Temporal bucket size in milliseconds this tile occupies.
     ///
-    /// `None` for tiles read from an archive that predates the temporal-LOD
-    /// scaffold; readers fall back to the archive-level
-    /// `Metadata::temporal_bucket_ms` in that case. New v3 archives written
-    /// after the scaffold landed always populate it — base tiles record the
-    /// archive's base bucket size; LOD tiles record their coarser bucket.
+    /// Base tiles record the archive's base bucket size; temporal-LOD tiles
+    /// record their coarser bucket. `None` when the archive carries no LOD
+    /// pyramid (readers fall back to `Metadata::temporal_bucket_ms`).
     pub temporal_bucket_ms: Option<u64>,
 }
 
@@ -100,23 +93,21 @@ impl TileEntry {
 /// Parsed archive header.
 #[derive(Debug, Clone)]
 pub struct ArchiveHeader {
-    /// Format version (2 or 3).
+    /// Format version (always [`FORMAT_VERSION`]).
     pub version: u8,
     /// Compression applied to every tile blob.
     pub compression: Compression,
-    /// Byte offset of the index table.
+    /// Byte offset of the directory.
     pub index_offset: u64,
-    /// Index table length in bytes.
+    /// Directory length in bytes.
     pub index_length: u64,
     /// Byte offset of the metadata JSON.
     pub metadata_offset: u64,
     /// Metadata JSON length in bytes.
     pub metadata_length: u64,
-    /// Byte offset of the optional zstd training dictionary (v3 only).
-    /// Zero if no dictionary is present.
+    /// Byte offset of the optional shared zstd dictionary. Zero if absent.
     pub dictionary_offset: u64,
-    /// Length of the optional zstd training dictionary in bytes (v3 only).
-    /// Zero if no dictionary is present.
+    /// Length of the optional shared zstd dictionary in bytes. Zero if absent.
     pub dictionary_length: u64,
 }
 
@@ -140,34 +131,24 @@ fn compression_from_byte(b: u8) -> Result<Compression> {
 }
 
 impl ArchiveHeader {
-    /// Read and validate a header. Accepts both v2 and v3 magic numbers.
+    /// Read and validate a v4 header.
     pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
-        let version = if &magic == MAGIC_V3 {
-            3
-        } else if &magic == MAGIC_V2 {
-            2
-        } else {
+        if &magic != MAGIC {
             return Err(Error::InvalidMagic);
-        };
-        let version_byte = reader.read_u8()?;
-        if version_byte != version {
-            return Err(Error::InvalidArchive(format!(
-                "header magic says v{version} but version byte is {version_byte}"
-            )));
         }
-        if version > FORMAT_VERSION {
-            return Err(Error::UnsupportedVersion(version_byte));
+        let version = reader.read_u8()?;
+        // The 4th magic byte doubles as a version field; both must be the one
+        // supported version.
+        if version != FORMAT_VERSION {
+            return Err(Error::UnsupportedVersion(version));
         }
         let compression = compression_from_byte(reader.read_u8()?)?;
         let index_offset = reader.read_u64::<LittleEndian>()?;
         let index_length = reader.read_u64::<LittleEndian>()?;
         let metadata_offset = reader.read_u64::<LittleEndian>()?;
         let metadata_length = reader.read_u64::<LittleEndian>()?;
-        // v3 stores dictionary_offset / dictionary_length immediately after
-        // the metadata fields. v2 has reserved zeros there — reading them as
-        // 0 is the correct fallback (no dictionary).
         let dictionary_offset = reader.read_u64::<LittleEndian>()?;
         let dictionary_length = reader.read_u64::<LittleEndian>()?;
         // Drain the remaining reserved bytes (HEADER_SIZE - 54).
@@ -185,19 +166,10 @@ impl ArchiveHeader {
         })
     }
 
-    /// Write the header. Picks v2 or v3 magic based on `version`.
+    /// Write the header.
     pub fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
-        let magic: &[u8; 4] = match self.version {
-            2 => MAGIC_V2,
-            3 => MAGIC_V3,
-            other => {
-                return Err(Error::InvalidArchive(format!(
-                    "cannot write unknown header version {other}"
-                )))
-            }
-        };
-        writer.write_all(magic)?;
-        writer.write_u8(self.version)?;
+        writer.write_all(MAGIC)?;
+        writer.write_u8(FORMAT_VERSION)?;
         writer.write_u8(compression_to_byte(self.compression))?;
         writer.write_u64::<LittleEndian>(self.index_offset)?;
         writer.write_u64::<LittleEndian>(self.index_length)?;
@@ -210,209 +182,7 @@ impl ArchiveHeader {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Index table (Arrow) encode / decode
-// ----------------------------------------------------------------------------
-
-/// Directory schema for v2 archives. Carries a 64-bit blake3 prefix that
-/// doubles as dedup key + integrity tag.
-fn index_schema_v2() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("zoom", DataType::UInt8, false),
-        Field::new("x", DataType::UInt32, false),
-        Field::new("y", DataType::UInt32, false),
-        Field::new("time_start", DataType::Int64, false),
-        Field::new("time_end", DataType::Int64, false),
-        Field::new("offset", DataType::UInt64, false),
-        Field::new("length", DataType::UInt32, false),
-        Field::new("uncompressed_size", DataType::UInt32, false),
-        Field::new("feature_count", DataType::UInt32, false),
-        Field::new("hilbert", DataType::UInt64, false),
-        Field::new("content_hash", DataType::UInt64, false),
-    ]))
-}
-
-/// Directory schema for v3 archives. Replaces the 8-byte blake3 prefix with
-/// a 4-byte CRC32C tag (no dedup, just integrity).
-///
-/// When `with_temporal_bucket` is `true`, a nullable `temporal_bucket_ms`
-/// column is appended — populated by the temporal-LOD scaffold so a reader
-/// can pick the right per-tile bucket size when the archive ships an LOD
-/// pyramid. Older v3 archives produced before that scaffold don't have the
-/// column; the reader handles either shape.
-fn index_schema_v3(with_temporal_bucket: bool) -> Arc<Schema> {
-    let mut fields = vec![
-        Field::new("zoom", DataType::UInt8, false),
-        Field::new("x", DataType::UInt32, false),
-        Field::new("y", DataType::UInt32, false),
-        Field::new("time_start", DataType::Int64, false),
-        Field::new("time_end", DataType::Int64, false),
-        Field::new("offset", DataType::UInt64, false),
-        Field::new("length", DataType::UInt32, false),
-        Field::new("uncompressed_size", DataType::UInt32, false),
-        Field::new("feature_count", DataType::UInt32, false),
-        Field::new("hilbert", DataType::UInt64, false),
-        Field::new("crc32c", DataType::UInt32, false),
-    ];
-    if with_temporal_bucket {
-        // Nullable so an archive that mixes LOD-aware and legacy rows (the
-        // append-merge case) doesn't have to retro-fill the column.
-        fields.push(Field::new("temporal_bucket_ms", DataType::UInt64, true));
-    }
-    Arc::new(Schema::new(fields))
-}
-
-fn encode_index(entries: &[TileEntry], version: u8) -> Result<Vec<u8>> {
-    // Emit the `temporal_bucket_ms` column only when at least one row has it
-    // set. Vanilla archives written before the temporal-LOD scaffold stay
-    // byte-identical (11-column index); LOD archives carry the extra column.
-    let with_temporal_bucket =
-        version == 3 && entries.iter().any(|e| e.temporal_bucket_ms.is_some());
-    let schema = if version == 3 {
-        index_schema_v3(with_temporal_bucket)
-    } else {
-        index_schema_v2()
-    };
-
-    let zoom = Arc::new(UInt8Array::from(entries.iter().map(|e| e.zoom).collect::<Vec<_>>())) as ArrayRef;
-    let x = Arc::new(UInt32Array::from(entries.iter().map(|e| e.x).collect::<Vec<_>>())) as ArrayRef;
-    let y = Arc::new(UInt32Array::from(entries.iter().map(|e| e.y).collect::<Vec<_>>())) as ArrayRef;
-    let time_start = Arc::new(Int64Array::from(entries.iter().map(|e| e.time_start).collect::<Vec<_>>())) as ArrayRef;
-    let time_end = Arc::new(Int64Array::from(entries.iter().map(|e| e.time_end).collect::<Vec<_>>())) as ArrayRef;
-    let offset = Arc::new(UInt64Array::from(entries.iter().map(|e| e.offset).collect::<Vec<_>>())) as ArrayRef;
-    let length = Arc::new(UInt32Array::from(entries.iter().map(|e| e.length).collect::<Vec<_>>())) as ArrayRef;
-    let uncompressed = Arc::new(UInt32Array::from(entries.iter().map(|e| e.uncompressed_size).collect::<Vec<_>>())) as ArrayRef;
-    let feature_count = Arc::new(UInt32Array::from(entries.iter().map(|e| e.feature_count).collect::<Vec<_>>())) as ArrayRef;
-    let hilbert = Arc::new(UInt64Array::from(entries.iter().map(|e| e.hilbert).collect::<Vec<_>>())) as ArrayRef;
-
-    let mut columns: Vec<ArrayRef> = if version == 3 {
-        let crc = Arc::new(UInt32Array::from(
-            entries.iter().map(|e| e.content_hash as u32).collect::<Vec<_>>(),
-        )) as ArrayRef;
-        vec![zoom, x, y, time_start, time_end, offset, length, uncompressed, feature_count, hilbert, crc]
-    } else {
-        let hash = Arc::new(UInt64Array::from(
-            entries.iter().map(|e| e.content_hash).collect::<Vec<_>>(),
-        )) as ArrayRef;
-        vec![zoom, x, y, time_start, time_end, offset, length, uncompressed, feature_count, hilbert, hash]
-    };
-    if with_temporal_bucket {
-        let bucket_ms = Arc::new(UInt64Array::from(
-            entries.iter().map(|e| e.temporal_bucket_ms).collect::<Vec<Option<u64>>>(),
-        )) as ArrayRef;
-        columns.push(bucket_ms);
-    }
-
-    let batch = RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| Error::Other(format!("failed to build index batch: {e}")))?;
-    let mut buf = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut buf, &schema)
-            .map_err(|e| Error::Other(format!("index IPC writer init failed: {e}")))?;
-        writer
-            .write(&batch)
-            .map_err(|e| Error::Other(format!("index IPC write failed: {e}")))?;
-        writer
-            .finish()
-            .map_err(|e| Error::Other(format!("index IPC finish failed: {e}")))?;
-    }
-    Ok(buf)
-}
-
-fn decode_index(bytes: &[u8], version: u8) -> Result<Vec<TileEntry>> {
-    let reader = StreamReader::try_new(bytes, None)
-        .map_err(|e| Error::InvalidArchive(format!("index IPC reader init failed: {e}")))?;
-    let mut entries = Vec::new();
-    for batch in reader {
-        let batch =
-            batch.map_err(|e| Error::InvalidArchive(format!("index IPC read failed: {e}")))?;
-        let col = |name: &str| -> Result<&ArrayRef> {
-            batch
-                .column_by_name(name)
-                .ok_or_else(|| Error::InvalidArchive(format!("index missing column '{name}'")))
-        };
-        macro_rules! cast {
-            ($name:literal, $ty:ty) => {
-                col($name)?
-                    .as_any()
-                    .downcast_ref::<$ty>()
-                    .ok_or_else(|| {
-                        Error::InvalidArchive(format!("index column '{}' has wrong type", $name))
-                    })?
-            };
-        }
-        let zoom = cast!("zoom", UInt8Array);
-        let x = cast!("x", UInt32Array);
-        let y = cast!("y", UInt32Array);
-        let time_start = cast!("time_start", Int64Array);
-        let time_end = cast!("time_end", Int64Array);
-        let offset = cast!("offset", UInt64Array);
-        let length = cast!("length", UInt32Array);
-        let uncompressed_size = cast!("uncompressed_size", UInt32Array);
-        let feature_count = cast!("feature_count", UInt32Array);
-        let hilbert = cast!("hilbert", UInt64Array);
-
-        // The integrity column changes name and width between versions; pick
-        // the one that's actually in the schema rather than the requested
-        // version, so a v3 archive built without the crc column (e.g. a
-        // future variant) still decodes its identifying columns.
-        let hash_u64 = batch
-            .column_by_name("content_hash")
-            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
-        let crc_u32 = batch
-            .column_by_name("crc32c")
-            .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
-        // Optional per-tile temporal bucket size — present only when the
-        // archive ships a temporal LOD pyramid. Older v3 archives just
-        // have no column; we surface `None` to the caller in that case.
-        let bucket_u64 = batch
-            .column_by_name("temporal_bucket_ms")
-            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
-
-        for i in 0..batch.num_rows() {
-            let content_hash = if let Some(arr) = hash_u64 {
-                arr.value(i)
-            } else if let Some(arr) = crc_u32 {
-                arr.value(i) as u64
-            } else if version == 3 {
-                return Err(Error::InvalidArchive(
-                    "v3 index missing both content_hash and crc32c columns".into(),
-                ));
-            } else {
-                return Err(Error::InvalidArchive("v2 index missing content_hash".into()));
-            };
-
-            let temporal_bucket_ms = bucket_u64.and_then(|arr| {
-                if arr.is_null(i) { None } else { Some(arr.value(i)) }
-            });
-
-            entries.push(TileEntry {
-                zoom: zoom.value(i),
-                x: x.value(i),
-                y: y.value(i),
-                time_start: time_start.value(i),
-                time_end: time_end.value(i),
-                offset: offset.value(i),
-                length: length.value(i),
-                uncompressed_size: uncompressed_size.value(i),
-                feature_count: feature_count.value(i),
-                hilbert: hilbert.value(i),
-                content_hash,
-                temporal_bucket_ms,
-            });
-        }
-    }
-    Ok(entries)
-}
-
-/// 64-bit blake3 prefix used for v2 dedup + integrity.
-fn blake3_prefix(bytes: &[u8]) -> u64 {
-    let digest = blake3::hash(bytes);
-    let b = digest.as_bytes();
-    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-}
-
-/// CRC32C integrity tag used for v3.
+/// CRC32C integrity tag for a compressed blob.
 fn crc32c_tag(bytes: &[u8]) -> u32 {
     crc32c::crc32c(bytes)
 }
@@ -435,18 +205,12 @@ struct TemporalLookup {
 }
 
 impl TemporalLookup {
-    /// Build the temporal lookup in `O(N log N + total bucket size)` time.
+    /// Build the temporal lookup in `O(N log N + total bucket size)` time via a
+    /// sweep over half-open interval events plus an incremental active set.
     ///
-    /// The previous implementation enumerated every distinct boundary and
-    /// scanned every entry for each — `O(N · B)`, with `B` up to `2N`. At a
-    /// million tiles that was effectively `O(N²)` and `archive open` could
-    /// take minutes on the larger archives. The sweep below produces the
-    /// same snapshot semantics with an event-sorted pass plus an incremental
-    /// `BTreeSet` of currently-active intervals.
-    ///
-    /// Snapshot semantics (unchanged from the previous impl):
-    /// - `boundaries[i]` is a half-open boundary after which the active set
-    ///   is stable until `boundaries[i+1]` (or +∞ for the last entry).
+    /// Snapshot semantics:
+    /// - `boundaries[i]` is a half-open boundary after which the active set is
+    ///   stable until `boundaries[i+1]` (or +∞ for the last entry).
     /// - A query for time `t` uses `partition_point(|&b| b <= t)` to find the
     ///   bucket index `b`. `b == 0` means the query is before any tile
     ///   started → empty.
@@ -456,11 +220,9 @@ impl TemporalLookup {
         }
 
         // Half-open events: START at `time_start`, END at `time_end + 1`
-        // (using `saturating_add` so an interval ending at `i64::MAX` still
-        // produces a well-defined event time). Tag bytes pack the event
-        // kind so the sort is a single `(t, kind, idx)` key — STARTs sort
-        // BEFORE ENDs at ties, so an instantaneous interval `[t, t]` is
-        // active exactly at time `t`.
+        // (saturating so an interval ending at `i64::MAX` still produces a
+        // well-defined event time). STARTs sort BEFORE ENDs at ties, so an
+        // instantaneous interval `[t, t]` is active exactly at time `t`.
         const START: u8 = 0;
         const END: u8 = 1;
         let mut events: Vec<(i64, u8, u32)> = Vec::with_capacity(entries.len() * 2);
@@ -476,14 +238,9 @@ impl TemporalLookup {
         let mut active: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
 
         let mut i = 0;
-        // Track the previous boundary's bucket so we can dedup consecutive
-        // snapshots — an event-time where STARTs and ENDs cancel produces
-        // the same active set, and emitting a duplicate just bloats the
-        // `bucket_refs` storage and slows down queries marginally.
         let mut prev_bucket_start: usize = 0;
         while i < events.len() {
             let t = events[i].0;
-            // Apply every event sharing this timestamp.
             while i < events.len() && events[i].0 == t {
                 let (_, kind, idx) = events[i];
                 if kind == START {
@@ -494,9 +251,8 @@ impl TemporalLookup {
                 i += 1;
             }
 
-            // Snapshot the active set. Skip when it matches the previous
-            // boundary exactly (STARTs and ENDs cancelled out at this time)
-            // so the boundary list stays minimal.
+            // Skip when the active set matches the previous boundary exactly
+            // (STARTs and ENDs cancelled out at this time).
             let prev_bucket_end = bucket_refs.len();
             let prev_active_len = prev_bucket_end - prev_bucket_start;
             if active.len() == prev_active_len {
@@ -549,9 +305,9 @@ impl TemporalLookup {
 
 /// Reader for an STT archive.
 ///
-/// The archive file is memory-mapped on open; tile payload reads serve
-/// slices directly out of the mapping rather than allocating + `pread`-ing
-/// a fresh `Vec<u8>` per call. For warm caches this is allocation-free.
+/// The archive file is memory-mapped on open; tile payload reads serve slices
+/// directly out of the mapping rather than allocating + `pread`-ing a fresh
+/// `Vec<u8>` per call. For warm caches this is allocation-free.
 pub struct ArchiveReader {
     /// Owned file handle keeps the mmap alive even after `open` returns.
     #[allow(dead_code)]
@@ -562,8 +318,7 @@ pub struct ArchiveReader {
     entries: Vec<TileEntry>,
     metadata: crate::metadata::Metadata,
     temporal: TemporalLookup,
-    /// Optional zstd training dictionary loaded from the v3 dictionary slot.
-    /// `None` for v2 archives and v3 archives written without a dictionary.
+    /// Shared zstd dictionary loaded from the dictionary slot, if present.
     dictionary: Option<Vec<u8>>,
 }
 
@@ -571,30 +326,25 @@ impl ArchiveReader {
     /// Open an archive for reading.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path)?;
-        // SAFETY: we treat the mmap as read-only. The file is kept open for
-        // the lifetime of the reader, and we never write through the map.
+        // SAFETY: we treat the mmap as read-only. The file is kept open for the
+        // lifetime of the reader, and we never write through the map.
         let mmap = unsafe { Mmap::map(&file) }
             .map_err(|e| Error::Other(format!("mmap failed: {e}")))?;
 
-        // Read the header from the mmap rather than re-`seek`+`read_exact`-ing
-        // the file (Track C). The version goes to `decode_index` so it can
-        // dispatch between v2's blake3 dedup keys and v3's CRC32C tags (Track B).
         let mut header_cursor = std::io::Cursor::new(&mmap[..HEADER_SIZE as usize]);
         let header = ArchiveHeader::read(&mut header_cursor)?;
 
         let index_end = (header.index_offset + header.index_length) as usize;
         if index_end > mmap.len() {
             return Err(Error::InvalidArchive(format!(
-                "index range {}..{} exceeds archive size {}",
+                "directory range {}..{} exceeds archive size {}",
                 header.index_offset,
                 index_end,
                 mmap.len()
             )));
         }
-        let entries = decode_index(
-            &mmap[header.index_offset as usize..index_end],
-            header.version,
-        )?;
+        let entries =
+            crate::directory::decode_directory(&mmap[header.index_offset as usize..index_end])?;
 
         let metadata_end = (header.metadata_offset + header.metadata_length) as usize;
         if metadata_end > mmap.len() {
@@ -609,11 +359,8 @@ impl ArchiveReader {
             &mmap[header.metadata_offset as usize..metadata_end],
         )?;
 
-        // Dictionary slot lives inside the mmap; just slice it out. Track C
-        // removed the per-call seek+read pattern in favour of mmap slices.
-        let dictionary = if header.version >= 3 && header.dictionary_length > 0 {
-            let dict_end =
-                (header.dictionary_offset + header.dictionary_length) as usize;
+        let dictionary = if header.dictionary_length > 0 {
+            let dict_end = (header.dictionary_offset + header.dictionary_length) as usize;
             if dict_end > mmap.len() {
                 return Err(Error::InvalidArchive(format!(
                     "dictionary range {}..{} exceeds archive size {}",
@@ -650,8 +397,7 @@ impl ArchiveReader {
         &self.header
     }
 
-    /// Optional zstd training dictionary. `None` for v2 archives and v3
-    /// archives written without a dictionary.
+    /// Shared zstd dictionary, if the archive ships one.
     pub fn dictionary(&self) -> Option<&[u8]> {
         self.dictionary.as_deref()
     }
@@ -680,11 +426,7 @@ impl ArchiveReader {
             .find(|e| e.zoom == zoom && e.x == x && e.y == y)
     }
 
-    /// Read and decompress a tile's raw payload bytes.
-    ///
-    /// Combines Track C's mmap-slice I/O (no per-call `Vec` alloc) with
-    /// Track B's version-aware integrity check (CRC32C for v3, blake3 prefix
-    /// for v2) and zstd-with-trained-dictionary decompression path.
+    /// Read and decompress a tile's raw payload bytes, verifying its CRC32C.
     pub fn read_payload(&self, entry: &TileEntry) -> Result<Vec<u8>> {
         let start = entry.offset as usize;
         let end = start + entry.length as usize;
@@ -697,21 +439,14 @@ impl ArchiveReader {
         }
         let compressed = &self.mmap[start..end];
 
-        let ok = if self.header.version >= 3 {
-            crc32c_tag(compressed) as u64 == entry.content_hash
-        } else {
-            blake3_prefix(compressed) == entry.content_hash
-        };
-        if !ok {
+        if crc32c_tag(compressed) != entry.crc32c {
             return Err(Error::InvalidArchive(format!(
                 "tile {:?} failed integrity check (corrupt archive)",
                 entry.tile_id()
             )));
         }
 
-        let payload = if self.header.version >= 3
-            && self.header.compression == Compression::Zstd
-        {
+        let payload = if self.header.compression == Compression::Zstd {
             compression::decompress_zstd_with_dict(compressed, self.dictionary.as_deref())?
         } else {
             compression::decompress(compressed, self.header.compression)?
@@ -728,10 +463,7 @@ impl ArchiveReader {
     }
 
     /// Read and decode a tile into its Arrow layers.
-    pub fn read_layers(
-        &self,
-        entry: &TileEntry,
-    ) -> Result<Vec<crate::arrow_tile::DecodedLayer>> {
+    pub fn read_layers(&self, entry: &TileEntry) -> Result<Vec<crate::arrow_tile::DecodedLayer>> {
         let payload = self.read_payload(entry)?;
         crate::arrow_tile::decode_tile(&payload)
     }
@@ -741,65 +473,73 @@ impl ArchiveReader {
 // Writer
 // ----------------------------------------------------------------------------
 
-/// Writer for creating an STT archive. Always writes the latest version
-/// (currently v3); use the [`ArchiveWriter::create_v2`] constructor to emit a
-/// legacy v2 archive (kept for migration tools and tests).
+/// A tile buffered for deferred, dictionary-trained compression.
+struct PendingTile {
+    z: u8,
+    x: u32,
+    y: u32,
+    hilbert: u64,
+    time_start: i64,
+    time_end: i64,
+    feature_count: u32,
+    temporal_bucket_ms: Option<u64>,
+    payload: Vec<u8>,
+}
+
+/// Writer for creating an STT archive.
+///
+/// Two modes:
+/// - [`create`](Self::create) — *eager*: each tile is compressed and written as
+///   it arrives, so peak memory is bounded (good for streaming huge builds).
+/// - [`create_optimized`](Self::create_optimized) — *buffered*: tiles are held
+///   until [`finalize`](Self::finalize), where a shared zstd dictionary is
+///   trained, byte-identical blobs are deduplicated, and blobs are written in
+///   Hilbert order. Smaller archives at the cost of holding payloads in memory.
 pub struct ArchiveWriter {
     file: File,
     compression: Compression,
-    version: u8,
     current_offset: u64,
     entries: Vec<TileEntry>,
-    /// v2: maps blake3 prefix -> already-written `(offset, length)`. v3 has
-    /// no dedup (it's near-zero on real-world continuous data) so this stays
-    /// empty.
-    dedup: std::collections::HashMap<u64, (u64, u32)>,
+    /// `Some` in the buffered/optimized mode (tiles parked until finalize).
+    pending: Option<Vec<PendingTile>>,
 }
 
 impl ArchiveWriter {
-    /// Create a new v3 archive. Tile blobs use `compression`.
+    /// Create an archive in eager (streaming) mode. Tile blobs use `compression`.
     pub fn create<P: AsRef<Path>>(path: P, compression: Compression) -> Result<Self> {
-        Self::create_with_version(path, compression, FORMAT_VERSION)
+        Self::open_file(path, compression, None)
     }
 
-    /// Create a legacy v2 archive (gzip-only, blake3 dedup). Useful for
-    /// migration scripts and the v2-compat test fixtures.
-    pub fn create_v2<P: AsRef<Path>>(path: P, compression: Compression) -> Result<Self> {
-        Self::create_with_version(path, compression, 2)
+    /// Create an archive in buffered "optimized" mode: a shared zstd dictionary
+    /// is trained over the tile corpus, byte-identical blobs are deduplicated,
+    /// and blobs are Hilbert-ordered for range-read locality. Requires zstd.
+    pub fn create_optimized<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_file(path, Compression::Zstd, Some(Vec::new()))
     }
 
-    fn create_with_version<P: AsRef<Path>>(
+    fn open_file<P: AsRef<Path>>(
         path: P,
         compression: Compression,
-        version: u8,
+        pending: Option<Vec<PendingTile>>,
     ) -> Result<Self> {
-        if version != 2 && version != 3 {
-            return Err(Error::InvalidArchive(format!(
-                "cannot create archive at version {version}"
-            )));
-        }
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .write(true)
             .read(true)
             .create(true)
             .truncate(true)
             .open(path)?;
-        let mut file = file;
         file.seek(SeekFrom::Start(HEADER_SIZE))?;
         Ok(Self {
             file,
             compression,
-            version,
             current_offset: HEADER_SIZE,
             entries: Vec::new(),
-            dedup: std::collections::HashMap::new(),
+            pending,
         })
     }
 
-    /// Add a tile. `payload` is the uncompressed tile payload (the layer
-    /// frame produced by [`crate::arrow_tile::encode_tile`]). For v2,
-    /// byte-identical compressed blobs are written once and shared via the
-    /// dedup table; v3 always appends.
+    /// Add a tile. `payload` is the uncompressed tile payload (the layer frame
+    /// produced by [`crate::arrow_tile::encode_tile`]).
     pub fn add_tile(
         &mut self,
         id: &TileId,
@@ -811,14 +551,8 @@ impl ArchiveWriter {
         self.add_tile_with_bucket(id, time_start, time_end, feature_count, None, payload)
     }
 
-    /// Add a tile, tagging the directory entry with the temporal bucket
-    /// size it represents.
-    ///
-    /// Use this overload when emitting temporal LOD aggregate tiles so the
-    /// reader can dispatch on `bucket_ms`. Pass `None` to leave the column
-    /// unset (the call collapses to [`Self::add_tile`]). Passing `Some(b)`
-    /// in a v2 archive is silently ignored — v2 archives don't carry the
-    /// column, so the LOD scaffold is v3-only.
+    /// Add a tile, tagging the directory entry with the temporal bucket size it
+    /// represents (used when emitting temporal-LOD aggregate tiles).
     pub fn add_tile_with_bucket(
         &mut self,
         id: &TileId,
@@ -828,38 +562,28 @@ impl ArchiveWriter {
         temporal_bucket_ms: Option<u64>,
         payload: &[u8],
     ) -> Result<()> {
+        if let Some(pending) = self.pending.as_mut() {
+            pending.push(PendingTile {
+                z: id.z,
+                x: id.x,
+                y: id.y,
+                hilbert: id.hilbert_index(),
+                time_start,
+                time_end,
+                feature_count,
+                temporal_bucket_ms,
+                payload: payload.to_vec(),
+            });
+            return Ok(());
+        }
+
         let uncompressed_size = payload.len() as u32;
         let compressed = compression::compress(payload, self.compression)?;
-
-        let (offset, length, hash_value) = if self.version >= 3 {
-            // v3: CRC32C, no dedup. Real-data dedup hit rates are sub-1% on
-            // continuous datasets — the blake3 + HashMap overhead is pure
-            // cost. Skip both.
-            let crc = crc32c_tag(&compressed) as u64;
-            let offset = self.current_offset;
-            let length = compressed.len() as u32;
-            self.file.write_all(&compressed)?;
-            self.current_offset += length as u64;
-            (offset, length, crc)
-        } else {
-            let hash = blake3_prefix(&compressed);
-            let (offset, length) = match self.dedup.get(&hash) {
-                Some(&existing) => existing,
-                None => {
-                    let offset = self.current_offset;
-                    let length = compressed.len() as u32;
-                    self.file.write_all(&compressed)?;
-                    self.current_offset += length as u64;
-                    self.dedup.insert(hash, (offset, length));
-                    (offset, length)
-                }
-            };
-            (offset, length, hash)
-        };
-
-        // v2 archives never write the bucket column; force-clear it so a
-        // round-trip preserves bit-identical v2 indices.
-        let bucket = if self.version >= 3 { temporal_bucket_ms } else { None };
+        let crc = crc32c_tag(&compressed);
+        let offset = self.current_offset;
+        let length = compressed.len() as u32;
+        self.file.write_all(&compressed)?;
+        self.current_offset += length as u64;
 
         self.entries.push(TileEntry {
             zoom: id.z,
@@ -872,50 +596,111 @@ impl ArchiveWriter {
             uncompressed_size,
             feature_count,
             hilbert: id.hilbert_index(),
-            content_hash: hash_value,
-            temporal_bucket_ms: bucket,
+            crc32c: crc,
+            temporal_bucket_ms,
         });
         Ok(())
     }
 
-    /// Number of tiles added so far.
+    /// Number of tiles staged so far (buffered or written).
     pub fn tile_count(&self) -> usize {
-        self.entries.len()
+        match &self.pending {
+            Some(p) => p.len(),
+            None => self.entries.len(),
+        }
     }
 
-    /// Finalise: write the index table, metadata, and header.
+    /// Finalise: write the dictionary (if any), directory, metadata, and header.
     pub fn finalize(self, metadata: &crate::metadata::Metadata) -> Result<()> {
-        self.finalize_with_dictionary(metadata, None)
+        if self.pending.is_some() {
+            self.finalize_buffered(metadata)
+        } else {
+            self.finalize_eager(metadata)
+        }
     }
 
-    /// Finalise, optionally embedding a zstd training dictionary.
+    /// Eager finalize: blobs are already written; lay down the directory,
+    /// metadata and header (no shared dictionary).
+    fn finalize_eager(mut self, metadata: &crate::metadata::Metadata) -> Result<()> {
+        self.entries.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start));
+        self.write_tail(metadata, 0, 0)
+    }
+
+    /// Buffered finalize: train a shared zstd dictionary over a sample of the
+    /// buffered payloads, compress every tile against it, deduplicate byte-
+    /// identical blobs, write blobs in Hilbert order, then the dictionary,
+    /// directory, metadata and header.
     ///
-    /// The dictionary slot is a v3-only feature: passing a dictionary on a
-    /// v2 archive is an error (v2 has no on-disk slot for it).
-    ///
-    /// WARNING: the TypeScript reader (`@stt/core`) decodes zstd tiles with
-    /// `fzstd`, which has no dictionary API and will refuse to open an archive
-    /// whose `dictionary_length > 0`. Do not emit dictionary archives for
-    /// browser consumption until a dictionary-capable zstd decoder is wired in
-    /// `packages/core/src/compression.ts`. The Rust reader handles them fine.
-    pub fn finalize_with_dictionary(
-        mut self,
-        metadata: &crate::metadata::Metadata,
-        dictionary: Option<&[u8]>,
-    ) -> Result<()> {
-        if dictionary.is_some() && self.version < 3 {
-            return Err(Error::InvalidArchive(
-                "zstd training dictionary requires a v3 archive".into(),
-            ));
+    /// Degrades gracefully to plain zstd (empty dictionary slot) when the
+    /// corpus is too small/sparse to train a useful dictionary.
+    fn finalize_buffered(mut self, metadata: &crate::metadata::Metadata) -> Result<()> {
+        let mut pending = self.pending.take().unwrap_or_default();
+
+        // Hilbert-order the blobs (not just the index) so a viewport maps to a
+        // near-contiguous byte range — what lets the client's range coalescer
+        // merge neighbouring tiles into one HTTP request.
+        pending.sort_by_key(|p| (p.z, p.hilbert, p.time_start));
+
+        // Train a shared dictionary from a bounded sample of payloads. Bytes
+        // shared across tiles (Arrow schema, dictionary key names, common
+        // coordinate prefixes) get hoisted into the dictionary once instead of
+        // repeating in every compressed blob.
+        let mut sample: Vec<&[u8]> = Vec::new();
+        let mut sample_bytes = 0usize;
+        for p in &pending {
+            if sample.len() >= DICT_SAMPLE_MAX_TILES || sample_bytes >= DICT_SAMPLE_MAX_BYTES {
+                break;
+            }
+            sample_bytes += p.payload.len();
+            sample.push(p.payload.as_slice());
+        }
+        let dictionary = compression::train_zstd_dictionary_from_slices(&sample, DICT_MAX_SIZE);
+
+        // Stream the dictionary-compressed blobs, deduplicating byte-identical
+        // ones (a static cell repeated across time buckets writes its blob
+        // once); the directory's run-length encoding then collapses the shared
+        // references into a single run.
+        self.file.seek(SeekFrom::Start(HEADER_SIZE))?;
+        self.current_offset = HEADER_SIZE;
+        let mut blob_dedup: std::collections::HashMap<[u8; 32], (u64, u32, u32, u32)> =
+            std::collections::HashMap::new();
+        for p in &pending {
+            let compressed =
+                compression::compress_zstd_with_dict(&p.payload, dictionary.as_deref())?;
+            let uncompressed_size = p.payload.len() as u32;
+            // Strong hash of the *compressed* bytes — deterministic zstd makes
+            // identical payloads identical blobs, so this dedup is exact.
+            let key = *blake3::hash(&compressed).as_bytes();
+            let (offset, length, crc) = if let Some(&(off, len, _unc, crc)) = blob_dedup.get(&key) {
+                (off, len, crc)
+            } else {
+                let offset = self.current_offset;
+                let length = compressed.len() as u32;
+                let crc = crc32c_tag(&compressed);
+                self.file.write_all(&compressed)?;
+                self.current_offset += length as u64;
+                blob_dedup.insert(key, (offset, length, uncompressed_size, crc));
+                (offset, length, crc)
+            };
+            self.entries.push(TileEntry {
+                zoom: p.z,
+                x: p.x,
+                y: p.y,
+                time_start: p.time_start,
+                time_end: p.time_end,
+                offset,
+                length,
+                uncompressed_size,
+                feature_count: p.feature_count,
+                hilbert: p.hilbert,
+                crc32c: crc,
+                temporal_bucket_ms: p.temporal_bucket_ms,
+            });
         }
 
-        // Sort the directory by (zoom, Hilbert index) for spatial locality.
-        self.entries.sort_by_key(|e| (e.zoom, e.hilbert));
-
-        // Optional dictionary section sits between the tile data and the
-        // index so a reader can fetch it alongside the index in a coalesced
-        // range request.
-        let (dictionary_offset, dictionary_length) = if let Some(dict) = dictionary {
+        // Dictionary section sits between the tile data and the directory so a
+        // reader can coalesce it with the directory range request.
+        let (dictionary_offset, dictionary_length) = if let Some(dict) = &dictionary {
             let off = self.current_offset;
             self.file.write_all(dict)?;
             self.current_offset += dict.len() as u64;
@@ -924,7 +709,19 @@ impl ArchiveWriter {
             (0, 0)
         };
 
-        let index_bytes = encode_index(&self.entries, self.version)?;
+        self.entries.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start));
+        self.write_tail(metadata, dictionary_offset, dictionary_length)
+    }
+
+    /// Shared tail writer: directory + metadata + header. Assumes blobs (and the
+    /// dictionary, if any) are already written and `self.entries` is sorted.
+    fn write_tail(
+        mut self,
+        metadata: &crate::metadata::Metadata,
+        dictionary_offset: u64,
+        dictionary_length: u64,
+    ) -> Result<()> {
+        let index_bytes = crate::directory::encode_directory(&self.entries);
         let index_offset = self.current_offset;
         let index_length = index_bytes.len() as u64;
         self.file.write_all(&index_bytes)?;
@@ -940,7 +737,7 @@ impl ArchiveWriter {
         self.file.set_len(self.current_offset)?;
 
         let header = ArchiveHeader {
-            version: self.version,
+            version: FORMAT_VERSION,
             compression: self.compression,
             index_offset,
             index_length,
@@ -965,7 +762,7 @@ impl Archive {
         ArchiveReader::open(path)
     }
 
-    /// Create a new (v3) archive.
+    /// Create a new archive (eager mode).
     pub fn create<P: AsRef<Path>>(path: P, compression: Compression) -> Result<ArchiveWriter> {
         ArchiveWriter::create(path, compression)
     }
@@ -993,9 +790,9 @@ mod tests {
     }
 
     #[test]
-    fn header_v3_roundtrips() {
+    fn header_roundtrips() {
         let header = ArchiveHeader {
-            version: 3,
+            version: FORMAT_VERSION,
             compression: Compression::Zstd,
             index_offset: 1234,
             index_length: 56,
@@ -1007,9 +804,9 @@ mod tests {
         let mut buf = Vec::new();
         header.write(&mut buf).unwrap();
         assert_eq!(buf.len(), HEADER_SIZE as usize);
-        assert_eq!(&buf[..4], MAGIC_V3);
+        assert_eq!(&buf[..4], MAGIC);
         let read = ArchiveHeader::read(&mut std::io::Cursor::new(buf)).unwrap();
-        assert_eq!(read.version, 3);
+        assert_eq!(read.version, FORMAT_VERSION);
         assert_eq!(read.index_offset, 1234);
         assert_eq!(read.dictionary_offset, 1100);
         assert_eq!(read.dictionary_length, 32);
@@ -1017,27 +814,14 @@ mod tests {
     }
 
     #[test]
-    fn header_v2_roundtrips() {
-        let header = ArchiveHeader {
-            version: 2,
-            compression: Compression::Gzip,
-            index_offset: 100,
-            index_length: 20,
-            metadata_offset: 120,
-            metadata_length: 30,
-            dictionary_offset: 0,
-            dictionary_length: 0,
-        };
-        let mut buf = Vec::new();
-        header.write(&mut buf).unwrap();
-        assert_eq!(&buf[..4], MAGIC_V2);
-        let read = ArchiveHeader::read(&mut std::io::Cursor::new(buf)).unwrap();
-        assert_eq!(read.version, 2);
-        assert_eq!(read.dictionary_length, 0);
+    fn rejects_foreign_magic() {
+        let mut buf = vec![b'X', b'Y', b'Z', 9];
+        buf.resize(HEADER_SIZE as usize, 0);
+        assert!(ArchiveHeader::read(&mut std::io::Cursor::new(buf)).is_err());
     }
 
     #[test]
-    fn archive_v3_roundtrips_tiles_and_temporal_lookup() {
+    fn eager_archive_roundtrips_tiles_and_temporal_lookup() {
         let path = NamedTempFile::new().unwrap().into_temp_path();
 
         let mut writer = ArchiveWriter::create(&path, Compression::Zstd).unwrap();
@@ -1047,12 +831,10 @@ mod tests {
         writer.add_tile(&TileId::new(10, 1, 1, 1000), 1000, 2000, 1, &tile_a).unwrap();
         writer.add_tile(&TileId::new(10, 2, 2, 1500), 1500, 3000, 2, &tile_b).unwrap();
         writer.add_tile(&TileId::new(11, 4, 4, 5000), 5000, 6000, 1, &tile_c).unwrap();
+        writer.finalize(&crate::metadata::Metadata::new("test-archive")).unwrap();
 
-        let metadata = crate::metadata::Metadata::new("test-archive");
-        writer.finalize(&metadata).unwrap();
-
-        let mut reader = ArchiveReader::open(&path).unwrap();
-        assert_eq!(reader.header().version, 3);
+        let reader = ArchiveReader::open(&path).unwrap();
+        assert_eq!(reader.header().version, FORMAT_VERSION);
         assert_eq!(reader.entries().len(), 3);
         assert_eq!(reader.metadata().name, "test-archive");
 
@@ -1070,48 +852,28 @@ mod tests {
     }
 
     #[test]
-    fn archive_v2_still_reads_back() {
+    fn corrupt_blob_is_detected() {
         let path = NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = ArchiveWriter::create_v2(&path, Compression::Gzip).unwrap();
-        let payload = crate::arrow_tile::encode_tile(&[point_layer("default", vec![1, 2], 0)]).unwrap();
-        writer.add_tile(&TileId::new(8, 1, 1, 0), 0, 1000, 2, &payload).unwrap();
-        writer.finalize(&crate::metadata::Metadata::new("legacy")).unwrap();
-
-        let mut reader = ArchiveReader::open(&path).unwrap();
-        assert_eq!(reader.header().version, 2);
-        let entry = reader.entries()[0].clone();
-        let layers = reader.read_layers(&entry).unwrap();
-        assert_eq!(layers[0].batch.num_rows(), 2);
-    }
-
-    #[test]
-    fn v2_dedup_still_works() {
-        let path = NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = ArchiveWriter::create_v2(&path, Compression::Gzip).unwrap();
+        let mut writer = ArchiveWriter::create(&path, Compression::None).unwrap();
         let payload = crate::arrow_tile::encode_tile(&[point_layer("default", vec![1], 1000)]).unwrap();
-        writer.add_tile(&TileId::new(10, 1, 1, 1000), 1000, 2000, 1, &payload).unwrap();
-        writer.add_tile(&TileId::new(10, 2, 2, 1000), 1000, 2000, 1, &payload).unwrap();
-        writer.finalize(&crate::metadata::Metadata::new("dedup")).unwrap();
+        writer.add_tile(&TileId::new(5, 0, 0, 1000), 1000, 2000, 1, &payload).unwrap();
+        writer.finalize(&crate::metadata::Metadata::new("corrupt")).unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[HEADER_SIZE as usize] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
 
         let reader = ArchiveReader::open(&path).unwrap();
-        let offsets: Vec<u64> = reader.entries().iter().map(|e| e.offset).collect();
-        assert_eq!(offsets[0], offsets[1], "v2 dedup should share the blob");
+        let entry = reader.entries()[0].clone();
+        assert!(reader.read_payload(&entry).is_err());
     }
 
-    /// `TemporalLookup` build correctness + worst-case timing regression.
-    ///
-    /// Builds 50k bucket-aligned entries (representative of mid-size archives)
-    /// and asserts:
-    /// 1. The lookup returns exactly the entries whose `[start, end]` spans
-    ///    a sample query time.
-    /// 2. Build completes in well under a second — the previous O(N · B)
-    ///    construction took 30+ s at this size and was a real archive-open
-    ///    bottleneck for the AIS / NYC-taxi datasets.
+    /// `TemporalLookup` build correctness + worst-case timing regression
+    /// (50k entries must build in well under a second).
     #[test]
     fn temporal_lookup_build_is_fast_and_correct() {
         let bucket = 3_600_000i64; // 1 hour
         let mut entries = Vec::with_capacity(50_000);
-        // 200 spatial cells × 250 temporal buckets each = 50k entries.
         for cell in 0..200u32 {
             for b in 0..250u32 {
                 let t_start = (b as i64) * bucket;
@@ -1126,7 +888,7 @@ mod tests {
                     uncompressed_size: 0,
                     feature_count: 0,
                     hilbert: 0,
-                    content_hash: 0,
+                    crc32c: 0,
                     temporal_bucket_ms: None,
                 });
             }
@@ -1135,14 +897,8 @@ mod tests {
         let started = std::time::Instant::now();
         let lookup = TemporalLookup::build(&entries);
         let elapsed_ms = started.elapsed().as_millis();
-        assert!(
-            elapsed_ms < 1000,
-            "TemporalLookup::build took {elapsed_ms}ms for 50k entries — \
-             the sweep-line build is meant to be sub-second",
-        );
+        assert!(elapsed_ms < 1000, "TemporalLookup::build took {elapsed_ms}ms for 50k entries");
 
-        // Sample query mid-archive: every entry whose interval contains this
-        // time must be in the result, and nothing else.
         let query_t = bucket * 123 + bucket / 2;
         let got: std::collections::BTreeSet<u32> = lookup.at(query_t).iter().copied().collect();
         let expected: std::collections::BTreeSet<u32> = entries
@@ -1152,214 +908,121 @@ mod tests {
             .map(|(i, _)| i as u32)
             .collect();
         assert_eq!(got, expected);
-
-        // Before-everything and after-everything queries return empty.
         assert!(lookup.at(-1).is_empty());
         assert!(lookup.at(bucket * 1_000_000).is_empty());
     }
 
-    /// Backwards compat: a v3 archive that never tagged its tiles with a
-    /// temporal bucket size (every entry's `temporal_bucket_ms` is `None`)
-    /// must not emit the optional column. Vanilla archives stay byte-stable
-    /// across the LOD scaffold rollout.
+    /// Optimized (buffered) archive: byte-identical tiles across time dedup to a
+    /// single blob and the run-length directory round-trips every entry.
     #[test]
-    fn v3_index_omits_bucket_column_for_legacy_tiles() {
+    fn optimized_archive_dedups_and_roundtrips() {
         let path = NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = ArchiveWriter::create(&path, Compression::None).unwrap();
-        let payload = crate::arrow_tile::encode_tile(&[point_layer("default", vec![1], 1000)]).unwrap();
-        writer.add_tile(&TileId::new(5, 0, 0, 1000), 1000, 2000, 1, &payload).unwrap();
-        writer.finalize(&crate::metadata::Metadata::new("plain")).unwrap();
+        let mut writer = ArchiveWriter::create_optimized(&path).unwrap();
 
-        let reader = ArchiveReader::open(&path).unwrap();
-        // Round-trip: the column is absent on the wire, so the entry parses
-        // back with `temporal_bucket_ms: None`.
-        assert!(reader.entries()[0].temporal_bucket_ms.is_none());
-
-        // Inspect the raw index buffer: the field is genuinely absent (this
-        // is the wire-compat guarantee).
-        let header = reader.header();
-        let mut file = std::fs::File::open(&path).unwrap();
-        file.seek(SeekFrom::Start(header.index_offset)).unwrap();
-        let mut index_bytes = vec![0u8; header.index_length as usize];
-        file.read_exact(&mut index_bytes).unwrap();
-        let stream = StreamReader::try_new(index_bytes.as_slice(), None).unwrap();
-        let mut found_field = false;
-        for batch in stream {
-            let batch = batch.unwrap();
-            if batch.schema().column_with_name("temporal_bucket_ms").is_some() {
-                found_field = true;
-            }
+        let static_payload =
+            crate::arrow_tile::encode_tile(&[point_layer("default", vec![1], 0)]).unwrap();
+        for b in 0..5i64 {
+            let t = b * 3_600_000;
+            writer
+                .add_tile(&TileId::new(9, 3, 4, t as u64), t, t + 3_599_999, 1, &static_payload)
+                .unwrap();
         }
-        assert!(!found_field, "vanilla v3 index leaked the LOD column");
-    }
-
-    /// Temporal LOD scaffold: tagged tiles round-trip through the v3 index
-    /// with the per-tile bucket size preserved.
-    #[test]
-    fn v3_index_carries_bucket_column_for_lod_tagged_tiles() {
-        let path = NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = ArchiveWriter::create(&path, Compression::None).unwrap();
-        let payload = crate::arrow_tile::encode_tile(&[point_layer("default", vec![1], 1000)]).unwrap();
-        // Two tiles at the same spatial cell, different LOD levels.
-        let base = 3_600_000u64; // 1h
-        let lod = 24 * base; // 1d
-        writer
-            .add_tile_with_bucket(
-                &TileId::new(5, 0, 0, 1000),
-                1000,
-                1000 + base as i64,
-                1,
-                Some(base),
-                &payload,
-            )
-            .unwrap();
-        writer
-            .add_tile_with_bucket(
-                &TileId::new(5, 0, 0, 1000),
-                1000,
-                1000 + lod as i64,
-                1,
-                Some(lod),
-                &payload,
-            )
-            .unwrap();
-        writer.finalize(&crate::metadata::Metadata::new("lod")).unwrap();
+        let other =
+            crate::arrow_tile::encode_tile(&[point_layer("default", vec![2, 3], 1000)]).unwrap();
+        writer.add_tile(&TileId::new(9, 5, 6, 0), 0, 1000, 2, &other).unwrap();
+        writer.finalize(&crate::metadata::Metadata::new("opt")).unwrap();
 
         let reader = ArchiveReader::open(&path).unwrap();
-        let buckets: Vec<Option<u64>> =
-            reader.entries().iter().map(|e| e.temporal_bucket_ms).collect();
-        assert_eq!(buckets, vec![Some(base), Some(lod)]);
+        assert_eq!(reader.header().version, FORMAT_VERSION);
+        assert_eq!(reader.entries().len(), 6);
+
+        let static_offsets: std::collections::BTreeSet<u64> = reader
+            .entries()
+            .iter()
+            .filter(|e| e.x == 3 && e.y == 4)
+            .map(|e| e.offset)
+            .collect();
+        assert_eq!(static_offsets.len(), 1, "static-across-time tiles should dedup to one blob");
+
+        let mid = reader.find_tile(9, 3, 4, 3 * 3_600_000).unwrap().clone();
+        assert_eq!(reader.read_layers(&mid).unwrap()[0].batch.num_rows(), 1);
+        let distinct = reader.entries().iter().find(|e| e.x == 5).unwrap().clone();
+        assert_eq!(reader.read_layers(&distinct).unwrap()[0].batch.num_rows(), 2);
     }
 
+    /// The shared dictionary shrinks a corpus of many small similar tiles and
+    /// every tile still decodes against the embedded dictionary.
     #[test]
-    fn corrupt_blob_is_detected_v3() {
-        let path = NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = ArchiveWriter::create(&path, Compression::None).unwrap();
-        let payload = crate::arrow_tile::encode_tile(&[point_layer("default", vec![1], 1000)]).unwrap();
-        writer.add_tile(&TileId::new(5, 0, 0, 1000), 1000, 2000, 1, &payload).unwrap();
-        writer.finalize(&crate::metadata::Metadata::new("corrupt")).unwrap();
-
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes[HEADER_SIZE as usize] ^= 0xFF;
-        std::fs::write(&path, &bytes).unwrap();
-
-        let mut reader = ArchiveReader::open(&path).unwrap();
-        let entry = reader.entries()[0].clone();
-        assert!(reader.read_payload(&entry).is_err());
-    }
-
-    /// Build a small but representative tile (point + categorical + path
-     /// with per-vertex times) and assert that the v3 archive is at least
-     /// 40% smaller than the v2 equivalent. The shrink is the combined
-     /// effect of zstd-3 over gzip-6, u16-delta vertex times, dictionary
-     /// categoricals, and the CRC32C column on the directory.
-    #[test]
-    fn v3_archives_are_substantially_smaller_than_v2() {
+    fn optimized_dictionary_shrinks_and_roundtrips() {
         use crate::arrow_tile::{ColumnarLayer, GeometryColumn, PropertyColumn};
 
-        // 16 path-like layers per tile across 32 tiles. Each layer has
-        // 64 features with ~16 vertices and a categorical "kind".
-        let kinds = ["bike", "car", "scooter", "bus"];
-        let make_tile = |seed: u64| -> Vec<u8> {
-            let mut layers = Vec::new();
-            for layer_i in 0..16u64 {
-                let n = 64usize;
-                let mut feature_ids = Vec::with_capacity(n);
-                let mut start_times = Vec::with_capacity(n);
-                let mut end_times = Vec::with_capacity(n);
-                let mut paths: Vec<Vec<[f64; 2]>> = Vec::with_capacity(n);
-                let mut vertex_times: Vec<Vec<i64>> = Vec::with_capacity(n);
-                let mut kind_col: Vec<Option<String>> = Vec::with_capacity(n);
-                for i in 0..n {
-                    feature_ids.push(seed * 1000 + layer_i * 100 + i as u64);
-                    let t0 = (i as i64) * 1000;
-                    start_times.push(t0);
-                    end_times.push(t0 + 1000);
-                    let vertices: Vec<[f64; 2]> = (0..16)
+        let kinds = ["bike", "car", "bus", "scooter"];
+        let make_payload = |seed: u64| -> Vec<u8> {
+            let f = 8usize;
+            let mut feature_ids = Vec::with_capacity(f);
+            let mut start_times = Vec::with_capacity(f);
+            let mut end_times = Vec::with_capacity(f);
+            let mut paths: Vec<Vec<[f64; 2]>> = Vec::with_capacity(f);
+            let mut vtimes: Vec<Vec<i64>> = Vec::with_capacity(f);
+            let mut kind: Vec<Option<String>> = Vec::with_capacity(f);
+            for i in 0..f {
+                feature_ids.push(seed * 100 + i as u64);
+                let t0 = i as i64 * 1000;
+                start_times.push(t0);
+                end_times.push(t0 + 1000);
+                paths.push(
+                    (0..16)
                         .map(|j| {
                             [
-                                -122.4 + (i as f64) * 0.001 + (j as f64) * 0.0001,
-                                37.7 + (layer_i as f64) * 0.001 + (j as f64) * 0.0001,
+                                -122.4 + i as f64 * 0.001 + j as f64 * 0.0001,
+                                37.7 + seed as f64 * 0.0001 + j as f64 * 0.0001,
                             ]
                         })
-                        .collect();
-                    let times: Vec<i64> = (0..16).map(|j| t0 + j * 60).collect();
-                    paths.push(vertices);
-                    vertex_times.push(times);
-                    kind_col.push(Some(kinds[(i + layer_i as usize) % kinds.len()].to_string()));
-                }
-                layers.push(ColumnarLayer {
-                    name: format!("layer_{layer_i}"),
-                    feature_ids,
-                    start_times,
-                    end_times,
-                    geometry: GeometryColumn::LineString(paths),
-                    vertex_times: Some(vertex_times),
-                    vertex_values: None,
-                    triangles: None,
-                    properties: vec![("kind".into(), PropertyColumn::Categorical(kind_col))],
-                });
+                        .collect(),
+                );
+                vtimes.push((0..16).map(|j| t0 + j * 60).collect());
+                kind.push(Some(kinds[(seed as usize + i) % kinds.len()].to_string()));
             }
-            crate::arrow_tile::encode_tile(&layers).unwrap()
-        };
-
-        let build_archive = |path: &std::path::Path, version: u8| -> u64 {
-            let mut writer = if version == 2 {
-                ArchiveWriter::create_v2(path, Compression::Gzip).unwrap()
-            } else {
-                ArchiveWriter::create(path, Compression::Zstd).unwrap()
-            };
-            for seed in 0..32u64 {
-                let payload = make_tile(seed);
-                writer
-                    .add_tile(
-                        &TileId::new(8, seed as u32, 0, 0),
-                        0,
-                        1_000_000,
-                        64 * 16,
-                        &payload,
-                    )
-                    .unwrap();
-            }
-            writer
-                .finalize(&crate::metadata::Metadata::new("size-comparison"))
-                .unwrap();
-            std::fs::metadata(path).unwrap().len()
+            crate::arrow_tile::encode_tile(&[ColumnarLayer {
+                name: "trips".to_string(),
+                feature_ids,
+                start_times,
+                end_times,
+                geometry: GeometryColumn::LineString(paths),
+                vertex_times: Some(vtimes),
+                vertex_values: None,
+                triangles: None,
+                properties: vec![("kind".to_string(), PropertyColumn::Categorical(kind))],
+            }])
+            .unwrap()
         };
 
         let dir = tempfile::tempdir().unwrap();
-        let v2_size = build_archive(&dir.path().join("v2.stt"), 2);
-        let v3_size = build_archive(&dir.path().join("v3.stt"), 3);
+        let opt_path = dir.path().join("opt.stt");
+        let plain_path = dir.path().join("plain.stt");
 
-        let ratio = v3_size as f64 / v2_size as f64;
-        eprintln!(
-            "v3 archive shrink: v2={} bytes, v3={} bytes, ratio={:.3}",
-            v2_size, v3_size, ratio
-        );
-        assert!(
-            ratio <= 0.60,
-            "expected v3 archive to be at most 60% the size of v2, got ratio={:.3} (v2={}, v3={})",
-            ratio,
-            v2_size,
-            v3_size
-        );
-    }
+        let mut w = ArchiveWriter::create_optimized(&opt_path).unwrap();
+        for s in 0..512u64 {
+            w.add_tile(&TileId::new(10, (s % 32) as u32, (s / 32) as u32, 0), 0, 8000, 8, &make_payload(s))
+                .unwrap();
+        }
+        w.finalize(&crate::metadata::Metadata::new("opt")).unwrap();
 
-    #[test]
-    fn v3_dictionary_slot_roundtrips() {
-        let path = NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = ArchiveWriter::create(&path, Compression::Zstd).unwrap();
-        let payload = crate::arrow_tile::encode_tile(&[point_layer("default", vec![1], 0)]).unwrap();
-        writer.add_tile(&TileId::new(5, 0, 0, 0), 0, 1, 1, &payload).unwrap();
-        // Embed an arbitrary "dictionary" blob in the slot (the reader does
-        // not validate its zstd-magic, just the size; production builds use
-        // a real trained dictionary).
-        let fake_dict = b"DICTIONARY-BYTES-GO-HERE".to_vec();
-        writer
-            .finalize_with_dictionary(&crate::metadata::Metadata::new("dict"), Some(&fake_dict))
-            .unwrap();
+        let mut w2 = ArchiveWriter::create(&plain_path, Compression::Zstd).unwrap();
+        for s in 0..512u64 {
+            w2.add_tile(&TileId::new(10, (s % 32) as u32, (s / 32) as u32, 0), 0, 8000, 8, &make_payload(s))
+                .unwrap();
+        }
+        w2.finalize(&crate::metadata::Metadata::new("plain")).unwrap();
 
-        let reader = ArchiveReader::open(&path).unwrap();
-        assert_eq!(reader.dictionary(), Some(fake_dict.as_slice()));
+        let opt_size = std::fs::metadata(&opt_path).unwrap().len();
+        let plain_size = std::fs::metadata(&plain_path).unwrap().len();
+        eprintln!("optimized: {opt_size} bytes, eager-zstd: {plain_size} bytes");
+
+        let reader = ArchiveReader::open(&opt_path).unwrap();
+        assert!(reader.dictionary().is_some(), "expected a trained dictionary");
+        let entry = reader.entries()[0].clone();
+        assert_eq!(reader.read_layers(&entry).unwrap()[0].batch.num_rows(), 8);
+        assert!(opt_size < plain_size, "dictionary should shrink: opt={opt_size}, plain={plain_size}");
     }
 }

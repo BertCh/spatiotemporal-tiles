@@ -98,6 +98,8 @@ fn streaming_pipeline_bounds_peak_rss_for_5m_features() {
         pre_tessellate: false,
         temporal_lod: Vec::new(),
         min_features_per_tile: 1,
+        time_aware_simplify: false,
+        adaptive_target_features: None,
     };
 
     let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
@@ -188,6 +190,8 @@ fn streaming_pipeline_runs_and_emits_tiles() {
         pre_tessellate: false,
         temporal_lod: Vec::new(),
         min_features_per_tile: 1,
+        time_aware_simplify: false,
+        adaptive_target_features: None,
     };
 
     let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();

@@ -13,6 +13,7 @@ pub mod archive;
 pub mod arrow_tile;
 pub mod budget;
 pub mod compression;
+pub mod directory;
 pub mod error;
 pub mod geometry;
 pub mod index;

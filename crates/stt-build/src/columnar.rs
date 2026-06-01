@@ -316,23 +316,51 @@ fn common_columns(
 /// keys, classifying each as numeric or categorical) and then materialises one
 /// value per feature, inserting `None` for missing entries.
 struct PropertyAccumulator {
-    /// Discovered columns, in stable (sorted) order.
+    /// Per-key type evidence gathered during the first (`observe`) pass.
+    seen: BTreeMap<String, KeyKind>,
+    /// Numeric columns, materialised at seal time, in stable (sorted) order.
     numeric: BTreeMap<String, Vec<Option<f64>>>,
+    /// Categorical columns, materialised at seal time.
     categorical: BTreeMap<String, Vec<Option<String>>>,
-    /// True once `push_row` has started; `observe` is then a no-op.
+    /// True once the schema is frozen (first `push_row`); `observe` is then a
+    /// no-op and the numeric/categorical split is fixed.
     sealed: bool,
+}
+
+/// Type evidence for one property key across a feature group.
+#[derive(Default)]
+struct KeyKind {
+    /// Saw a real JSON number.
+    has_number: bool,
+    /// Saw a string that parses cleanly as a finite f64 (e.g. "1000.0").
+    has_numeric_string: bool,
+    /// Saw a value that can't be numeric (non-numeric string, boolean, …).
+    has_other: bool,
+}
+
+/// Coerce a JSON value to f64, accepting both real numbers and strings that
+/// hold a number — so a producer that encoded e.g. `altitude` as the string
+/// "1000.0" (a known line/polygon writer bug) still yields a numeric column
+/// that can drive colour ramps and elevation.
+fn value_as_f64(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(_) => v.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok().filter(|f| f.is_finite()),
+        _ => None,
+    }
 }
 
 impl PropertyAccumulator {
     fn new() -> Self {
         Self {
+            seen: BTreeMap::new(),
             numeric: BTreeMap::new(),
             categorical: BTreeMap::new(),
             sealed: false,
         }
     }
 
-    /// First pass: register the keys present on a feature.
+    /// First pass: record type evidence for every key present on a feature.
     fn observe(&mut self, props: Option<&serde_json::Map<String, serde_json::Value>>) {
         if self.sealed {
             return;
@@ -342,37 +370,54 @@ impl PropertyAccumulator {
             if value.is_null() {
                 continue;
             }
+            let kind = self.seen.entry(key.clone()).or_default();
             if value.is_number() {
-                // Numeric wins over categorical for a given key.
-                if !self.categorical.contains_key(key) {
-                    self.numeric.entry(key.clone()).or_default();
+                kind.has_number = true;
+            } else if let Some(s) = value.as_str() {
+                if s.trim().parse::<f64>().map(|f| f.is_finite()).unwrap_or(false) {
+                    kind.has_numeric_string = true;
+                } else {
+                    kind.has_other = true;
                 }
-            } else if (value.is_string() || value.is_boolean())
-                && !self.numeric.contains_key(key)
-            {
-                // Booleans are carried as a categorical "true"/"false" column.
-                // Without this branch they matched neither arm and were
-                // silently dropped from the tile. (A producer that wants to
-                // sum a flag should emit it as a numeric 0/1 column instead,
-                // since the summary tier aggregates via as_f64.)
-                self.categorical.entry(key.clone()).or_default();
+            } else {
+                // Booleans (and anything else non-numeric) → categorical. A flag
+                // a producer wants to *sum* should be emitted as numeric 0/1.
+                kind.has_other = true;
+            }
+        }
+    }
+
+    /// Freeze the schema: a key is numeric iff every observed value was a
+    /// number (or a numeric-looking string) and nothing forced it categorical.
+    fn seal(&mut self) {
+        if self.sealed {
+            return;
+        }
+        self.sealed = true;
+        for (key, kind) in &self.seen {
+            let is_numeric = (kind.has_number || kind.has_numeric_string) && !kind.has_other;
+            if is_numeric {
+                self.numeric.insert(key.clone(), Vec::new());
+            } else {
+                self.categorical.insert(key.clone(), Vec::new());
             }
         }
     }
 
     /// Second pass: append this feature's value for every discovered column.
     fn push_row(&mut self, props: Option<&serde_json::Map<String, serde_json::Value>>) {
-        self.sealed = true;
+        if !self.sealed {
+            self.seal();
+        }
         for (key, col) in self.numeric.iter_mut() {
-            let v = props
-                .and_then(|p| p.get(key))
-                .and_then(|v| v.as_f64());
+            let v = props.and_then(|p| p.get(key)).and_then(value_as_f64);
             col.push(v);
         }
         for (key, col) in self.categorical.iter_mut() {
             let v = props.and_then(|p| p.get(key)).and_then(|v| match v {
                 serde_json::Value::String(s) => Some(s.clone()),
                 serde_json::Value::Bool(b) => Some(b.to_string()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
                 _ => None,
             });
             col.push(v);
@@ -697,6 +742,58 @@ mod tests {
                 assert_eq!(v[1].as_deref(), Some("false"));
             }
             _ => panic!("boolean should be carried as categorical"),
+        }
+    }
+
+    /// The keystone producer-drift fix: a property a generator encoded as
+    /// numeric *strings* (the line/polygon writer bug that flattened flights'
+    /// altitude) must still be classified numeric so it can drive ramps and
+    /// elevation — while a genuinely non-numeric string column stays categorical.
+    #[test]
+    fn numeric_strings_are_promoted_to_numeric() {
+        let f1 = point_feature(
+            -122.4,
+            37.7,
+            json!({ "altitude": "1000.0", "code": "A12", "mixed": "5" }),
+        );
+        let f2 = point_feature(
+            -122.5,
+            37.8,
+            json!({ "altitude": "2000", "code": "B7", "mixed": "n/a" }),
+        );
+        let layers = build_layers_from_features(&[&f1, &f2], "default").unwrap();
+        let col = |name: &str| {
+            layers[0]
+                .properties
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, c)| c)
+        };
+
+        // All-numeric strings → promoted to a Numeric column.
+        match col("altitude").expect("altitude column") {
+            PropertyColumn::Numeric(v) => {
+                assert_eq!(v[0], Some(1000.0));
+                assert_eq!(v[1], Some(2000.0));
+            }
+            _ => panic!("string-encoded numbers should promote to numeric"),
+        }
+        // Non-numeric strings → stays categorical.
+        match col("code").expect("code column") {
+            PropertyColumn::Categorical(v) => {
+                assert_eq!(v[0].as_deref(), Some("A12"));
+                assert_eq!(v[1].as_deref(), Some("B7"));
+            }
+            _ => panic!("non-numeric strings should stay categorical"),
+        }
+        // A column with *any* non-numeric value stays categorical (no partial
+        // promotion that would silently null-out the "n/a" row).
+        match col("mixed").expect("mixed column") {
+            PropertyColumn::Categorical(v) => {
+                assert_eq!(v[0].as_deref(), Some("5"));
+                assert_eq!(v[1].as_deref(), Some("n/a"));
+            }
+            _ => panic!("mixed numeric/non-numeric column should stay categorical"),
         }
     }
 

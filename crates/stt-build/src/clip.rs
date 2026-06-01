@@ -12,7 +12,7 @@
 //! - Optional line simplification for lower zoom levels
 
 use crate::input::SharedProperties;
-use crate::simplify::simplify_for_zoom;
+use crate::simplify::{simplify_for_zoom, simplify_td_tr_for_zoom};
 use geojson::{Feature, Geometry, Value as GeomValue};
 use std::collections::HashSet;
 
@@ -55,6 +55,10 @@ pub struct ClipConfig {
     pub simplify: bool,
     /// Maximum zoom level to apply simplification (higher zooms keep full detail)
     pub simplify_max_zoom: u8,
+    /// When true (and `simplify` is on), use time-aware TD-TR / Synchronized
+    /// Euclidean Distance simplification instead of plain spatial Visvalingam,
+    /// preserving per-vertex timing through the simplification.
+    pub time_aware_simplify: bool,
 }
 
 impl Default for ClipConfig {
@@ -68,6 +72,7 @@ impl Default for ClipConfig {
             // Simplification disabled by default
             simplify: false,
             simplify_max_zoom: 14,
+            time_aware_simplify: false,
         }
     }
 }
@@ -517,135 +522,114 @@ fn clip_trajectory_to_tile(
     }
 }
 
-/// Slice a segment at temporal boundaries
+/// Slice a clipped segment at temporal bucket boundaries so each output segment
+/// lies within a single bucket.
 ///
-/// If the segment spans multiple temporal chunks (based on granularity),
-/// split it into multiple segments at those boundaries.
+/// Every edge is split at *every* bucket boundary it crosses (interpolating a
+/// shared vertex at each), so even a sparse edge that jumps several buckets
+/// yields one segment per bucket. A vertex landing exactly on a boundary is
+/// shared between the closing and opening segment — not duplicated within
+/// either.
 fn slice_segment_temporally(
     segment: ClippedSegment,
     granularity_ms: u64,
 ) -> Vec<ClippedSegment> {
-    if segment.coordinates.len() < 2 || granularity_ms == 0 {
+    let n = segment.coordinates.len();
+    if n < 2 || granularity_ms == 0 {
         return vec![segment];
     }
-
-    let start_chunk = segment.start_time / granularity_ms;
-    let end_chunk = segment.end_time / granularity_ms;
-
-    // If entirely within one chunk, no splitting needed
-    if start_chunk == end_chunk {
-        return vec![segment];
+    let g = granularity_ms;
+    if segment.start_time / g == segment.end_time / g {
+        return vec![segment]; // entirely within one bucket
     }
 
-    // Carry per-vertex scalar values through the split only when the segment
-    // actually has them; an empty `vertex_values` means "no value channel".
-    let has_values = !segment.vertex_values.is_empty();
-    let mut slices = Vec::new();
-    let mut current_coords: Vec<(f64, f64, f64)> = Vec::new();
-    let mut current_times: Vec<u64> = Vec::new();
-    let mut current_values: Vec<f32> = Vec::new();
-    let mut current_chunk = start_chunk;
-
-    for i in 0..segment.coordinates.len() {
-        let coord = segment.coordinates[i];
-        let time = segment.timestamps[i];
-        let value = if has_values { segment.vertex_values[i] } else { f32::NAN };
-        let chunk = time / granularity_ms;
-
-        // If we're crossing into a new chunk, finalize current slice and start new one
-        if chunk > current_chunk && current_coords.len() >= 2 {
-            // We need to interpolate the boundary point
-            if i > 0 {
-                let boundary_time = (current_chunk + 1) * granularity_ms;
-                let prev_time = segment.timestamps[i - 1];
-                let curr_time = time;
-
-                if prev_time < boundary_time && boundary_time <= curr_time {
-                    // Interpolate point at boundary
-                    let t = if curr_time > prev_time {
-                        (boundary_time - prev_time) as f64 / (curr_time - prev_time) as f64
-                    } else {
-                        0.0
-                    };
-
-                    let prev_coord = segment.coordinates[i - 1];
-                    let boundary_coord = (
-                        prev_coord.0 + t * (coord.0 - prev_coord.0),
-                        prev_coord.1 + t * (coord.1 - prev_coord.1),
-                        prev_coord.2 + t * (coord.2 - prev_coord.2),
-                    );
-                    let boundary_value = if has_values {
-                        interpolate_value(segment.vertex_values[i - 1], value, t)
-                    } else {
-                        f32::NAN
-                    };
-
-                    // Add boundary point to current slice
-                    current_coords.push(boundary_coord);
-                    current_times.push(boundary_time);
-                    if has_values {
-                        current_values.push(boundary_value);
-                    }
-
-                    // Finalize current slice
-                    if current_coords.len() >= 2 {
-                        slices.push(ClippedSegment {
-                            tile_x: segment.tile_x,
-                            tile_y: segment.tile_y,
-                            zoom: segment.zoom,
-                            coordinates: current_coords.clone(),
-                            timestamps: current_times.clone(),
-                            vertex_values: if has_values {
-                                current_values.clone()
-                            } else {
-                                Vec::new()
-                            },
-                            start_time: *current_times.first().unwrap(),
-                            end_time: *current_times.last().unwrap(),
-                            properties: segment.properties.clone(),
-                            feature_id: segment.feature_id.clone(),
-                        });
-                    }
-
-                    // Start new slice with boundary point
-                    current_coords = vec![boundary_coord];
-                    current_times = vec![boundary_time];
-                    current_values = if has_values {
-                        vec![boundary_value]
-                    } else {
-                        Vec::new()
-                    };
-                }
-            }
-
-            current_chunk = chunk;
-        }
-
-        current_coords.push(coord);
-        current_times.push(time);
+    // Own the inputs so the closures below don't borrow `segment`.
+    let ClippedSegment {
+        tile_x,
+        tile_y,
+        zoom,
+        coordinates,
+        timestamps,
+        vertex_values,
+        properties,
+        feature_id,
+        ..
+    } = segment;
+    let has_values = !vertex_values.is_empty();
+    let value_at = |i: usize| -> f32 {
         if has_values {
-            current_values.push(value);
+            vertex_values[i]
+        } else {
+            f32::NAN
         }
+    };
+
+    // Augmented vertex stream: the originals plus an interpolated point at every
+    // bucket boundary strictly inside an edge.
+    type Aug = ((f64, f64, f64), u64, f32);
+    let mut aug: Vec<Aug> = Vec::with_capacity(n);
+    aug.push((coordinates[0], timestamps[0], value_at(0)));
+    for i in 1..n {
+        let pt = timestamps[i - 1];
+        let ct = timestamps[i];
+        let (px, py, pa) = coordinates[i - 1];
+        let (cx, cy, ca) = coordinates[i];
+        if ct > pt {
+            for k in (pt / g + 1)..=(ct / g) {
+                let b = k * g;
+                if b <= pt || b >= ct {
+                    continue; // only boundaries strictly inside the edge
+                }
+                let t = (b - pt) as f64 / (ct - pt) as f64;
+                let bc = (px + t * (cx - px), py + t * (cy - py), pa + t * (ca - pa));
+                let bv = if has_values {
+                    interpolate_value(value_at(i - 1), value_at(i), t)
+                } else {
+                    f32::NAN
+                };
+                aug.push((bc, b, bv));
+            }
+        }
+        aug.push((coordinates[i], ct, value_at(i)));
     }
 
-    // Finalize last slice
-    if current_coords.len() >= 2 {
-        slices.push(ClippedSegment {
-            tile_x: segment.tile_x,
-            tile_y: segment.tile_y,
-            zoom: segment.zoom,
-            coordinates: current_coords,
-            timestamps: current_times.clone(),
-            vertex_values: if has_values { current_values } else { Vec::new() },
-            start_time: *current_times.first().unwrap(),
-            end_time: *current_times.last().unwrap(),
-            properties: segment.properties.clone(),
-            feature_id: segment.feature_id.clone(),
-        });
+    let make_slice = |pts: &[Aug]| -> ClippedSegment {
+        ClippedSegment {
+            tile_x,
+            tile_y,
+            zoom,
+            coordinates: pts.iter().map(|p| p.0).collect(),
+            timestamps: pts.iter().map(|p| p.1).collect(),
+            vertex_values: if has_values {
+                pts.iter().map(|p| p.2).collect()
+            } else {
+                Vec::new()
+            },
+            start_time: pts.first().unwrap().1,
+            end_time: pts.last().unwrap().1,
+            properties: properties.clone(),
+            feature_id: feature_id.clone(),
+        }
+    };
+
+    // Split at every vertex on a bucket boundary (shared with the next slice).
+    let mut slices: Vec<ClippedSegment> = Vec::new();
+    let mut cur: Vec<Aug> = vec![aug[0]];
+    for i in 1..aug.len() {
+        cur.push(aug[i]);
+        if aug[i].1 % g == 0 && i < aug.len() - 1 {
+            if cur.len() >= 2 {
+                slices.push(make_slice(&cur));
+            }
+            cur = vec![aug[i]];
+        }
+    }
+    if cur.len() >= 2 {
+        slices.push(make_slice(&cur));
     }
 
     if slices.is_empty() {
-        vec![segment]
+        vec![make_slice(&aug)]
     } else {
         slices
     }
@@ -703,44 +687,59 @@ pub fn clip_trajectory(
         return vec![];
     }
 
-    // Apply simplification for lower zoom levels if enabled
-    let coords = if config.simplify {
-        simplify_for_zoom(&coords, zoom, config.simplify_max_zoom)
-    } else {
-        coords
-    };
-
-    // Skip if simplification reduced below minimum
-    if coords.len() < config.min_vertices {
-        return vec![];
-    }
-
-    // Compute per-vertex timestamps. Prefer supplied times when present and
-    // alignment was preserved through simplification.
-    let simplification_preserved_alignment = coords.len() == original_vertex_count;
-    let timestamps: Vec<u64> = match supplied_vertex_times {
-        Some(supplied)
-            if simplification_preserved_alignment && supplied.len() == coords.len() =>
-        {
-            supplied.to_vec()
-        }
+    // Compute per-vertex times + values on the FULL geometry first, so a
+    // time-aware simplifier can keep the producer's real timing.
+    let full_times: Vec<u64> = match supplied_vertex_times {
+        Some(s) if s.len() == coords.len() => s.to_vec(),
         _ => compute_vertex_timestamps(&coords, start_time, end_time),
     };
-
-    // Per-vertex scalar values, aligned with `coords`. Accept the supplied
-    // values only when simplification preserved alignment and the length
-    // matches; otherwise this trajectory carries no value channel. `values` is
-    // always full-length (NaN-filled) so the clipper can index it uniformly;
-    // `has_values` decides whether the channel is emitted on each segment.
-    let has_values = matches!(
-        supplied_vertex_values,
-        Some(supplied) if simplification_preserved_alignment && supplied.len() == coords.len()
-    );
-    let values: Vec<f32> = if has_values {
+    let full_has_values =
+        matches!(supplied_vertex_values, Some(s) if s.len() == coords.len());
+    let full_values: Vec<f32> = if full_has_values {
         supplied_vertex_values.unwrap().to_vec()
     } else {
         vec![f32::NAN; coords.len()]
     };
+
+    // Apply simplification for lower zoom levels if enabled.
+    let (coords, timestamps, values, has_values) = if config.simplify {
+        if config.time_aware_simplify {
+            // TD-TR keeps a subset of vertices preserving position-at-time,
+            // carrying the real times + values (no alignment loss).
+            let (sc, st, sv) = simplify_td_tr_for_zoom(
+                &coords,
+                &full_times,
+                &full_values,
+                zoom,
+                config.simplify_max_zoom,
+            );
+            (sc, st, sv, full_has_values)
+        } else {
+            // Spatial Visvalingam: dropped vertices break per-vertex-time
+            // alignment, so recompute times by distance and drop the supplied
+            // value channel when simplification changed the vertex set.
+            let sc = simplify_for_zoom(&coords, zoom, config.simplify_max_zoom);
+            let preserved = sc.len() == original_vertex_count;
+            let st = if preserved {
+                full_times.clone()
+            } else {
+                compute_vertex_timestamps(&sc, start_time, end_time)
+            };
+            let (sv, hv) = if preserved && full_has_values {
+                (full_values.clone(), true)
+            } else {
+                (vec![f32::NAN; sc.len()], false)
+            };
+            (sc, st, sv, hv)
+        }
+    } else {
+        (coords, full_times, full_values, full_has_values)
+    };
+
+    // Skip if simplification reduced below minimum.
+    if coords.len() < config.min_vertices {
+        return vec![];
+    }
 
     let mut segments = Vec::new();
 
@@ -1070,6 +1069,43 @@ mod tests {
         for seg in &segments {
             assert!(seg.start_time <= seg.end_time);
         }
+    }
+
+    #[test]
+    fn temporal_slicing_splits_every_bucket_on_multi_bucket_jump() {
+        // A 2-vertex segment whose single edge spans 5 one-second buckets must
+        // yield a slice per crossed bucket, none spanning more than one bucket,
+        // and with no duplicated boundary vertices.
+        let seg = ClippedSegment {
+            tile_x: 0,
+            tile_y: 0,
+            zoom: 5,
+            coordinates: vec![(0.0, 0.0, 0.0), (5.0, 0.0, 0.0)],
+            timestamps: vec![0, 5000],
+            vertex_values: Vec::new(),
+            start_time: 0,
+            end_time: 5000,
+            properties: None,
+            feature_id: None,
+        };
+        let slices = slice_segment_temporally(seg, 1000);
+        assert_eq!(slices.len(), 5, "5-bucket edge should split into 5 slices");
+        for s in &slices {
+            assert!(
+                s.end_time - s.start_time <= 1000,
+                "slice spans {} ms > one 1000ms bucket",
+                s.end_time - s.start_time
+            );
+            for w in s.coordinates.windows(2) {
+                assert!(
+                    (w[0].0 - w[1].0).abs() > 1e-12 || (w[0].1 - w[1].1).abs() > 1e-12,
+                    "duplicate vertex in slice: {:?}",
+                    s.coordinates
+                );
+            }
+        }
+        assert_eq!(slices[0].start_time, 0);
+        assert_eq!(slices.last().unwrap().end_time, 5000);
     }
 
     // ------------------------------------------------------------------
