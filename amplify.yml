@@ -1,0 +1,25 @@
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        # Amplify's base image ships Node but not pnpm. Pin Node 20 and install
+        # the exact pnpm version this workspace uses (packageManager field).
+        - nvm install 20 && nvm use 20
+        - npm install -g pnpm@10.19.0
+        - pnpm install --frozen-lockfile
+    build:
+      commands:
+        # Turbo builds @stt/showcase and its workspace deps (@stt/core,
+        # @stt/deck.gl, @stt/maplibre) via the `^build` dependency. Tile data is
+        # not in the repo (gitignored) and is served from R2 at runtime via
+        # examples/showcase/.env.production (VITE_DATA_BASE_URL).
+        - pnpm exec turbo run build --filter=@stt/showcase
+  artifacts:
+    baseDirectory: examples/showcase/dist
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*
+      - .turbo/**/*
