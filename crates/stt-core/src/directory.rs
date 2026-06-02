@@ -30,6 +30,14 @@ use crate::error::{Error, Result};
 /// archive `FORMAT_VERSION` so the directory codec can evolve on its own.
 pub const DIRECTORY_VERSION: u8 = 4;
 
+/// Tag for the optional trailing **covering** section: one signed varint per
+/// entry (in directory order) giving `cover_t_min - time_start`, the tight
+/// lower temporal bound. Backward-compatible — a pre-covering archive's buffer
+/// simply ends after the per-run blob columns, and the decoder leaves
+/// `cover_t_min = None`. Forward-compatible — a decoder that doesn't recognise a
+/// trailing tag stops reading it. See [`TileEntry::cover_t_min`].
+const COVER_SECTION_TMIN: u8 = 1;
+
 // ----------------------------------------------------------------------------
 // LEB128 varints
 // ----------------------------------------------------------------------------
@@ -181,6 +189,21 @@ pub fn encode_directory(entries: &[TileEntry]) -> Vec<u8> {
         expected_offset = offset.wrapping_add(*length as u64);
     }
 
+    // Optional trailing covering section. Emitted only when EVERY entry carries
+    // a tight lower bound, so it's exactly N signed varints indexable 1:1 with
+    // the key rows. A mixed or all-`None` corpus writes nothing (the common case
+    // for repacked/transcoded archives), keeping the buffer byte-identical to a
+    // pre-covering directory.
+    if n > 0 && sorted.iter().all(|e| e.cover_t_min.is_some()) {
+        buf.push(COVER_SECTION_TMIN);
+        for e in &sorted {
+            // cover_t_min - time_start; signed because a feature can start
+            // before its bucket boundary. Small magnitude → ~1-2 bytes.
+            let delta = e.cover_t_min.unwrap().wrapping_sub(e.time_start);
+            put_ivarint(&mut buf, delta);
+        }
+    }
+
     buf
 }
 
@@ -312,6 +335,7 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
                 hilbert: k.hilbert,
                 crc32c: crc,
                 temporal_bucket_ms: k.temporal_bucket_ms,
+                cover_t_min: None,
             });
         }
         expected_offset = offset.wrapping_add(length as u64);
@@ -321,6 +345,20 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
         return Err(Error::InvalidArchive(format!(
             "directory: runs covered {cursor} entries, expected {n}"
         )));
+    }
+
+    // Optional trailing covering section(s). A pre-covering archive's buffer
+    // ends here; if bytes remain, read tagged sections. Unknown tags stop the
+    // scan (forward-compat) rather than erroring.
+    if pos < bytes.len() {
+        let tag = bytes[pos];
+        pos += 1;
+        if tag == COVER_SECTION_TMIN {
+            for e in entries.iter_mut() {
+                let delta = get_ivarint(bytes, &mut pos)?;
+                e.cover_t_min = Some(e.time_start.wrapping_add(delta));
+            }
+        }
     }
 
     Ok(entries)
@@ -357,6 +395,7 @@ mod tests {
             hilbert,
             crc32c: crc,
             temporal_bucket_ms: tb,
+            cover_t_min: None,
         }
     }
 
@@ -365,6 +404,42 @@ mod tests {
         let bytes = encode_directory(&[]);
         let back = decode_directory(&bytes).unwrap();
         assert!(back.is_empty());
+    }
+
+    /// The optional covering section round-trips `cover_t_min` exactly (incl. a
+    /// value BELOW `time_start` — a feature starting before its bucket edge).
+    #[test]
+    fn cover_t_min_section_roundtrips() {
+        let mut entries = Vec::new();
+        for i in 0..20u32 {
+            let mut e = entry(
+                10, i, i, i as u64, (i as i64) * 1000, (i as i64) * 1000 + 900,
+                64 + i as u64 * 50, 50, 100, i, 0x100 + i, Some(1000),
+            );
+            // tight lower bound: usually inside the bucket, but entry 0 starts
+            // 500ms BEFORE its bucket boundary to exercise the signed delta.
+            e.cover_t_min = Some(if i == 0 { -500 } else { (i as i64) * 1000 + 250 });
+            entries.push(e);
+        }
+        let bytes = encode_directory(&entries);
+        let back = decode_directory(&bytes).unwrap();
+        let mut expected = entries.clone();
+        expected.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start));
+        assert_eq!(back, expected);
+        assert!(back.iter().all(|e| e.cover_t_min.is_some()));
+    }
+
+    /// A directory with NO covering bounds must produce a buffer byte-identical
+    /// to the pre-covering codec (no trailing section), and decode to `None`.
+    #[test]
+    fn absent_cover_section_is_backward_compatible() {
+        let e = entry(10, 5, 7, 42, 1000, 2000, 64, 128, 256, 3, 7, None);
+        let bytes = encode_directory(std::slice::from_ref(&e));
+        // No trailing tag byte: the last byte is the run's crc (4 LE bytes),
+        // never a lone COVER_SECTION_TMIN tag.
+        let back = decode_directory(&bytes).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].cover_t_min, None);
     }
 
     #[test]

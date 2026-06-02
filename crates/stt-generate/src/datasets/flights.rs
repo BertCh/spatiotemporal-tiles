@@ -173,10 +173,14 @@ pub fn run(args: Args) -> Result<()> {
                 }
             }
 
-            // Extract tar (produces .csv.gz file)
+            // Extract tar (produces .csv.gz file). `current_dir` is already the
+            // download dir, so pass the BARE filename — passing the full
+            // download-dir-prefixed path here made tar resolve
+            // `<download_dir>/<download_dir>/states_….csv.tar`, which never
+            // exists ("Failed to open archive"), silently breaking every build.
             if tar_path.exists() && !gz_path.exists() {
                 let status = Command::new("tar")
-                    .args(["-xf", tar_path.to_str().unwrap()])
+                    .args(["-xf", &tar_filename])
                     .current_dir(&args.download_dir)
                     .status();
                 if let Err(e) = status {

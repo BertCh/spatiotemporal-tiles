@@ -19,10 +19,15 @@ use stt_core::tile::TileId;
 pub struct GeneratedTile {
     /// Tile identity.
     pub id: TileId,
-    /// Inclusive temporal start (Unix ms).
+    /// Inclusive temporal start (Unix ms) — the addressable bucket boundary.
     pub time_start: i64,
-    /// Inclusive temporal end (Unix ms).
+    /// Inclusive temporal end (Unix ms) — the latest feature end in the tile.
     pub time_end: i64,
+    /// Tight lower covering bound: the earliest feature *start* time actually
+    /// present in the tile (≤ `time_end`, and may be ≥ or < `time_start`).
+    /// Stored in the directory so a client can prune a tile whose data lies
+    /// entirely after a query window. See [`stt_core::archive::TileEntry::cover_t_min`].
+    pub cover_t_min: i64,
     /// One or more Arrow layers (grouped by geometry kind / clip status).
     pub layers: Vec<ColumnarLayer>,
 }
@@ -614,10 +619,19 @@ fn build_tile(
     if layers.is_empty() {
         return Ok(None);
     }
+    // Tight lower covering bound: earliest feature start actually in the tile
+    // (vs `time_start`, the addressable bucket edge). Falls back to `time_start`
+    // for an (unexpected) empty feature set.
+    let cover_t_min = features
+        .iter()
+        .map(|f| f.timestamp() as i64)
+        .min()
+        .unwrap_or(time_start);
     Ok(Some(GeneratedTile {
         id,
         time_start,
         time_end,
+        cover_t_min,
         layers,
     }))
 }
@@ -626,11 +640,13 @@ fn build_tile(
 impl TileWriter for stt_core::archive::ArchiveWriter {
     fn write_tile(&mut self, tile: &GeneratedTile) -> Result<()> {
         let payload = encode_tile(&tile.layers)?;
-        self.add_tile(
+        self.add_tile_full(
             &tile.id,
             tile.time_start,
             tile.time_end,
+            Some(tile.cover_t_min),
             tile.feature_count(),
+            None,
             &payload,
         )?;
         Ok(())
@@ -654,10 +670,11 @@ impl LodTileWriter for stt_core::archive::ArchiveWriter {
         temporal_bucket_ms: Option<u64>,
     ) -> Result<()> {
         let payload = encode_tile(&tile.layers)?;
-        self.add_tile_with_bucket(
+        self.add_tile_full(
             &tile.id,
             tile.time_start,
             tile.time_end,
+            Some(tile.cover_t_min),
             tile.feature_count(),
             temporal_bucket_ms,
             &payload,
@@ -680,6 +697,12 @@ enum OwnedTileFeature {
 }
 
 impl OwnedTileFeature {
+    fn start_timestamp(&self) -> u64 {
+        match self {
+            OwnedTileFeature::Original(f) => f.timestamp,
+            OwnedTileFeature::Clipped(s) => s.start_time,
+        }
+    }
     fn end_timestamp(&self) -> u64 {
         match self {
             OwnedTileFeature::Original(f) => f.end_timestamp.unwrap_or(f.timestamp),
@@ -923,6 +946,12 @@ fn flush_bucket<W: TileWriter>(
         .map(|f| f.end_timestamp())
         .max()
         .unwrap_or(bucket_start + config.temporal_bucket_ms);
+    let cover_t_min = bucket
+        .features
+        .iter()
+        .map(|f| f.start_timestamp() as i64)
+        .min()
+        .unwrap_or(bucket_start as i64);
     let id = TileId::new(zoom, x, y, bucket_start);
 
     // Split into originals + clipped segments and reuse the existing
@@ -963,6 +992,7 @@ fn flush_bucket<W: TileWriter>(
         id,
         time_start: bucket_start as i64,
         time_end: time_end as i64,
+        cover_t_min,
         layers,
     };
     if tile.feature_count() < config.min_features_per_tile.max(1) {
@@ -1026,6 +1056,57 @@ mod tests {
             lon: first[0],
             lat: first[1],
         }
+    }
+
+    /// The tight covering lower bound `cover_t_min` is the earliest feature
+    /// START in a tile — strictly after the bucket-aligned `time_start` when the
+    /// data sits late in the bucket — and survives build → write → read.
+    #[test]
+    fn cover_t_min_tracks_earliest_feature_through_build_and_read() {
+        let hour = 3_600_000u64;
+        let base = 1_600_000_000_000u64;
+        // All points land in the SECOND half of their hour bucket, so the tight
+        // lower bound is well after the bucket edge.
+        let mut features = Vec::new();
+        for i in 0..12u64 {
+            let lon = -122.45 + i as f64 * 0.02; // spread across tiles
+            let ts = base + hour / 2 + i * 1000;
+            features.push(point(lon, 37.75, ts));
+        }
+
+        let config = TileConfig {
+            min_zoom: 8,
+            max_zoom: 11,
+            layer_name: "default".to_string(),
+            temporal_bucket_ms: hour,
+            clip_trajectories: false,
+            ..TileConfig::default()
+        };
+        let tiles = generate_tiles(&features, &config, 2).unwrap();
+        assert!(!tiles.is_empty());
+        // Every tile's covering bound is ≥ its bucket edge, and at least one is
+        // strictly tighter (the whole point of the lever).
+        assert!(tiles.iter().all(|t| t.cover_t_min >= t.time_start));
+        assert!(
+            tiles.iter().any(|t| t.cover_t_min > t.time_start),
+            "expected a tile whose earliest feature is after the bucket edge"
+        );
+
+        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let mut writer = Archive::create(&path, Compression::Gzip).unwrap();
+        for tile in &tiles {
+            writer.write_tile(tile).unwrap();
+        }
+        writer.finalize(&Metadata::new("cover")).unwrap();
+
+        let reader = ArchiveReader::open(&path).unwrap();
+        // The covering section round-trips: every entry carries a bound and at
+        // least one is tighter than its bucket edge.
+        assert!(reader.entries().iter().all(|e| e.cover_t_min.is_some()));
+        assert!(reader
+            .entries()
+            .iter()
+            .any(|e| e.cover_t_min.unwrap() > e.time_start));
     }
 
     /// Full pipeline: features -> tiles -> archive -> read back.

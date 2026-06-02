@@ -261,10 +261,18 @@ pub fn build_summary_tier<W: TileWriter>(
                 .map(|c| c.time_end)
                 .max()
                 .unwrap_or((bucket_start + bucket_ms) as i64);
+            // Tight lower bound: earliest observed time across the cells (each
+            // cell's `time_start` is its min observed time, not the bucket edge).
+            let cover_t_min = cells
+                .values()
+                .map(|c| c.time_start)
+                .min()
+                .unwrap_or(bucket_start as i64);
             let tile = GeneratedTile {
                 id: TileId::new(zoom, tx, ty, bucket_start),
                 time_start: bucket_start as i64,
                 time_end,
+                cover_t_min,
                 layers: vec![layer],
             };
             writer.write_tile(&tile)?;
@@ -508,6 +516,7 @@ mod tests {
                 id: tile.id,
                 time_start: tile.time_start,
                 time_end: tile.time_end,
+                cover_t_min: tile.cover_t_min,
                 layers: tile.layers.clone(),
             });
             Ok(())

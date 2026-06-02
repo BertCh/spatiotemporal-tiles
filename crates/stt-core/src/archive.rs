@@ -81,6 +81,14 @@ pub struct TileEntry {
     /// record their coarser bucket. `None` when the archive carries no LOD
     /// pyramid (readers fall back to `Metadata::temporal_bucket_ms`).
     pub temporal_bucket_ms: Option<u64>,
+    /// **Tight lower covering bound** — the minimum feature *start* time actually
+    /// present in the tile. `time_start` is the addressable *bucket boundary*
+    /// (kept loose so `(z,x,y,bucket)` lookup works); `cover_t_min` is the real
+    /// earliest data, which a client uses to prune a tile whose features all lie
+    /// after a query window (`time_end` already gives the tight upper bound).
+    /// `None` when not computed — repacked/transcoded archives and pre-covering
+    /// builds — in which case clients fall back to `time_start`.
+    pub cover_t_min: Option<i64>,
 }
 
 impl TileEntry {
@@ -481,6 +489,7 @@ struct PendingTile {
     hilbert: u64,
     time_start: i64,
     time_end: i64,
+    cover_t_min: Option<i64>,
     feature_count: u32,
     temporal_bucket_ms: Option<u64>,
     payload: Vec<u8>,
@@ -502,25 +511,67 @@ pub struct ArchiveWriter {
     entries: Vec<TileEntry>,
     /// `Some` in the buffered/optimized mode (tiles parked until finalize).
     pending: Option<Vec<PendingTile>>,
+    /// Blob byte-order applied at `finalize_buffered` (ignored in eager mode,
+    /// which never reorders blobs).
+    ordering: crate::curve::BlobOrdering,
+    /// Train + ship a shared zstd dictionary (buffered mode). OFF keeps the
+    /// archive decodable by readers without a dictionary-capable zstd (the
+    /// current TS reader throws on a dictionary), so blob *reordering* — which
+    /// is reader-safe on its own — can ship independently of the dict.
+    train_dict: bool,
 }
 
 impl ArchiveWriter {
     /// Create an archive in eager (streaming) mode. Tile blobs use `compression`.
     pub fn create<P: AsRef<Path>>(path: P, compression: Compression) -> Result<Self> {
-        Self::open_file(path, compression, None)
+        Self::open_file(path, compression, None, crate::curve::BlobOrdering::default(), false)
     }
 
     /// Create an archive in buffered "optimized" mode: a shared zstd dictionary
     /// is trained over the tile corpus, byte-identical blobs are deduplicated,
-    /// and blobs are Hilbert-ordered for range-read locality. Requires zstd.
+    /// and blobs are laid down in 2D-spatial-Hilbert order for range-read
+    /// locality. Requires zstd. See [`create_optimized_with_ordering`] to pick a
+    /// different (e.g. space-time) blob order.
+    ///
+    /// [`create_optimized_with_ordering`]: Self::create_optimized_with_ordering
     pub fn create_optimized<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_file(path, Compression::Zstd, Some(Vec::new()))
+        Self::create_optimized_with_ordering(path, crate::curve::BlobOrdering::SpatialMajor)
+    }
+
+    /// Buffered "optimized" mode with an explicit blob byte-[`ordering`]. The
+    /// directory index stays `(zoom, hilbert, time_start)` regardless; only the
+    /// physical blob layout changes, so readers are unaffected. The default
+    /// ([`BlobOrdering::Hilbert3`]) minimises range requests across the widest
+    /// range of datasets (see `examples/simulate_layout.rs`).
+    ///
+    /// [`ordering`]: crate::curve::BlobOrdering
+    /// [`BlobOrdering::Hilbert3`]: crate::curve::BlobOrdering::Hilbert3
+    pub fn create_optimized_with_ordering<P: AsRef<Path>>(
+        path: P,
+        ordering: crate::curve::BlobOrdering,
+    ) -> Result<Self> {
+        Self::open_file(path, Compression::Zstd, Some(Vec::new()), ordering, true)
+    }
+
+    /// Buffered mode that **reorders blobs but ships NO shared dictionary**, so
+    /// the result stays decodable by readers without a dictionary-capable zstd
+    /// (today's TS reader). Per-blob zstd + byte-identical dedup still apply.
+    /// This is the reader-safe way to get the range-request win from blob
+    /// [`ordering`](crate::curve::BlobOrdering) without the dict that the TS
+    /// reader can't yet decode.
+    pub fn create_reordered<P: AsRef<Path>>(
+        path: P,
+        ordering: crate::curve::BlobOrdering,
+    ) -> Result<Self> {
+        Self::open_file(path, Compression::Zstd, Some(Vec::new()), ordering, false)
     }
 
     fn open_file<P: AsRef<Path>>(
         path: P,
         compression: Compression,
         pending: Option<Vec<PendingTile>>,
+        ordering: crate::curve::BlobOrdering,
+        train_dict: bool,
     ) -> Result<Self> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -535,6 +586,8 @@ impl ArchiveWriter {
             current_offset: HEADER_SIZE,
             entries: Vec::new(),
             pending,
+            ordering,
+            train_dict,
         })
     }
 
@@ -562,6 +615,24 @@ impl ArchiveWriter {
         temporal_bucket_ms: Option<u64>,
         payload: &[u8],
     ) -> Result<()> {
+        self.add_tile_full(id, time_start, time_end, None, feature_count, temporal_bucket_ms, payload)
+    }
+
+    /// Add a tile carrying the full directory metadata, including the tight
+    /// lower covering bound `cover_t_min` (the earliest feature *start* time
+    /// actually present — see [`TileEntry::cover_t_min`]). `None` leaves the
+    /// entry without a covering bound (clients fall back to `time_start`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_tile_full(
+        &mut self,
+        id: &TileId,
+        time_start: i64,
+        time_end: i64,
+        cover_t_min: Option<i64>,
+        feature_count: u32,
+        temporal_bucket_ms: Option<u64>,
+        payload: &[u8],
+    ) -> Result<()> {
         if let Some(pending) = self.pending.as_mut() {
             pending.push(PendingTile {
                 z: id.z,
@@ -570,6 +641,7 @@ impl ArchiveWriter {
                 hilbert: id.hilbert_index(),
                 time_start,
                 time_end,
+                cover_t_min,
                 feature_count,
                 temporal_bucket_ms,
                 payload: payload.to_vec(),
@@ -598,6 +670,7 @@ impl ArchiveWriter {
             hilbert: id.hilbert_index(),
             crc32c: crc,
             temporal_bucket_ms,
+            cover_t_min,
         });
         Ok(())
     }
@@ -636,25 +709,60 @@ impl ArchiveWriter {
     fn finalize_buffered(mut self, metadata: &crate::metadata::Metadata) -> Result<()> {
         let mut pending = self.pending.take().unwrap_or_default();
 
-        // Hilbert-order the blobs (not just the index) so a viewport maps to a
+        // Order the blobs (not just the index) so a viewport maps to a
         // near-contiguous byte range — what lets the client's range coalescer
-        // merge neighbouring tiles into one HTTP request.
-        pending.sort_by_key(|p| (p.z, p.hilbert, p.time_start));
-
-        // Train a shared dictionary from a bounded sample of payloads. Bytes
-        // shared across tiles (Arrow schema, dictionary key names, common
-        // coordinate prefixes) get hoisted into the dictionary once instead of
-        // repeating in every compressed blob.
-        let mut sample: Vec<&[u8]> = Vec::new();
-        let mut sample_bytes = 0usize;
-        for p in &pending {
-            if sample.len() >= DICT_SAMPLE_MAX_TILES || sample_bytes >= DICT_SAMPLE_MAX_BYTES {
-                break;
+        // merge neighbouring tiles into one HTTP request. The byte order is
+        // decoupled from the directory index (which stays (zoom,hilbert,t)); the
+        // best order depends on the dataset's space-vs-time shape, so it's a
+        // knob (default 3D Hilbert). See crate::curve.
+        let base_bucket = metadata.temporal_bucket_ms.max(1) as i64;
+        let tb = |p: &PendingTile| {
+            let b = p.temporal_bucket_ms.map(|v| v as i64).unwrap_or(base_bucket).max(1);
+            p.time_start.div_euclid(b)
+        };
+        let (tb_min, tb_max) = pending.iter().fold((i64::MAX, i64::MIN), |(lo, hi), p| {
+            let t = tb(p);
+            (lo.min(t), hi.max(t))
+        });
+        let tb_span = if pending.is_empty() { 0 } else { tb_max - tb_min };
+        // Resolve an `Auto` ordering to a concrete one from the dataset's
+        // space-vs-time cardinality (wide-time → spatial-major for playback
+        // locality; otherwise the 3D-Hilbert generalist).
+        let ordering = match self.ordering {
+            crate::curve::BlobOrdering::Auto => {
+                let max_z = pending.iter().map(|p| p.z).max().unwrap_or(0) as u32;
+                let time_bits = crate::curve::bits_for((tb_span.max(0) + 1) as u64);
+                crate::curve::BlobOrdering::choose(max_z, time_bits)
             }
-            sample_bytes += p.payload.len();
-            sample.push(p.payload.as_slice());
-        }
-        let dictionary = compression::train_zstd_dictionary_from_slices(&sample, DICT_MAX_SIZE);
+            other => other,
+        };
+        pending.sort_by_key(|p| {
+            crate::curve::space_time_key(
+                ordering, p.z, p.x, p.y, p.hilbert, p.time_start, tb(p), tb_min, tb_span,
+            )
+        });
+
+        // Train a shared dictionary from a bounded sample of payloads (only when
+        // requested). Bytes shared across tiles (Arrow schema, dictionary key
+        // names, common coordinate prefixes) get hoisted into the dictionary
+        // once instead of repeating in every compressed blob. Skipped by the
+        // reorder-only path so the archive stays decodable by readers without a
+        // dictionary-capable zstd; `compress_zstd_with_dict(_, None)` then emits
+        // plain zstd and the dictionary section is omitted.
+        let dictionary = if self.train_dict {
+            let mut sample: Vec<&[u8]> = Vec::new();
+            let mut sample_bytes = 0usize;
+            for p in &pending {
+                if sample.len() >= DICT_SAMPLE_MAX_TILES || sample_bytes >= DICT_SAMPLE_MAX_BYTES {
+                    break;
+                }
+                sample_bytes += p.payload.len();
+                sample.push(p.payload.as_slice());
+            }
+            compression::train_zstd_dictionary_from_slices(&sample, DICT_MAX_SIZE)
+        } else {
+            None
+        };
 
         // Stream the dictionary-compressed blobs, deduplicating byte-identical
         // ones (a static cell repeated across time buckets writes its blob
@@ -695,6 +803,7 @@ impl ArchiveWriter {
                 hilbert: p.hilbert,
                 crc32c: crc,
                 temporal_bucket_ms: p.temporal_bucket_ms,
+                cover_t_min: p.cover_t_min,
             });
         }
 
@@ -890,6 +999,7 @@ mod tests {
                     hilbert: 0,
                     crc32c: 0,
                     temporal_bucket_ms: None,
+                    cover_t_min: None,
                 });
             }
         }
@@ -948,6 +1058,70 @@ mod tests {
         assert_eq!(reader.read_layers(&mid).unwrap()[0].batch.num_rows(), 1);
         let distinct = reader.entries().iter().find(|e| e.x == 5).unwrap().clone();
         assert_eq!(reader.read_layers(&distinct).unwrap()[0].batch.num_rows(), 2);
+    }
+
+    /// The reorder-only buffered path applies the chosen blob ordering but ships
+    /// NO shared dictionary, so the archive stays decodable by readers without a
+    /// dictionary-capable zstd (today's TS reader throws on a dictionary). This
+    /// is the reader-safety contract behind `stt-build --blob-ordering`.
+    #[test]
+    fn reordered_archive_has_no_dict_and_roundtrips() {
+        use crate::curve::{space_time_key, BlobOrdering};
+        let path = NamedTempFile::new().unwrap().into_temp_path();
+        let mut writer = ArchiveWriter::create_reordered(&path, BlobOrdering::Hilbert3).unwrap();
+
+        // A small space×time grid with all-distinct payloads (no dedup) so blob
+        // order is a 1:1 image of the curve order.
+        let mut expected = 0usize;
+        for x in 0..4u32 {
+            for y in 0..4u32 {
+                for b in 0..3i64 {
+                    let t = b * 3_600_000;
+                    let p = crate::arrow_tile::encode_tile(&[point_layer(
+                        "default",
+                        vec![(x * 16 + y) as u64 + b as u64 * 1000],
+                        1000,
+                    )])
+                    .unwrap();
+                    writer
+                        .add_tile(&TileId::new(10, x, y, t as u64), t, t + 3_599_999, 1, &p)
+                        .unwrap();
+                    expected += 1;
+                }
+            }
+        }
+        writer
+            .finalize(&crate::metadata::Metadata::new("reordered"))
+            .unwrap();
+
+        let reader = ArchiveReader::open(&path).unwrap();
+        // Reader-safety contract: NO shared dictionary section.
+        assert!(reader.dictionary().is_none(), "reorder path must not ship a dict");
+        assert_eq!(reader.entries().len(), expected);
+        // Every tile still decodes.
+        for e in reader.entries().to_vec() {
+            assert_eq!(reader.read_layers(&e).unwrap()[0].batch.num_rows(), 1);
+        }
+        // Blobs are physically laid down in Hilbert order: walking entries by
+        // ascending byte offset yields a non-decreasing curve key.
+        let mut ents = reader.entries().to_vec();
+        ents.sort_by_key(|e| e.offset);
+        let key = |e: &TileEntry| {
+            space_time_key(
+                BlobOrdering::Hilbert3,
+                e.zoom,
+                e.x,
+                e.y,
+                e.hilbert,
+                e.time_start,
+                e.time_start.div_euclid(3_600_000),
+                0,
+                2,
+            )
+        };
+        for w in ents.windows(2) {
+            assert!(key(&w[0]) <= key(&w[1]), "blobs must be in Hilbert order on disk");
+        }
     }
 
     /// The shared dictionary shrinks a corpus of many small similar tiles and

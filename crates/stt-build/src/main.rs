@@ -53,6 +53,16 @@ struct Args {
     #[arg(long, default_value = "zstd")]
     compression: String,
 
+    /// On-disk blob byte ordering (in-memory builds only):
+    /// `eager` (default; stream blobs in add-order, lowest build RAM),
+    /// or a buffered/optimized order — `spatial`, `time-major`, `hilbert3`,
+    /// `morton3`, or `auto` (pick from the dataset's space-vs-time cardinality:
+    /// wide-time → spatial-major, else the 3D-Hilbert generalist). Non-`eager`
+    /// values reorder blobs for far fewer client range requests but hold all
+    /// tile payloads in RAM until finalize. Ignored with --streaming-arrow.
+    #[arg(long, default_value = "eager")]
+    blob_ordering: String,
+
     /// Temporal bucket size for chunking tiles (e.g., "1h", "6h", "1d", "30m")
     /// Features are grouped into fixed temporal intervals, creating predictable tile boundaries
     /// that align with natural time units for efficient animation and prefetching.
@@ -293,6 +303,19 @@ fn main() -> Result<()> {
     // Parse compression
     let compression = parse_compression(&args.compression)?;
 
+    // Parse blob ordering: `eager` -> None (stream blobs in add-order);
+    // anything else -> Some(BlobOrdering) (buffered/optimized reorder).
+    let blob_ordering: Option<stt_core::BlobOrdering> =
+        if args.blob_ordering.trim().eq_ignore_ascii_case("eager") {
+            None
+        } else {
+            Some(
+                args.blob_ordering
+                    .parse()
+                    .map_err(|e: String| anyhow::anyhow!(e))?,
+            )
+        };
+
     let strictness = if args.strict_times {
         input::InputStrictness::Strict
     } else {
@@ -368,6 +391,14 @@ fn main() -> Result<()> {
             // streaming path keeps fixed buckets, so this is ignored here.
             adaptive_target_features: None,
         };
+        if blob_ordering.is_some() {
+            warn!(
+                "--blob-ordering {} ignored in --streaming-arrow mode: blob reordering \
+                 needs the buffered in-memory pipeline (it holds all payloads until \
+                 finalize). Streaming keeps add-order. Drop --streaming-arrow to reorder.",
+                args.blob_ordering
+            );
+        }
         let mut writer = stt_core::Archive::create(&args.output, compression)?;
         let mut bounds_lon = (f64::MAX, f64::MIN);
         let mut bounds_lat = (f64::MAX, f64::MIN);
@@ -565,7 +596,24 @@ fn main() -> Result<()> {
         info!("Pre-tessellation enabled (triangle indices written alongside polygon geometry)");
     }
 
-    let mut writer = stt_core::Archive::create(&args.output, compression)?;
+    let mut writer = match blob_ordering {
+        Some(ordering) => {
+            if compression != stt_core::types::Compression::Zstd {
+                warn!(
+                    "--compression {} ignored: --blob-ordering uses the buffered writer, \
+                     which compresses per-blob with zstd.",
+                    args.compression
+                );
+            }
+            info!(
+                "Blob ordering: {ordering} (buffered writer — space-time blob layout + \
+                 byte-identical dedup, NO shared dict so the TS reader can decode it; \
+                 holds payloads in RAM until finalize)"
+            );
+            stt_core::ArchiveWriter::create_reordered(&args.output, ordering)?
+        }
+        None => stt_core::Archive::create(&args.output, compression)?,
+    };
 
     let tile_count = if !temporal_lod.is_empty() {
         // --temporal-lod path: emit base tiles + per-level aggregate tiles.
