@@ -1,0 +1,10 @@
+# Python deps for the ECCO "Perpetual Ocean" advection generator (ecco_advect.py).
+# Install into a venv:  python3 -m venv venv && ./venv/bin/pip install -r requirements-ecco.txt
+numpy
+xarray
+netCDF4        # NetCDF reading engine for xarray (h5netcdf also works)
+pyarrow        # GeoParquet output
+shapely        # WKB LineString encoding
+
+# Downloading the ECCO granules (separate, needs a free NASA Earthdata login):
+#   pip install podaac-data-downloader

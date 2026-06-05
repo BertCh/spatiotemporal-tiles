@@ -1,0 +1,13 @@
+# Local-only artifacts for the ECCO (and other) data-generation pipelines.
+# Code (ecco_advect.py, download_ecco.py, ECCO.md, requirements-ecco.txt) is
+# committed; large inputs, venvs, and intermediates are not.
+venv/
+venv-dl/
+__pycache__/
+*.pyc
+
+# ECCO raw granules + advection intermediate (the built .stt lives under
+# examples/showcase/public/data and is ignored there).
+ecco-vel/
+*.nc
+*.parquet

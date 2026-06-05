@@ -5,6 +5,7 @@
 pub mod ais;
 pub mod animals;
 pub mod drifters;
+pub mod drifters_hourly;
 pub mod earthquakes;
 pub mod flights;
 pub mod hurricanes;

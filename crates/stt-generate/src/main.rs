@@ -61,6 +61,9 @@ enum Commands {
     /// Generate ocean-current trajectories from NOAA's Global Drifter Program
     Drifters(datasets::drifters::Args),
 
+    /// EXPERIMENTAL: GDP HOURLY ocean-current trajectories (drifter_hourly_qc)
+    DriftersHourly(datasets::drifters_hourly::Args),
+
     /// Generate animal-migration trajectories from GBIF tracking datasets
     Animals(datasets::animals::Args),
 
@@ -87,6 +90,7 @@ fn main() -> Result<()> {
         Commands::NycTaxiPoints(args) => datasets::nyc_taxi_points::run(args),
         Commands::Satellites(args) => datasets::satellites::run(args),
         Commands::Drifters(args) => datasets::drifters::run(args),
+        Commands::DriftersHourly(args) => datasets::drifters_hourly::run(args),
         Commands::Animals(args) => datasets::animals::run(args),
         Commands::OsmEdits(args) => datasets::osm_edits::run(args),
     }
