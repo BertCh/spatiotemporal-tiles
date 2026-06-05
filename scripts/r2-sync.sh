@@ -52,6 +52,11 @@ COMMON_FLAGS=(
   --s3-chunk-size 64M
   --s3-upload-concurrency 8
   --s3-no-check-bucket
+  # .stt archives change only when regenerated. Cache a day in the browser and
+  # let the Cloudflare edge revalidate via ETag. After re-syncing a CHANGED file,
+  # purge it from the Cloudflare cache (filenames are reused, so the edge would
+  # otherwise serve stale bytes until TTL). Bump max-age if filenames get versioned.
+  --header-upload "Cache-Control: public, max-age=86400"
 )
 
 # Pass any flags (e.g. --dry-run) straight through; treat a bare *.stt arg as a
