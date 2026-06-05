@@ -1,10 +1,8 @@
 {
+  "_comment": "Tiles are public, read-only data. A wildcard origin avoids origin-mismatch CORS errors (http vs https, apex vs www vs workers.dev) and caches cleanly at the edge (no Vary: Origin fan-out). Applied via the Cloudflare API (Workers R2 Storage token), not the S3 API. See conversation 2026-06-05.",
   "CORSRules": [
     {
-      "AllowedOrigins": [
-        "https://poopdeck.gl",
-        "https://www.poopdeck.gl"
-      ],
+      "AllowedOrigins": ["*"],
       "AllowedMethods": ["GET", "HEAD"],
       "AllowedHeaders": ["Range", "If-Match", "If-None-Match", "If-Modified-Since"],
       "ExposeHeaders": ["Content-Range", "Content-Length", "Accept-Ranges", "ETag", "Last-Modified"],
