@@ -19,6 +19,7 @@ pub mod error;
 pub mod geometry;
 pub mod index;
 pub mod metadata;
+pub mod pack;
 pub mod projection;
 pub mod tile;
 pub mod types;
@@ -27,6 +28,7 @@ pub mod types;
 pub use archive::{Archive, ArchiveReader, ArchiveWriter};
 pub use curve::BlobOrdering;
 pub use error::{Error, Result};
+pub use pack::{transcode_archive_to_packs, Manifest, PackWriter, PackedReader};
 pub use tile::TileId;
 pub use types::{BoundingBox, TimeRange};
 

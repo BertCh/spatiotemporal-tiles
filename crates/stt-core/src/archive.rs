@@ -63,7 +63,18 @@ pub struct TileEntry {
     pub time_start: i64,
     /// Inclusive temporal end (Unix ms).
     pub time_end: i64,
-    /// Byte offset of the compressed blob within the archive.
+    /// Index of the pack object holding this tile's blob (packed format).
+    ///
+    /// In the single-file v4 archive every tile lives in the one file, so this
+    /// is always `0` and [`offset`](Self::offset) is whole-file relative. In the
+    /// multi-object packed format this selects `manifest.packs[pack_id]` and
+    /// [`offset`](Self::offset) becomes **pack-relative**. A per-blob (per-run)
+    /// property, not a per-entry key — entries RLE-collapse only within one pack.
+    pub pack_id: u32,
+    /// Byte offset of the compressed blob.
+    ///
+    /// Whole-file relative for the v4 single-file archive; pack-relative (within
+    /// `packs[pack_id]`) for the packed format.
     pub offset: u64,
     /// Compressed blob length in bytes.
     pub length: u32,
@@ -663,6 +674,8 @@ impl ArchiveWriter {
             y: id.y,
             time_start,
             time_end,
+            // Single-file archive: one pack, whole-file-relative offsets.
+            pack_id: 0,
             offset,
             length,
             uncompressed_size,
@@ -796,6 +809,8 @@ impl ArchiveWriter {
                 y: p.y,
                 time_start: p.time_start,
                 time_end: p.time_end,
+                // Single-file archive: one pack, whole-file-relative offsets.
+                pack_id: 0,
                 offset,
                 length,
                 uncompressed_size,
@@ -992,6 +1007,7 @@ mod tests {
                     y: 0,
                     time_start: t_start,
                     time_end: t_start + bucket - 1,
+                    pack_id: 0,
                     offset: 0,
                     length: 0,
                     uncompressed_size: 0,

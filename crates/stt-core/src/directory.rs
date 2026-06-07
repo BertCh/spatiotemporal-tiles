@@ -1,4 +1,4 @@
-//! STT v4 directory — a compact, range-request-friendly tile index.
+//! STT v5 directory — a compact, range-request-friendly tile index.
 //!
 //! Replaces the v2/v3 Arrow-IPC index (fixed-width columns + IPC framing) with
 //! a columnar binary encoding inspired by PMTiles v3:
@@ -11,9 +11,16 @@
 //!   buckets — the temporal analogue of PMTiles' ocean tiles) collapse into one
 //!   run. The heavy per-blob columns (offset/length/uncompressed/crc) are then
 //!   stored once per *run* instead of once per *entry*.
-//! - **Offset contiguity sentinel.** A run whose blob immediately follows the
-//!   previous run's blob stores offset `0`; otherwise `offset + 1`. Sequential
-//!   archives (the common case) cost ~1 byte for the whole offset column.
+//! - **Per-run pack id (v5).** Each run carries a `pack_id` (which packed-format
+//!   object holds the blob), delta+zig-zag coded against the previous run's
+//!   pack id — packs are near-monotonic in directory order, so ~1 byte/run. A
+//!   single-file archive has `pack_id == 0` on every run.
+//! - **Pack-relative offset contiguity sentinel.** A run whose blob immediately
+//!   follows the previous run's blob *in the same pack* stores offset `0`;
+//!   otherwise a `1` flag + the raw offset. The contiguity expectation resets to
+//!   `0` whenever the pack id changes between consecutive runs, so the first run
+//!   of every pack still hits the cheap `0` sentinel. Sequential archives (the
+//!   common case) cost ~1 byte for the whole offset column.
 //!
 //! The directory is self-describing (leading version byte + entry/run counts)
 //! and decodes to exactly the `TileEntry` list that was encoded, provided the
@@ -21,14 +28,33 @@
 //!
 //! This module is pure (no I/O): `encode_directory` / `decode_directory` map
 //! `&[TileEntry] ⇆ Vec<u8>`. The archive writer/reader own where the buffer
-//! lives in the file (it occupies the header's `index_*` byte range for v4).
+//! lives in the file (single-file v4) or object (packed `index/<hash>.sttd`).
+//!
+//! ## v5 wire format (per-run columns, in order)
+//!
+//! Each run, in directory order, writes:
+//! 1. `run_len`         — uvarint
+//! 2. `Δpack_id`        — ivarint (zig-zag of `pack_id - prev_pack_id`)
+//! 3. offset sentinel   — uvarint `0` (== `expected_offset`) **or** `1` then a
+//!    uvarint raw offset. `expected_offset` is reset to `0` before this run when
+//!    `pack_id != prev_pack_id`.
+//! 4. `length`          — uvarint
+//! 5. `uncompressed`    — uvarint
+//! 6. `crc32c`          — 4 raw little-endian bytes
+//!
+//! The `Δpack_id` column is **new in v5** and sits immediately after `run_len`,
+//! before the offset sentinel. Per-entry key columns and the trailing
+//! `COVER_SECTION_TMIN` section are byte-identical to v4.
 
 use crate::archive::TileEntry;
 use crate::error::{Error, Result};
 
 /// Directory format tag (first byte of the buffer). Bumped independently of the
 /// archive `FORMAT_VERSION` so the directory codec can evolve on its own.
-pub const DIRECTORY_VERSION: u8 = 4;
+///
+/// v5 adds the per-run `pack_id` column and makes the offset contiguity sentinel
+/// pack-relative (reset on every pack change). See the module docs.
+pub const DIRECTORY_VERSION: u8 = 5;
 
 /// Tag for the optional trailing **covering** section: one signed varint per
 /// entry (in directory order) giving `cover_t_min - time_start`, the tight
@@ -97,21 +123,24 @@ fn get_ivarint(buf: &[u8], pos: &mut usize) -> Result<i64> {
 // Encode
 // ----------------------------------------------------------------------------
 
-/// Encode tile entries into the v4 directory buffer.
+/// Encode tile entries into the v5 directory buffer.
 ///
 /// Entries are sorted into directory order `(zoom, hilbert, time_start)` first,
 /// so the caller need not pre-sort. Two entries are considered to share a blob
-/// (and so RLE-collapse) when their `(offset, length, uncompressed_size,
-/// crc32c)` all match — which is exactly what the dedup-on-write path produces
-/// for byte-identical tiles.
+/// (and so RLE-collapse) when their `(pack_id, offset, length,
+/// uncompressed_size, crc32c)` all match — which is exactly what the
+/// dedup-on-write path produces for byte-identical tiles within one pack. The
+/// `pack_id` is part of the run identity (v5): two entries collapse only when
+/// they live in the same pack *and* point at the same blob.
 pub fn encode_directory(entries: &[TileEntry]) -> Vec<u8> {
     let mut sorted: Vec<&TileEntry> = entries.iter().collect();
     sorted.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start));
     let n = sorted.len();
 
     // Compute blob runs up front so we can write the run count into the header.
-    // A run is a maximal stretch of consecutive entries pointing at one blob.
-    let mut runs: Vec<(usize, u64, u32, u32, u32)> = Vec::new();
+    // A run is a maximal stretch of consecutive entries pointing at one blob in
+    // one pack (pack_id is part of the run identity in v5).
+    let mut runs: Vec<(usize, u32, u64, u32, u32, u32)> = Vec::new();
     let mut i = 0;
     while i < n {
         let head = sorted[i];
@@ -119,7 +148,8 @@ pub fn encode_directory(entries: &[TileEntry]) -> Vec<u8> {
         let mut j = i + 1;
         while j < n {
             let e = sorted[j];
-            if e.offset == head.offset
+            if e.pack_id == head.pack_id
+                && e.offset == head.offset
                 && e.length == head.length
                 && e.uncompressed_size == head.uncompressed_size
                 && e.crc32c == crc
@@ -129,7 +159,14 @@ pub fn encode_directory(entries: &[TileEntry]) -> Vec<u8> {
                 break;
             }
         }
-        runs.push((j - i, head.offset, head.length, head.uncompressed_size, crc));
+        runs.push((
+            j - i,
+            head.pack_id,
+            head.offset,
+            head.length,
+            head.uncompressed_size,
+            crc,
+        ));
         i = j;
     }
 
@@ -170,10 +207,23 @@ pub fn encode_directory(entries: &[TileEntry]) -> Vec<u8> {
         }
     }
 
-    // Per-run blob columns with offset contiguity.
+    // Per-run blob columns: run_len, Δpack_id, offset (pack-relative
+    // contiguity), length, uncompressed, crc. The pack_id is delta+zig-zag coded
+    // against the previous run (packs are near-monotonic → ~1 byte/run), and the
+    // offset contiguity expectation resets to 0 whenever the pack changes so the
+    // first run of each pack hits the cheap `0` sentinel.
     let mut expected_offset = 0u64;
-    for (run_len, offset, length, uncompressed, crc) in &runs {
+    let mut prev_pack_id = 0i64;
+    for (run_len, pack_id, offset, length, uncompressed, crc) in &runs {
         put_uvarint(&mut buf, *run_len as u64);
+        // Δpack_id (zig-zag). When the pack changes, reset the offset contiguity
+        // expectation so this run's first blob is "contiguous from 0".
+        let pid = *pack_id as i64;
+        if pid != prev_pack_id {
+            expected_offset = 0;
+        }
+        put_ivarint(&mut buf, pid.wrapping_sub(prev_pack_id));
+        prev_pack_id = pid;
         // Offset: 0 = contiguous (== expected); else a `1` flag followed by the
         // raw offset, so a real u64::MAX offset can't collide with the
         // contiguity sentinel.
@@ -211,18 +261,31 @@ pub fn encode_directory(entries: &[TileEntry]) -> Vec<u8> {
 // Decode
 // ----------------------------------------------------------------------------
 
-/// Decode a v4 directory buffer back into tile entries (in directory order).
+/// Lowest directory version this decoder accepts. v4 (single-file archives) has
+/// no per-run `pack_id` column and whole-file offsets — decoded as `pack_id = 0`
+/// with no pack-relative reset. v5 adds the `pack_id` column. The encoder always
+/// writes [`DIRECTORY_VERSION`] (v5); v4 read support keeps the v4 single-file
+/// `ArchiveReader` working as the transcode input.
+const MIN_DIRECTORY_VERSION: u8 = 4;
+
+/// Decode a v4/v5 directory buffer back into tile entries (in directory order).
+///
+/// Both versions share the per-entry key columns and the trailing cover section.
+/// v5 prepends a `Δpack_id` (zig-zag) varint to each run's columns and resets
+/// the offset contiguity expectation on every pack change; v4 omits the column
+/// and never resets (one implicit pack, `pack_id = 0`).
 pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
     let mut pos = 0usize;
     let version = *bytes
         .first()
         .ok_or_else(|| Error::InvalidArchive("directory: empty buffer".into()))?;
     pos += 1;
-    if version != DIRECTORY_VERSION {
+    if !(MIN_DIRECTORY_VERSION..=DIRECTORY_VERSION).contains(&version) {
         return Err(Error::InvalidArchive(format!(
-            "directory: unsupported version {version} (expected {DIRECTORY_VERSION})"
+            "directory: unsupported version {version} (expected {MIN_DIRECTORY_VERSION}..={DIRECTORY_VERSION})"
         )));
     }
+    let has_pack_id = version >= 5;
     let n = get_uvarint(bytes, &mut pos)? as usize;
     let run_count = get_uvarint(bytes, &mut pos)? as usize;
 
@@ -292,12 +355,34 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
         });
     }
 
-    // Expand runs over the keys, assigning each run's shared blob fields.
+    // Expand runs over the keys, assigning each run's shared blob fields. The
+    // pack_id is delta+zig-zag against the previous run, and the offset
+    // contiguity expectation resets to 0 on every pack change — symmetric with
+    // the encoder.
     let mut entries = Vec::with_capacity(n);
     let mut cursor = 0usize;
     let mut expected_offset = 0u64;
+    let mut prev_pack_id = 0i64;
     for _ in 0..run_count {
         let run_len = get_uvarint(bytes, &mut pos)? as usize;
+        // v5 carries a Δpack_id column (zig-zag) and resets the offset
+        // contiguity expectation on every pack change. v4 has neither: one
+        // implicit pack (pack_id = 0), whole-file-contiguous offsets.
+        let pid = if has_pack_id {
+            prev_pack_id.wrapping_add(get_ivarint(bytes, &mut pos)?)
+        } else {
+            0
+        };
+        if pid != prev_pack_id {
+            expected_offset = 0;
+        }
+        prev_pack_id = pid;
+        if !(0..=u32::MAX as i64).contains(&pid) {
+            return Err(Error::InvalidArchive(format!(
+                "directory: pack_id {pid} out of u32 range"
+            )));
+        }
+        let pack_id = pid as u32;
         let offset = if get_uvarint(bytes, &mut pos)? == 0 {
             expected_offset
         } else {
@@ -328,6 +413,7 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
                 y: k.y,
                 time_start: k.time_start,
                 time_end: k.time_end,
+                pack_id,
                 offset,
                 length,
                 uncompressed_size,
@@ -388,6 +474,7 @@ mod tests {
             y,
             time_start: ts,
             time_end: te,
+            pack_id: 0,
             offset,
             length,
             uncompressed_size: unc,
@@ -397,6 +484,28 @@ mod tests {
             temporal_bucket_ms: tb,
             cover_t_min: None,
         }
+    }
+
+    /// Build an entry with an explicit `pack_id` (v5 packed format).
+    #[allow(clippy::too_many_arguments)]
+    fn entry_pack(
+        pack_id: u32,
+        zoom: u8,
+        x: u32,
+        y: u32,
+        hilbert: u64,
+        ts: i64,
+        te: i64,
+        offset: u64,
+        length: u32,
+        unc: u32,
+        fc: u32,
+        crc: u32,
+        tb: Option<u64>,
+    ) -> TileEntry {
+        let mut e = entry(zoom, x, y, hilbert, ts, te, offset, length, unc, fc, crc, tb);
+        e.pack_id = pack_id;
+        e
     }
 
     #[test]
@@ -625,6 +734,7 @@ mod tests {
         put_uvarint(&mut buf, 0); // feature_count
         put_uvarint(&mut buf, 0); // bucket present = 0
         put_uvarint(&mut buf, 1); // run_len
+        put_ivarint(&mut buf, 0); // Δpack_id (v5)
         put_uvarint(&mut buf, 0); // offset flag (contiguous)
         put_uvarint(&mut buf, 0); // length
         put_uvarint(&mut buf, 0); // uncompressed
@@ -644,5 +754,109 @@ mod tests {
         let bytes = encode_directory(&entries);
         let back = decode_directory(&bytes).unwrap();
         assert_eq!(back, entries);
+    }
+
+    /// v5: entries spread across multiple packs round-trip with the correct
+    /// `pack_id`, and each pack's offsets are pack-relative (every pack starts
+    /// from a small offset, riding the contiguity sentinel reset).
+    #[test]
+    fn multi_pack_offsets_are_pack_relative_and_roundtrip() {
+        let mut entries = Vec::new();
+        // Three packs, each with a fresh offset run starting at 0. Distinct
+        // blobs within a pack are contiguous (offset += length).
+        for pack_id in 0..3u32 {
+            let mut off = 0u64;
+            for i in 0..6u32 {
+                let hil = (pack_id as u64) * 100 + i as u64; // monotone in dir order
+                let len = 40 + i;
+                entries.push(entry_pack(
+                    pack_id,
+                    9,
+                    pack_id * 10 + i,
+                    i,
+                    hil,
+                    (i as i64) * 1000,
+                    (i as i64) * 1000 + 500,
+                    off,
+                    len,
+                    len * 2,
+                    i,
+                    0x2000 + pack_id * 100 + i,
+                    Some(3_600_000),
+                ));
+                off += len as u64;
+            }
+        }
+        let bytes = encode_directory(&entries);
+        let back = decode_directory(&bytes).unwrap();
+        let mut expected = entries.clone();
+        expected.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start));
+        assert_eq!(back, expected);
+        // Every pack contributes entries, and the first run of each pack has
+        // offset 0 (pack-relative reset). pack_ids observed are exactly {0,1,2}.
+        let packs: std::collections::BTreeSet<u32> = back.iter().map(|e| e.pack_id).collect();
+        assert_eq!(packs, [0u32, 1, 2].into_iter().collect());
+        for p in 0..3u32 {
+            assert!(back.iter().any(|e| e.pack_id == p && e.offset == 0));
+        }
+    }
+
+    /// v5: RLE within a pack still collapses a static cell across time, but two
+    /// blobs that are byte-identical in *different* packs must NOT collapse
+    /// (pack_id is part of the run identity), and both decode to their own pack.
+    #[test]
+    fn rle_collapses_within_pack_but_not_across_packs() {
+        let crc = 0x55AA_55AAu32;
+        let mut entries = Vec::new();
+        // Pack 0: one static cell across 50 hourly buckets — one run.
+        for b in 0..50u64 {
+            entries.push(entry_pack(
+                0, 9, 3, 4, 77,
+                (b as i64) * 3_600_000,
+                (b as i64) * 3_600_000 + 3_599_999,
+                4096, 512, 1024, 64, crc, Some(3_600_000),
+            ));
+        }
+        // Pack 1: same blob fields (offset/len/unc/crc) but a different pack —
+        // a separate physical object, so it must stay its own run.
+        for b in 0..50u64 {
+            entries.push(entry_pack(
+                1, 9, 5, 6, 99,
+                (b as i64) * 3_600_000,
+                (b as i64) * 3_600_000 + 3_599_999,
+                4096, 512, 1024, 64, crc, Some(3_600_000),
+            ));
+        }
+        let bytes = encode_directory(&entries);
+        let back = decode_directory(&bytes).unwrap();
+        let mut expected = entries.clone();
+        expected.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start));
+        assert_eq!(back, expected);
+        assert!(back.iter().any(|e| e.pack_id == 0));
+        assert!(back.iter().any(|e| e.pack_id == 1));
+    }
+
+    /// v5: the cover section still round-trips alongside multi-pack pack_ids.
+    #[test]
+    fn cover_section_roundtrips_with_pack_ids() {
+        let mut entries = Vec::new();
+        for i in 0..12u32 {
+            let pack_id = i / 4; // packs 0,1,2
+            let mut e = entry_pack(
+                pack_id, 10, i, i, i as u64,
+                (i as i64) * 1000, (i as i64) * 1000 + 900,
+                (i % 4) as u64 * 50, 50, 100, i, 0x300 + i, Some(1000),
+            );
+            e.cover_t_min = Some((i as i64) * 1000 + 250);
+            entries.push(e);
+        }
+        let bytes = encode_directory(&entries);
+        let back = decode_directory(&bytes).unwrap();
+        let mut expected = entries.clone();
+        expected.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start));
+        assert_eq!(back, expected);
+        assert!(back.iter().all(|e| e.cover_t_min.is_some()));
+        let packs: std::collections::BTreeSet<u32> = back.iter().map(|e| e.pack_id).collect();
+        assert_eq!(packs, [0u32, 1, 2].into_iter().collect());
     }
 }

@@ -20,7 +20,13 @@ struct Args {
     #[arg(short, long)]
     input: PathBuf,
 
-    /// Output archive path (.stt file)
+    /// Output packed-dataset DIRECTORY (manifest.json + index/ + packs/).
+    ///
+    /// stt-build now emits the multi-object **packed format** instead of a
+    /// single-file `.stt`. The output is a directory tree; for convenience a
+    /// path ending in `.stt` has that extension stripped, so `-o foo.stt`
+    /// produces `foo/{manifest.json,index/,packs/}`. A directory-like path is
+    /// used as-is.
     #[arg(short, long)]
     output: PathBuf,
 
@@ -53,15 +59,23 @@ struct Args {
     #[arg(long, default_value = "zstd")]
     compression: String,
 
-    /// On-disk blob byte ordering (in-memory builds only):
-    /// `eager` (default; stream blobs in add-order, lowest build RAM),
-    /// or a buffered/optimized order — `spatial`, `time-major`, `hilbert3`,
-    /// `morton3`, or `auto` (pick from the dataset's space-vs-time cardinality:
-    /// wide-time → spatial-major, else the 3D-Hilbert generalist). Non-`eager`
-    /// values reorder blobs for far fewer client range requests but hold all
-    /// tile payloads in RAM until finalize. Ignored with --streaming-arrow.
-    #[arg(long, default_value = "eager")]
+    /// Pack ordering — how tile blobs are laid out before being cut into packs:
+    /// `auto` (default; pick from the dataset's space-vs-time cardinality:
+    /// wide-time → spatial-major, else the 3D-Hilbert generalist), or an explicit
+    /// `spatial`, `time-major`, `hilbert3`, or `morton3`. Locality means fewer
+    /// packs touched per viewport (fewer client range requests). The in-memory
+    /// pipeline holds all tile payloads in RAM until finalize. With
+    /// --streaming-arrow this controls the ordering of the transcode pass.
+    #[arg(long, default_value = "auto")]
     blob_ordering: String,
+
+    /// Target pack object size in MiB (default 64). Tile blobs are cut into
+    /// packs of at most this size (a single blob larger than the target gets
+    /// its own pack rather than being split). Smaller → finer cache
+    /// granularity + more parallel range reads but more objects; larger →
+    /// fewer, coarser objects. Stay well under the CDN per-object cap (512 MB).
+    #[arg(long, default_value = "64")]
+    pack_size: u64,
 
     /// Temporal bucket size for chunking tiles (e.g., "1h", "6h", "1d", "30m")
     /// Features are grouped into fixed temporal intervals, creating predictable tile boundaries
@@ -283,9 +297,14 @@ fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)
         .context("Failed to set tracing subscriber")?;
 
+    // Resolve the output into a packed-dataset directory. A path ending in
+    // `.stt` has the extension stripped (so `-o foo.stt` -> `foo/`); anything
+    // else is used as the directory as-is.
+    let out_dir = packed_output_dir(&args.output);
+
     info!("Starting stt-build");
     info!("Input: {}", args.input.display());
-    info!("Output: {}", args.output.display());
+    info!("Output (packed dataset dir): {}", out_dir.display());
 
     // Validate input file is GeoParquet
     let extension = args.input.extension().and_then(|s| s.to_str()).unwrap_or("");
@@ -303,18 +322,23 @@ fn main() -> Result<()> {
     // Parse compression
     let compression = parse_compression(&args.compression)?;
 
-    // Parse blob ordering: `eager` -> None (stream blobs in add-order);
-    // anything else -> Some(BlobOrdering) (buffered/optimized reorder).
-    let blob_ordering: Option<stt_core::BlobOrdering> =
+    // Parse the pack ordering (the packed format always buffers + reorders
+    // before cutting packs). `eager` is accepted for backward-compat and maps
+    // to `auto`.
+    let pack_ordering: stt_core::BlobOrdering =
         if args.blob_ordering.trim().eq_ignore_ascii_case("eager") {
-            None
+            stt_core::BlobOrdering::Auto
         } else {
-            Some(
-                args.blob_ordering
-                    .parse()
-                    .map_err(|e: String| anyhow::anyhow!(e))?,
-            )
+            args.blob_ordering
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!(e))?
         };
+
+    // Pack target size (MiB -> bytes). Never 0.
+    let pack_target_bytes = args
+        .pack_size
+        .saturating_mul(1024 * 1024)
+        .max(1);
 
     let strictness = if args.strict_times {
         input::InputStrictness::Strict
@@ -391,15 +415,22 @@ fn main() -> Result<()> {
             // streaming path keeps fixed buckets, so this is ignored here.
             adaptive_target_features: None,
         };
-        if blob_ordering.is_some() {
-            warn!(
-                "--blob-ordering {} ignored in --streaming-arrow mode: blob reordering \
-                 needs the buffered in-memory pipeline (it holds all payloads until \
-                 finalize). Streaming keeps add-order. Drop --streaming-arrow to reorder.",
-                args.blob_ordering
-            );
-        }
-        let mut writer = stt_core::Archive::create(&args.output, compression)?;
+        // --streaming-arrow stays bounded-RAM: it streams tiles into a TEMP
+        // single-file archive (the only writer that doesn't buffer all
+        // payloads), then transcodes that temp file into the packed dir. The
+        // pack ordering is applied during the transcode pass.
+        info!(
+            "Streaming to a temp single-file archive, then transcoding to packs \
+             (ordering {pack_ordering}, pack target {} MiB)",
+            args.pack_size
+        );
+        let temp_archive = tempfile::Builder::new()
+            .prefix("stt-build-streaming-")
+            .suffix(".stt")
+            .tempfile()
+            .context("failed to create temp archive for --streaming-arrow")?;
+        let temp_archive_path = temp_archive.path().to_path_buf();
+        let mut writer = stt_core::Archive::create(&temp_archive_path, compression)?;
         let mut bounds_lon = (f64::MAX, f64::MIN);
         let mut bounds_lat = (f64::MAX, f64::MIN);
         let mut time_range = (u64::MAX, 0u64);
@@ -499,11 +530,21 @@ fn main() -> Result<()> {
         .with_zoom_levels(args.min_zoom, args.max_zoom)
         .with_temporal_bucket_ms(temporal_bucket_ms);
         writer.finalize(&metadata)?;
+
+        // Transcode the bounded-RAM temp archive into the packed dataset dir,
+        // then drop the temp file. Shared with the pack-transcode example.
+        info!("Transcoding temp archive -> packed dir {}", out_dir.display());
+        let manifest =
+            stt_core::transcode_archive_to_packs(&temp_archive_path, &out_dir, pack_ordering, pack_target_bytes)?;
+        drop(temp_archive); // delete the temp .stt
+        let total_pack_bytes: u64 = manifest.packs.iter().map(|p| p.length).sum();
         info!(
-            "Archive written successfully to {} ({} tiles, {} features)",
-            args.output.display(),
+            "Packed dataset written to {} ({} tiles, {} features, {} packs, {} pack bytes)",
+            out_dir.display(),
             stats.total_tiles,
-            feature_count
+            feature_count,
+            manifest.packs.len(),
+            total_pack_bytes,
         );
         return Ok(());
     }
@@ -596,24 +637,20 @@ fn main() -> Result<()> {
         info!("Pre-tessellation enabled (triangle indices written alongside polygon geometry)");
     }
 
-    let mut writer = match blob_ordering {
-        Some(ordering) => {
-            if compression != stt_core::types::Compression::Zstd {
-                warn!(
-                    "--compression {} ignored: --blob-ordering uses the buffered writer, \
-                     which compresses per-blob with zstd.",
-                    args.compression
-                );
-            }
-            info!(
-                "Blob ordering: {ordering} (buffered writer — space-time blob layout + \
-                 byte-identical dedup, NO shared dict so the TS reader can decode it; \
-                 holds payloads in RAM until finalize)"
-            );
-            stt_core::ArchiveWriter::create_reordered(&args.output, ordering)?
-        }
-        None => stt_core::Archive::create(&args.output, compression)?,
-    };
+    if compression != stt_core::types::Compression::Zstd {
+        warn!(
+            "--compression {} ignored: the packed format compresses per-blob with \
+             zstd (no shared dict, so the TS reader can decode it).",
+            args.compression
+        );
+    }
+    info!(
+        "Pack ordering: {pack_ordering} (buffered — space-time blob layout + \
+         byte-identical dedup, then cut into packs of ≤{} MiB; holds payloads \
+         in RAM until finalize)",
+        args.pack_size
+    );
+    let mut writer = stt_core::PackWriter::create(&out_dir, pack_ordering, pack_target_bytes)?;
 
     let tile_count = if !temporal_lod.is_empty() {
         // --temporal-lod path: emit base tiles + per-level aggregate tiles.
@@ -834,13 +871,20 @@ fn main() -> Result<()> {
         }
     }
 
-    writer.finalize(&metadata)?;
+    let manifest = writer.finalize(&metadata)?;
 
     // Step 6: Write metadata JSON if requested
     if let Some(metadata_path) = args.metadata_output {
         info!("Writing metadata JSON to {}...", metadata_path.display());
+        // The packed dataset is addressed by its manifest, so the dataset
+        // "filename" is now `<dir>/manifest.json`.
+        let manifest_rel = out_dir.join("manifest.json");
         let metadata_json = serde_json::json!({
-            "filename": args.output.file_name().unwrap().to_string_lossy(),
+            "filename": format!(
+                "{}/manifest.json",
+                out_dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+            ),
+            "path": manifest_rel.to_string_lossy(),
             "name": metadata.name,
             "description": metadata.description,
             "attribution": metadata.attribution,
@@ -865,11 +909,36 @@ fn main() -> Result<()> {
         std::fs::write(metadata_path, serde_json::to_string_pretty(&metadata_json)?)?;
     }
 
-    info!("Archive written successfully to {}", args.output.display());
+    let total_pack_bytes: u64 = manifest.packs.iter().map(|p| p.length).sum();
+    info!(
+        "Packed dataset written successfully to {} ({} packs, {} pack bytes)",
+        out_dir.display(),
+        manifest.packs.len(),
+        total_pack_bytes,
+    );
     info!("Total tiles: {}", tile_count);
     info!("Total features: {}", features.len());
 
     Ok(())
+}
+
+/// Resolve the `-o/--output` value into a packed-dataset directory.
+///
+/// The packed format is a directory tree (`manifest.json` + `index/` +
+/// `packs/`). For convenience a path ending in `.stt` (the old single-file
+/// extension) has that extension stripped, so `-o foo.stt` -> `foo/`. Any other
+/// path is used verbatim as the dataset directory.
+fn packed_output_dir(output: &std::path::Path) -> PathBuf {
+    let is_stt = output
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| e.eq_ignore_ascii_case("stt"))
+        .unwrap_or(false);
+    if is_stt {
+        output.with_extension("")
+    } else {
+        output.to_path_buf()
+    }
 }
 
 /// Parse a `--heatmap-raster WxH` spec into a [`RasterTier`] descriptor.

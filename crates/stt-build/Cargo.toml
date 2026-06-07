@@ -35,6 +35,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 
+# Temp single-file archive staging for the --streaming-arrow -> packed transcode.
+tempfile = "3.10"
+
 # H3 hexagonal aggregation cells for the summary tier.
 h3o = "0.7"
 

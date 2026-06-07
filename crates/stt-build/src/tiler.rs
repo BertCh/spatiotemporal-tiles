@@ -653,6 +653,27 @@ impl TileWriter for stt_core::archive::ArchiveWriter {
     }
 }
 
+/// Stream generated tiles straight into a packed-format [`stt_core::PackWriter`].
+///
+/// Identical mapping to the [`stt_core::archive::ArchiveWriter`] impl above —
+/// `PackWriter` shares the same `add_tile_full` contract; it just buffers the
+/// tiles and cuts them into content-addressed packs at finalize.
+impl TileWriter for stt_core::PackWriter {
+    fn write_tile(&mut self, tile: &GeneratedTile) -> Result<()> {
+        let payload = encode_tile(&tile.layers)?;
+        self.add_tile_full(
+            &tile.id,
+            tile.time_start,
+            tile.time_end,
+            Some(tile.cover_t_min),
+            tile.feature_count(),
+            None,
+            &payload,
+        )?;
+        Ok(())
+    }
+}
+
 /// Sink that also forwards the per-tile temporal bucket size.
 pub trait LodTileWriter {
     /// Persist one tile, tagging the directory entry with `temporal_bucket_ms`.
@@ -664,6 +685,26 @@ pub trait LodTileWriter {
 }
 
 impl LodTileWriter for stt_core::archive::ArchiveWriter {
+    fn write_lod_tile(
+        &mut self,
+        tile: &GeneratedTile,
+        temporal_bucket_ms: Option<u64>,
+    ) -> Result<()> {
+        let payload = encode_tile(&tile.layers)?;
+        self.add_tile_full(
+            &tile.id,
+            tile.time_start,
+            tile.time_end,
+            Some(tile.cover_t_min),
+            tile.feature_count(),
+            temporal_bucket_ms,
+            &payload,
+        )?;
+        Ok(())
+    }
+}
+
+impl LodTileWriter for stt_core::PackWriter {
     fn write_lod_tile(
         &mut self,
         tile: &GeneratedTile,
