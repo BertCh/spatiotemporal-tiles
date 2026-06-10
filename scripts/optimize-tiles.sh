@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 #
-# optimize-tiles.sh — post-build blob-layout optimizer for STT v4 archives.
+# optimize-tiles.sh — post-build blob-layout optimizer for **legacy single-file**
+# STT v4 archives (`.stt`).
+#
+# LEGACY / single-file only. The packed format orders blobs at pack-cutting time
+# (PackWriter / pack-transcode), so packed datasets need no post-hoc reordering.
+# This script remains useful only for measuring/optimizing single-file archives
+# (e.g. the streaming intermediate). It does not understand packed datasets.
 #
 # For each .stt argument (default: examples/showcase/public/data/*.stt):
 #   1. run the layout simulator to PICK the best blob ordering and its predicted

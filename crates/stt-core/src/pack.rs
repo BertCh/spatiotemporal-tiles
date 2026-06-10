@@ -496,6 +496,113 @@ pub fn transcode_archive_to_packs<I: AsRef<Path>, O: AsRef<Path>>(
 }
 
 // ----------------------------------------------------------------------------
+// Integrity
+// ----------------------------------------------------------------------------
+
+/// Verify the on-disk integrity of a packed dataset against its manifest.
+///
+/// Because packs and the directory are **content-addressed**, integrity is a
+/// property anyone can check with no trusted side-channel: each object's bytes
+/// must blake3-hash to the name the manifest gave it, and its on-disk length
+/// must match the declared length. Additionally the directory must decode and
+/// reference no `pack_id` outside the manifest's pack table.
+///
+/// Returns the list of violations (empty ⇒ clean). Returns `Err` only when the
+/// manifest itself cannot be read or parsed (a missing referenced object is a
+/// reported violation, not an `Err`, so a full report is produced in one pass).
+pub fn verify_packed_objects<P: AsRef<Path>>(manifest_path: P) -> Result<Vec<String>> {
+    let manifest_path = manifest_path.as_ref();
+    let root = manifest_path
+        .parent()
+        .ok_or_else(|| Error::InvalidArchive("manifest path has no parent dir".into()))?;
+    let manifest = Manifest::from_json_bytes(&fs::read(manifest_path)?)?;
+
+    let mut issues = Vec::new();
+
+    if manifest.format != PACKED_FORMAT {
+        issues.push(format!(
+            "manifest format is {:?}, expected {PACKED_FORMAT:?}",
+            manifest.format
+        ));
+    }
+    if manifest.format_version != PACKED_FORMAT_VERSION {
+        issues.push(format!(
+            "manifest formatVersion is {}, expected {PACKED_FORMAT_VERSION}",
+            manifest.format_version
+        ));
+    }
+    if manifest.directory.directory_version != crate::directory::DIRECTORY_VERSION {
+        issues.push(format!(
+            "directoryVersion is {}, expected {}",
+            manifest.directory.directory_version,
+            crate::directory::DIRECTORY_VERSION
+        ));
+    }
+
+    // Each content-addressed object: name must equal blake3-128 of its bytes,
+    // and on-disk length must equal the declared length.
+    fn check_object(
+        root: &Path,
+        key: &str,
+        declared_len: u64,
+        prefix: &str,
+        ext: &str,
+        issues: &mut Vec<String>,
+    ) {
+        match fs::read(root.join(key)) {
+            Ok(bytes) => {
+                if bytes.len() as u64 != declared_len {
+                    issues.push(format!(
+                        "{key}: on-disk length {} != manifest-declared {declared_len}",
+                        bytes.len()
+                    ));
+                }
+                let expected = format!("{prefix}/{}.{ext}", blake3_128_hex(&bytes));
+                if key != expected {
+                    issues.push(format!(
+                        "{key}: content-address mismatch (bytes hash to {expected})"
+                    ));
+                }
+            }
+            Err(e) => issues.push(format!("{key}: cannot read object ({e})")),
+        }
+    }
+
+    check_object(
+        root,
+        &manifest.directory.key,
+        manifest.directory.length,
+        "index",
+        "sttd",
+        &mut issues,
+    );
+    for p in &manifest.packs {
+        check_object(root, &p.key, p.length, "packs", "sttp", &mut issues);
+    }
+
+    // Directory must decode and reference only packs that exist.
+    match fs::read(root.join(&manifest.directory.key)) {
+        Ok(dir_bytes) => match crate::directory::decode_directory(&dir_bytes) {
+            Ok(entries) => {
+                if let Some(max_pid) = entries.iter().map(|e| e.pack_id).max() {
+                    if max_pid as usize >= manifest.packs.len() {
+                        issues.push(format!(
+                            "directory references pack_id {max_pid} but the manifest lists only {} pack(s)",
+                            manifest.packs.len()
+                        ));
+                    }
+                }
+            }
+            Err(e) => issues.push(format!("directory failed to decode: {e}")),
+        },
+        // A read failure here is already reported by check_object above.
+        Err(_) => {}
+    }
+
+    Ok(issues)
+}
+
+// ----------------------------------------------------------------------------
 // Reader
 // ----------------------------------------------------------------------------
 
@@ -873,5 +980,39 @@ mod tests {
         let reader = PackedReader::open(out.join("manifest.json")).unwrap();
         let big_entry = reader.entries().iter().find(|e| e.x == 0).unwrap();
         assert_eq!(reader.read_payload(big_entry).unwrap(), big);
+    }
+
+    /// A clean packed dataset verifies with no issues; corrupting a pack's
+    /// bytes (without changing its length) breaks the content address and is
+    /// reported.
+    #[test]
+    fn verify_packed_objects_clean_then_detects_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+
+        let mut w = PackWriter::create(&out, BlobOrdering::Auto, 8 * 1024).unwrap();
+        for k in 0..12u64 {
+            let p = distinct_tile(k);
+            w.add_tile_full(&TileId::new(10, k as u32, 0, 0), 0, 100, None, 6, None, &p)
+                .unwrap();
+        }
+        let manifest = w.finalize(&Metadata::new("verify")).unwrap();
+        let manifest_path = out.join("manifest.json");
+
+        // Clean dataset → no integrity violations.
+        assert!(verify_packed_objects(&manifest_path).unwrap().is_empty());
+
+        // Flip a byte in pack 0: same length, but blake3 no longer matches the
+        // filename it was addressed by.
+        let pack0 = out.join(&manifest.packs[0].key);
+        let mut bytes = fs::read(&pack0).unwrap();
+        bytes[0] ^= 0xff;
+        fs::write(&pack0, &bytes).unwrap();
+
+        let issues = verify_packed_objects(&manifest_path).unwrap();
+        assert!(
+            issues.iter().any(|s| s.contains("content-address mismatch")),
+            "expected a content-address mismatch, got {issues:?}"
+        );
     }
 }

@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 #
-# Transcode every single-file v4 .stt in the showcase data dir into the packed
-# format (manifest.json + index/<hash>.sttd + packs/<hash>.sttp). No generators
-# are re-run — the existing .stt files are read directly. Skips empty/scratch
-# files and datasets already transcoded.
+# ONE-TIME MIGRATION. Transcode every legacy single-file v4 .stt in the showcase
+# data dir into the packed format (manifest.json + index/<hash>.sttd +
+# packs/<hash>.sttp). No generators are re-run — the existing .stt files are read
+# directly. Skips empty/scratch files and datasets already transcoded.
+#
+# This is NOT part of the steady-state build/deploy flow: `stt-build` now emits
+# packed datasets directly. Use this only to migrate pre-existing single-file
+# `.stt` archives (e.g. the original showcase data) to packed.
 #
 # Usage:
 #   scripts/transcode-all-packed.sh            # transcode all

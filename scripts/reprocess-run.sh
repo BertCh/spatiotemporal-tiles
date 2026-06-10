@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# One-off: re-process feasible direct-API showcase datasets through the updated
-# pipeline (fresh build → optimize/repack → measure), staging via .new and
-# promoting only on success. Logs a results table to stdout.
+# One-off, LEGACY (single-file `.stt`): re-process feasible direct-API showcase
+# datasets through the updated pipeline (fresh build → optimize/repack → measure),
+# staging via .new and promoting only on success. Logs a results table to stdout.
+#
+# Superseded by the packed flow: `stt-build` now emits packed datasets directly
+# (blobs ordered at pack-cutting time), so the optimize/repack step here applies
+# only to single-file archives. Kept for single-file measurement.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 DATA=examples/showcase/public/data
