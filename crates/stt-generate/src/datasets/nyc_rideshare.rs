@@ -72,6 +72,18 @@ pub struct Args {
     #[arg(long)]
     pub paths: bool,
 
+    /// Aggregate routed trips into time-binned road-segment flow corridors —
+    /// the pre-aggregated *overview* layer (one feature per corridor per
+    /// `--flow-bin`, per-vertex `vertex_values` carry traversal counts).
+    /// With `--from-intermediate <paths.parquet>` re-aggregates a kept
+    /// `--paths` intermediate without re-routing through OSRM.
+    #[arg(long)]
+    pub flows: bool,
+
+    /// Time bin duration for --flows aggregation (e.g. "15m", "1h")
+    #[arg(long, default_value = "15m")]
+    pub flow_bin: String,
+
     /// Skip stt-build step
     #[arg(long)]
     pub skip_build: bool,
@@ -190,6 +202,11 @@ pub fn run(args: Args) -> Result<()> {
     // Handle --from-intermediate option (skip to STT build)
     if let Some(ref intermediate_file) = args.from_intermediate {
         println!("📂 Using existing intermediate file: {}", intermediate_file.display());
+        if args.flows {
+            // The intermediate is a --paths parquet: re-aggregate it into
+            // flow corridors (no OSRM round-trip), then build.
+            return flows_from_paths_intermediate(&args, intermediate_file);
+        }
         return build_stt_from_intermediate(&args, intermediate_file);
     }
 
@@ -210,7 +227,14 @@ pub fn run(args: Args) -> Result<()> {
     println!("   Output:        {}", args.output.display());
     println!("   Intermediate:  {}", intermediate_path.display());
     println!("   Format:        {}", if use_parquet { "GeoParquet (streaming)" } else { "GeoJSON" });
-    println!("   Mode:          {}", if args.paths { "LineString paths" } else { "Point trajectories" });
+    let mode = if args.flows {
+        "Flow corridors (time-binned segment aggregation)"
+    } else if args.paths {
+        "LineString paths"
+    } else {
+        "Point trajectories"
+    };
+    println!("   Mode:          {}", mode);
     println!("   Routing:       {}", if args.skip_routing { "Disabled (straight lines)" } else { &args.osrm_url });
     if let Some(max) = args.max_trips {
         println!("   Max trips:     {}", max);
@@ -305,7 +329,14 @@ pub fn run(args: Args) -> Result<()> {
     println!("   Processing {} trips...", trips.len());
     println!("   Output: {}", intermediate_path.display());
     
-    if args.paths {
+    if args.flows {
+        if !use_parquet {
+            return Err(anyhow!(
+                "--flows requires a .stt or .parquet output (GeoJSON not supported)"
+            ));
+        }
+        generate_flows_parquet(&trips, &args, &intermediate_path)?;
+    } else if args.paths {
         if use_parquet {
             generate_paths_parquet(&trips, &args, &intermediate_path)?;
         } else {
@@ -366,7 +397,21 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     
     let time_field = "timestamp";
-    let end_time_field = if args.paths { Some("end_timestamp") } else { None };
+    let end_time_field = if args.paths || args.flows {
+        Some("end_timestamp")
+    } else {
+        None
+    };
+
+    // Flow corridors are an overview layer: shallower zooms, and the tile
+    // temporal bucket matches the aggregation bin so one tile holds exactly
+    // one animation frame's features.
+    let (min_zoom, max_zoom) = if args.flows { (8, 14) } else { (10, 16) };
+    let temporal_bucket = if args.flows {
+        &args.flow_bin
+    } else {
+        &args.temporal_bucket
+    };
 
     println!("   Input:      {}", intermediate_path.display());
     println!("   Output:     {}", args.output.display());
@@ -374,8 +419,8 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
     if let Some(end_field) = end_time_field {
         println!("   End time:   {}", end_field);
     }
-    println!("   Zoom:       10-16");
-    println!("   Temporal bucket: {}", args.temporal_bucket);
+    println!("   Zoom:       {}-{}", min_zoom, max_zoom);
+    println!("   Temporal bucket: {}", temporal_bucket);
     println!();
 
     // Single shared entry point for both the points (no end-time) and paths
@@ -391,12 +436,85 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
         &args.output,
         time_field,
         end_time_field,
-        10,
-        16,
+        min_zoom,
+        max_zoom,
         "zstd",
-        Some(&args.temporal_bucket),
+        Some(temporal_bucket),
     )?;
 
+    Ok(())
+}
+
+/// `--flows --from-intermediate <paths.parquet>`: re-aggregate a kept
+/// `--paths` intermediate into flow corridors, write the flows parquet next
+/// to the output, then build the archive. Routing is skipped entirely.
+fn flows_from_paths_intermediate(args: &Args, paths_parquet: &PathBuf) -> Result<()> {
+    use crate::datasets::nyc_rideshare_flows::{parse_bin_ms, FlowAggregator};
+
+    let bin_ms = parse_bin_ms(&args.flow_bin)?;
+    let flows_parquet = if args.output.extension().map(|e| e == "stt").unwrap_or(false) {
+        args.output.with_extension("parquet")
+    } else {
+        args.output.clone()
+    };
+    if flows_parquet == *paths_parquet {
+        return Err(anyhow!(
+            "flows output parquet would overwrite the paths intermediate ({}); \
+             choose a different --output",
+            flows_parquet.display()
+        ));
+    }
+
+    println!("\n🔁 Aggregating paths intermediate into {} flow bins", args.flow_bin);
+    let mut agg = FlowAggregator::new(bin_ms);
+    let rows = crate::datasets::nyc_rideshare_flows::aggregate_paths_parquet(paths_parquet, &mut agg)?;
+    let (added, skipped, entries) = agg.stats();
+    println!("   ✓ {} rows read ({} aggregated, {} skipped)", rows, added, skipped);
+    println!("   ✓ {} (bin, segment) entries", entries);
+
+    let (features, bins) = agg.write_parquet(&flows_parquet)?;
+    println!("   ✓ {} corridor features across {} bins → {}", features, bins, flows_parquet.display());
+
+    if args.output.extension().map(|e| e == "stt").unwrap_or(false) && !args.skip_build {
+        build_stt_from_intermediate(args, &flows_parquet)?;
+        if !args.keep_intermediate {
+            let _ = std::fs::remove_file(&flows_parquet);
+        }
+    }
+    Ok(())
+}
+
+/// `--flows` from freshly routed trips: route in parallel (same pipeline as
+/// `--paths`), aggregate in memory, write the flows parquet.
+fn generate_flows_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Result<()> {
+    use crate::datasets::nyc_rideshare_flows::{parse_bin_ms, FlowAggregator};
+
+    let bin_ms = parse_bin_ms(&args.flow_bin)?;
+    let (results, annotated, failed) = route_trips_parallel(trips, args);
+
+    println!("✓ Routing complete, aggregating into {} flow bins...", args.flow_bin);
+    println!(
+        "📊 OSRM annotations captured for {}/{} trips ({:.1}%), {} fallback routes",
+        annotated,
+        trips.len(),
+        100.0 * annotated as f64 / trips.len().max(1) as f64,
+        failed
+    );
+
+    let mut agg = FlowAggregator::new(bin_ms);
+    for (_, trip, coords, vertex_times) in &results {
+        agg.add_trip(
+            coords,
+            vertex_times.as_deref(),
+            trip.pickup_time.timestamp_millis(),
+            trip.dropoff_time.timestamp_millis(),
+        );
+    }
+    let (added, skipped, entries) = agg.stats();
+    println!("   ✓ {} trips aggregated ({} skipped), {} (bin, segment) entries", added, skipped, entries);
+
+    let (features, bins) = agg.write_parquet(output)?;
+    println!("✓ GeoParquet (flow corridors) written: {} features across {} bins", features, bins);
     Ok(())
 }
 
@@ -1093,13 +1211,19 @@ fn generate_paths_geojson(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
     Ok(())
 }
 
-fn generate_paths_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Result<()> {
+/// Per-trip routing result: (trip index, trip, polyline, optional per-vertex
+/// absolute timestamps from OSRM's `annotations=duration`). `None` timestamps
+/// mean stt-build falls back to uniform-by-distance interpolation.
+type TripResult = (usize, Trip, Vec<[f64; 2]>, Option<Vec<i64>>);
+
+/// Route trips through OSRM in parallel batches. Returns (results,
+/// annotated-route count, failed-route count). Shared by `--paths` (which
+/// writes one feature per trip) and `--flows` (which aggregates).
+fn route_trips_parallel(trips: &[Trip], args: &Args) -> (Vec<TripResult>, usize, usize) {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
-    
-    println!("\n🚀 Generating paths (Parquet) - PARALLEL MODE");
-    
+
     // Determine parallelism - use fewer threads to avoid overwhelming OSRM
     let num_threads = std::cmp::min(rayon::current_num_threads(), 16);
     println!("   Using {} parallel workers", num_threads);
@@ -1109,12 +1233,7 @@ fn generate_paths_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
     let osrm_url = args.osrm_url.clone();
     let skip_routing = args.skip_routing;
     let total_trips = trips.len();
-    
-    // Process trips in parallel batches for better throughput.
-    // Per-trip result carries the optional per-vertex absolute timestamps
-    // derived from OSRM's `annotations=duration`. `None` means stt-build
-    // will fall back to uniform-by-distance interpolation (legacy behaviour).
-    type TripResult = (usize, Trip, Vec<[f64; 2]>, Option<Vec<i64>>);
+
     let batch_size = 5000;
     let mut all_results: Vec<TripResult> = Vec::with_capacity(trips.len());
     let start_time = Instant::now();
@@ -1126,7 +1245,6 @@ fn generate_paths_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
     for (batch_idx, batch_start) in (0..trips.len()).step_by(batch_size).enumerate() {
         let batch_end = std::cmp::min(batch_start + batch_size, trips.len());
         let batch = &trips[batch_start..batch_end];
-        let batch_start_time = Instant::now();
 
         // Process batch in parallel
         let batch_results: Vec<TripResult> = batch
@@ -1188,8 +1306,7 @@ fn generate_paths_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
         let elapsed = start_time.elapsed().as_secs_f64();
         let rate = done as f64 / elapsed;
         let remaining = (total_trips - done) as f64 / rate;
-        let batch_time = batch_start_time.elapsed().as_secs_f64();
-        
+
         eprintln!(
             "   [{:>3}/{}] Batch {} complete: {}/{} trips ({:.0}/s) - ETA: {:.0}m {:.0}s",
             batch_idx + 1,
@@ -1202,6 +1319,15 @@ fn generate_paths_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
             remaining % 60.0
         );
     }
+
+    let failed = failed_routes.load(Ordering::Relaxed);
+    (all_results, annotated_routes, failed)
+}
+
+fn generate_paths_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Result<()> {
+    println!("\n🚀 Generating paths (Parquet) - PARALLEL MODE");
+
+    let (all_results, annotated_routes, failed) = route_trips_parallel(trips, args);
     println!("✓ Routing complete, writing to Parquet...");
 
     // Create streaming Parquet writer and write results sequentially
@@ -1245,7 +1371,6 @@ fn generate_paths_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
     }
 
     let count = writer.finish()?;
-    let failed = failed_routes.load(Ordering::Relaxed);
     println!("✓ GeoParquet (LineString) written successfully ({} rows)", count);
     println!("📊 Generated {} path features with {} total coordinates", count, total_coords);
     println!(

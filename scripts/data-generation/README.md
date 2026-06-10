@@ -55,6 +55,14 @@ stt-generate flights --date 2020-01-06 --hours 0-12 --output flights.stt
 
 # NYC Rideshare: Download TLC data (pre-July 2016 for lat/long)
 stt-generate nyc-rideshare --download 2016-01 --max-trips 10000 --output nyc.stt
+
+# NYC Taxi Flow (pre-aggregated overview): route once keeping the paths
+# intermediate, then aggregate into time-binned road-segment flow corridors.
+# Re-run step 2 alone to re-tune --flow-bin without re-routing through OSRM.
+stt-generate nyc-rideshare --input yellow_tripdata_2015-01.csv --paths \
+  --chronological --max-trips 500000 --output nyc-taxi-paths-2015-01.parquet
+stt-generate nyc-rideshare --flows --flow-bin 15m \
+  --from-intermediate nyc-taxi-paths-2015-01.parquet --output nyc-taxi-flows.stt
 ```
 
 ## Custom Data
