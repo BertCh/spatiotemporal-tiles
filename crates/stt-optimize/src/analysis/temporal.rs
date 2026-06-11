@@ -388,5 +388,53 @@ mod tests {
         let (bucket, _) = recommend_bucket_size(one_year, 10000, 100000, &TemporalDistribution::Uniform);
         assert!(bucket >= 3_600_000); // At least 1 hour
     }
+
+    #[test]
+    fn test_recommend_bucket_targets_1500_buckets() {
+        // For a uniform distribution the target is ~1500 buckets. Over a 30-day
+        // span the chosen bucket should land at-or-under that target (the picker
+        // walks bucket sizes up until bucket_count <= target).
+        let span = 30 * 86_400_000u64; // 30 days
+        let target = 1500u64;
+        let (bucket, name) =
+            recommend_bucket_size(span, 5000, 50000, &TemporalDistribution::Uniform);
+        assert!(bucket > 0, "bucket must be non-zero for a real span");
+        let bucket_count = span / bucket;
+        assert!(
+            bucket_count <= target,
+            "30-day span chose {} ({} buckets), exceeds target {}",
+            name,
+            bucket_count,
+            target
+        );
+        // 30 days / 1500 buckets ~= 28.8 min, so the picker should land on the
+        // 30-minute bucket (the first standard size at-or-under target).
+        assert_eq!(bucket, 1_800_000, "expected 30-minute bucket, got {}", name);
+    }
+
+    #[test]
+    fn test_recommend_bucket_zero_for_empty_span() {
+        let (bucket, name) =
+            recommend_bucket_size(0, 0, 0, &TemporalDistribution::Instantaneous);
+        assert_eq!(bucket, 0);
+        assert_eq!(name, "N/A");
+    }
+
+    #[test]
+    fn test_recommend_bucket_sparse_uses_fewer_buckets() {
+        // Sparse distribution targets only 500 buckets, so for the same span it
+        // should choose a coarser (>=) bucket than a uniform distribution.
+        let span = 365 * 86_400_000u64; // 1 year
+        let (uniform, _) =
+            recommend_bucket_size(span, 1000, 10000, &TemporalDistribution::Uniform);
+        let (sparse, _) =
+            recommend_bucket_size(span, 1000, 10000, &TemporalDistribution::Sparse);
+        assert!(
+            sparse >= uniform,
+            "sparse bucket {} should be >= uniform bucket {}",
+            sparse,
+            uniform
+        );
+    }
 }
 

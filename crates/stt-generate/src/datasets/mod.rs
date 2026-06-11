@@ -13,6 +13,7 @@ pub mod nyc_rideshare;
 pub mod nyc_rideshare_flows;
 pub mod nyc_taxi_points;
 pub mod osm_edits;
+pub mod osm_streets;
 pub mod satellites;
 pub mod wildfires;
 

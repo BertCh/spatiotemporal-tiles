@@ -3,7 +3,7 @@
 
 use crate::clip::{clip_trajectory, is_clippable_trajectory, ClipConfig, ClippedSegment};
 use crate::columnar::{
-    build_layer_from_segments, build_layers_from_features_with, ColumnarOptions,
+    build_layer_from_segments, build_layers_from_features_with, AttributeFilter, ColumnarOptions,
 };
 use crate::input::ParsedFeature;
 use anyhow::Result;
@@ -11,6 +11,7 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use stt_core::arrow_tile::{encode_tile, ColumnarLayer};
+use stt_core::budget::TileBudget;
 use stt_core::projection;
 use stt_core::tile::TileId;
 
@@ -105,6 +106,25 @@ pub struct TileConfig {
     /// `[time_start, time_end]`. In-memory path only (the streaming path keeps
     /// fixed buckets).
     pub adaptive_target_features: Option<u32>,
+    /// When set, the named per-feature numeric property is a road-class-style
+    /// LOD floor: a feature is SKIPPED at any zoom below its value (vector-tile
+    /// "show major roads when zoomed out"). Whole-feature inclusion only — the
+    /// feature's geometry/attributes (incl. the value matrix) are untouched.
+    /// `None` = no filter (every feature at every zoom in range).
+    pub min_zoom_field: Option<String>,
+    /// Opt-in per-tile size/feature budget (tippecanoe
+    /// `--maximum-tile-bytes`/`--maximum-tile-features`). `None` (the default)
+    /// means NO budget — every feature gathered for a tile is emitted, byte-for-
+    /// byte identical to a build without the flags. When `Some`, a tile whose
+    /// gathered features exceed the cap has its lowest-importance features
+    /// dropped to fit (importance-scored, never random), and the exact dropped
+    /// count is logged per affected tile. Honours the project's "no thinning by
+    /// default" principle: inert unless explicitly opted in.
+    pub tile_budget: Option<TileBudget>,
+    /// Opt-in user-property selection (`--exclude`/`--include`/`--exclude-all`).
+    /// Default [`AttributeFilter::KeepAll`] — every user property kept. System
+    /// columns always survive regardless.
+    pub attribute_filter: AttributeFilter,
 }
 
 impl Default for TileConfig {
@@ -123,6 +143,9 @@ impl Default for TileConfig {
             min_features_per_tile: 1,
             time_aware_simplify: false,
             adaptive_target_features: None,
+            min_zoom_field: None,
+            tile_budget: None,
+            attribute_filter: AttributeFilter::KeepAll,
         }
     }
 }
@@ -133,6 +156,7 @@ impl TileConfig {
     fn columnar_options(&self) -> ColumnarOptions {
         ColumnarOptions {
             pre_tessellate: self.pre_tessellate,
+            attribute_filter: self.attribute_filter.clone(),
         }
     }
 }
@@ -445,6 +469,18 @@ fn clip_config_from(config: &TileConfig) -> ClipConfig {
 
 /// Process a single zoom level: clip in parallel, bucket spatially then
 /// temporally, and build each tile's layers.
+/// Read a feature's LOD floor from the configured `min_zoom_field` property:
+/// the shallowest zoom the feature appears at. `None` = always shown.
+fn feature_min_zoom(feature: &ParsedFeature, field: &Option<String>) -> Option<u8> {
+    let field = field.as_deref()?;
+    feature
+        .shared_properties
+        .as_ref()?
+        .get(field)
+        .and_then(|v| v.as_f64())
+        .map(|z| z.round() as u8)
+}
+
 fn process_zoom_level(
     features: &[ParsedFeature],
     zoom: u8,
@@ -457,6 +493,13 @@ fn process_zoom_level(
     let placed: Vec<(u32, u32, TileFeature)> = features
         .par_iter()
         .flat_map(|feature| {
+            // Road-class LOD: hide a feature at zooms below its min_zoom floor.
+            // Whole-feature skip BEFORE clip — the value matrix is never touched.
+            if let Some(mz) = feature_min_zoom(feature, &config.min_zoom_field) {
+                if zoom < mz {
+                    return Vec::new();
+                }
+            }
             let should_clip = config.clip_trajectories
                 && is_clippable_trajectory(&feature.geojson, feature.end_timestamp);
             if should_clip {
@@ -588,9 +631,27 @@ fn build_tile(
     time_start: i64,
     time_end: i64,
 ) -> Result<Option<GeneratedTile>> {
+    // Opt-in per-tile budget. Default (`tile_budget: None`) skips this entirely,
+    // so a build without `--maximum-tile-bytes`/`--maximum-tile-features` is
+    // byte-for-byte identical to before. When a budget is set and the tile
+    // exceeds it, the lowest-importance features are dropped to fit and the
+    // exact dropped count is logged for THIS tile (no silent truncation).
+    let kept_indices = config
+        .tile_budget
+        .as_ref()
+        .map(|budget| apply_tile_budget(budget, id, features));
+    // Materialise the surviving feature list only when the budget actually
+    // dropped something; otherwise reference the originals in place.
+    let kept_features: Vec<&TileFeature> = match &kept_indices {
+        Some(keep) if keep.len() < features.len() => {
+            keep.iter().map(|&i| &features[i]).collect()
+        }
+        _ => features.iter().collect(),
+    };
+
     let mut originals: Vec<&ParsedFeature> = Vec::new();
     let mut segments: Vec<&ClippedSegment> = Vec::new();
-    for f in features {
+    for f in &kept_features {
         match f {
             TileFeature::Original(o) => originals.push(o),
             TileFeature::Clipped(s) => segments.push(s),
@@ -600,7 +661,11 @@ fn build_tile(
     let mut layers: Vec<ColumnarLayer> = Vec::new();
 
     if !segments.is_empty() {
-        layers.push(build_layer_from_segments(&segments, &config.layer_name)?);
+        layers.push(build_layer_from_segments(
+            &segments,
+            &config.layer_name,
+            &config.attribute_filter,
+        )?);
     }
     if !originals.is_empty() {
         // Suffix the originals layer name when clipped segments are also
@@ -621,9 +686,10 @@ fn build_tile(
         return Ok(None);
     }
     // Tight lower covering bound: earliest feature start actually in the tile
-    // (vs `time_start`, the addressable bucket edge). Falls back to `time_start`
-    // for an (unexpected) empty feature set.
-    let cover_t_min = features
+    // (vs `time_start`, the addressable bucket edge). Computed over the KEPT
+    // features so a dropped early feature can't widen the bound. Falls back to
+    // `time_start` for an (unexpected) empty feature set.
+    let cover_t_min = kept_features
         .iter()
         .map(|f| f.timestamp() as i64)
         .min()
@@ -635,6 +701,81 @@ fn build_tile(
         cover_t_min,
         layers,
     }))
+}
+
+/// Estimated uncompressed payload bytes for one tile feature (geometry + props).
+/// Mirrors `budget.rs`'s 16-bytes-per-coordinate-pair + per-property estimate so
+/// the byte cap is comparable to `TileBudget::estimate_size`.
+fn tile_feature_size(f: &TileFeature) -> usize {
+    let (verts, props) = tile_feature_signals(f);
+    verts * 16 + props * 16 + 32
+}
+
+/// `(vertex_count, property_count)` signals the budget's importance scorer
+/// needs, extracted without building an `stt_core::tile::Feature`.
+fn tile_feature_signals(f: &TileFeature) -> (usize, usize) {
+    match f {
+        TileFeature::Original(o) => {
+            let verts = geojson_vertex_count(&o.geojson);
+            let props = o.shared_properties.as_ref().map(|p| p.len()).unwrap_or(0);
+            (verts, props)
+        }
+        TileFeature::Clipped(s) => {
+            let props = s.properties.as_ref().map(|p| p.len()).unwrap_or(0);
+            (s.coordinates.len(), props)
+        }
+    }
+}
+
+/// Count the vertices in a GeoJSON feature's geometry (0 when absent).
+fn geojson_vertex_count(f: &geojson::Feature) -> usize {
+    use geojson::Value as G;
+    let Some(geom) = f.geometry.as_ref() else {
+        return 1;
+    };
+    match &geom.value {
+        G::Point(_) => 1,
+        G::MultiPoint(pts) => pts.len(),
+        G::LineString(c) => c.len(),
+        G::MultiLineString(lines) => lines.iter().map(|l| l.len()).sum(),
+        G::Polygon(rings) => rings.iter().map(|r| r.len()).sum(),
+        G::MultiPolygon(polys) => polys.iter().flatten().map(|r| r.len()).sum(),
+        G::GeometryCollection(_) => 1,
+    }
+}
+
+/// Run a tile's gathered features through the budget, returning the indices to
+/// KEEP (ascending). Logs the per-tile dropped count whenever anything is
+/// dropped — the "no silent caps" guarantee.
+fn apply_tile_budget(
+    budget: &TileBudget,
+    id: TileId,
+    features: &[TileFeature],
+) -> Vec<usize> {
+    let keep = budget.enforce_indexed(
+        features.len(),
+        |i| {
+            let (v, p) = tile_feature_signals(&features[i]);
+            budget.score_signals(v, p)
+        },
+        |i| tile_feature_size(&features[i]),
+    );
+    let dropped = features.len() - keep.len();
+    if dropped > 0 {
+        tracing::warn!(
+            "tile z{} x{} y{} t{}: dropped {} of {} features to fit budget \
+             (max_features={}, max_bytes={})",
+            id.z,
+            id.x,
+            id.y,
+            id.t,
+            dropped,
+            features.len(),
+            budget.max_feature_count,
+            budget.max_uncompressed_size,
+        );
+    }
+    keep
 }
 
 /// Stream generated tiles straight into an [`stt_core::archive::ArchiveWriter`].
@@ -853,6 +994,12 @@ where
         // still happens on the writer side.
         for (zi, &zoom) in zooms.iter().enumerate() {
             for feature in &features {
+                // Road-class LOD: hide a feature below its min_zoom floor.
+                if let Some(mz) = feature_min_zoom(feature, &config.min_zoom_field) {
+                    if zoom < mz {
+                        continue;
+                    }
+                }
                 let should_clip = config.clip_trajectories
                     && is_clippable_trajectory(&feature.geojson, feature.end_timestamp);
                 if should_clip {
@@ -1009,11 +1156,16 @@ fn flush_bucket<W: TileWriter>(
         }
     }
 
+    // NOTE: the streaming-arrow path does not honour per-tile budgets or
+    // attribute control (main.rs rejects the combination up front). The
+    // `attribute_filter` here is therefore always `KeepAll` — passed only so
+    // the same layer builders compile/behave identically.
     let mut layers: Vec<ColumnarLayer> = Vec::new();
     if !segments.is_empty() {
         layers.push(crate::columnar::build_layer_from_segments(
             &segments,
             &config.layer_name,
+            &config.attribute_filter,
         )?);
     }
     if !originals.is_empty() {
@@ -1701,5 +1853,80 @@ mod tests {
                 assert!(l.vertex_times.is_some(), "trajectory layer should carry vertex_times");
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Opt-in per-tile budgets (Wave-1)
+    // ------------------------------------------------------------------
+
+    /// Build 30 points that all land in one (zoom, x, y, bucket) tile so we can
+    /// exercise the budget on a single dense tile.
+    fn dense_single_tile_features(n: u64) -> (Vec<ParsedFeature>, TileConfig) {
+        let base = 1_700_000_000_000u64;
+        let features: Vec<ParsedFeature> = (0..n)
+            // Tiny lon jitter keeps them in one zoom-6 tile while giving each a
+            // distinct id; same timestamp -> one temporal bucket.
+            .map(|i| point(-122.40 + i as f64 * 1e-6, 37.75, base))
+            .collect();
+        let config = TileConfig {
+            min_zoom: 6,
+            max_zoom: 6,
+            layer_name: "default".to_string(),
+            temporal_bucket_ms: 3_600_000,
+            clip_trajectories: false,
+            ..TileConfig::default()
+        };
+        (features, config)
+    }
+
+    /// Default (no budget) leaves every feature in the tile — the inert path.
+    #[test]
+    fn budget_off_by_default_keeps_all_features() {
+        let (features, config) = dense_single_tile_features(30);
+        assert!(config.tile_budget.is_none());
+        let tiles = generate_tiles(&features, &config, 1).unwrap();
+        let total: u32 = tiles.iter().map(|t| t.feature_count()).sum();
+        assert_eq!(total, 30, "no budget => no features dropped");
+    }
+
+    /// `--maximum-tile-features` caps the per-tile count and drops the surplus.
+    #[test]
+    fn maximum_tile_features_caps_feature_count() {
+        let (features, mut config) = dense_single_tile_features(30);
+        config.tile_budget = Some(
+            TileBudget::new(usize::MAX, usize::MAX, 10)
+                .with_scorer(stt_core::budget::ImportanceScorer::Combined),
+        );
+        let tiles = generate_tiles(&features, &config, 1).unwrap();
+        // All 30 collapsed into one dense tile, capped to 10.
+        assert_eq!(tiles.len(), 1, "all points share one tile");
+        assert_eq!(
+            tiles[0].feature_count(),
+            10,
+            "feature cap of 10 must be enforced"
+        );
+    }
+
+    /// A tile already under the cap is left completely untouched.
+    #[test]
+    fn budget_under_cap_is_noop() {
+        let (features, mut config) = dense_single_tile_features(5);
+        config.tile_budget = Some(TileBudget::new(usize::MAX, usize::MAX, 10));
+        let tiles = generate_tiles(&features, &config, 1).unwrap();
+        let total: u32 = tiles.iter().map(|t| t.feature_count()).sum();
+        assert_eq!(total, 5, "under-cap tile keeps every feature");
+    }
+
+    /// The byte-cap axis also drops features (here a very small cap forces a
+    /// drop even though the feature count is modest).
+    #[test]
+    fn maximum_tile_bytes_drops_to_fit() {
+        let (features, mut config) = dense_single_tile_features(30);
+        // ~48 bytes per point estimate; a 200-byte cap keeps only a few.
+        config.tile_budget = Some(TileBudget::new(200, 200, usize::MAX));
+        let tiles = generate_tiles(&features, &config, 1).unwrap();
+        let total: u32 = tiles.iter().map(|t| t.feature_count()).sum();
+        assert!(total < 30, "byte cap must drop some features, kept {total}");
+        assert!(total >= 1, "byte cap should still keep at least one feature");
     }
 }

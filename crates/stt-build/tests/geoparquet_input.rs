@@ -62,8 +62,12 @@ fn load(
     )
 }
 
+/// Non-WGS84 CRS is a correctness hazard, not an ingestion blocker: by default
+/// the build proceeds with a loud warning (so files with a mis-declared or
+/// already-lon-lat CRS still build), and only `--strict-geometry` makes it a
+/// hard error. This test pins both halves of that contract.
 #[test]
-fn non_wgs84_crs_is_rejected_with_named_crs() {
+fn non_wgs84_crs_warns_by_default_and_fails_under_strict() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mercator.parquet");
     let geo = serde_json::json!({
@@ -82,20 +86,25 @@ fn non_wgs84_crs_is_rejected_with_named_crs() {
         }
     })
     .to_string();
-    write_parquet(
-        &path,
-        binary_geom_schema("geometry"),
+    let columns = || {
         vec![
             Arc::new(BinaryArray::from_opt_vec(vec![Some(
                 wkb_point(1.0, 2.0).as_slice(),
-            )])),
-            Arc::new(Int64Array::from(vec![1_700_000_000_000i64])),
-        ],
-        Some(geo),
-    );
+            )])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1_700_000_000_000i64])) as ArrayRef,
+        ]
+    };
+    write_parquet(&path, binary_geom_schema("geometry"), columns(), Some(geo));
 
-    let err = load(&path, InputStrictness::Warn, InputStrictness::Warn)
-        .expect_err("EPSG:3857 input must hard-error");
+    // Default (Warn): the build proceeds — the CRS is advisory only.
+    let features = load(&path, InputStrictness::Warn, InputStrictness::Warn)
+        .expect("non-WGS84 CRS must not block the build by default");
+    assert_eq!(features.len(), 1, "row tiled as-is under the warn-only guard");
+
+    // --strict-geometry (Strict): the same input hard-errors, naming both the
+    // found CRS and the required one.
+    let err = load(&path, InputStrictness::Warn, InputStrictness::Strict)
+        .expect_err("EPSG:3857 input must hard-error under --strict-geometry");
     let msg = format!("{err:#}");
     assert!(msg.contains("EPSG:3857"), "must name the found CRS: {msg}");
     assert!(msg.contains("CRS84"), "must name the required CRS: {msg}");

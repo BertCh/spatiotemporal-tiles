@@ -47,7 +47,7 @@ use arrow::datatypes::{DataType, Field, Schema, UInt16Type};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// Top bit of the layer frame's leading u16: marks an *aligned* frame whose
@@ -365,6 +365,10 @@ pub const DEFAULT_VERTEX_TIME_MAX_STEP_MS: u32 = 1000;
 /// config, so `Relaxed` is sufficient.
 static VERTEX_TIME_MAX_STEP_MS: AtomicU32 = AtomicU32::new(DEFAULT_VERTEX_TIME_MAX_STEP_MS);
 
+/// Latch so the "u16-delta ceiling exceeded" warning fires at most once per
+/// process instead of once per tile.
+static VERTEX_TIME_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// Override the u16-delta `vertex_time` step ceiling for every subsequent
 /// [`encode_layer`] call. Values below 1 ms clamp to 1 (every layer with a
 /// span beyond u16 milliseconds then takes the exact `List<Int64>` path).
@@ -502,6 +506,17 @@ fn build_vertex_time_array(
                 array: Arc::new(builder.finish()),
                 encoding: Some((min, step)),
             });
+        }
+        // Reached the exact-Int64 fallback because the span needs a coarser
+        // step than the ceiling. Warn once per process (not per tile).
+        if !VERTEX_TIME_FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "vertex-time span {}ms exceeds u16-delta ceiling (step {}ms > max {}ms); \
+                 falling back to exact Int64 — payload keeps full precision but is ~4x larger",
+                span,
+                step,
+                max_step_ms
+            );
         }
     }
 

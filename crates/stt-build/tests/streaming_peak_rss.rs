@@ -100,6 +100,9 @@ fn streaming_pipeline_bounds_peak_rss_for_5m_features() {
         min_features_per_tile: 1,
         time_aware_simplify: false,
         adaptive_target_features: None,
+        min_zoom_field: None,
+        tile_budget: None,
+        attribute_filter: Default::default(),
     };
 
     let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
@@ -192,6 +195,9 @@ fn streaming_pipeline_runs_and_emits_tiles() {
         min_features_per_tile: 1,
         time_aware_simplify: false,
         adaptive_target_features: None,
+        min_zoom_field: None,
+        tile_budget: None,
+        attribute_filter: Default::default(),
     };
 
     let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();

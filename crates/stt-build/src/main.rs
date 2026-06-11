@@ -253,6 +253,13 @@ struct Args {
     #[arg(long, default_value = "1")]
     min_features_per_tile: u32,
 
+    /// Per-feature numeric property naming the shallowest zoom a feature
+    /// appears at (road-class-style LOD). A feature is skipped at any zoom
+    /// below its value — major roads when zoomed out, all streets up close.
+    /// Whole-feature filtering only; geometry/attributes are untouched.
+    #[arg(long)]
+    min_zoom_field: Option<String>,
+
     /// Feature property used to drive the HeatmapLayer's per-splat weight.
     /// When set, the build computes the property's [min, 95th percentile]
     /// across all features and bakes it into the archive metadata as the
@@ -285,6 +292,54 @@ struct Args {
     /// payload size on very wide temporal-LOD buckets.
     #[arg(long, default_value_t = stt_core::arrow_tile::DEFAULT_VERTEX_TIME_MAX_STEP_MS, value_name = "MS")]
     vertex_time_precision: u32,
+
+    // --- Per-tile budgets (OPT-IN; default OFF) ----------------------------
+    // The project follows a documented "no thinning / comprehensive data by
+    // default" principle. These caps are inert unless explicitly set, and when
+    // they DO drop features they log exactly how many per affected tile.
+    /// OPT-IN soft cap on a tile's estimated UNCOMPRESSED payload in bytes.
+    /// When a tile exceeds this, its lowest-importance features are dropped to
+    /// fit (importance-scored — never random; see `--drop-densest-as-needed`).
+    /// Unset (the default) = no byte cap, every feature is kept. Each affected
+    /// tile logs its dropped count. tippecanoe analogue: `--maximum-tile-bytes`.
+    #[arg(long, value_name = "BYTES")]
+    maximum_tile_bytes: Option<usize>,
+
+    /// OPT-IN hard cap on the number of features per tile. When a tile exceeds
+    /// this, its lowest-importance features are dropped to fit. Unset (the
+    /// default) = no feature cap. Each affected tile logs its dropped count.
+    /// tippecanoe analogue: `--maximum-tile-features`.
+    #[arg(long, value_name = "N")]
+    maximum_tile_features: Option<usize>,
+
+    /// OPT-IN: when a per-tile budget drops features, prefer to drop from the
+    /// DENSEST features first (importance-per-byte via geometry size). Only
+    /// meaningful together with `--maximum-tile-bytes`/`--maximum-tile-features`.
+    /// Without this flag a budget still drops the LEAST-important features
+    /// first (a combined geometry+property score) — never randomly; this flag
+    /// switches to a pure geometry-size density strategy (tippecanoe's
+    /// `--drop-densest-as-needed`).
+    #[arg(long)]
+    drop_densest_as_needed: bool,
+
+    // --- Attribute control (OPT-IN; default = keep every property) ---------
+    /// OPT-IN: drop these property columns from output tiles (repeatable).
+    /// System columns (id/time/geometry/vertex_*/triangles) always survive.
+    /// Mutually exclusive with `--include`. tippecanoe analogue: `--exclude`.
+    #[arg(long, value_name = "PROP")]
+    exclude: Vec<String>,
+
+    /// OPT-IN: keep ONLY these property columns (repeatable). System columns
+    /// always survive regardless. Mutually exclusive with `--exclude`.
+    /// tippecanoe analogue: `--include`.
+    #[arg(long, value_name = "PROP")]
+    include: Vec<String>,
+
+    /// OPT-IN: drop EVERY user property — geometry + times only. Mutually
+    /// exclusive with `--exclude`/`--include`. tippecanoe analogue:
+    /// `--exclude-all`.
+    #[arg(long)]
+    exclude_all: bool,
 }
 
 /// Aggregation scheme for `--summary-tier`. `quadbin` is reserved (declared
@@ -328,6 +383,13 @@ fn main() -> Result<()> {
             extension
         );
     }
+
+    // Validate attribute-filter flags up front — before loading input — so a
+    // misuse like `--exclude X --include Y` (or excluding a column that
+    // `--heatmap-weight`/`--summary-columns` depends on) fails fast with a clear
+    // message instead of after the GeoParquet file is opened. The filter is
+    // rebuilt at the tiling stage; this call is purely for early validation.
+    build_attribute_filter(&args)?;
 
     if args.auto {
         apply_auto_recommendations(&matches, &mut args)?;
@@ -396,6 +458,28 @@ fn main() -> Result<()> {
         if args.metadata_output.is_some() {
             unsupported.push("--metadata-output");
         }
+        // Per-tile budgets + attribute control hook into the in-memory
+        // build_tile path only (the streaming-arrow path finalizes a temp
+        // single-file archive through a different tile builder). Mirror the
+        // existing gate rather than silently honour them.
+        if args.maximum_tile_bytes.is_some() {
+            unsupported.push("--maximum-tile-bytes");
+        }
+        if args.maximum_tile_features.is_some() {
+            unsupported.push("--maximum-tile-features");
+        }
+        if args.drop_densest_as_needed {
+            unsupported.push("--drop-densest-as-needed");
+        }
+        if !args.exclude.is_empty() {
+            unsupported.push("--exclude");
+        }
+        if !args.include.is_empty() {
+            unsupported.push("--include");
+        }
+        if args.exclude_all {
+            unsupported.push("--exclude-all");
+        }
         if !unsupported.is_empty() {
             anyhow::bail!(
                 "--streaming-arrow does not yet support {} (the streaming pipeline \
@@ -435,6 +519,12 @@ fn main() -> Result<()> {
             // Adaptive temporal chunking is an in-memory-only feature; the
             // streaming path keeps fixed buckets, so this is ignored here.
             adaptive_target_features: None,
+            min_zoom_field: args.min_zoom_field.clone(),
+            // Per-tile budgets + attribute control are in-memory-only; the
+            // streaming-arrow combination is rejected above, so these stay at
+            // their inert defaults here.
+            tile_budget: None,
+            attribute_filter: stt_build::columnar::AttributeFilter::KeepAll,
         };
         // --streaming-arrow stays bounded-RAM: it streams tiles into a TEMP
         // single-file archive (the only writer that doesn't buffer all
@@ -640,6 +730,36 @@ fn main() -> Result<()> {
         );
     }
 
+    // Opt-in per-tile budget + attribute control (default OFF — the build is
+    // byte-for-byte identical to before when none of these flags are set).
+    let tile_budget = build_tile_budget(&args);
+    if let Some(b) = &tile_budget {
+        warn!(
+            "Per-tile budget ENABLED (opt-in): max_features={}, max_bytes={}, \
+             drop strategy={} — tiles over the cap will have their lowest-value \
+             features dropped (each affected tile logs its dropped count)",
+            if b.max_feature_count == usize::MAX {
+                "∞".to_string()
+            } else {
+                b.max_feature_count.to_string()
+            },
+            if b.max_uncompressed_size == usize::MAX {
+                "∞".to_string()
+            } else {
+                b.max_uncompressed_size.to_string()
+            },
+            if args.drop_densest_as_needed {
+                "densest-first (geometry size)"
+            } else {
+                "least-important-first (combined)"
+            },
+        );
+    }
+    let attribute_filter = build_attribute_filter(&args)?;
+    if !attribute_filter.is_keep_all() {
+        info!("Attribute control ENABLED (opt-in): {:?}", attribute_filter);
+    }
+
     let tile_config = tiler::TileConfig {
         min_zoom: args.min_zoom,
         max_zoom: args.max_zoom,
@@ -654,6 +774,9 @@ fn main() -> Result<()> {
         min_features_per_tile: args.min_features_per_tile,
         time_aware_simplify: args.time_aware_simplify,
         adaptive_target_features: args.adaptive_temporal,
+        min_zoom_field: args.min_zoom_field.clone(),
+        tile_budget,
+        attribute_filter,
     };
 
     if args.pre_tessellate {
@@ -774,9 +897,7 @@ fn main() -> Result<()> {
     let summary_tier_descriptor = if let Some(scheme) = args.summary_tier {
         let scheme = match scheme {
             SummaryTierScheme::H3 => stt_core::metadata::SummaryScheme::H3,
-            SummaryTierScheme::Quadbin => {
-                anyhow::bail!("--summary-tier quadbin is not implemented yet (h3 only)");
-            }
+            SummaryTierScheme::Quadbin => stt_core::metadata::SummaryScheme::Quadbin,
         };
         let sm_min = args.summary_min_zoom.unwrap_or(args.min_zoom);
         let sm_max = args
@@ -1128,6 +1249,111 @@ fn parse_compression(s: &str) -> Result<stt_core::types::Compression> {
     }
 }
 
+/// Build the opt-in per-tile budget from the CLI flags, or `None` when neither
+/// `--maximum-tile-bytes` nor `--maximum-tile-features` was passed (the default
+/// "no thinning" behaviour — the budget is inert and the in-memory path is
+/// byte-for-byte identical to before).
+///
+/// The scorer choice encodes feature #2: with `--drop-densest-as-needed` the
+/// budget drops the densest features first (pure `GeometrySize`); without it the
+/// budget still drops the LEAST-important features (a `Combined`
+/// geometry+property score) rather than randomly.
+fn build_tile_budget(args: &Args) -> Option<stt_core::budget::TileBudget> {
+    use stt_core::budget::{ImportanceScorer, TileBudget};
+    if args.maximum_tile_bytes.is_none() && args.maximum_tile_features.is_none() {
+        return None;
+    }
+    // Unset cap → effectively unbounded for that axis, so only the axis the
+    // user actually set constrains the tile.
+    let max_bytes = args.maximum_tile_bytes.unwrap_or(usize::MAX);
+    let max_features = args.maximum_tile_features.unwrap_or(usize::MAX);
+    let scorer = if args.drop_densest_as_needed {
+        ImportanceScorer::GeometrySize
+    } else {
+        ImportanceScorer::Combined
+    };
+    // `max_compressed_size` is unused by the build-time enforcement (we cap the
+    // pre-compression estimate); set it to the byte cap so the struct is sane.
+    Some(TileBudget::new(max_bytes, max_bytes, max_features).with_scorer(scorer))
+}
+
+/// Resolve `--exclude` / `--include` / `--exclude-all` into an
+/// [`stt_build::columnar::AttributeFilter`], validating mutual exclusivity and
+/// guarding columns that other features still need.
+///
+/// Errors when:
+/// * more than one of exclude/include/exclude-all is given, or
+/// * a property the build still needs (`--heatmap-weight`, `--heatmap-class`,
+///   or any `--summary-columns` source column, or `--min-zoom-field`) would be
+///   removed by the filter — refusing rather than silently breaking those
+///   features.
+fn build_attribute_filter(args: &Args) -> Result<stt_build::columnar::AttributeFilter> {
+    use stt_build::columnar::AttributeFilter;
+    use std::collections::HashSet;
+
+    let has_exclude = !args.exclude.is_empty();
+    let has_include = !args.include.is_empty();
+
+    // Mutual exclusivity (exclude / include / exclude-all are three ways to say
+    // the same thing and must not be combined).
+    let modes = [has_exclude, has_include, args.exclude_all]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if modes > 1 {
+        anyhow::bail!(
+            "--exclude, --include and --exclude-all are mutually exclusive; pass at most one"
+        );
+    }
+
+    let filter = if args.exclude_all {
+        AttributeFilter::ExcludeAll
+    } else if has_include {
+        AttributeFilter::Include(args.include.iter().cloned().collect())
+    } else if has_exclude {
+        AttributeFilter::Exclude(args.exclude.iter().cloned().collect())
+    } else {
+        AttributeFilter::KeepAll
+    };
+
+    // Guard columns other features depend on. A filter that would drop a
+    // property the heatmap/summary/min-zoom passes read is almost certainly a
+    // mistake — error out rather than emit a quietly-broken archive.
+    let mut required: Vec<String> = Vec::new();
+    if let Some(w) = &args.heatmap_weight {
+        required.push(w.clone());
+    }
+    if let Some(c) = &args.heatmap_class {
+        required.push(c.clone());
+    }
+    if let Some(z) = &args.min_zoom_field {
+        required.push(z.clone());
+    }
+    // Summary aggregation source columns (the `name` of each `name:agg` entry).
+    for col in summary::parse_summary_columns(&args.summary_columns)? {
+        if !col.name.is_empty() && col.name != "_count" {
+            required.push(col.name.clone());
+        }
+    }
+
+    let dropped_required: Vec<&String> =
+        required.iter().filter(|p| !filter.keeps(p)).collect();
+    if !dropped_required.is_empty() {
+        let uniq: HashSet<&String> = dropped_required.into_iter().collect();
+        let mut names: Vec<&str> = uniq.iter().map(|s| s.as_str()).collect();
+        names.sort_unstable();
+        anyhow::bail!(
+            "attribute filter would drop column(s) still needed by another build \
+             feature (--heatmap-weight/--heatmap-class/--summary-columns/\
+             --min-zoom-field): {}. Add them to --include (or drop the \
+             conflicting flag).",
+            names.join(", ")
+        );
+    }
+
+    Ok(filter)
+}
+
 /// Parse a `--temporal-lod` spec like `"1d,30d"` or `"1d@8,30d@4"`. Each
 /// entry is `<duration>` (applies at every zoom) or `<duration>@<zoom>`
 /// (applies at zoom <= the given level). Entries are returned in input
@@ -1195,4 +1421,101 @@ fn parse_duration(s: &str) -> Result<u64> {
     };
 
     Ok((value * multiplier as f64) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stt_build::columnar::AttributeFilter;
+
+    /// Parse `Args` from a flag list, always supplying the required
+    /// `--input`/`--output`. Lets the CLI-validation helpers be unit-tested
+    /// without running a full build.
+    fn args_from(extra: &[&str]) -> Args {
+        let mut argv: Vec<&str> = vec!["stt-build", "-i", "in.parquet", "-o", "out"];
+        argv.extend_from_slice(extra);
+        Args::parse_from(argv)
+    }
+
+    #[test]
+    fn no_budget_flags_yields_no_budget() {
+        let args = args_from(&[]);
+        assert!(build_tile_budget(&args).is_none());
+    }
+
+    #[test]
+    fn maximum_tile_features_builds_budget() {
+        let args = args_from(&["--maximum-tile-features", "100"]);
+        let budget = build_tile_budget(&args).expect("budget present");
+        assert_eq!(budget.max_feature_count, 100);
+        // Unset byte cap => unbounded on that axis.
+        assert_eq!(budget.max_uncompressed_size, usize::MAX);
+    }
+
+    #[test]
+    fn maximum_tile_bytes_builds_budget() {
+        let args = args_from(&["--maximum-tile-bytes", "50000"]);
+        let budget = build_tile_budget(&args).expect("budget present");
+        assert_eq!(budget.max_uncompressed_size, 50_000);
+        assert_eq!(budget.max_feature_count, usize::MAX);
+    }
+
+    #[test]
+    fn no_attribute_flags_keeps_all() {
+        let args = args_from(&[]);
+        let filter = build_attribute_filter(&args).unwrap();
+        assert!(matches!(filter, AttributeFilter::KeepAll));
+    }
+
+    #[test]
+    fn exclude_builds_exclude_filter() {
+        let args = args_from(&["--exclude", "secret", "--exclude", "debug"]);
+        let filter = build_attribute_filter(&args).unwrap();
+        assert!(!filter.keeps("secret"));
+        assert!(!filter.keeps("debug"));
+        assert!(filter.keeps("speed"));
+    }
+
+    #[test]
+    fn include_builds_include_filter() {
+        let args = args_from(&["--include", "speed"]);
+        let filter = build_attribute_filter(&args).unwrap();
+        assert!(filter.keeps("speed"));
+        assert!(!filter.keeps("anything_else"));
+    }
+
+    #[test]
+    fn exclude_and_include_together_is_an_error() {
+        let args = args_from(&["--exclude", "a", "--include", "b"]);
+        let err = build_attribute_filter(&args).unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn exclude_all_with_include_is_an_error() {
+        let args = args_from(&["--exclude-all", "--include", "b"]);
+        assert!(build_attribute_filter(&args).is_err());
+    }
+
+    #[test]
+    fn filter_guards_heatmap_weight_column() {
+        // Excluding the heatmap-weight column must error rather than silently
+        // break the heatmap-domain pass.
+        let args = args_from(&["--heatmap-weight", "magnitude", "--exclude", "magnitude"]);
+        let err = build_attribute_filter(&args).unwrap_err().to_string();
+        assert!(err.contains("magnitude"), "got: {err}");
+    }
+
+    #[test]
+    fn filter_guards_summary_source_column() {
+        // An --include that omits a summary source column must error.
+        let args = args_from(&[
+            "--summary-columns",
+            "depth:mean",
+            "--include",
+            "speed",
+        ]);
+        let err = build_attribute_filter(&args).unwrap_err().to_string();
+        assert!(err.contains("depth"), "got: {err}");
+    }
 }

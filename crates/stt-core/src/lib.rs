@@ -21,7 +21,6 @@
 //! `stt-build --streaming-arrow` transcodes into packs, and (b) the read side
 //! that [`transcode_archive_to_packs`] consumes when migrating old archives.
 
-pub mod analyzer;
 pub mod archive;
 pub mod arrow_tile;
 pub mod budget;
@@ -30,7 +29,6 @@ pub mod curve;
 pub mod directory;
 pub mod error;
 pub mod geometry;
-pub mod index;
 pub mod metadata;
 pub mod pack;
 pub mod projection;

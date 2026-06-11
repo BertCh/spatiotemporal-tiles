@@ -7,6 +7,7 @@
 pub mod clip;
 pub mod columnar;
 pub mod input;
+pub mod quadbin;
 pub mod simplify;
 pub mod summary;
 pub mod tiler;

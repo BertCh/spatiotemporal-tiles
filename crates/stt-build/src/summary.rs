@@ -19,6 +19,7 @@
 //! dispatch between summary and raw rendering.
 
 use crate::input::ParsedFeature;
+use crate::quadbin;
 use crate::tiler::{GeneratedTile, TileWriter};
 use anyhow::Result;
 use h3o::{LatLng, Resolution};
@@ -65,7 +66,7 @@ impl SummaryConfig {
         for z in self.min_zoom..=self.max_zoom {
             resolutions.push(match self.scheme {
                 SummaryScheme::H3 => h3_resolution_for_zoom(z),
-                SummaryScheme::Quadbin => z,
+                SummaryScheme::Quadbin => quadbin_zoom_for_zoom(z),
             });
         }
         SummaryTier {
@@ -94,6 +95,26 @@ pub fn h3_resolution_for_zoom(zoom: u8) -> u8 {
     // Clamp at H3's max resolution (15) — we never actually want res > 6 or
     // so in practice because the *raw* tiles take over above that point.
     zoom.min(15)
+}
+
+/// Quadbin summary cells are FINER than the view zoom by this many levels.
+///
+/// Quadbin cells ARE XYZ tiles, so a 1:1 map-zoom→quadbin-zoom mapping makes
+/// each cell exactly the web-Mercator tile at the view zoom — and a viewport
+/// only ever spans ~2-4 tiles, so a 1:1 summary renders as a handful of giant
+/// cells (useless as a density overview). H3's res-N hexes are ~hundreds of
+/// metres at the same N, so H3's 1:1 mapping already yields a fine grid; to
+/// reach comparable usefulness, Quadbin offsets the cell resolution finer so a
+/// viewport shows a readable grid of cells. Each summary tile at map-zoom `z`
+/// then holds (≈4^OFFSET) cells at quadbin-zoom `z + OFFSET`.
+pub const QUADBIN_RES_OFFSET: u8 = 3;
+
+/// Map a tile zoom to a CARTO Quadbin cell zoom level — the view zoom plus
+/// [`QUADBIN_RES_OFFSET`] so cells are finer than the tile that carries them.
+/// Clamp at the Quadbin band's max zoom (26) so the 5-bit zoom field and
+/// 52-bit Morton payload never overflow.
+pub fn quadbin_zoom_for_zoom(zoom: u8) -> u8 {
+    zoom.saturating_add(QUADBIN_RES_OFFSET).min(26)
 }
 
 /// Per-cell running aggregate for a single tile + time bucket.
@@ -173,10 +194,19 @@ pub fn build_summary_tier<W: TileWriter>(
     let mut total = 0usize;
 
     for zoom in config.min_zoom..=config.max_zoom {
-        let h3_res_u8 = h3_resolution_for_zoom(zoom);
-        let h3_res = Resolution::try_from(h3_res_u8).map_err(|e| {
-            anyhow::anyhow!("invalid H3 resolution {h3_res_u8} for zoom {zoom}: {e:?}")
-        })?;
+        // Cell binning is scheme-dependent. For H3 we resolve the configured
+        // resolution into an `h3o::Resolution`; for Quadbin the resolution
+        // table value IS the Quadbin zoom level (clamped to the 0..=26 band).
+        let h3_res = match config.scheme {
+            SummaryScheme::H3 => {
+                let h3_res_u8 = h3_resolution_for_zoom(zoom);
+                Some(Resolution::try_from(h3_res_u8).map_err(|e| {
+                    anyhow::anyhow!("invalid H3 resolution {h3_res_u8} for zoom {zoom}: {e:?}")
+                })?)
+            }
+            SummaryScheme::Quadbin => None,
+        };
+        let quad_z = quadbin_zoom_for_zoom(zoom);
 
         // (tile_x, tile_y, time_bucket) -> (cell_id -> aggregate)
         let mut buckets: BTreeMap<(u32, u32, u64), HashMap<u64, CellAggregate>> =
@@ -189,11 +219,23 @@ pub fn build_summary_tier<W: TileWriter>(
                     Err(_) => continue,
                 };
             let bucket_start = (feature.timestamp / bucket_ms) * bucket_ms;
-            let cell = match LatLng::new(feature.lat, feature.lon) {
-                Ok(ll) => ll.to_cell(h3_res),
-                Err(_) => continue, // out-of-range lat/lon (e.g. NaN)
+            let cell_id: u64 = match config.scheme {
+                SummaryScheme::H3 => {
+                    let res = h3_res.expect("H3 resolution resolved above");
+                    match LatLng::new(feature.lat, feature.lon) {
+                        Ok(ll) => ll.to_cell(res).into(),
+                        Err(_) => continue, // out-of-range lat/lon (e.g. NaN)
+                    }
+                }
+                SummaryScheme::Quadbin => {
+                    // Web-Mercator can't represent NaN/inf lat/lon — skip them
+                    // so a malformed row never poisons a cell.
+                    if !feature.lon.is_finite() || !feature.lat.is_finite() {
+                        continue;
+                    }
+                    quadbin::lonlat_to_quadbin(feature.lon, feature.lat, quad_z)
+                }
             };
-            let cell_id: u64 = cell.into();
 
             let bucket = buckets
                 .entry((tx, ty, bucket_start))
@@ -255,7 +297,8 @@ pub fn build_summary_tier<W: TileWriter>(
             if cells.is_empty() {
                 continue;
             }
-            let layer = build_summary_layer(&config.layer_name, &config.columns, &cells);
+            let layer =
+                build_summary_layer(config.scheme, &config.layer_name, &config.columns, &cells);
             let time_end = cells
                 .values()
                 .map(|c| c.time_end)
@@ -293,11 +336,13 @@ pub fn build_summary_tier<W: TileWriter>(
 ///   we never need to differentiate integer-vs-float on the wire).
 /// - per [`SummaryConfig::columns`] entry, one numeric property column.
 ///
-/// Geometry is the H3 cell centroid as a Point, which gives the reader a
-/// representative lon/lat to use for picking and quick "no-hex-rendering"
-/// fallbacks. The actual hexagon vertices are reconstructable from the
-/// `cell_id` via h3-js on the client.
+/// Geometry is the cell centroid as a Point, which gives the reader a
+/// representative lon/lat to use for picking and quick "no-cell-rendering"
+/// fallbacks. The actual cell vertices are reconstructable from the
+/// `cell_id` on the client (h3-js for H3, the Quadbin → quadkey path for
+/// Quadbin).
 fn build_summary_layer(
+    scheme: SummaryScheme,
     name: &str,
     columns: &[SummaryColumn],
     cells: &HashMap<u64, CellAggregate>,
@@ -325,14 +370,22 @@ fn build_summary_layer(
         end_times.push(agg.time_end);
         counts.push(Some(agg.count as f64));
 
-        // Cell centroid (lon, lat). h3o exposes `cell.into() -> CellIndex`
-        // already; we recover the centroid via LatLng::from(cell_index).
-        let centroid: Coord = match h3o::CellIndex::try_from(*cell_id) {
-            Ok(c) => {
-                let ll: LatLng = c.into();
-                [ll.lng(), ll.lat()]
+        // Cell centroid (lon, lat). The cell id self-describes its geometry
+        // for both schemes: h3o recovers the H3 hexagon centre via
+        // `CellIndex -> LatLng`; for Quadbin we decode the (z, x, y) tile out
+        // of the u64 and take its centre.
+        let centroid: Coord = match scheme {
+            SummaryScheme::H3 => match h3o::CellIndex::try_from(*cell_id) {
+                Ok(c) => {
+                    let ll: LatLng = c.into();
+                    [ll.lng(), ll.lat()]
+                }
+                Err(_) => [0.0, 0.0],
+            },
+            SummaryScheme::Quadbin => {
+                let (z, x, y) = quadbin::quadbin_to_tile(*cell_id);
+                quadbin::quadbin_centroid(z, x, y)
             }
-            Err(_) => [0.0, 0.0],
         };
         centroids.push(centroid);
 
@@ -603,6 +656,81 @@ mod tests {
             .map(|t| t.feature_count() as usize)
             .sum();
         assert!(z0_total <= 5, "expected ≤5 cells at zoom 0, got {z0_total}");
+    }
+
+    #[test]
+    fn build_summary_tier_quadbin_aggregates_into_one_cell() {
+        // A tight cluster of points sits inside a single Quadbin cell at a
+        // modest zoom; aggregation must collapse them to one summary row whose
+        // `count` equals the cluster size. A distant point lands in its own
+        // cell, so we never see fewer than two cells across the world tier.
+        let n_cluster = 4u64;
+        let mut features = Vec::new();
+        for i in 0..n_cluster {
+            // ~SF, sub-cell spacing so they share a Quadbin cell at z=8.
+            features.push(point(-122.4194 + 0.0001 * i as f64, 37.7749, 1_000_000, 5.0));
+        }
+        // A far-away point (Tokyo) to confirm distinct cells stay distinct.
+        features.push(point(139.6917, 35.6895, 1_000_000, 9.0));
+
+        let config = SummaryConfig {
+            scheme: SummaryScheme::Quadbin,
+            min_zoom: 8,
+            max_zoom: 8,
+            temporal_bucket_ms: 3_600_000,
+            columns: vec![SummaryColumn {
+                name: "_count".into(),
+                agg: SummaryAggregation::Count,
+            }],
+            layer_name: "summary".into(),
+            sub_buckets: 1,
+        };
+
+        let mut writer = CollectingWriter { tiles: Vec::new() };
+        let n = build_summary_tier(&features, &config, &mut writer).unwrap();
+        assert!(n > 0, "expected at least one quadbin summary tile");
+
+        // Every emitted feature id is a well-formed Quadbin u64 (header nibble
+        // 0b100, mode bit set, zoom field == build zoom + QUADBIN_RES_OFFSET),
+        // and the cluster collapses to a single cell whose count == n_cluster.
+        let mut saw_cluster_count = false;
+        let mut total_cells = 0usize;
+        for tile in &writer.tiles {
+            assert_eq!(tile.layers.len(), 1);
+            let layer = &tile.layers[0];
+            assert_eq!(layer.name, "summary");
+            total_cells += layer.feature_ids.len();
+            for &id in &layer.feature_ids {
+                assert_eq!(id >> 60, 0b100, "id not a Quadbin header: {id:#018x}");
+                assert_eq!((id >> 59) & 1, 1, "Quadbin mode bit unset: {id:#018x}");
+                assert_eq!(
+                    ((id >> 52) & 0x1f) as u8,
+                    8 + QUADBIN_RES_OFFSET,
+                    "wrong zoom field: {id:#018x}"
+                );
+            }
+            // The implicit `count` column carries the per-cell counts.
+            let counts = layer
+                .properties
+                .iter()
+                .find(|(n, _)| n == "count")
+                .map(|(_, c)| c)
+                .expect("count column present");
+            if let PropertyColumn::Numeric(vals) = counts {
+                if vals
+                    .iter()
+                    .any(|v| matches!(v, Some(c) if (*c - n_cluster as f64).abs() < f64::EPSILON))
+                {
+                    saw_cluster_count = true;
+                }
+            }
+        }
+        assert!(
+            saw_cluster_count,
+            "expected a cell with count == {n_cluster}"
+        );
+        // SF cluster (1 cell) + Tokyo (1 cell) = 2 distinct cells.
+        assert_eq!(total_cells, 2, "expected exactly two quadbin cells");
     }
 
     #[test]

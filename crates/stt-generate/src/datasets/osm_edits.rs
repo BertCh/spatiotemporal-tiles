@@ -276,6 +276,7 @@ fn run_nodes(
             summary,
             summary_sub_buckets: None,
             min_features_per_tile: Some(2),
+            min_zoom_field: None,
         })?;
         let _ = std::fs::remove_file(intermediate);
     }
@@ -521,6 +522,7 @@ fn run_changesets(
             // summary tier animates smoothly with no data re-upload.
             summary_sub_buckets: if args.summary_tier { Some(30) } else { None },
             min_features_per_tile: None,
+            min_zoom_field: None,
         })?;
         let _ = std::fs::remove_file(intermediate);
     }

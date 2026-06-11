@@ -2964,11 +2964,13 @@ name = "stt-validate"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "clap",
  "indicatif",
  "serde",
  "serde_json",
  "stt-core",
+ "tempfile",
 ]
 
 [[package]]

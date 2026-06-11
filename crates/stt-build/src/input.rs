@@ -145,7 +145,7 @@ where
     );
     let geom_col_name = find_geometry_column(&schema, geo_meta.as_ref())?;
     if let Some(meta) = geo_meta.as_ref() {
-        validate_geo_column(meta, &geom_col_name)?;
+        validate_geo_column(meta, &geom_col_name, geometry_strictness)?;
     }
     let time_col_idx = schema
         .fields()
@@ -578,17 +578,24 @@ fn crs_is_lonlat_wgs84(crs: &serde_json::Value) -> std::result::Result<(), Strin
     match crs {
         serde_json::Value::Null => Ok(()),
         serde_json::Value::String(s) => {
-            // "EPSG:4326" / "OGC:CRS84" / urn:ogc:def:crs:OGC:1.3:CRS84 forms.
+            // "EPSG:4326" / "OGC:CRS84" / urn:ogc:def:crs:OGC:1.3:CRS84 forms,
+            // plus the bare aliases producers commonly write ("CRS84", "4326",
+            // "WGS 84", "WGS84"). Match leniently — these are all WGS 84 lon/lat.
             let norm = s.trim();
-            let ok = match norm.rsplit_once(':') {
-                Some((head, code)) => {
-                    let auth = head.rsplit(':').find(|p| !p.is_empty()).unwrap_or(head);
-                    auth_code_ok(auth, code)
-                        || (norm.to_ascii_lowercase().contains("ogc")
-                            && code.eq_ignore_ascii_case("CRS84"))
-                }
-                None => false,
-            };
+            let bare_ok = matches!(
+                norm.to_ascii_uppercase().as_str(),
+                "CRS84" | "4326" | "WGS 84" | "WGS84" | "WGS_1984" | "WGS84(DD)"
+            );
+            let ok = bare_ok
+                || match norm.rsplit_once(':') {
+                    Some((head, code)) => {
+                        let auth = head.rsplit(':').find(|p| !p.is_empty()).unwrap_or(head);
+                        auth_code_ok(auth, code)
+                            || (norm.to_ascii_lowercase().contains("ogc")
+                                && code.eq_ignore_ascii_case("CRS84"))
+                    }
+                    None => false,
+                };
             if ok { Ok(()) } else { Err(format!("'{norm}'")) }
         }
         serde_json::Value::Object(obj) => {
@@ -627,17 +634,43 @@ fn crs_is_lonlat_wgs84(crs: &serde_json::Value) -> std::result::Result<(), Strin
 /// lon/lat WGS 84 coordinates, and an encoding the extractors can actually
 /// ingest (WKB or native point — the native linestring/polygon/multi*
 /// layouts have no extraction path here).
-fn validate_geo_column(meta: &GeoFileMeta, geom_col_name: &str) -> Result<()> {
+///
+/// The CRS gate is advisory under `--strict-geometry == Warn`: a non-WGS84
+/// declaration is a *correctness hazard*, not an ingestion blocker — the whole
+/// pipeline assumes lon/lat degrees and will tile the raw coordinates as-is, so
+/// non-WGS84 input yields silently-wrong tiles. We warn loudly by default (so a
+/// mis-declared/already-lon-lat file still builds) and hard-fail under
+/// `--strict-geometry`. The encoding gate stays a hard error in both modes: an
+/// unsupported native encoding has no extraction path, so there is nothing to
+/// tile at all.
+fn validate_geo_column(
+    meta: &GeoFileMeta,
+    geom_col_name: &str,
+    geometry_strictness: InputStrictness,
+) -> Result<()> {
     let Some(col) = meta.columns.get(geom_col_name) else {
         return Ok(());
     };
     if let Some(crs) = &col.crs {
         if let Err(found) = crs_is_lonlat_wgs84(crs) {
-            anyhow::bail!(
-                "GeoParquet geometry column '{geom_col_name}' declares CRS {found}, \
-                 but stt-build requires lon/lat degrees (OGC:CRS84 / EPSG:4326). \
-                 Reproject the input before export (e.g. geopandas: \
-                 gdf.to_crs(4326).to_parquet(...))."
+            // Coordinates are consumed verbatim downstream; a non-WGS84 CRS
+            // means every tiled position is wrong. Fail in strict mode, warn
+            // (once, at load) otherwise.
+            if geometry_strictness == InputStrictness::Strict {
+                anyhow::bail!(
+                    "GeoParquet geometry column '{geom_col_name}' declares CRS {found}, \
+                     but stt-build requires lon/lat degrees (OGC:CRS84 / EPSG:4326). \
+                     Reproject the input before export (e.g. geopandas: \
+                     gdf.to_crs(4326).to_parquet(...))."
+                );
+            }
+            tracing::warn!(
+                "GeoParquet geometry column '{geom_col_name}' declares CRS {found}, but \
+                 stt-build assumes WGS 84 lon/lat degrees (OGC:CRS84 / EPSG:4326) and \
+                 tiles coordinates AS-IS — output tiles will be WRONG if the data is \
+                 actually in another CRS. Reproject to EPSG:4326 first (e.g. geopandas: \
+                 gdf.to_crs(4326).to_parquet(...)), or pass --strict-geometry to make \
+                 this a hard error.",
             );
         }
     }

@@ -130,6 +130,106 @@ impl TileBudget {
         }
     }
 
+    /// Enforce the budget over an *opaque, externally-owned* collection of
+    /// `count` items, identified only by index.
+    ///
+    /// This is the type-impedance bridge used by stt-build: the tiler's
+    /// per-tile feature representation (`TileFeature` — an enum over a borrowed
+    /// `ParsedFeature` or an owned clipped segment) is not a [`Feature`], and
+    /// converting it into one (and back) would be both lossy and wasteful.
+    /// Instead the caller supplies two closures over its own collection:
+    ///
+    /// * `score(i)` — importance of item `i` (higher = keep). Mirror the
+    ///   [`ImportanceScorer`] semantics for the chosen strategy.
+    /// * `size(i)`  — estimated uncompressed bytes of item `i`.
+    ///
+    /// The drop policy is identical to [`Self::enforce`]:
+    /// 1. **Count cap** (`max_feature_count`): keep the highest-scored items.
+    /// 2. **Size cap** (`max_uncompressed_size`): greedily keep items by
+    ///    descending importance-per-byte until the target (90% of the cap) is
+    ///    reached.
+    ///
+    /// Returns the indices to KEEP, **sorted ascending** so the caller can
+    /// preserve its original feature order. Nothing is dropped (every index is
+    /// returned) when the collection already fits — guaranteeing the
+    /// default-off / under-budget path is a no-op.
+    pub fn enforce_indexed<S, Z>(&self, count: usize, score: S, size: Z) -> Vec<usize>
+    where
+        S: Fn(usize) -> f64,
+        Z: Fn(usize) -> usize,
+    {
+        // Fast path: a collection within BOTH caps is returned untouched. This
+        // is what makes a tile under the budget byte-for-byte identical to a
+        // build with no budget at all.
+        let total_size: usize = (0..count).map(&size).sum();
+        if count <= self.max_feature_count && total_size <= self.max_uncompressed_size {
+            return (0..count).collect();
+        }
+
+        // Pre-score every item once.
+        let mut scored: Vec<(usize, f64, usize)> = (0..count)
+            .map(|i| (i, score(i), size(i)))
+            .collect();
+
+        // Step 1: count cap — keep the highest-scored items.
+        if scored.len() > self.max_feature_count {
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(self.max_feature_count);
+        }
+
+        // Step 2: size cap — greedy keep by importance-per-byte. Identical
+        // policy to `drop_by_size` (target = 90% of the cap, with the same
+        // slight-overshoot tolerance) but operating on indices.
+        let kept_size: usize = scored.iter().map(|(_, _, s)| *s).sum();
+        let mut keep: Vec<usize> = if kept_size > self.max_uncompressed_size {
+            let target = (self.max_uncompressed_size as f64 * 0.9) as usize;
+            scored.sort_by(|a, b| {
+                let ratio_a = a.1 / (a.2.max(1) as f64);
+                let ratio_b = b.1 / (b.2.max(1) as f64);
+                ratio_b
+                    .partial_cmp(&ratio_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut kept = Vec::new();
+            let mut total = 0usize;
+            for (i, _, s) in &scored {
+                if total + s <= target {
+                    total += s;
+                    kept.push(*i);
+                } else if total < target * 95 / 100 && total + s <= target * 105 / 100 {
+                    // Within 5% of budget — allow a slight overshoot to fill it.
+                    total += s;
+                    kept.push(*i);
+                }
+            }
+            kept
+        } else {
+            scored.into_iter().map(|(i, _, _)| i).collect()
+        };
+
+        // Restore the caller's original order so feature emission is stable.
+        keep.sort_unstable();
+        keep
+    }
+
+    /// Score one *opaque* item for the budget's configured scorer, given the
+    /// raw signals the tiler can cheaply produce: geometry vertex count and
+    /// property count. Mirrors [`ImportanceScorer::score`] but without needing
+    /// a [`Feature`]. `Random`/`FeatureId` are not reachable via this path
+    /// (the budget always uses a deterministic geometry/combined strategy from
+    /// stt-build), so they fall back to the combined formula.
+    pub fn score_signals(&self, vertex_count: usize, property_count: usize) -> f64 {
+        match self.scorer {
+            ImportanceScorer::GeometrySize => vertex_count as f64,
+            ImportanceScorer::PropertyCount => property_count as f64,
+            ImportanceScorer::Combined
+            | ImportanceScorer::FeatureId
+            | ImportanceScorer::Random => {
+                vertex_count as f64 + property_count as f64 * 10.0
+            }
+        }
+    }
+
     /// Drop features to fit within budget constraints
     /// Returns (kept_features, dropped_count)
     pub fn enforce(&self, mut features: Vec<Feature>) -> (Vec<Feature>, usize) {
@@ -152,7 +252,7 @@ impl TileBudget {
     }
 
     /// Drop features to meet a count limit
-    fn drop_by_count(&self, mut features: Vec<Feature>, max_count: usize) -> Vec<Feature> {
+    fn drop_by_count(&self, features: Vec<Feature>, max_count: usize) -> Vec<Feature> {
         if features.len() <= max_count {
             return features;
         }
@@ -175,7 +275,7 @@ impl TileBudget {
     }
 
     /// Drop features to meet a size limit
-    fn drop_by_size(&self, mut features: Vec<Feature>, target_size: usize) -> Vec<Feature> {
+    fn drop_by_size(&self, features: Vec<Feature>, target_size: usize) -> Vec<Feature> {
         let current_size = Self::estimate_size(&features);
         if current_size <= target_size {
             return features;
@@ -354,6 +454,59 @@ mod tests {
 
         assert_eq!(kept.len(), original_count);
         assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn test_enforce_indexed_under_budget_is_noop() {
+        // Well within both caps -> every index returned, in order.
+        let budget = TileBudget::new(1_000_000, 256 * 1024, 1000);
+        let sizes = [100usize, 50, 200, 75];
+        let keep = budget.enforce_indexed(
+            sizes.len(),
+            |i| sizes[i] as f64,
+            |i| sizes[i],
+        );
+        assert_eq!(keep, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_enforce_indexed_count_cap_keeps_highest_scored() {
+        // Cap at 2 features; scorer = geometry size (here, size doubles as both
+        // score and bytes). The two largest (idx 2 and 3) survive, returned in
+        // ascending index order.
+        let budget = TileBudget::new(1_000_000, 256 * 1024, 2);
+        let sizes = [10usize, 50, 200, 100];
+        let mut keep = budget.enforce_indexed(
+            sizes.len(),
+            |i| sizes[i] as f64,
+            |i| sizes[i],
+        );
+        keep.sort_unstable();
+        assert_eq!(keep, vec![2, 3]); // 200 and 100 are largest
+    }
+
+    #[test]
+    fn test_enforce_indexed_size_cap_drops_to_fit() {
+        // Tiny byte cap forces a size-based drop; result must fit under cap.
+        let budget = TileBudget::new(150, 256 * 1024, 10_000);
+        let sizes = [100usize, 100, 100, 100];
+        let keep = budget.enforce_indexed(
+            sizes.len(),
+            |i| sizes[i] as f64,
+            |i| sizes[i],
+        );
+        let kept_bytes: usize = keep.iter().map(|&i| sizes[i]).sum();
+        assert!(keep.len() < sizes.len(), "expected some features dropped");
+        // 90%-of-cap target with slight-overshoot tolerance (<=105%).
+        assert!(kept_bytes <= 150 * 105 / 100);
+    }
+
+    #[test]
+    fn test_score_signals_matches_scorer() {
+        let geo = TileBudget::default().with_scorer(ImportanceScorer::GeometrySize);
+        assert_eq!(geo.score_signals(10, 5), 10.0);
+        let combined = TileBudget::default().with_scorer(ImportanceScorer::Combined);
+        assert_eq!(combined.score_signals(10, 5), 10.0 + 50.0);
     }
 
     #[test]

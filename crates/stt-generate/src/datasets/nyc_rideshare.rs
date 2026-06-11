@@ -72,6 +72,26 @@ pub struct Args {
     #[arg(long)]
     pub paths: bool,
 
+    /// Emit ONE 2-vertex origin→destination LineString per trip (vertex 0 =
+    /// pickup, vertex 1 = dropoff), with `timestamp` = pickup and
+    /// `end_timestamp` = dropoff. This is the straight-line OD *overview*
+    /// geometry the AnimatedArcLayer/AnimatedLineLayer consume (first vertex =
+    /// source, last = target) — no OSRM routing, so it works fully offline.
+    /// Carries `pickup_borough`/`dropoff_borough` categoricals; pairs well with
+    /// `--with-bearing` (origin→destination great-circle heading) for arc tint
+    /// or icon rotation. Mutually exclusive with `--paths`/`--flows`.
+    #[arg(long)]
+    pub od: bool,
+
+    /// Add a per-feature `bearing` numeric column (degrees, 0 = N, clockwise).
+    /// For `--od` it is the initial great-circle bearing from origin to
+    /// destination. For point trajectories it is the heading toward the next
+    /// point of the same trip (the final point repeats the prior bearing), so
+    /// AnimatedIconLayer can rotate markers by direction of travel. No effect on
+    /// `--paths`/`--flows`.
+    #[arg(long)]
+    pub with_bearing: bool,
+
     /// Aggregate routed trips into time-binned road-segment flow corridors —
     /// the pre-aggregated *overview* layer (one feature per corridor per
     /// `--flow-bin`, per-vertex `vertex_values` carry traversal counts).
@@ -84,13 +104,13 @@ pub struct Args {
     #[arg(long, default_value = "15m")]
     pub flow_bin: String,
 
-    /// Segment-snap grid for --flows, in metres. Larger MERGES nearby road
-    /// nodes, collapsing the network into fewer corridors so the static-geometry
-    /// overview tile (per-vertex × per-bucket value matrix) stays light at low
-    /// zoom. ~30 m keeps the street grid legible while making the city-wide
-    /// tile tractable; 0 disables snapping (exact OSRM geometry, heavy).
-    #[arg(long, default_value = "30")]
-    pub flow_snap_meters: f64,
+    /// OSM `.osm.pbf` road network for `--flows` (required). Trip traffic is
+    /// aggregated onto the actual OSM streets in this extract — use the same
+    /// file OSRM was built from (e.g. `osrm-data/new-york-latest.osm.pbf`) so
+    /// routed-trip vertices land on its ways. Corridors then trace exact street
+    /// geometry and carry a road-class `min_zoom` for vector-tile-style LOD.
+    #[arg(long)]
+    pub osm_pbf: Option<PathBuf>,
 
     /// Skip stt-build step
     #[arg(long)]
@@ -207,6 +227,16 @@ pub fn run(args: Args) -> Result<()> {
     println!("║           🚕 NYC Rideshare Trajectory Generator              ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
+    // `--od` emits straight O→D lines with no routing; `--paths`/`--flows`
+    // both route through OSRM. They produce different geometries/schemas, so
+    // they can't be combined — fail fast with a clear message.
+    if args.od && (args.paths || args.flows) {
+        return Err(anyhow!(
+            "--od (straight origin→destination overview, no routing) is mutually \
+             exclusive with --paths/--flows (OSRM-routed). Pick one mode."
+        ));
+    }
+
     // Handle --from-intermediate option (skip to STT build)
     if let Some(ref intermediate_file) = args.from_intermediate {
         println!("📂 Using existing intermediate file: {}", intermediate_file.display());
@@ -237,6 +267,8 @@ pub fn run(args: Args) -> Result<()> {
     println!("   Format:        {}", if use_parquet { "GeoParquet (streaming)" } else { "GeoJSON" });
     let mode = if args.flows {
         "Flow corridors (time-binned segment aggregation)"
+    } else if args.od {
+        "Origin→destination lines (2-vertex, straight, no routing)"
     } else if args.paths {
         "LineString paths"
     } else {
@@ -322,8 +354,9 @@ pub fn run(args: Args) -> Result<()> {
         trips
     };
 
-    // Check OSRM connectivity if routing is enabled
-    if !args.skip_routing {
+    // Check OSRM connectivity if routing is enabled. `--od` is a straight
+    // O→D overview that never routes, so skip the OSRM round-trip entirely.
+    if !args.skip_routing && !args.od {
         println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!("📝 STEP 3: Verify OSRM routing server");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -332,7 +365,14 @@ pub fn run(args: Args) -> Result<()> {
 
     // Generate trajectories
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("📝 STEP 4: Generate {} with OSRM routing", if args.paths { "paths" } else { "trajectories" });
+    let step4_what = if args.od {
+        "origin→destination lines (no routing)"
+    } else if args.paths {
+        "paths with OSRM routing"
+    } else {
+        "trajectories with OSRM routing"
+    };
+    println!("📝 STEP 4: Generate {}", step4_what);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("   Processing {} trips...", trips.len());
     println!("   Output: {}", intermediate_path.display());
@@ -344,6 +384,13 @@ pub fn run(args: Args) -> Result<()> {
             ));
         }
         generate_flows_parquet(&trips, &args, &intermediate_path)?;
+    } else if args.od {
+        if !use_parquet {
+            return Err(anyhow!(
+                "--od requires a .stt or .parquet output (GeoJSON not supported)"
+            ));
+        }
+        generate_od_parquet(&trips, &args, &intermediate_path)?;
     } else if args.paths {
         if use_parquet {
             generate_paths_parquet(&trips, &args, &intermediate_path)?;
@@ -405,16 +452,19 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     
     let time_field = "timestamp";
-    let end_time_field = if args.paths || args.flows {
+    // OD lines carry a pickup→dropoff range just like paths, so they also need
+    // the end-time field for time-windowed animation.
+    let end_time_field = if args.paths || args.flows || args.od {
         Some("end_timestamp")
     } else {
         None
     };
 
-    // Flow corridors are a static-geometry overview: each corridor is stored
-    // ONCE and carries a per-vertex × per-bucket value matrix. `--flow-snap`
-    // coarsens the network (merging nearby road nodes) enough that even the
-    // city-wide z8 tile is light, so the full overview pyramid is viable.
+    // Flow corridors are a static-geometry overview: each corridor is one OSM
+    // way stored ONCE with a per-vertex × per-bucket value matrix, tagged with a
+    // road-class `min_zoom`. The build's `--min-zoom-field min_zoom` filter
+    // (below) keeps z8 light (only motorways/trunks) and fills in every street by
+    // z13, so the full overview pyramid is viable on exact street geometry.
     let (min_zoom, max_zoom) = if args.flows { (8, 14) } else { (10, 16) };
     let temporal_bucket = if args.flows {
         &args.flow_bin
@@ -440,29 +490,52 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
     // `args.paths`, so this is behaviour-identical to the old fork. The v3
     // zstd default compresses ~5× faster than gzip-6 for an equivalent ratio
     // and the v3 reader decodes ~3.3× faster (Sprint 2026-05 phase-1).
-    common::run_stt_build_with_options(
-        intermediate_path,
-        &args.output,
-        time_field,
-        end_time_field,
-        min_zoom,
-        max_zoom,
-        "zstd",
-        Some(temporal_bucket),
-    )?;
+    if args.flows {
+        // Flows need the per-feature road-class LOD filter, so go through the
+        // full-options entry point with `min_zoom_field`.
+        common::run_stt_build_with_full_options(common::SttBuildOptions {
+            input: intermediate_path.to_path_buf(),
+            output: args.output.to_path_buf(),
+            time_field: time_field.to_string(),
+            end_time_field: end_time_field.map(str::to_string),
+            min_zoom,
+            max_zoom,
+            compression: "zstd".to_string(),
+            temporal_bucket: Some(temporal_bucket.to_string()),
+            temporal_lod: None,
+            summary: None,
+            summary_sub_buckets: None,
+            min_features_per_tile: None,
+            min_zoom_field: Some("min_zoom".to_string()),
+        })?;
+    } else {
+        common::run_stt_build_with_options(
+            intermediate_path,
+            &args.output,
+            time_field,
+            end_time_field,
+            min_zoom,
+            max_zoom,
+            "zstd",
+            Some(temporal_bucket),
+        )?;
+    }
 
     Ok(())
 }
 
-/// Convert `--flow-snap-meters` into a snap grid in degrees (latitude metres),
-/// or a fine ~0.1 m grid when snapping is disabled (`<= 0`). `FlowAggregator`
-/// uses this to merge nearby road nodes so the overview matrix stays light.
-fn flow_snap_deg(args: &Args) -> Option<f64> {
-    if args.flow_snap_meters > 0.0 {
-        Some(args.flow_snap_meters / 111_320.0)
-    } else {
-        Some(1e-6)
-    }
+/// Load the OSM road network for `--flows` (required — flows now aggregate onto
+/// real OSM streets). Errors with guidance when `--osm-pbf` is missing.
+fn load_flow_network(args: &Args) -> Result<crate::datasets::osm_streets::OsmNetwork> {
+    let pbf = args.osm_pbf.as_ref().ok_or_else(|| {
+        anyhow!(
+            "--flows aggregates trips onto the OSM street network; pass \
+             --osm-pbf <file.osm.pbf> (e.g. osrm-data/new-york-latest.osm.pbf — \
+             the extract OSRM was built from)"
+        )
+    })?;
+    println!("🗺  Loading OSM road network from {} …", pbf.display());
+    crate::datasets::osm_streets::OsmNetwork::from_pbf(pbf)
 }
 
 /// `--flows --from-intermediate <paths.parquet>`: re-aggregate a kept
@@ -485,12 +558,18 @@ fn flows_from_paths_intermediate(args: &Args, paths_parquet: &PathBuf) -> Result
         ));
     }
 
-    println!("\n🔁 Aggregating paths intermediate into {} flow bins", args.flow_bin);
-    let mut agg = FlowAggregator::new(bin_ms, flow_snap_deg(args));
+    let network = load_flow_network(args)?;
+    println!("\n🔁 Aggregating paths intermediate onto OSM streets ({} flow bins)", args.flow_bin);
+    let mut agg = FlowAggregator::new(bin_ms, network);
     let rows = crate::datasets::nyc_rideshare_flows::aggregate_paths_parquet(paths_parquet, &mut agg)?;
-    let (added, skipped, entries) = agg.stats();
-    println!("   ✓ {} rows read ({} aggregated, {} skipped)", rows, added, skipped);
-    println!("   ✓ {} (bin, segment) entries", entries);
+    let (added, skipped, exact, fallback, miss) = agg.stats();
+    let matched = exact + fallback;
+    let total = (matched + miss).max(1);
+    println!("   ✓ {} rows read ({} trips aggregated, {} skipped)", rows, added, skipped);
+    println!(
+        "   ✓ segment match: {} exact + {} fallback + {} miss ({:.1}% matched to OSM)",
+        exact, fallback, miss, 100.0 * matched as f64 / total as f64
+    );
 
     let (features, bins) = agg.write_parquet(&flows_parquet)?;
     println!("   ✓ {} corridor features across {} bins → {}", features, bins, flows_parquet.display());
@@ -521,7 +600,8 @@ fn generate_flows_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
         failed
     );
 
-    let mut agg = FlowAggregator::new(bin_ms, flow_snap_deg(args));
+    let network = load_flow_network(args)?;
+    let mut agg = FlowAggregator::new(bin_ms, network);
     for (_, trip, coords, vertex_times) in &results {
         agg.add_trip(
             coords,
@@ -530,8 +610,13 @@ fn generate_flows_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
             trip.dropoff_time.timestamp_millis(),
         );
     }
-    let (added, skipped, entries) = agg.stats();
-    println!("   ✓ {} trips aggregated ({} skipped), {} (bin, segment) entries", added, skipped, entries);
+    let (added, skipped, exact, fallback, miss) = agg.stats();
+    let matched = exact + fallback;
+    let total = (matched + miss).max(1);
+    println!(
+        "   ✓ {} trips aggregated ({} skipped); OSM match {} exact + {} fallback + {} miss ({:.1}%)",
+        added, skipped, exact, fallback, miss, 100.0 * matched as f64 / total as f64
+    );
 
     let (features, bins) = agg.write_parquet(output)?;
     println!("✓ GeoParquet (flow corridors) written: {} features across {} bins", features, bins);
@@ -812,6 +897,79 @@ fn is_in_nyc(lon: f64, lat: f64) -> bool {
     lon >= NYC_MIN_LON && lon <= NYC_MAX_LON && lat >= NYC_MIN_LAT && lat <= NYC_MAX_LAT
 }
 
+/// Initial great-circle bearing (forward azimuth) from one point to another,
+/// in compass degrees: 0° = due north, increasing clockwise, normalized to
+/// `[0, 360)`. Standard forward-azimuth formula on a sphere.
+///
+/// Two coincident points have no defined heading; we return `0.0` there.
+/// Used for the `--od` / `--with-bearing` `bearing` column so the deck.gl
+/// AnimatedIconLayer can rotate markers by direction of travel.
+fn initial_bearing_degrees(from_lon: f64, from_lat: f64, to_lon: f64, to_lat: f64) -> f64 {
+    let lat1 = from_lat.to_radians();
+    let lat2 = to_lat.to_radians();
+    let delta_lon = (to_lon - from_lon).to_radians();
+
+    let y = delta_lon.sin() * lat2.cos();
+    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * delta_lon.cos();
+    if y == 0.0 && x == 0.0 {
+        return 0.0;
+    }
+    // atan2 yields (-180, 180]; shift into [0, 360).
+    (y.atan2(x).to_degrees() + 360.0) % 360.0
+}
+
+/// Per-point heading for a trip's ordered `(lon, lat, time)` samples: point `i`
+/// gets the initial bearing toward point `i + 1`; the final point repeats the
+/// previous point's bearing (it has no successor to aim at). A single-point
+/// trip yields `[0.0]`. Drives the per-point `bearing` column for
+/// AnimatedIconLayer rotation in point/icon modes.
+fn point_bearings(points: &[(f64, f64, DateTime<Utc>)]) -> Vec<f64> {
+    let n = points.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut bearings = Vec::with_capacity(n);
+    for i in 0..n.saturating_sub(1) {
+        let (lon0, lat0, _) = points[i];
+        let (lon1, lat1, _) = points[i + 1];
+        bearings.push(initial_bearing_degrees(lon0, lat0, lon1, lat1));
+    }
+    // Last point repeats the previous bearing (or 0 for a lone point).
+    bearings.push(bearings.last().copied().unwrap_or(0.0));
+    bearings
+}
+
+/// Coarse NYC borough label from a lon/lat, derived purely from geography (the
+/// pre-2017 TLC CSVs carry lat/lon but no borough/zone column, and we never
+/// download an external taxi-zone lookup). Returns one of "Manhattan",
+/// "Brooklyn", "Queens", "Bronx", "Staten Island", or "Other" for points
+/// outside these rough envelopes. Intended only as a categorical grouping
+/// dimension for OD arcs, not authoritative geocoding.
+fn nyc_borough(lon: f64, lat: f64) -> &'static str {
+    // Bronx: north of ~40.80, east of the Hudson.
+    if lat >= 40.785 && lon >= -73.935 {
+        return "Bronx";
+    }
+    // Manhattan: the island, roughly the -74.02..-73.907 / 40.70..40.88 strip
+    // west of the East River.
+    if lon >= -74.02 && lon <= -73.907 && lat >= 40.700 && lat <= 40.880 {
+        return "Manhattan";
+    }
+    // Staten Island: far southwest.
+    if lon <= -74.05 && lat <= 40.65 {
+        return "Staten Island";
+    }
+    // Brooklyn: southern, west of ~-73.86.
+    if lat < 40.74 && lon < -73.86 {
+        return "Brooklyn";
+    }
+    // Queens: eastern, the remaining easterly chunk.
+    if lon >= -73.96 {
+        return "Queens";
+    }
+    "Other"
+}
+
 fn parse_tlc_datetime(s: &str) -> Result<DateTime<Utc>> {
     let formats = [
         "%Y-%m-%dT%H:%M:%S%.3f",
@@ -1084,13 +1242,19 @@ fn generate_trajectories_parquet(trips: &[Trip], args: &Args, output: &PathBuf) 
     // sees numerics as numerics (passenger_count/trip_distance/fare_amount)
     // and status as a string category. Mirrors the schema the old GeoJSON
     // path produced after going through stt-build's type inference.
-    let property_columns = vec![
+    let mut property_columns = vec![
         PropertyColumn { name: "trip_id".into(), kind: PropertyKind::Numeric },
         PropertyColumn { name: "passenger_count".into(), kind: PropertyKind::Numeric },
         PropertyColumn { name: "trip_distance".into(), kind: PropertyKind::Numeric },
         PropertyColumn { name: "fare_amount".into(), kind: PropertyKind::Numeric },
         PropertyColumn { name: "status".into(), kind: PropertyKind::String },
     ];
+    // With --with-bearing, attach a per-point heading (toward the next point of
+    // the same trip) so AnimatedIconLayer can rotate markers by travel
+    // direction. Numeric so it survives stt-build's columnar inference.
+    if args.with_bearing {
+        property_columns.push(PropertyColumn { name: "bearing".into(), kind: PropertyKind::Numeric });
+    }
     let mut writer = StreamingParquetWriter::with_columns(output, property_columns)?;
 
     let mut failed_routes = 0usize;
@@ -1122,6 +1286,14 @@ fn generate_trajectories_parquet(trips: &[Trip], args: &Args, output: &PathBuf) 
         };
 
         let last_idx = points.len().saturating_sub(1);
+        // Per-point heading toward the NEXT point of the same trip; the last
+        // point repeats the previous bearing (no successor to aim at). Computed
+        // once per trip only when requested.
+        let bearings: Option<Vec<f64>> = if args.with_bearing {
+            Some(point_bearings(&points))
+        } else {
+            None
+        };
         for (i, (lon, lat, timestamp)) in points.iter().enumerate() {
             let status = if i == 0 {
                 "pickup"
@@ -1136,6 +1308,9 @@ fn generate_trajectories_parquet(trips: &[Trip], args: &Args, output: &PathBuf) 
             properties.insert("trip_distance".into(), json!(trip.trip_distance));
             properties.insert("fare_amount".into(), json!(trip.fare_amount));
             properties.insert("status".into(), json!(status));
+            if let Some(bs) = &bearings {
+                properties.insert("bearing".into(), json!(bs[i]));
+            }
 
             writer.write_point(&PointRecord {
                 lon: *lon,
@@ -1406,6 +1581,105 @@ fn generate_paths_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
     Ok(())
 }
 
+/// `--od`: emit one straight 2-vertex origin→destination LineString per trip.
+///
+/// vertex 0 = pickup (origin), vertex 1 = dropoff (destination); `timestamp` =
+/// pickup time, `end_timestamp` = dropoff time. This is the OD *overview*
+/// geometry the AnimatedArcLayer/AnimatedLineLayer read (first vertex = source,
+/// last = target). No OSRM routing is involved — that's the whole point of an OD
+/// overview vs `--paths`, so it builds fully offline.
+///
+/// Carries the existing numeric trip props plus `pickup_borough`/
+/// `dropoff_borough` categoricals (derived from coordinates, since the TLC CSVs
+/// have no borough column) and, when `--with-bearing`, a numeric `bearing` =
+/// initial great-circle heading from origin to destination.
+fn generate_od_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Result<()> {
+    use common::PropertyKind;
+
+    println!("\n🚀 Generating origin→destination lines (Parquet)...");
+
+    let pb = ProgressBar::new(trips.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{bar:40}] {pos}/{len} trips ({eta})")?
+            .progress_chars("=>-"),
+    );
+
+    // Numeric trip props (mirrors --paths) + borough categoricals. `bearing`
+    // is appended as a numeric column only when --with-bearing is set, so the
+    // schema stays stable for callers that don't ask for it.
+    let mut property_columns = vec![
+        PropertyColumn::numeric("trip_id"),
+        PropertyColumn::numeric("passenger_count"),
+        PropertyColumn::numeric("trip_distance"),
+        PropertyColumn::numeric("fare_amount"),
+        PropertyColumn { name: "pickup_borough".into(), kind: PropertyKind::String },
+        PropertyColumn { name: "dropoff_borough".into(), kind: PropertyKind::String },
+    ];
+    if args.with_bearing {
+        property_columns.push(PropertyColumn::numeric("bearing"));
+    }
+    let mut writer = StreamingLineStringParquetWriter::with_columns(output, property_columns)?;
+
+    let mut written = 0usize;
+    for (trip_id, trip) in trips.iter().enumerate() {
+        // Drop degenerate trips whose pickup == dropoff: a zero-length arc has
+        // no source→target direction and would render as a dot.
+        if trip.pickup_lon == trip.dropoff_lon && trip.pickup_lat == trip.dropoff_lat {
+            pb.inc(1);
+            continue;
+        }
+
+        let coords = vec![
+            [trip.pickup_lon, trip.pickup_lat],
+            [trip.dropoff_lon, trip.dropoff_lat],
+        ];
+
+        let mut properties = Map::new();
+        properties.insert("trip_id".to_string(), json!(trip_id));
+        properties.insert("passenger_count".to_string(), json!(trip.passenger_count));
+        properties.insert("trip_distance".to_string(), json!(trip.trip_distance));
+        properties.insert("fare_amount".to_string(), json!(trip.fare_amount));
+        properties.insert(
+            "pickup_borough".to_string(),
+            json!(nyc_borough(trip.pickup_lon, trip.pickup_lat)),
+        );
+        properties.insert(
+            "dropoff_borough".to_string(),
+            json!(nyc_borough(trip.dropoff_lon, trip.dropoff_lat)),
+        );
+        if args.with_bearing {
+            let bearing = initial_bearing_degrees(
+                trip.pickup_lon,
+                trip.pickup_lat,
+                trip.dropoff_lon,
+                trip.dropoff_lat,
+            );
+            properties.insert("bearing".to_string(), json!(bearing));
+        }
+
+        let record = LineStringRecord::new(
+            coords,
+            trip.pickup_time,
+            Some(trip.dropoff_time),
+            properties,
+        );
+        writer.write_linestring(&record)?;
+        written += 1;
+        pb.inc(1);
+    }
+
+    let count = writer.finish()?;
+    pb.finish_and_clear();
+    println!("✓ GeoParquet (OD LineString) written: {} features", count);
+    let skipped = trips.len().saturating_sub(written);
+    if skipped > 0 {
+        println!("⚠️  {} zero-length (pickup == dropoff) trips skipped", skipped);
+    }
+
+    Ok(())
+}
+
 /// Thread-local HTTP client for connection pooling
 fn get_osrm_route_pooled(osrm_url: &str, from_lon: f64, from_lat: f64, to_lon: f64, to_lat: f64) -> Result<Option<OsrmRoute>> {
     use std::cell::RefCell;
@@ -1437,4 +1711,146 @@ fn get_osrm_route_pooled(osrm_url: &str, from_lon: f64, from_lat: f64, to_lon: f
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// Bearing within `tol` degrees, accounting for the 0/360 wrap.
+    fn assert_bearing_near(actual: f64, expected: f64, tol: f64) {
+        let diff = ((actual - expected + 540.0) % 360.0) - 180.0;
+        assert!(
+            diff.abs() <= tol,
+            "bearing {actual} not within {tol}° of {expected} (Δ={diff})"
+        );
+    }
+
+    #[test]
+    fn bearing_due_north_is_zero() {
+        // Same longitude, target to the north → ~0°.
+        let b = initial_bearing_degrees(-74.0, 40.0, -74.0, 41.0);
+        assert_bearing_near(b, 0.0, 1e-6);
+    }
+
+    #[test]
+    fn bearing_due_south_is_180() {
+        let b = initial_bearing_degrees(-74.0, 41.0, -74.0, 40.0);
+        assert_bearing_near(b, 180.0, 1e-6);
+    }
+
+    #[test]
+    fn bearing_due_east_is_90() {
+        // Same latitude near the equator, target to the east → ~90°.
+        let b = initial_bearing_degrees(0.0, 0.0, 1.0, 0.0);
+        assert_bearing_near(b, 90.0, 1e-3);
+    }
+
+    #[test]
+    fn bearing_due_west_is_270() {
+        let b = initial_bearing_degrees(0.0, 0.0, -1.0, 0.0);
+        assert_bearing_near(b, 270.0, 1e-3);
+    }
+
+    #[test]
+    fn bearing_diagonal_northeast() {
+        // Near the equator a small NE step (+1° lon, +1° lat) is almost 45°;
+        // it's slightly under 45° because meridians converge toward the pole.
+        let b = initial_bearing_degrees(0.0, 0.0, 1.0, 1.0);
+        assert_bearing_near(b, 45.0, 0.5);
+        assert!(b < 45.0, "NE diagonal bearing should be just under 45°, got {b}");
+    }
+
+    #[test]
+    fn bearing_is_normalized_into_0_360() {
+        // A southwest heading must land in [0, 360), not negative.
+        let b = initial_bearing_degrees(0.0, 0.0, -1.0, -1.0);
+        assert!((0.0..360.0).contains(&b), "bearing {b} out of [0,360)");
+        assert_bearing_near(b, 225.0, 0.5);
+    }
+
+    #[test]
+    fn bearing_coincident_points_is_zero() {
+        assert_eq!(initial_bearing_degrees(-74.0, 40.7, -74.0, 40.7), 0.0);
+    }
+
+    #[test]
+    fn point_bearings_last_repeats_previous() {
+        let t = Utc.timestamp_opt(0, 0).unwrap();
+        // North then east: p0→p1 ≈ 0°, p1→p2 ≈ 90°, p2 repeats p1's bearing.
+        let pts = vec![
+            (-74.0, 40.0, t),
+            (-74.0, 41.0, t),
+            (-73.0, 41.0, t),
+        ];
+        let b = point_bearings(&pts);
+        assert_eq!(b.len(), 3);
+        assert_bearing_near(b[0], 0.0, 1e-3);
+        assert_bearing_near(b[1], 90.0, 1.0);
+        assert_eq!(b[2], b[1], "last point should repeat the previous bearing");
+    }
+
+    #[test]
+    fn point_bearings_single_point_is_zero() {
+        let t = Utc.timestamp_opt(0, 0).unwrap();
+        assert_eq!(point_bearings(&[(-74.0, 40.0, t)]), vec![0.0]);
+        assert!(point_bearings(&[]).is_empty());
+    }
+
+    /// An `--od` feature is a 2-vertex LineString: vertex 0 = pickup (origin),
+    /// vertex 1 = dropoff (destination), `timestamp` = pickup, `end_timestamp`
+    /// = dropoff (pickup strictly before dropoff). This mirrors exactly what
+    /// `generate_od_parquet` builds per trip, without touching the filesystem.
+    #[test]
+    fn od_builds_two_vertex_record_with_ordered_times() {
+        let pickup = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let dropoff = Utc.timestamp_opt(1_700_000_600, 0).unwrap(); // +10 min
+        let trip = Trip {
+            pickup_time: pickup,
+            dropoff_time: dropoff,
+            pickup_lon: -73.99,
+            pickup_lat: 40.73,
+            dropoff_lon: -73.97,
+            dropoff_lat: 40.75,
+            passenger_count: 2,
+            trip_distance: 1.2,
+            fare_amount: 8.5,
+        };
+
+        let coords = vec![
+            [trip.pickup_lon, trip.pickup_lat],
+            [trip.dropoff_lon, trip.dropoff_lat],
+        ];
+        let record = LineStringRecord::new(
+            coords,
+            trip.pickup_time,
+            Some(trip.dropoff_time),
+            Map::new(),
+        );
+
+        // Exactly two vertices, origin first, destination last.
+        assert_eq!(record.coordinates.len(), 2);
+        assert_eq!(record.coordinates[0], [trip.pickup_lon, trip.pickup_lat]);
+        assert_eq!(
+            *record.coordinates.last().unwrap(),
+            [trip.dropoff_lon, trip.dropoff_lat]
+        );
+        // timestamp = pickup, end_timestamp = dropoff, in the right order.
+        assert_eq!(record.timestamp_ms, pickup.timestamp_millis());
+        assert_eq!(record.end_timestamp_ms, Some(dropoff.timestamp_millis()));
+        assert!(
+            record.timestamp_ms < record.end_timestamp_ms.unwrap(),
+            "pickup must precede dropoff"
+        );
+        // No routed/per-vertex channels on a straight OD line.
+        assert!(record.vertex_timestamps_ms.is_none());
+        assert!(record.vertex_value_matrix.is_none());
+    }
+
+    #[test]
+    fn borough_classifies_manhattan_and_jfk() {
+        // Times Square → Manhattan; JFK airport → Queens (eastern envelope).
+        assert_eq!(nyc_borough(-73.9855, 40.7580), "Manhattan");
+        assert_eq!(nyc_borough(-73.7781, 40.6413), "Queens");
+    }
+}
 

@@ -23,7 +23,8 @@ pub struct GeometryAnalysis {
     pub property_stats: PropertyStats,
     /// Geometry complexity classification
     pub complexity: GeometryComplexity,
-    /// Recommended compression method
+    /// Recommended compression method. Advisory only — the packed STT format is
+    /// zstd-only, so this is always zstd and `stt-build --auto` ignores it.
     pub recommended_compression: String,
 }
 
@@ -169,7 +170,7 @@ fn empty_analysis() -> GeometryAnalysis {
             avg: 0.0,
         },
         complexity: GeometryComplexity::Simple,
-        recommended_compression: "gzip".to_string(),
+        recommended_compression: "zstd".to_string(),
     }
 }
 
@@ -272,23 +273,14 @@ fn classify_complexity(
     GeometryComplexity::Moderate
 }
 
-/// Recommend compression method based on complexity
-fn recommend_compression(complexity: &GeometryComplexity, _size_stats: &SizeStats) -> String {
-    match complexity {
-        GeometryComplexity::Simple => {
-            // Small data, gzip is fine
-            "gzip".to_string()
-        }
-        GeometryComplexity::Moderate => {
-            // Moderate data, gzip works well
-            "gzip".to_string()
-        }
-        GeometryComplexity::Complex | GeometryComplexity::VeryComplex => {
-            // Complex data benefits from gzip
-            // Note: Could recommend Brotli if supported
-            "gzip".to_string()
-        }
-    }
+/// Recommend a compression method.
+///
+/// The packed STT format is zstd-only, so this is always "zstd". The field is
+/// kept (rather than dropped) because it appears in the advisory report/JSON;
+/// `stt-build --auto` ignores it. Complexity and size are unused but retained
+/// so the signature documents the inputs this decision would consider.
+fn recommend_compression(_complexity: &GeometryComplexity, _size_stats: &SizeStats) -> String {
+    "zstd".to_string()
 }
 
 #[cfg(test)]

@@ -145,8 +145,10 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
         "  --chunk-size {}\n",
         recommendations.chunk_size
     ));
+    // Advisory only: the packed STT format is zstd-only, so compression is not a
+    // build knob. stt-build --auto consumes only the zoom/temporal-bucket values.
     output.push_str(&format!(
-        "  --compression {}\n",
+        "  compression: {} (fixed; packed format is zstd-only)\n",
         recommendations.compression
     ));
     output.push('\n');

@@ -12,16 +12,29 @@
 //! 3. Every tile blob round-trips its content hash and decompresses to its
 //!    declared uncompressed size (enforced by `read_payload`).
 //! 4. Every payload decodes as a layer frame of Arrow IPC streams.
-//! 5. Feature counts in tile entries match the decoded layer rows.
-//! 6. Tile temporal extents lie inside the dataset's metadata time range.
+//! 5. Every decoded layer matches the STT tile schema contract (required
+//!    columns present with the expected Arrow types and a GeoArrow geometry
+//!    column), and tiles agree on their schema (no producer drift).
+//! 6. Feature counts in tile entries match the decoded layer rows.
+//! 7. Tile temporal extents lie inside the dataset's metadata time range.
+//!
+//! The integrity, header, content-address and per-entry temporal-bound checks
+//! (1–3, 7) are cheap and always run over **every** tile. The expensive
+//! Arrow-decode + schema + feature-count checks (4–6) can be restricted to a
+//! deterministic representative sample with `--sample N` for very large
+//! archives; the report then states clearly how many tiles were decoded.
 //!
 //! Exits non-zero on any failure. With `--json` emits a machine-readable
 //! report; without it emits a short human summary.
 
+mod schema;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
+use schema::{check_tile_schema, schema_signature};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use stt_core::archive::TileEntry;
@@ -47,6 +60,15 @@ struct Args {
     /// content hashes).
     #[arg(long)]
     skip_decode: bool,
+
+    /// Decode only a deterministic, evenly-spread sample of at most N tiles
+    /// instead of every tile. Integrity / header / content-hash / temporal-
+    /// bound checks still run over ALL tiles (they're cheap); only the
+    /// expensive Arrow-decode + schema + feature-count checks are sampled.
+    /// The sample is reproducible (every `ceil(total/N)`-th entry), and the
+    /// report makes clear that the decode was sampled rather than exhaustive.
+    #[arg(long, value_name = "N")]
+    sample: Option<usize>,
 }
 
 #[derive(Serialize, Default)]
@@ -56,8 +78,21 @@ struct Report {
     version: u8,
     compression: String,
     tile_count: usize,
+    /// Number of tiles actually decoded (== `tile_count` unless `--sample`/
+    /// `--skip-decode` reduced it). Always <= `tile_count`.
+    tiles_decoded: usize,
+    /// True when the per-tile decode was restricted to a `--sample`d subset, so
+    /// a reader never mistakes a sampled run for a full verification.
+    sampled: bool,
     feature_count_index: u64,
     feature_count_decoded: u64,
+    /// Whether `feature_count_decoded` reflects EVERY tile. False when decoding
+    /// was sampled or skipped, in which case the decoded sum covers only the
+    /// inspected subset and the grand-total metadata check is not run.
+    feature_count_decoded_complete: bool,
+    /// Number of distinct layer schemas observed across the decoded tiles. >1
+    /// means producer drift (see `errors` for the disagreeing signatures).
+    distinct_schemas: usize,
     payload_bytes_compressed: u64,
     payload_bytes_uncompressed: u64,
     elapsed_ms: u128,
@@ -177,8 +212,31 @@ fn validate_single_file(args: &Args, report: &mut Report) -> Result<Metadata> {
     Ok(metadata)
 }
 
+/// Whether the per-tile decode covers EVERY tile. The grand-total feature-count
+/// check (and the `feature_count_decoded` total being meaningful) depend on a
+/// complete decode: a sampled or skipped decode only sums a subset.
+fn decode_is_complete(args: &Args) -> bool {
+    !args.skip_decode && args.sample.is_none()
+}
+
+/// Deterministic stride for `--sample N`: pick every `ceil(total/N)`-th entry,
+/// starting at index 0, yielding at most `N` evenly-spread tiles. Reproducible
+/// across runs (no randomness) so a sampled "OK" is something a producer can
+/// re-confirm. `N == 0` decodes nothing; `N >= total` decodes everything.
+fn sample_stride(total: usize, n: usize) -> usize {
+    if n == 0 {
+        return usize::MAX; // nothing selected
+    }
+    total.div_ceil(n).max(1)
+}
+
 /// Per-tile validation shared by both readers. `read_payload` reads (and CRC-
 /// and size-checks) one tile's decompressed bytes from whichever container.
+///
+/// Cheap per-entry checks (temporal bounds, byte/feature tallies, content
+/// hashes via `read_payload`) run for **every** entry. The expensive
+/// Arrow-decode + schema + feature-count checks run for every entry too, unless
+/// `--sample N` restricts them to a deterministic stride of the directory.
 fn validate_entries(
     entries: &[TileEntry],
     metadata: &Metadata,
@@ -190,7 +248,16 @@ fn validate_entries(
     let meta_start = metadata.time_range.start as i64;
     let meta_end = metadata.time_range.end as i64;
 
-    for entry in entries {
+    report.sampled = args.sample.is_some() && !args.skip_decode;
+    let stride = args.sample.map(|n| sample_stride(entries.len(), n));
+
+    // Distinct schema signatures seen across decoded layers, for producer-drift
+    // detection. We keep the first tile that exhibited each signature so the
+    // error can name a concrete disagreeing pair.
+    let mut schemas: BTreeSet<String> = BTreeSet::new();
+    let mut first_schema_example: Option<(String, String)> = None;
+
+    for (idx, entry) in entries.iter().enumerate() {
         report.payload_bytes_compressed += entry.length as u64;
         report.payload_bytes_uncompressed += entry.uncompressed_size as u64;
         report.feature_count_index += entry.feature_count as u64;
@@ -210,7 +277,13 @@ fn validate_entries(
             )?;
         }
 
-        // read_payload does the content-hash and uncompressed-size checks.
+        // Is this entry in the decode set? Skipped entirely under --skip-decode;
+        // under --sample only every `stride`-th entry is decoded.
+        let decode_this = !args.skip_decode && stride.map(|s| idx % s == 0).unwrap_or(true);
+
+        // read_payload does the content-hash and uncompressed-size checks. We
+        // still read non-sampled tiles so the content-address verification
+        // stays total — only the Arrow decode below is sampled.
         let payload = match read_payload(entry) {
             Ok(b) => b,
             Err(e) => {
@@ -226,9 +299,10 @@ fn validate_entries(
             }
         };
 
-        if !args.skip_decode {
+        if decode_this {
             match stt_core::arrow_tile::decode_tile(&payload) {
                 Ok(layers) => {
+                    report.tiles_decoded += 1;
                     let row_total: u64 = layers.iter().map(|l| l.batch.num_rows() as u64).sum();
                     report.feature_count_decoded += row_total;
                     if row_total != entry.feature_count as u64 {
@@ -242,6 +316,36 @@ fn validate_entries(
                                 row_total
                             ),
                         )?;
+                    }
+
+                    // Schema / column-type contract per layer.
+                    for issue in check_tile_schema(&layers) {
+                        push_err(
+                            report,
+                            args.fail_fast,
+                            format!("tile {:?} schema: {issue}", entry.tile_id()),
+                        )?;
+                    }
+
+                    // Producer-drift detection: track the distinct schema
+                    // signatures and flag the first tile that disagrees with
+                    // an earlier one.
+                    let sig = schema_signature(&layers);
+                    if schemas.insert(sig.clone()) {
+                        match &first_schema_example {
+                            None => first_schema_example = Some((format!("{:?}", entry.tile_id()), sig)),
+                            Some((first_tile, first_sig)) => {
+                                push_err(
+                                    report,
+                                    args.fail_fast,
+                                    format!(
+                                        "schema drift: tile {:?} layer schema differs from tile {first_tile}\n  {first_tile}: {first_sig}\n  {:?}: {sig}",
+                                        entry.tile_id(),
+                                        entry.tile_id()
+                                    ),
+                                )?;
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -259,11 +363,16 @@ fn validate_entries(
         }
     }
 
+    report.distinct_schemas = schemas.len();
+    report.feature_count_decoded_complete = decode_is_complete(args);
     Ok(())
 }
 
 fn finalize_feature_check(args: &Args, report: &mut Report, metadata: &Metadata) {
-    if !args.skip_decode
+    // Only meaningful when EVERY tile was decoded — a sampled or skipped decode
+    // sums a subset, so comparing it to the metadata grand total would spuriously
+    // fail. Such runs leave `feature_count_decoded_complete = false` and skip it.
+    if decode_is_complete(args)
         && report.feature_count_decoded != metadata.feature_count
         && metadata.feature_count != 0
     {
@@ -303,10 +412,29 @@ fn print_summary(report: &Report, metadata: &Metadata) {
     println!("compression      {}", report.compression);
     println!("name             {}", metadata.name);
     println!("tiles            {}", report.tile_count);
-    println!(
-        "features (index) {}  (decoded sum: {})",
-        report.feature_count_index, report.feature_count_decoded
-    );
+    if report.sampled {
+        println!(
+            "decoded          {} of {} tiles (SAMPLED — not a full verification)",
+            report.tiles_decoded, report.tile_count
+        );
+    } else {
+        println!("decoded          {} of {} tiles", report.tiles_decoded, report.tile_count);
+    }
+    println!("distinct schemas {}", report.distinct_schemas);
+    if report.feature_count_decoded_complete {
+        println!(
+            "features (index) {}  (decoded sum: {})",
+            report.feature_count_index, report.feature_count_decoded
+        );
+    } else {
+        println!(
+            "features (index) {}  (decoded sum: {} over {} tiles; grand-total not checked — {})",
+            report.feature_count_index,
+            report.feature_count_decoded,
+            report.tiles_decoded,
+            if report.sampled { "sampled" } else { "decode skipped" }
+        );
+    }
     println!(
         "payload bytes    {} compressed / {} uncompressed ({:.2}x ratio)",
         report.payload_bytes_compressed,

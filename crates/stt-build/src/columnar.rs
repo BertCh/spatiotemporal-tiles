@@ -13,14 +13,57 @@ use stt_core::arrow_tile::{
 };
 use stt_core::types::GeometryType;
 
+/// Opt-in user-property selection (tippecanoe `--exclude`/`--include`/
+/// `--exclude-all` mental model). Applied at the point property columns are
+/// materialised, so it governs BOTH point/line/polygon layers and clipped
+/// trajectory-segment layers.
+///
+/// SYSTEM columns (feature id, start/end time, geometry, vertex_time /
+/// vertex_value / vertex_value_matrix, triangles) are NOT user properties and
+/// are therefore never reachable here — they always survive. This filter only
+/// ever touches the `properties` map.
+#[derive(Debug, Clone, Default)]
+pub enum AttributeFilter {
+    /// No filtering — every user property is kept (the default; byte-for-byte
+    /// identical to a build with none of the attribute flags set).
+    #[default]
+    KeepAll,
+    /// Drop exactly these property names (`--exclude`).
+    Exclude(std::collections::HashSet<String>),
+    /// Keep ONLY these property names (`--include`).
+    Include(std::collections::HashSet<String>),
+    /// Drop every user property — geometry + times only (`--exclude-all`).
+    ExcludeAll,
+}
+
+impl AttributeFilter {
+    /// Should the named user property be emitted?
+    pub fn keeps(&self, name: &str) -> bool {
+        match self {
+            AttributeFilter::KeepAll => true,
+            AttributeFilter::Exclude(set) => !set.contains(name),
+            AttributeFilter::Include(set) => set.contains(name),
+            AttributeFilter::ExcludeAll => false,
+        }
+    }
+
+    /// True when the filter is the inert default (no property is ever dropped).
+    pub fn is_keep_all(&self) -> bool {
+        matches!(self, AttributeFilter::KeepAll)
+    }
+}
+
 /// Per-tile build options that influence the columnar layout (independent of
 /// the tile-level partitioning logic the tiler owns).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ColumnarOptions {
     /// When true, polygon layers will carry pre-baked earcut triangle indices
     /// in a `triangles` sidecar column — letting the renderer skip its own
     /// CPU-side tessellation on tile arrival (MLT-style).
     pub pre_tessellate: bool,
+    /// Opt-in user-property selection. Default [`AttributeFilter::KeepAll`] —
+    /// inert unless `--exclude`/`--include`/`--exclude-all` is passed.
+    pub attribute_filter: AttributeFilter,
 }
 
 /// Build layers from a set of features sharing a tile. Features are grouped by
@@ -75,13 +118,13 @@ pub fn build_layers_from_features_with(
     };
 
     if !points.is_empty() {
-        layers.push(build_point_layer(&points, name_for("points"))?);
+        layers.push(build_point_layer(&points, name_for("points"), &opts)?);
     }
     if !lines.is_empty() {
-        layers.push(build_line_layer(&lines, name_for("lines"))?);
+        layers.push(build_line_layer(&lines, name_for("lines"), &opts)?);
     }
     if !polygons.is_empty() {
-        layers.push(build_polygon_layer(&polygons, name_for("polygons"), opts)?);
+        layers.push(build_polygon_layer(&polygons, name_for("polygons"), &opts)?);
     }
     Ok(layers)
 }
@@ -91,6 +134,7 @@ pub fn build_layers_from_features_with(
 pub fn build_layer_from_segments(
     segments: &[&ClippedSegment],
     layer_name: &str,
+    filter: &AttributeFilter,
 ) -> Result<ColumnarLayer> {
     let n = segments.len();
     let mut feature_ids = Vec::with_capacity(n);
@@ -103,7 +147,7 @@ pub fn build_layer_from_segments(
     let mut any_values = false;
     let mut any_matrix = false;
 
-    let mut props = PropertyAccumulator::new();
+    let mut props = PropertyAccumulator::with_filter(filter.clone());
 
     for seg in segments {
         feature_ids.push(segment_feature_id(seg));
@@ -175,8 +219,12 @@ pub fn build_layer_from_segments(
 // Per-geometry-kind builders
 // ----------------------------------------------------------------------------
 
-fn build_point_layer(features: &[&ParsedFeature], name: String) -> Result<ColumnarLayer> {
-    let (ids, start, end, props) = common_columns(features);
+fn build_point_layer(
+    features: &[&ParsedFeature],
+    name: String,
+    opts: &ColumnarOptions,
+) -> Result<ColumnarLayer> {
+    let (ids, start, end, props) = common_columns(features, &opts.attribute_filter);
     let geometry: Vec<Coord> = features.iter().map(|f| [f.lon, f.lat]).collect();
     Ok(ColumnarLayer {
         name,
@@ -192,8 +240,12 @@ fn build_point_layer(features: &[&ParsedFeature], name: String) -> Result<Column
     })
 }
 
-fn build_line_layer(features: &[&ParsedFeature], name: String) -> Result<ColumnarLayer> {
-    let (ids, start, end, props) = common_columns(features);
+fn build_line_layer(
+    features: &[&ParsedFeature],
+    name: String,
+    opts: &ColumnarOptions,
+) -> Result<ColumnarLayer> {
+    let (ids, start, end, props) = common_columns(features, &opts.attribute_filter);
 
     let mut geometry: Vec<Vec<Coord>> = Vec::with_capacity(features.len());
     let mut vertex_times: Vec<Vec<i64>> = Vec::with_capacity(features.len());
@@ -287,9 +339,9 @@ fn build_line_layer(features: &[&ParsedFeature], name: String) -> Result<Columna
 fn build_polygon_layer(
     features: &[&ParsedFeature],
     name: String,
-    opts: ColumnarOptions,
+    opts: &ColumnarOptions,
 ) -> Result<ColumnarLayer> {
-    let (ids, start, end, props) = common_columns(features);
+    let (ids, start, end, props) = common_columns(features, &opts.attribute_filter);
     let mut geometry: Vec<Vec<Vec<Coord>>> = Vec::with_capacity(features.len());
     for f in features {
         geometry.push(extract_polygon_rings(f)?);
@@ -323,11 +375,12 @@ fn build_polygon_layer(
 /// Build the id / start / end / property columns shared by every layer kind.
 fn common_columns(
     features: &[&ParsedFeature],
+    filter: &AttributeFilter,
 ) -> (Vec<u64>, Vec<i64>, Vec<i64>, Vec<(String, PropertyColumn)>) {
     let mut ids = Vec::with_capacity(features.len());
     let mut start = Vec::with_capacity(features.len());
     let mut end = Vec::with_capacity(features.len());
-    let mut props = PropertyAccumulator::new();
+    let mut props = PropertyAccumulator::with_filter(filter.clone());
 
     for f in features {
         ids.push(determine_feature_id(f));
@@ -358,6 +411,11 @@ struct PropertyAccumulator {
     /// True once the schema is frozen (first `push_row`); `observe` is then a
     /// no-op and the numeric/categorical split is fixed.
     sealed: bool,
+    /// Opt-in user-property selection. A key the filter rejects is never
+    /// recorded in `seen`, so it produces no column at all. Default `KeepAll`
+    /// (every key kept) keeps output byte-for-byte identical to the no-flag
+    /// build.
+    filter: AttributeFilter,
 }
 
 /// Type evidence for one property key across a feature group.
@@ -384,12 +442,16 @@ fn value_as_f64(v: &serde_json::Value) -> Option<f64> {
 }
 
 impl PropertyAccumulator {
-    fn new() -> Self {
+    /// Construct with an opt-in user-property selection. Pass
+    /// [`AttributeFilter::KeepAll`] for the default "keep every property"
+    /// behaviour.
+    fn with_filter(filter: AttributeFilter) -> Self {
         Self {
             seen: BTreeMap::new(),
             numeric: BTreeMap::new(),
             categorical: BTreeMap::new(),
             sealed: false,
+            filter,
         }
     }
 
@@ -401,6 +463,12 @@ impl PropertyAccumulator {
         let Some(props) = props else { return };
         for (key, value) in props {
             if value.is_null() {
+                continue;
+            }
+            // Opt-in attribute control: a rejected key never enters `seen`, so
+            // it yields no column. System columns aren't user properties and
+            // never pass through here, so they always survive.
+            if !self.filter.keeps(key) {
                 continue;
             }
             let kind = self.seen.entry(key.clone()).or_default();
@@ -832,6 +900,100 @@ mod tests {
         }
     }
 
+    /// `--exclude` drops the named property while leaving every other user
+    /// property AND all system columns (id/start/end/geometry) intact.
+    #[test]
+    fn exclude_drops_only_named_property() {
+        let f1 = point_feature(-122.4, 37.7, json!({ "speed": 10.0, "kind": "car", "name": "a" }));
+        let f2 = point_feature(-122.5, 37.8, json!({ "speed": 20.0, "kind": "bus", "name": "b" }));
+        let opts = ColumnarOptions {
+            attribute_filter: AttributeFilter::Exclude(
+                ["kind".to_string()].into_iter().collect(),
+            ),
+            ..Default::default()
+        };
+        let layers =
+            build_layers_from_features_with(&[&f1, &f2], "default", opts).unwrap();
+        let names: Vec<&str> = layers[0].properties.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(!names.contains(&"kind"), "excluded property must be gone");
+        assert!(names.contains(&"speed"));
+        assert!(names.contains(&"name"));
+        // System columns untouched.
+        assert_eq!(layers[0].feature_count(), 2);
+        assert_eq!(layers[0].start_times.len(), 2);
+        assert_eq!(layers[0].geometry.len(), 2);
+    }
+
+    /// `--include` keeps ONLY the named properties (plus system columns).
+    #[test]
+    fn include_keeps_only_named_properties() {
+        let f1 = point_feature(-122.4, 37.7, json!({ "speed": 10.0, "kind": "car", "name": "a" }));
+        let f2 = point_feature(-122.5, 37.8, json!({ "speed": 20.0, "kind": "bus", "name": "b" }));
+        let opts = ColumnarOptions {
+            attribute_filter: AttributeFilter::Include(
+                ["speed".to_string()].into_iter().collect(),
+            ),
+            ..Default::default()
+        };
+        let layers =
+            build_layers_from_features_with(&[&f1, &f2], "default", opts).unwrap();
+        let names: Vec<&str> = layers[0].properties.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["speed"], "only the included property survives");
+        // System columns untouched.
+        assert_eq!(layers[0].feature_count(), 2);
+        assert!(!layers[0].start_times.is_empty());
+        assert!(!layers[0].end_times.is_empty());
+    }
+
+    /// `--exclude-all` drops every user property but keeps system columns.
+    #[test]
+    fn exclude_all_drops_every_user_property() {
+        let f1 = point_feature(-122.4, 37.7, json!({ "speed": 10.0, "kind": "car" }));
+        let opts = ColumnarOptions {
+            attribute_filter: AttributeFilter::ExcludeAll,
+            ..Default::default()
+        };
+        let layers =
+            build_layers_from_features_with(&[&f1], "default", opts).unwrap();
+        assert!(layers[0].properties.is_empty(), "no user property survives");
+        // System columns remain.
+        assert_eq!(layers[0].feature_count(), 1);
+        assert_eq!(layers[0].geometry.len(), 1);
+    }
+
+    /// Clipped-segment layers honour the same attribute filter.
+    #[test]
+    fn segment_layer_honours_attribute_filter() {
+        use crate::clip::ClippedSegment;
+        let props = json!({ "road": "main", "lanes": 4 })
+            .as_object()
+            .cloned()
+            .map(std::sync::Arc::new);
+        let seg = ClippedSegment {
+            tile_x: 0,
+            tile_y: 0,
+            zoom: 10,
+            coordinates: vec![(0.0, 0.0, 0.0), (1.0, 1.0, 0.0)],
+            timestamps: vec![1000, 2000],
+            vertex_values: vec![],
+            vertex_value_matrix: vec![],
+            start_time: 1000,
+            end_time: 2000,
+            properties: props,
+            feature_id: None,
+        };
+        let layer = build_layer_from_segments(
+            &[&seg],
+            "tracks",
+            &AttributeFilter::Include(["road".to_string()].into_iter().collect()),
+        )
+        .unwrap();
+        let names: Vec<&str> = layer.properties.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["road"]);
+        // vertex_time is a SYSTEM column and must survive the filter.
+        assert!(layer.vertex_times.is_some());
+    }
+
     #[test]
     fn mixed_geometry_types_split_into_separate_layers() {
         let pt = point_feature(0.0, 0.0, json!({}));
@@ -916,7 +1078,10 @@ mod tests {
         let layers = build_layers_from_features_with(
             &refs,
             "default",
-            ColumnarOptions { pre_tessellate: true },
+            ColumnarOptions {
+                pre_tessellate: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(layers.len(), 1);

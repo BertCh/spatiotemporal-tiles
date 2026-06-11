@@ -223,6 +223,7 @@ pub fn run(args: Args) -> Result<()> {
             // their shallower-zoom ancestors — visually identical for point
             // markers that scale by magnitude in pixels.
             min_features_per_tile: Some(2),
+            min_zoom_field: None,
             summary,
         })?;
 

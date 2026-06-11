@@ -6,22 +6,29 @@ use crate::analysis::AnalysisResult;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Recommended parameters for stt-build
+/// Recommended parameters for stt-build.
+///
+/// `stt-build --auto` consumes only `min_zoom`, `max_zoom`, and
+/// `temporal_bucket_ms`. The remaining fields (`chunk_size`, `compression`,
+/// `confidence`, `explanations`) are advisory only: they appear in the
+/// standalone `analyze`/`recommend` reports but the builder does not read them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recommendations {
     /// Minimum zoom level
     pub min_zoom: u8,
     /// Maximum zoom level
     pub max_zoom: u8,
-    /// Target chunk size in bytes
+    /// Target chunk size in bytes (advisory only; builder does not read this)
     pub chunk_size: usize,
-    /// Compression method ("none" or "gzip")
+    /// Compression method. Advisory only — the packed format is zstd-only, so
+    /// this is always "zstd" and the builder ignores it.
     pub compression: String,
     /// Suggested temporal bucket size in milliseconds (0 = no bucketing)
     pub temporal_bucket_ms: u64,
     /// Human-readable temporal bucket description
     pub temporal_bucket_human: String,
-    /// Confidence level in recommendations (0-100)
+    /// Confidence level in recommendations (0-100). Advisory only; builder does
+    /// not read this.
     pub confidence: u8,
     /// Explanation of key decisions
     pub explanations: Vec<String>,
@@ -46,11 +53,12 @@ pub fn generate_recommendations(result: &AnalysisResult) -> Recommendations {
         chunk_size / 1000
     ));
 
-    // Compression from geometry analysis
+    // Compression is fixed: the packed STT format is zstd-only. This is carried
+    // as advisory text only; stt-build --auto does not act on it.
     let compression = result.geometry.recommended_compression.clone();
     explanations.push(format!(
-        "Compression '{}' for {} geometry",
-        compression, result.geometry.complexity
+        "Compression '{}' (packed format is zstd-only)",
+        compression
     ));
 
     // Temporal bucketing
@@ -165,7 +173,7 @@ mod tests {
             min_zoom: 0,
             max_zoom: 10,
             chunk_size: 256_000,
-            compression: "gzip".to_string(),
+            compression: "zstd".to_string(),
             temporal_bucket_ms: 3_600_000,
             temporal_bucket_human: "1 hour".to_string(),
             confidence: 85,

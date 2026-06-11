@@ -1016,6 +1016,7 @@ pub fn run_stt_build_with_options(
         summary: None,
         summary_sub_buckets: None,
         min_features_per_tile: None,
+        min_zoom_field: None,
     })
 }
 
@@ -1060,6 +1061,10 @@ pub struct SttBuildOptions {
     /// overhead. `None` keeps the stt-build default of 1 (write all
     /// non-empty tiles).
     pub min_features_per_tile: Option<u32>,
+    /// Forwarded to `stt-build --min-zoom-field`. Names a per-feature numeric
+    /// property that is the road-class LOD floor: a feature is hidden at zooms
+    /// below its value. `None` = no filter.
+    pub min_zoom_field: Option<String>,
 }
 
 /// Single entry point that drives the stt-build CLI with every option,
@@ -1100,6 +1105,10 @@ pub fn run_stt_build_with_full_options(opts: SttBuildOptions) -> Result<()> {
 
     if let Some(n) = opts.min_features_per_tile {
         cmd.arg("--min-features-per-tile").arg(n.to_string());
+    }
+
+    if let Some(field) = &opts.min_zoom_field {
+        cmd.arg("--min-zoom-field").arg(field);
     }
 
     if let Some(sm) = &opts.summary {
