@@ -98,7 +98,8 @@ For format v3 (zstd + Dictionary categoricals + u16 vertex-time deltas):
 - **Shared `time-window.glsl.ts`** replaces 6 inline divergent copies;
   parity test sweeps 200 random triplets against deck.gl's extension.
 - **`ProjectionWorkerPool`** + `time-window` module shipped; full per-layer
-  adoption is a follow-up.
+  adoption is a follow-up. *(Historical note: the worker projection pool was
+  later removed in the 2026-06 SoTA pass — projection now runs inline.)*
 
 ### Track B — format v3 (30fa3f5)
 
