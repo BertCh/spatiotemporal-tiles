@@ -538,6 +538,13 @@ pub struct LineStringRecord {
     /// Carried through stt-build into the tile's `vertex_value` column so
     /// renderers can color the line by it.
     pub vertex_values: Option<Vec<f32>>,
+    /// Optional per-vertex × per-time-bucket value matrix, flattened
+    /// **vertex-major**: `matrix[v * num_buckets + b]`. Length must be a
+    /// multiple of `coordinates.len()`; `num_buckets = len / num_vertices`.
+    /// Lets a static-geometry overview (e.g. flow corridors) carry a time
+    /// series of per-vertex values without re-emitting geometry per bucket.
+    /// Carried through stt-build into the tile's `vertex_value_matrix` column.
+    pub vertex_value_matrix: Option<Vec<f32>>,
     pub properties: Map<String, JsonValue>,
 }
 
@@ -554,6 +561,7 @@ impl LineStringRecord {
             end_timestamp_ms: end_timestamp.map(|t| t.timestamp_millis()),
             vertex_timestamps_ms: None,
             vertex_values: None,
+            vertex_value_matrix: None,
             properties,
         }
     }
@@ -575,6 +583,11 @@ pub struct StreamingLineStringParquetWriter {
     vertex_timestamps_builder: ListBuilder<TimestampMillisecondBuilder>,
     /// Per-vertex scalar values (one list per row, nullable), `Float32` child.
     vertex_values_builder: ListBuilder<Float32Builder>,
+    /// Per-vertex × per-bucket value matrix, flattened vertex-major (one list
+    /// per row, nullable), `Float32` child. Length is `num_vertices *
+    /// num_buckets`; the bucket count is recovered downstream from the row's
+    /// vertex count.
+    vertex_value_matrix_builder: ListBuilder<Float32Builder>,
     property_builders: Vec<PropertyBuilder>,
 
     batch_size: usize,
@@ -624,6 +637,11 @@ impl StreamingLineStringParquetWriter {
                 DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
                 true,
             ),
+            Field::new(
+                "vertex_value_matrix",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                true,
+            ),
         ];
 
         for col in &property_columns {
@@ -659,6 +677,10 @@ impl StreamingLineStringParquetWriter {
             ListBuilder::new(Float32Builder::with_capacity(batch_size * 32))
                 .with_field(Arc::new(Field::new("item", DataType::Float32, true)));
 
+        let vertex_value_matrix_builder =
+            ListBuilder::new(Float32Builder::with_capacity(batch_size * 32))
+                .with_field(Arc::new(Field::new("item", DataType::Float32, true)));
+
         Ok(Self {
             writer,
             schema,
@@ -668,6 +690,7 @@ impl StreamingLineStringParquetWriter {
             end_timestamp_builder: TimestampMillisecondBuilder::with_capacity(batch_size),
             vertex_timestamps_builder,
             vertex_values_builder,
+            vertex_value_matrix_builder,
             property_builders,
             batch_size,
             current_batch_size: 0,
@@ -717,6 +740,22 @@ impl StreamingLineStringParquetWriter {
             }
         }
 
+        let nverts = record.coordinates.len();
+        match &record.vertex_value_matrix {
+            Some(m) if nverts > 0 && !m.is_empty() && m.len() % nverts == 0 => {
+                let inner = self.vertex_value_matrix_builder.values();
+                for &v in m {
+                    inner.append_value(v);
+                }
+                self.vertex_value_matrix_builder.append(true);
+            }
+            _ => {
+                // Absent or not a clean multiple of the vertex count — leave
+                // null so no matrix channel is emitted for this row.
+                self.vertex_value_matrix_builder.append(false);
+            }
+        }
+
         for (i, col) in self.property_columns.iter().enumerate() {
             let value = record.properties.get(&col.name);
             self.property_builders[i].append(value);
@@ -743,6 +782,7 @@ impl StreamingLineStringParquetWriter {
             Arc::new(self.end_timestamp_builder.finish().with_timezone("UTC")),
             Arc::new(self.vertex_timestamps_builder.finish()),
             Arc::new(self.vertex_values_builder.finish()),
+            Arc::new(self.vertex_value_matrix_builder.finish()),
         ];
 
         for builder in &mut self.property_builders {

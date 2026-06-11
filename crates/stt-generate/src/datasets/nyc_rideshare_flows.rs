@@ -1,23 +1,31 @@
 //! Time-binned road-segment flow aggregation for NYC taxi trips (`--flows`).
 //!
 //! Builds the *overview* counterpart to `--paths`: instead of one feature per
-//! trip, emit one feature per (road corridor, time bin) whose per-vertex
-//! `vertex_values` carry the number of trips that traversed each segment
-//! during that bin. Because OSRM snaps every trip to the same road network
-//! (GeoJSON output, 1e-6° precision), consecutive-vertex pairs from different
-//! trips are byte-identical on shared streets — so segment identity is exact
-//! coordinate quantization, no map-matching needed.
+//! trip, emit one feature per **road corridor** whose geometry is stored ONCE
+//! and which carries a per-vertex × per-time-bin **value matrix** of traversal
+//! counts. Because OSRM snaps every trip to the same road network (GeoJSON
+//! output, 1e-6° precision), consecutive-vertex pairs from different trips are
+//! byte-identical on shared streets — so segment identity is exact coordinate
+//! quantization, no map-matching needed.
 //!
-//! Encoding choices (consumed by `AnimatedTripsLayer` via `tripGradient`):
-//! - `timestamp` = bin start, `end_timestamp` = bin end
-//! - `vertex_timestamps` all = bin start: the whole corridor lights up on the
-//!   bin boundary; the renderer's trail fade cross-fades into the next bin.
-//!   (Safe through stt-build: temporal splitting guards `ct > pt`, and the
-//!   rideshare build path runs without `--simplify`, so supplied times pass
-//!   through by length match.)
-//! - `vertex_values` = per-vertex traversal count (endpoints take the single
-//!   adjacent segment's count, interior vertices the mean of both sides), so
-//!   color varies along a corridor without breaking it into per-segment rows.
+//! Why a matrix instead of one feature per (corridor, bin): the street network
+//! is static across the whole time range, so re-emitting its geometry per bin
+//! duplicated it ~159× (≈1 GB) and forced the client to re-fetch corridor
+//! positions every time the playhead crossed a bin. Here the corridor geometry
+//! loads once and the renderer animates by selecting the active bin column —
+//! the line generalisation of the summary tier's `subBuckets` mechanism.
+//!
+//! Encoding choices (consumed by `FlowCorridorLayer`):
+//! - geometry: one stable corridor per chain over the *sorted union* of every
+//!   segment that ever carries traffic (deterministic → reproducible,
+//!   content-addressable packs).
+//! - `timestamp` = global bucket-0 start, `end_timestamp` = end of the whole
+//!   range. The tile spans the full range so it loads once and never re-fetches.
+//! - `vertex_value_matrix` = flat **vertex-major** `[vertex][bucket]` f32 grid
+//!   (length `num_vertices * num_buckets`). Per bucket, per-vertex values follow
+//!   the endpoint/mean rule (endpoints take the single adjacent segment's count,
+//!   interior vertices the mean of both sides). `num_buckets` is recoverable as
+//!   `matrix.len() / num_vertices`; bucket width = range / num_buckets.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Map};
@@ -27,7 +35,11 @@ use std::path::Path;
 
 use crate::common::{LineStringRecord, PropertyColumn, StreamingLineStringParquetWriter};
 
-/// Lon/lat quantized to 1e-6° (~0.1 m) — exact for OSRM GeoJSON output.
+/// Lon/lat snapped to a quantization grid (degrees). At 1e-6° (~0.1 m) it is
+/// exact for OSRM GeoJSON output; a coarser grid is the network-coarsening
+/// lever — it MERGES nearby road nodes, collapsing a dense street network into
+/// far fewer unique segments so the per-vertex × per-bucket value matrix stays
+/// light at overview zoom. Counts from merged segments aggregate together.
 type QPoint = (i32, i32);
 /// Undirected segment key: endpoints in lexicographic order.
 type SegKey = (QPoint, QPoint);
@@ -36,12 +48,17 @@ type SegKey = (QPoint, QPoint);
 /// features land in (and bloat) every tile they cross at every zoom.
 const MAX_CHAIN_SEGMENTS: usize = 64;
 
-fn quantize(lon: f64, lat: f64) -> QPoint {
-    ((lon * 1e6).round() as i32, (lat * 1e6).round() as i32)
+/// Default segment-snap grid (degrees) ≈ 30 m at NYC latitude — collapses
+/// OSRM's sub-segment over-sampling into a network coarse enough that the
+/// whole-city overview tile is light, while staying street-resolved.
+const DEFAULT_SNAP_DEG: f64 = 3.0e-4;
+
+fn quantize(lon: f64, lat: f64, quant: f64) -> QPoint {
+    ((lon / quant).round() as i32, (lat / quant).round() as i32)
 }
 
-fn dequantize(p: QPoint) -> [f64; 2] {
-    [p.0 as f64 / 1e6, p.1 as f64 / 1e6]
+fn dequantize(p: QPoint, quant: f64) -> [f64; 2] {
+    [p.0 as f64 * quant, p.1 as f64 * quant]
 }
 
 /// Parse a bin duration like `"15m"`, `"1h"`, `"90s"`, `"1d"` into ms.
@@ -65,19 +82,34 @@ pub fn parse_bin_ms(s: &str) -> Result<i64> {
     Ok(n * unit_ms)
 }
 
-/// Accumulates (time bin, road segment) → traversal count across trips.
+/// Accumulates per-segment, per-time-bin traversal counts across trips.
+///
+/// `counts` maps each undirected road segment to a sparse `bin → count` map.
+/// The bin axis is densified into contiguous buckets `[min_bin, max_bin]` at
+/// write time, so every corridor in the dataset shares one global bucket axis
+/// (required for the renderer's single bucket-index uniform).
 pub struct FlowAggregator {
     bin_ms: i64,
-    counts: HashMap<(i64, SegKey), u32>,
+    /// Segment-snap grid in degrees (see [`DEFAULT_SNAP_DEG`]). Larger merges
+    /// more nodes → lighter overview, coarser geometry.
+    snap_deg: f64,
+    counts: HashMap<SegKey, HashMap<i64, u32>>,
+    min_bin: i64,
+    max_bin: i64,
     trips_added: usize,
     trips_skipped: usize,
 }
 
 impl FlowAggregator {
-    pub fn new(bin_ms: i64) -> Self {
+    /// `snap_deg` is the segment-snap grid in degrees; pass `None` for the
+    /// default (~30 m at NYC). Use a finer grid (e.g. `1e-6`) for exact tests.
+    pub fn new(bin_ms: i64, snap_deg: Option<f64>) -> Self {
         Self {
             bin_ms,
+            snap_deg: snap_deg.unwrap_or(DEFAULT_SNAP_DEG),
             counts: HashMap::new(),
+            min_bin: i64::MAX,
+            max_bin: i64::MIN,
             trips_added: 0,
             trips_skipped: 0,
         }
@@ -104,67 +136,94 @@ impl FlowAggregator {
         };
 
         for i in 1..coords.len() {
-            let a = quantize(coords[i - 1][0], coords[i - 1][1]);
-            let b = quantize(coords[i][0], coords[i][1]);
+            let a = quantize(coords[i - 1][0], coords[i - 1][1], self.snap_deg);
+            let b = quantize(coords[i][0], coords[i][1], self.snap_deg);
             if a == b {
                 continue; // zero-length after quantization
             }
             let key = if a <= b { (a, b) } else { (b, a) };
             let mid = (times[i - 1] + times[i]) / 2;
             let bin = mid.div_euclid(self.bin_ms);
-            *self.counts.entry((bin, key)).or_insert(0) += 1;
+            *self.counts.entry(key).or_default().entry(bin).or_insert(0) += 1;
+            self.min_bin = self.min_bin.min(bin);
+            self.max_bin = self.max_bin.max(bin);
         }
         self.trips_added += 1;
     }
 
     pub fn stats(&self) -> (usize, usize, usize) {
-        (self.trips_added, self.trips_skipped, self.counts.len())
+        let entries = self.counts.values().map(|m| m.len()).sum();
+        (self.trips_added, self.trips_skipped, entries)
     }
 
-    /// Chain segments into corridors per bin and stream rows to `output`.
-    /// Returns (features written, number of bins).
+    /// Chain the segment union into stable corridors, then stream one row per
+    /// corridor carrying a `[vertex][bucket]` value matrix. Returns
+    /// (features written, number of buckets).
     pub fn write_parquet(self, output: &Path) -> Result<(usize, usize)> {
-        // Group by bin.
-        let mut bins: HashMap<i64, Vec<(SegKey, u32)>> = HashMap::new();
-        for ((bin, key), count) in self.counts {
-            bins.entry(bin).or_default().push((key, count));
-        }
-        let mut bin_ids: Vec<i64> = bins.keys().copied().collect();
-        bin_ids.sort_unstable();
-        let num_bins = bin_ids.len();
-
         let property_columns = vec![PropertyColumn::numeric("max_count")];
         let mut writer = StreamingLineStringParquetWriter::with_columns(output, property_columns)?;
 
+        if self.counts.is_empty() {
+            writer.finish()?;
+            return Ok((0, 0));
+        }
+
+        let bin_ms = self.bin_ms;
+        let snap_deg = self.snap_deg;
+        let min_bin = self.min_bin;
+        let num_buckets = (self.max_bin - min_bin + 1) as usize;
+        let bucket0 = min_bin * bin_ms;
+        let range_end = bucket0 + num_buckets as i64 * bin_ms;
+
+        // Stable, deterministic corridor decomposition over the SORTED union of
+        // every segment that ever carries traffic. Sorting is load-bearing:
+        // HashMap iteration order is non-deterministic, and a non-deterministic
+        // decomposition churns the content-addressed pack keys every build.
+        let mut all_segs: Vec<SegKey> = self.counts.keys().copied().collect();
+        all_segs.sort_unstable();
+        let chains = chain_segments(&all_segs, MAX_CHAIN_SEGMENTS);
+
         let mut features = 0usize;
-        for bin in bin_ids {
-            let segs = &bins[&bin];
-            let bin_start = bin * self.bin_ms;
-            let bin_end = bin_start + self.bin_ms;
+        for (nodes, seg_indices) in chains {
+            let coords: Vec<[f64; 2]> = nodes.iter().map(|&p| dequantize(p, snap_deg)).collect();
+            let n = coords.len(); // == seg_indices.len() + 1
 
-            for (nodes, seg_counts) in chain_segments(segs, MAX_CHAIN_SEGMENTS) {
-                let coords: Vec<[f64; 2]> = nodes.iter().map(|&p| dequantize(p)).collect();
-                let values = vertex_values_from_segment_counts(&seg_counts);
-                let max_count = seg_counts.iter().copied().max().unwrap_or(0);
-
-                let mut properties = Map::new();
-                properties.insert("max_count".to_string(), json!(max_count));
-
-                let n = coords.len();
-                let record = LineStringRecord {
-                    coordinates: coords,
-                    timestamp_ms: bin_start,
-                    end_timestamp_ms: Some(bin_end),
-                    vertex_timestamps_ms: Some(vec![bin_start; n]),
-                    vertex_values: Some(values),
-                    properties,
-                };
-                writer.write_linestring(&record)?;
-                features += 1;
+            // Flat vertex-major matrix: matrix[v * num_buckets + b].
+            let mut matrix = vec![0.0f32; n * num_buckets];
+            let mut overall_max = 0u32;
+            for b in 0..num_buckets {
+                let bin = min_bin + b as i64;
+                let seg_counts: Vec<u32> = seg_indices
+                    .iter()
+                    .map(|&si| {
+                        let c = self.counts[&all_segs[si]].get(&bin).copied().unwrap_or(0);
+                        overall_max = overall_max.max(c);
+                        c
+                    })
+                    .collect();
+                let vvals = vertex_values_from_segment_counts(&seg_counts);
+                for (v, &val) in vvals.iter().enumerate() {
+                    matrix[v * num_buckets + b] = val;
+                }
             }
+
+            let mut properties = Map::new();
+            properties.insert("max_count".to_string(), json!(overall_max));
+
+            let record = LineStringRecord {
+                coordinates: coords,
+                timestamp_ms: bucket0,
+                end_timestamp_ms: Some(range_end),
+                vertex_timestamps_ms: None,
+                vertex_values: None,
+                vertex_value_matrix: Some(matrix),
+                properties,
+            };
+            writer.write_linestring(&record)?;
+            features += 1;
         }
         writer.finish()?;
-        Ok((features, num_bins))
+        Ok((features, num_buckets))
     }
 }
 
@@ -191,12 +250,14 @@ fn interpolate_times_by_distance(coords: &[[f64; 2]], start_ms: i64, end_ms: i64
         .collect()
 }
 
-/// Greedy path cover: every segment ends up in exactly one chain; chains
-/// extend through nodes as long as any unused adjacent segment exists.
-/// Returns (node sequence, per-segment counts) per chain.
-fn chain_segments(segs: &[(SegKey, u32)], max_chain: usize) -> Vec<(Vec<QPoint>, Vec<u32>)> {
+/// Greedy path cover over segment *identity*: every segment ends up in exactly
+/// one chain; chains extend through nodes as long as any unused adjacent segment
+/// exists. Returns (node sequence, ordered indices into `segs`) per chain — the
+/// caller attaches per-bucket counts by index afterward, so one decomposition
+/// serves every time bucket. Deterministic when `segs` is sorted.
+fn chain_segments(segs: &[SegKey], max_chain: usize) -> Vec<(Vec<QPoint>, Vec<usize>)> {
     let mut adj: HashMap<QPoint, Vec<usize>> = HashMap::new();
-    for (i, ((a, b), _)) in segs.iter().enumerate() {
+    for (i, (a, b)) in segs.iter().enumerate() {
         adj.entry(*a).or_default().push(i);
         adj.entry(*b).or_default().push(i);
     }
@@ -209,13 +270,13 @@ fn chain_segments(segs: &[(SegKey, u32)], max_chain: usize) -> Vec<(Vec<QPoint>,
             continue;
         }
         used[seed] = true;
-        let ((a, b), count) = segs[seed];
+        let (a, b) = segs[seed];
         let mut nodes: std::collections::VecDeque<QPoint> = [a, b].into_iter().collect();
-        let mut counts: std::collections::VecDeque<u32> = [count].into_iter().collect();
+        let mut seg_idx: std::collections::VecDeque<usize> = [seed].into_iter().collect();
 
         // Extend at the back, then at the front.
         for forward in [true, false] {
-            while counts.len() < max_chain {
+            while seg_idx.len() < max_chain {
                 let tip = if forward {
                     *nodes.back().unwrap()
                 } else {
@@ -226,18 +287,18 @@ fn chain_segments(segs: &[(SegKey, u32)], max_chain: usize) -> Vec<(Vec<QPoint>,
                     .and_then(|cands| cands.iter().copied().find(|&i| !used[i]));
                 let Some(i) = next else { break };
                 used[i] = true;
-                let ((a, b), c) = segs[i];
-                let other = if a == tip { b } else { a };
+                let (sa, sb) = segs[i];
+                let other = if sa == tip { sb } else { sa };
                 if forward {
                     nodes.push_back(other);
-                    counts.push_back(c);
+                    seg_idx.push_back(i);
                 } else {
                     nodes.push_front(other);
-                    counts.push_front(c);
+                    seg_idx.push_front(i);
                 }
             }
         }
-        chains.push((nodes.into_iter().collect(), counts.into_iter().collect()));
+        chains.push((nodes.into_iter().collect(), seg_idx.into_iter().collect()));
     }
     chains
 }
@@ -368,7 +429,7 @@ mod tests {
 
     #[test]
     fn shared_segments_accumulate() {
-        let mut agg = FlowAggregator::new(900_000);
+        let mut agg = FlowAggregator::new(900_000, Some(1e-6));
         // Two trips traverse the same two segments within the same bin;
         // a third traverses them in the next bin.
         let coords = [[0.0, 0.0], [0.001, 0.0], [0.002, 0.0]];
@@ -382,54 +443,57 @@ mod tests {
         let (added, skipped, entries) = agg.stats();
         assert_eq!(added, 3);
         assert_eq!(skipped, 0);
-        // 2 segments × 2 bins
+        // 2 segments, each carrying 2 bins → 4 (segment, bin) entries.
+        assert_eq!(agg.counts.len(), 2);
         assert_eq!(entries, 4);
-        let c: Vec<u32> = {
-            let mut v: Vec<u32> = agg.counts.values().copied().collect();
-            v.sort_unstable();
-            v
-        };
+        let mut c: Vec<u32> = agg
+            .counts
+            .values()
+            .flat_map(|m| m.values().copied())
+            .collect();
+        c.sort_unstable();
         assert_eq!(c, vec![1, 1, 2, 2]);
     }
 
     #[test]
     fn direction_is_normalized() {
-        let mut agg = FlowAggregator::new(900_000);
+        let mut agg = FlowAggregator::new(900_000, Some(1e-6));
         let fwd = [[0.0, 0.0], [0.001, 0.0]];
         let rev = [[0.001, 0.0], [0.0, 0.0]];
         agg.add_trip(&fwd, Some(&[0, 10_000]), 0, 10_000);
         agg.add_trip(&rev, Some(&[0, 10_000]), 0, 10_000);
         assert_eq!(agg.counts.len(), 1);
-        assert_eq!(*agg.counts.values().next().unwrap(), 2);
+        let seg = agg.counts.values().next().unwrap();
+        assert_eq!(seg.values().copied().sum::<u32>(), 2);
     }
 
     #[test]
     fn chains_merge_collinear_segments() {
         // Three segments in a line: a-b, b-c, c-d → one chain of 4 nodes.
-        let a = quantize(0.0, 0.0);
-        let b = quantize(0.001, 0.0);
-        let c = quantize(0.002, 0.0);
-        let d = quantize(0.003, 0.0);
-        let segs = vec![((a, b), 4u32), ((b, c), 2u32), ((c, d), 2u32)];
+        let a = quantize(0.0, 0.0, 1e-6);
+        let b = quantize(0.001, 0.0, 1e-6);
+        let c = quantize(0.002, 0.0, 1e-6);
+        let d = quantize(0.003, 0.0, 1e-6);
+        let segs = vec![(a, b), (b, c), (c, d)];
         let chains = chain_segments(&segs, 64);
         assert_eq!(chains.len(), 1);
-        let (nodes, counts) = &chains[0];
+        let (nodes, seg_idx) = &chains[0];
         assert_eq!(nodes.len(), 4);
-        assert_eq!(counts.len(), 3);
-        // Every segment appears exactly once with its count preserved.
-        let mut sorted = counts.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, vec![2, 2, 4]);
+        assert_eq!(seg_idx.len(), 3);
+        // Every input segment appears exactly once.
+        let mut covered = seg_idx.clone();
+        covered.sort_unstable();
+        assert_eq!(covered, vec![0, 1, 2]);
     }
 
     #[test]
     fn chain_cap_respected() {
         // A long line of 10 segments with max_chain 4 → ceil(10/4) = 3 chains.
-        let nodes: Vec<QPoint> = (0..11).map(|i| quantize(0.001 * i as f64, 0.0)).collect();
-        let segs: Vec<(SegKey, u32)> = (0..10)
+        let nodes: Vec<QPoint> = (0..11).map(|i| quantize(0.001 * i as f64, 0.0, 1e-6)).collect();
+        let segs: Vec<SegKey> = (0..10)
             .map(|i| {
                 let (a, b) = (nodes[i], nodes[i + 1]);
-                (if a <= b { (a, b) } else { (b, a) }, 1u32)
+                if a <= b { (a, b) } else { (b, a) }
             })
             .collect();
         let chains = chain_segments(&segs, 4);

@@ -84,6 +84,14 @@ pub struct Args {
     #[arg(long, default_value = "15m")]
     pub flow_bin: String,
 
+    /// Segment-snap grid for --flows, in metres. Larger MERGES nearby road
+    /// nodes, collapsing the network into fewer corridors so the static-geometry
+    /// overview tile (per-vertex × per-bucket value matrix) stays light at low
+    /// zoom. ~30 m keeps the street grid legible while making the city-wide
+    /// tile tractable; 0 disables snapping (exact OSRM geometry, heavy).
+    #[arg(long, default_value = "30")]
+    pub flow_snap_meters: f64,
+
     /// Skip stt-build step
     #[arg(long)]
     pub skip_build: bool,
@@ -403,9 +411,10 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
         None
     };
 
-    // Flow corridors are an overview layer: shallower zooms, and the tile
-    // temporal bucket matches the aggregation bin so one tile holds exactly
-    // one animation frame's features.
+    // Flow corridors are a static-geometry overview: each corridor is stored
+    // ONCE and carries a per-vertex × per-bucket value matrix. `--flow-snap`
+    // coarsens the network (merging nearby road nodes) enough that even the
+    // city-wide z8 tile is light, so the full overview pyramid is viable.
     let (min_zoom, max_zoom) = if args.flows { (8, 14) } else { (10, 16) };
     let temporal_bucket = if args.flows {
         &args.flow_bin
@@ -445,6 +454,17 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
     Ok(())
 }
 
+/// Convert `--flow-snap-meters` into a snap grid in degrees (latitude metres),
+/// or a fine ~0.1 m grid when snapping is disabled (`<= 0`). `FlowAggregator`
+/// uses this to merge nearby road nodes so the overview matrix stays light.
+fn flow_snap_deg(args: &Args) -> Option<f64> {
+    if args.flow_snap_meters > 0.0 {
+        Some(args.flow_snap_meters / 111_320.0)
+    } else {
+        Some(1e-6)
+    }
+}
+
 /// `--flows --from-intermediate <paths.parquet>`: re-aggregate a kept
 /// `--paths` intermediate into flow corridors, write the flows parquet next
 /// to the output, then build the archive. Routing is skipped entirely.
@@ -466,7 +486,7 @@ fn flows_from_paths_intermediate(args: &Args, paths_parquet: &PathBuf) -> Result
     }
 
     println!("\n🔁 Aggregating paths intermediate into {} flow bins", args.flow_bin);
-    let mut agg = FlowAggregator::new(bin_ms);
+    let mut agg = FlowAggregator::new(bin_ms, flow_snap_deg(args));
     let rows = crate::datasets::nyc_rideshare_flows::aggregate_paths_parquet(paths_parquet, &mut agg)?;
     let (added, skipped, entries) = agg.stats();
     println!("   ✓ {} rows read ({} aggregated, {} skipped)", rows, added, skipped);
@@ -501,7 +521,7 @@ fn generate_flows_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Resu
         failed
     );
 
-    let mut agg = FlowAggregator::new(bin_ms);
+    let mut agg = FlowAggregator::new(bin_ms, flow_snap_deg(args));
     for (_, trip, coords, vertex_times) in &results {
         agg.add_trip(
             coords,
