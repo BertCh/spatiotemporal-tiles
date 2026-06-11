@@ -13,7 +13,7 @@
 //! | `start_time`  | `Int64`                                 | Unix ms, absolute             |
 //! | `end_time`    | `Int64`                                 | Unix ms, absolute             |
 //! | `geometry`    | GeoArrow point / linestring / polygon   | interleaved f64 lon/lat       |
-//! | `vertex_time` | `List<Int64>` (nullable)                | per-vertex Unix ms (optional) |
+//! | `vertex_time` | `List<UInt16>` deltas or `List<Int64>` (nullable) | per-vertex Unix ms (optional; see [`build_vertex_time_array`]) |
 //! | `vertex_value`| `List<Float32>` (nullable)              | per-vertex scalar, e.g. SST (optional) |
 //! | `<property>`  | `Float64` or `Dictionary<UInt16,Utf8>`   | one column per property       |
 //!
@@ -21,9 +21,19 @@
 //! carry, say, a linestring layer and a point layer side by side:
 //!
 //! ```text
-//! [u16 layer_count]
-//!   repeated: [u16 name_len][name utf8][u32 ipc_len][ipc stream bytes]
+//! [u16 layer_count | ALIGNED_FRAME_FLAG]
+//!   repeated: [u16 name_len][name utf8][u32 ipc_len][pad to 8][ipc stream bytes]
 //! ```
+//!
+//! The leading u16's top bit ([`ALIGNED_FRAME_FLAG`]) marks the *aligned*
+//! frame: zero padding after each `ipc_len` places every Arrow IPC stream at
+//! an 8-byte boundary relative to the payload start, so readers can hand the
+//! stream to an Arrow implementation zero-copy (Arrow buffers are 8-byte
+//! aligned *within* a stream; the stream itself must start aligned for that
+//! to survive). The pad length is not stored — readers derive it as
+//! `(8 - pos % 8) % 8` from the position after `ipc_len`. Frames without the
+//! flag (every archive written before the flag existed) carry no padding and
+//! decode exactly as before.
 
 use crate::error::{Error, Result};
 use crate::types::GeometryType;
@@ -37,7 +47,17 @@ use arrow::datatypes::{DataType, Field, Schema, UInt16Type};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+
+/// Top bit of the layer frame's leading u16: marks an *aligned* frame whose
+/// IPC streams are padded to 8-byte boundaries (see the module docs). The
+/// remaining 15 bits carry the layer count, so a tile may have at most
+/// `0x7fff` layers. Old frames never set this bit (layer counts are tiny).
+pub const ALIGNED_FRAME_FLAG: u16 = 0x8000;
+
+/// Alignment (bytes) of each layer's Arrow IPC stream within an aligned frame.
+const FRAME_ALIGN: usize = 8;
 
 /// GeoArrow extension-name metadata key.
 const GEOARROW_EXT_KEY: &str = "ARROW:extension:name";
@@ -134,6 +154,16 @@ pub struct ColumnarLayer {
     /// the feature count and each inner vec matches that feature's vertex count.
     /// `NaN` marks a vertex with no value; renderers map it to a fallback color.
     pub vertex_values: Option<Vec<Vec<f32>>>,
+    /// Optional per-vertex × per-time-bucket value matrix, flattened
+    /// **vertex-major** per feature: `matrix[v * num_buckets + b]`. When
+    /// present, length equals the feature count and each inner vec is
+    /// `feature_vertex_count * num_buckets` long. Lets a static-geometry
+    /// overview carry a per-vertex time series (e.g. flow-corridor counts per
+    /// bin) so the renderer animates resident data instead of re-fetching
+    /// geometry per bucket. Encoded as the tile's `vertex_value_matrix` column;
+    /// `num_buckets` is recorded in schema metadata under
+    /// `stt:vertex_value_buckets`.
+    pub vertex_value_matrix: Option<Vec<Vec<f32>>>,
     /// Optional pre-baked triangle indices for polygon features (MLT-style).
     ///
     /// When present, `triangles.len() == feature_count` and each inner vec is
@@ -175,6 +205,9 @@ impl ColumnarLayer {
         }
         if let Some(vv) = &self.vertex_values {
             check("vertex_values", vv.len())?;
+        }
+        if let Some(vm) = &self.vertex_value_matrix {
+            check("vertex_value_matrix", vm.len())?;
         }
         if let Some(tri) = &self.triangles {
             check("triangles", tri.len())?;
@@ -312,6 +345,37 @@ fn build_geometry_array(geom: &GeometryColumn) -> ArrayRef {
 /// Schema metadata keys for the v3 per-vertex time encoding.
 const VERTEX_TIME_ORIGIN_KEY: &str = "stt:vertex_time_origin_ms";
 const VERTEX_TIME_STEP_KEY: &str = "stt:vertex_time_step_ms";
+/// Number of time buckets packed into each row of the `vertex_value_matrix`
+/// column. The renderer reshapes the flat vertex-major list back into a
+/// `[vertex][bucket]` grid using this count.
+const VERTEX_VALUE_BUCKETS_KEY: &str = "stt:vertex_value_buckets";
+
+/// Default ceiling (ms) on the u16-delta `vertex_time` quantization step.
+///
+/// The u16 encoding trades precision for a 4x payload shrink, but the step is
+/// derived from the layer's temporal span — without a ceiling, a wide layer
+/// (e.g. a 30-day temporal-LOD bucket) silently quantizes vertex times to
+/// tens of seconds. A 1 s ceiling keeps the worst-case error below anything
+/// playback can show; layers needing a coarser step fall back to the exact
+/// `List<Int64>` shape instead (no thinning).
+pub const DEFAULT_VERTEX_TIME_MAX_STEP_MS: u32 = 1000;
+
+/// Process-wide step ceiling, settable once at startup (e.g. from
+/// `stt-build --vertex-time-precision`). Reads/writes are monotonic-free
+/// config, so `Relaxed` is sufficient.
+static VERTEX_TIME_MAX_STEP_MS: AtomicU32 = AtomicU32::new(DEFAULT_VERTEX_TIME_MAX_STEP_MS);
+
+/// Override the u16-delta `vertex_time` step ceiling for every subsequent
+/// [`encode_layer`] call. Values below 1 ms clamp to 1 (every layer with a
+/// span beyond u16 milliseconds then takes the exact `List<Int64>` path).
+pub fn set_vertex_time_max_step_ms(ms: u32) {
+    VERTEX_TIME_MAX_STEP_MS.store(ms.max(1), Ordering::Relaxed);
+}
+
+/// The currently configured u16-delta `vertex_time` step ceiling (ms).
+pub fn vertex_time_max_step_ms() -> u32 {
+    VERTEX_TIME_MAX_STEP_MS.load(Ordering::Relaxed)
+}
 
 /// Build a (key_array, value_array) pair for a Dictionary<UInt16, Utf8>
 /// column. Null inputs become null keys (the corresponding string is not
@@ -361,20 +425,25 @@ fn build_dictionary_indices(
 struct VertexTimeColumn {
     array: ArrayRef,
     /// `(origin_ms, step_ms)` when the column is u16-delta-encoded. `None`
-    /// when the column kept its absolute `List<Int64>` shape (the v2 fallback
-    /// path, used for layers whose temporal span exceeds 65,535 * step).
+    /// when the column kept its absolute `List<Int64>` shape (the exact
+    /// fallback path, used for layers whose temporal span would need a step
+    /// beyond the configured ceiling — see [`DEFAULT_VERTEX_TIME_MAX_STEP_MS`]).
     encoding: Option<(i64, u32)>,
 }
 
 /// Build the optional per-vertex time column.
 ///
 /// v3 attempts to encode timestamps as `List<UInt16>` deltas relative to
-/// a per-layer origin and step (`absolute = origin + delta * step`). When
-/// the layer's temporal range overflows `u16::MAX * step`, it falls back to
-/// the v2 `List<Int64>` shape so we never lose precision.
+/// a per-layer origin and step (`absolute = origin + delta * step`), with
+/// the step bounded by `max_step_ms` (see
+/// [`DEFAULT_VERTEX_TIME_MAX_STEP_MS`]). When the layer's temporal span
+/// would need a coarser step than that, the column keeps the exact v2
+/// `List<Int64>` shape instead — bounded quantization or no quantization,
+/// never a silent precision cliff.
 fn build_vertex_time_array(
     vertex_times: &Option<Vec<Vec<i64>>>,
     feature_count: usize,
+    max_step_ms: u32,
 ) -> Option<VertexTimeColumn> {
     let vt = vertex_times.as_ref()?;
 
@@ -399,17 +468,19 @@ fn build_vertex_time_array(
     if any && max >= min {
         // Pick the smallest step (in ms) that keeps every (t - min) inside
         // u16::MAX. step=1 means "exact ms granularity"; larger steps trade
-        // precision (bounded by step/2 ms) for a 4x payload shrink vs i64.
+        // precision (bounded by step ms) for a 4x payload shrink vs i64.
         let span = (max - min) as u64;
+        // Computed in u64 and compared BEFORE narrowing: a pathological span
+        // whose step overflows u32 must hit the i64 path, not wrap small.
         let step = if span <= u16::MAX as u64 {
-            1u32
+            1u64
         } else {
-            ((span + u16::MAX as u64 - 1) / u16::MAX as u64).max(1) as u32
+            ((span + u16::MAX as u64 - 1) / u16::MAX as u64).max(1)
         };
-        // Round-trip safety: a step too large to fit u32 isn't reachable
-        // through any sensible tile (span < ~136 years for step=1), but we
-        // still bail back to i64 if it ever happens.
-        if step != 0 {
+        // Step ceiling: beyond it the quantization error would exceed the
+        // configured precision, so take the exact i64 path below instead.
+        if step <= max_step_ms as u64 {
+            let step = step as u32;
             let mut builder = ListBuilder::new(UInt16Builder::new());
             for i in 0..feature_count {
                 match vt.get(i) {
@@ -485,6 +556,25 @@ fn build_vertex_value_array(
     Some(Arc::new(builder.finish()))
 }
 
+/// Recover the per-vertex value-matrix bucket count: for the first LineString
+/// feature carrying both vertices and matrix data, `num_buckets = matrix_len /
+/// vertex_count` (the matrix is vertex-major, `num_vertices * num_buckets`
+/// long). Returns `None` for non-line geometry or when no feature carries a
+/// clean multiple — the matrix column is then present but non-animatable.
+fn infer_vertex_value_buckets(matrix: &[Vec<f32>], geometry: &GeometryColumn) -> Option<u32> {
+    let lines = match geometry {
+        GeometryColumn::LineString(lines) => lines,
+        _ => return None,
+    };
+    for (i, m) in matrix.iter().enumerate() {
+        let nv = lines.get(i)?.len();
+        if !m.is_empty() && nv > 0 && m.len() % nv == 0 {
+            return Some((m.len() / nv) as u32);
+        }
+    }
+    None
+}
+
 // ----------------------------------------------------------------------------
 // Encoding
 // ----------------------------------------------------------------------------
@@ -527,7 +617,7 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
     // Track per-layer vertex-time encoding so the schema metadata (set
     // below) records the origin/step needed for the u16-delta reader path.
     let mut vertex_time_encoding: Option<(i64, u32)> = None;
-    if let Some(vt_col) = build_vertex_time_array(&layer.vertex_times, n) {
+    if let Some(vt_col) = build_vertex_time_array(&layer.vertex_times, n, vertex_time_max_step_ms()) {
         fields.push(Arc::new(Field::new(
             "vertex_time",
             vt_col.array.data_type().clone(),
@@ -546,6 +636,24 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
             true,
         )));
         columns.push(vv_array);
+    }
+
+    // Optional per-vertex × per-bucket value matrix (static-geometry overview
+    // animation). Reuses the `vertex_value` List<Float32> encoding — each row
+    // is just longer (vertex_count * num_buckets, vertex-major). num_buckets is
+    // recovered from the per-feature vertex count and recorded in schema meta.
+    let mut vertex_value_buckets: Option<u32> = None;
+    if let Some(vm_array) = build_vertex_value_array(&layer.vertex_value_matrix, n) {
+        fields.push(Arc::new(Field::new(
+            "vertex_value_matrix",
+            vm_array.data_type().clone(),
+            true,
+        )));
+        columns.push(vm_array);
+        vertex_value_buckets = layer
+            .vertex_value_matrix
+            .as_ref()
+            .and_then(|vm| infer_vertex_value_buckets(vm, &layer.geometry));
     }
 
     // Pre-baked triangle indices (MLT-style). Only emitted for polygon
@@ -619,6 +727,9 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
         schema_meta.insert(VERTEX_TIME_ORIGIN_KEY.to_string(), origin.to_string());
         schema_meta.insert(VERTEX_TIME_STEP_KEY.to_string(), step.to_string());
     }
+    if let Some(buckets) = vertex_value_buckets {
+        schema_meta.insert(VERTEX_VALUE_BUCKETS_KEY.to_string(), buckets.to_string());
+    }
     if has_triangles {
         schema_meta.insert(TRIANGLES_METADATA_KEY.to_string(), "true".to_string());
     }
@@ -642,15 +753,22 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
 }
 
 /// Encode a full tile payload (one or more layers) with the layer frame.
+///
+/// Always emits the *aligned* frame ([`ALIGNED_FRAME_FLAG`] set): each
+/// layer's IPC stream is preceded by zero padding to an 8-byte boundary
+/// relative to the payload start, so readers can wrap the stream zero-copy.
+/// `ipc_len` records the exact IPC byte length (padding excluded); readers
+/// derive the pad from alignment math alone.
 pub fn encode_tile(layers: &[ColumnarLayer]) -> Result<Vec<u8>> {
-    if layers.len() > u16::MAX as usize {
+    if layers.len() >= ALIGNED_FRAME_FLAG as usize {
         return Err(Error::Other(format!(
-            "tile has {} layers, exceeds u16 frame limit",
-            layers.len()
+            "tile has {} layers, exceeds the {} frame limit",
+            layers.len(),
+            ALIGNED_FRAME_FLAG - 1
         )));
     }
     let mut out = Vec::new();
-    out.extend_from_slice(&(layers.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(layers.len() as u16 | ALIGNED_FRAME_FLAG).to_le_bytes());
     for layer in layers {
         let name = layer.name.as_bytes();
         if name.len() > u16::MAX as usize {
@@ -660,6 +778,8 @@ pub fn encode_tile(layers: &[ColumnarLayer]) -> Result<Vec<u8>> {
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name);
         out.extend_from_slice(&(ipc.len() as u32).to_le_bytes());
+        let pad = (FRAME_ALIGN - out.len() % FRAME_ALIGN) % FRAME_ALIGN;
+        out.extend_from_slice(&[0u8; FRAME_ALIGN][..pad]);
         out.extend_from_slice(&ipc);
     }
     Ok(out)
@@ -697,11 +817,17 @@ pub fn decode_layer(ipc: &[u8]) -> Result<RecordBatch> {
 }
 
 /// Decode a full tile payload (the layer frame) into its layers.
+///
+/// Accepts both frame shapes: the aligned frame ([`ALIGNED_FRAME_FLAG`] set,
+/// with derived padding before each IPC stream) and the legacy unpadded
+/// frame written by every archive that predates the flag.
 pub fn decode_tile(payload: &[u8]) -> Result<Vec<DecodedLayer>> {
     if payload.len() < 2 {
         return Err(Error::Other("tile payload too short for layer frame".into()));
     }
-    let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    let raw_count = u16::from_le_bytes([payload[0], payload[1]]);
+    let aligned = raw_count & ALIGNED_FRAME_FLAG != 0;
+    let count = (raw_count & !ALIGNED_FRAME_FLAG) as usize;
     let mut pos = 2usize;
     let mut layers = Vec::with_capacity(count);
     for _ in 0..count {
@@ -710,6 +836,10 @@ pub fn decode_tile(payload: &[u8]) -> Result<Vec<DecodedLayer>> {
         let name = String::from_utf8(name.to_vec())
             .map_err(|e| Error::Other(format!("layer name not utf8: {e}")))?;
         let ipc_len = read_u32(payload, &mut pos)? as usize;
+        if aligned {
+            let pad = (FRAME_ALIGN - pos % FRAME_ALIGN) % FRAME_ALIGN;
+            read_slice(payload, &mut pos, pad)?;
+        }
         let ipc = read_slice(payload, &mut pos, ipc_len)?;
         let batch = decode_layer(ipc)?;
         layers.push(DecodedLayer { name, batch });
@@ -757,6 +887,7 @@ mod tests {
             vertex_times: None,
             vertex_values: None,
             triangles: None,
+            vertex_value_matrix: None,
             properties: vec![
                 (
                     "speed".to_string(),
@@ -787,6 +918,7 @@ mod tests {
             vertex_times: Some(vec![vec![0, 25, 50], vec![100, 200]]),
             vertex_values: None,
             triangles: None,
+            vertex_value_matrix: None,
             properties: vec![],
         }
     }
@@ -806,6 +938,7 @@ mod tests {
             vertex_times: None,
             vertex_values: None,
             triangles: None,
+            vertex_value_matrix: None,
             properties: vec![],
         }
     }
@@ -821,6 +954,7 @@ mod tests {
             vertex_times: None,
             vertex_values: None,
             triangles: None,
+            vertex_value_matrix: None,
             properties: vec![(
                 "kind".into(),
                 PropertyColumn::Categorical(vec![
@@ -882,6 +1016,7 @@ mod tests {
             vertex_times: None,
             vertex_values: None,
             triangles: None,
+            vertex_value_matrix: None,
             properties: vec![("kind".into(), PropertyColumn::Categorical(kinds))],
         };
         let err = encode_layer(&layer).expect_err("overflowing dictionary must error");
@@ -1024,6 +1159,7 @@ mod tests {
             vertex_times: None,
             vertex_values: Some(vec![vec![5.0, f32::NAN, 27.5], vec![12.0, 13.0]]),
             triangles: None,
+            vertex_value_matrix: None,
             properties: vec![],
         };
         let ipc = encode_layer(&layer).unwrap();
@@ -1047,31 +1183,78 @@ mod tests {
     }
 
     #[test]
+    fn line_layer_roundtrips_with_vertex_value_matrix() {
+        // Static-geometry overview: per-vertex × per-bucket value matrix rides a
+        // nullable List<Float32>, flattened vertex-major (vertex 0's buckets,
+        // then vertex 1's, ...). num_buckets is recorded in schema metadata.
+        // Feature 0: 3 vertices × 2 buckets; feature 1: 2 vertices × 2 buckets.
+        let layer = ColumnarLayer {
+            name: "flows".into(),
+            feature_ids: vec![1, 2],
+            start_times: vec![0, 0],
+            end_times: vec![1800, 1800],
+            geometry: GeometryColumn::LineString(vec![
+                vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]],
+                vec![[3.0, 3.0], [4.0, 4.0]],
+            ]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            // vertex-major: [v0b0, v0b1, v1b0, v1b1, v2b0, v2b1]
+            vertex_value_matrix: Some(vec![
+                vec![10.0, 11.0, 20.0, 21.0, 30.0, 31.0],
+                vec![40.0, 41.0, 50.0, 51.0],
+            ]),
+            properties: vec![],
+        };
+        let ipc = encode_layer(&layer).unwrap();
+        let batch = decode_layer(&ipc).unwrap();
+
+        let vm = batch
+            .column_by_name("vertex_value_matrix")
+            .expect("matrix layers carry a vertex_value_matrix column")
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(vm.len(), 2);
+        let f0 = vm.value(0);
+        let f0v = f0.as_any().downcast_ref::<arrow::array::Float32Array>().unwrap();
+        assert_eq!(f0v.values(), &[10.0, 11.0, 20.0, 21.0, 30.0, 31.0]);
+        let f1 = vm.value(1);
+        let f1v = f1.as_any().downcast_ref::<arrow::array::Float32Array>().unwrap();
+        assert_eq!(f1v.values(), &[40.0, 41.0, 50.0, 51.0]);
+
+        // num_buckets = matrix_len / vertex_count = 6 / 3 = 2, in schema meta.
+        assert_eq!(
+            batch.schema().metadata().get("stt:vertex_value_buckets"),
+            Some(&"2".to_string())
+        );
+    }
+
+    #[test]
     fn vertex_time_falls_back_to_int64_for_wide_spans() {
-        // span = 100 billion ms; step would need to be ~1.5e6 ms — that's
-        // still fine for u16 deltas, so we instead force the fallback by
-        // disabling u16 (an empty `vertex_times` list); the v3 encoder must
-        // never silently corrupt absolute timestamps.
+        // span = 100 billion ms; the u16 encoding would need step ≈ 1.5e6 ms,
+        // far beyond the DEFAULT_VERTEX_TIME_MAX_STEP_MS ceiling — so the
+        // encoder must take the exact List<Int64> path, byte-for-byte
+        // absolute timestamps, with no origin/step metadata.
         let layer = ColumnarLayer {
             name: "edge".into(),
             feature_ids: vec![1],
             start_times: vec![0],
             end_times: vec![100],
             geometry: GeometryColumn::LineString(vec![vec![[0.0, 0.0], [1.0, 1.0]]]),
-            // Two timestamps far enough apart that any step <= u16::MAX
-            // still keeps them inside u16 — the encoder picks step≈1.5e6
-            // ms. We assert round-trip precision is bounded by step/2.
             vertex_times: Some(vec![vec![0, 100_000_000_000]]),
             vertex_values: None,
             triangles: None,
+            vertex_value_matrix: None,
             properties: vec![],
         };
         let ipc = encode_layer(&layer).unwrap();
         let batch = decode_layer(&ipc).unwrap();
         let schema = batch.schema();
         let meta = schema.metadata();
-        let origin: i64 = meta.get("stt:vertex_time_origin_ms").unwrap().parse().unwrap();
-        let step: u32 = meta.get("stt:vertex_time_step_ms").unwrap().parse().unwrap();
+        assert!(meta.get("stt:vertex_time_origin_ms").is_none());
+        assert!(meta.get("stt:vertex_time_step_ms").is_none());
         let vt = batch
             .column_by_name("vertex_time")
             .unwrap()
@@ -1079,18 +1262,55 @@ mod tests {
             .downcast_ref::<ListArray>()
             .unwrap();
         let first = vt.value(0);
-        let deltas = first
+        let absolutes = first
             .as_any()
-            .downcast_ref::<arrow::array::UInt16Array>()
+            .downcast_ref::<Int64Array>()
+            .expect("wide spans must keep the exact Int64 shape");
+        assert_eq!(absolutes.values(), &[0, 100_000_000_000]);
+    }
+
+    #[test]
+    fn vertex_time_step_ceiling_is_the_u16_vs_int64_threshold() {
+        // span = 65_535_000 ms quantizes at exactly the 1000 ms default
+        // ceiling → u16 deltas; one ms more pushes the step to 1001 → i64.
+        let make = |span: i64| ColumnarLayer {
+            name: "edge".into(),
+            feature_ids: vec![1],
+            start_times: vec![0],
+            end_times: vec![100],
+            geometry: GeometryColumn::LineString(vec![vec![[0.0, 0.0], [1.0, 1.0]]]),
+            vertex_times: Some(vec![vec![0, span]]),
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![],
+        };
+
+        let at_ceiling = decode_layer(&encode_layer(&make(65_535_000)).unwrap()).unwrap();
+        let schema = at_ceiling.schema();
+        let step: u32 = schema
+            .metadata()
+            .get("stt:vertex_time_step_ms")
+            .expect("span at the ceiling stays u16-delta encoded")
+            .parse()
             .unwrap();
-        let absolutes: Vec<i64> = deltas
-            .values()
-            .iter()
-            .map(|d| origin + (*d as i64) * step as i64)
-            .collect();
-        // First sample is exact; second is within one step.
-        assert_eq!(absolutes[0], 0);
-        assert!((absolutes[1] - 100_000_000_000).unsigned_abs() <= step as u64);
+        assert_eq!(step, DEFAULT_VERTEX_TIME_MAX_STEP_MS);
+
+        let past_ceiling = decode_layer(&encode_layer(&make(65_536_000)).unwrap()).unwrap();
+        assert!(past_ceiling
+            .schema()
+            .metadata()
+            .get("stt:vertex_time_step_ms")
+            .is_none());
+        let vt = past_ceiling
+            .column_by_name("vertex_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let first = vt.value(0);
+        let absolutes = first.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(absolutes.values(), &[0, 65_536_000]);
     }
 
     #[test]
@@ -1196,6 +1416,7 @@ mod tests {
             vertex_times: None,
             vertex_values: None,
             triangles: Some(vec![tris.clone()]),
+            vertex_value_matrix: None,
             properties: vec![],
         };
         let ipc = encode_layer(&layer).unwrap();
@@ -1250,6 +1471,89 @@ mod tests {
         let batch = decode_layer(&ipc).unwrap();
         assert!(!batch.schema().metadata().contains_key(TRIANGLES_METADATA_KEY));
         assert!(batch.column_by_name("triangles").is_none());
+    }
+
+    /// Walk a frame and return each layer's IPC start offset + length,
+    /// honouring the aligned-frame padding rule.
+    fn ipc_offsets(payload: &[u8]) -> Vec<(usize, usize)> {
+        let raw = u16::from_le_bytes([payload[0], payload[1]]);
+        let aligned = raw & ALIGNED_FRAME_FLAG != 0;
+        let count = (raw & !ALIGNED_FRAME_FLAG) as usize;
+        let mut pos = 2usize;
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let name_len =
+                u16::from_le_bytes([payload[pos], payload[pos + 1]]) as usize;
+            pos += 2 + name_len;
+            let ipc_len = u32::from_le_bytes([
+                payload[pos],
+                payload[pos + 1],
+                payload[pos + 2],
+                payload[pos + 3],
+            ]) as usize;
+            pos += 4;
+            if aligned {
+                pos += (FRAME_ALIGN - pos % FRAME_ALIGN) % FRAME_ALIGN;
+            }
+            out.push((pos, ipc_len));
+            pos += ipc_len;
+        }
+        out
+    }
+
+    #[test]
+    fn encoded_frames_align_every_ipc_stream_to_8_bytes() {
+        // Layer names of varying lengths so the unpadded offsets would land
+        // all over the place; the aligned frame must place every IPC stream
+        // at an 8-byte boundary regardless.
+        let mut a = sample_line_layer();
+        a.name = "x".into();
+        let mut b = sample_point_layer();
+        b.name = "a-longer-layer-name".into();
+        let payload = encode_tile(&[a, b]).unwrap();
+
+        let raw = u16::from_le_bytes([payload[0], payload[1]]);
+        assert_ne!(raw & ALIGNED_FRAME_FLAG, 0, "writer must set the aligned flag");
+
+        let offsets = ipc_offsets(&payload);
+        assert_eq!(offsets.len(), 2);
+        for (off, _) in &offsets {
+            assert_eq!(off % 8, 0, "IPC stream at offset {off} is misaligned");
+        }
+
+        // And the padded frame still round-trips.
+        let decoded = decode_tile(&payload).unwrap();
+        assert_eq!(decoded[0].name, "x");
+        assert_eq!(decoded[1].name, "a-longer-layer-name");
+        assert_eq!(decoded[0].batch.num_rows(), 2);
+        assert_eq!(decoded[1].batch.num_rows(), 3);
+    }
+
+    #[test]
+    fn legacy_unpadded_frames_still_decode() {
+        // Rebuild an old-style frame (no flag, no padding) from the layers'
+        // IPC bytes — the shape every pre-alignment archive carries — and
+        // assert the decoder reproduces the aligned frame's batches.
+        let layers = vec![sample_line_layer(), sample_point_layer()];
+        let aligned_payload = encode_tile(&layers).unwrap();
+        let aligned = decode_tile(&aligned_payload).unwrap();
+
+        let mut legacy: Vec<u8> = Vec::new();
+        legacy.extend_from_slice(&(layers.len() as u16).to_le_bytes());
+        for ((off, len), layer) in ipc_offsets(&aligned_payload).iter().zip(&layers) {
+            let name = layer.name.as_bytes();
+            legacy.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            legacy.extend_from_slice(name);
+            legacy.extend_from_slice(&(*len as u32).to_le_bytes());
+            legacy.extend_from_slice(&aligned_payload[*off..*off + *len]);
+        }
+
+        let decoded = decode_tile(&legacy).unwrap();
+        assert_eq!(decoded.len(), aligned.len());
+        for (l, a) in decoded.iter().zip(&aligned) {
+            assert_eq!(l.name, a.name);
+            assert_eq!(l.batch, a.batch);
+        }
     }
 
     #[test]

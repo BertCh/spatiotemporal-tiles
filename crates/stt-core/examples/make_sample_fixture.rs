@@ -60,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vertex_times: None,
         vertex_values: None,
         triangles: None,
+        vertex_value_matrix: None,
         properties: vec![
             (
                 "speed".into(),

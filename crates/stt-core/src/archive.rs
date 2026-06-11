@@ -708,7 +708,8 @@ impl ArchiveWriter {
     /// Eager finalize: blobs are already written; lay down the directory,
     /// metadata and header (no shared dictionary).
     fn finalize_eager(mut self, metadata: &crate::metadata::Metadata) -> Result<()> {
-        self.entries.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start));
+        self.entries
+            .sort_by_key(|e| (e.zoom, e.hilbert, e.time_start, e.temporal_bucket_ms));
         self.write_tail(metadata, 0, 0)
     }
 
@@ -749,9 +750,19 @@ impl ArchiveWriter {
             }
             other => other,
         };
+        // Total tiebreak after the curve key (which ties between base and
+        // temporal-LOD tiles of one cell) so the blob byte order — and any
+        // packed transcode derived from it — is reproducible across rebuilds.
         pending.sort_by_key(|p| {
-            crate::curve::space_time_key(
-                ordering, p.z, p.x, p.y, p.hilbert, p.time_start, tb(p), tb_min, tb_span,
+            (
+                crate::curve::space_time_key(
+                    ordering, p.z, p.x, p.y, p.hilbert, p.time_start, tb(p), tb_min, tb_span,
+                ),
+                p.z,
+                p.x,
+                p.y,
+                p.time_start,
+                p.temporal_bucket_ms,
             )
         });
 
@@ -833,7 +844,10 @@ impl ArchiveWriter {
             (0, 0)
         };
 
-        self.entries.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start));
+        // Bucket tiebreak keeps base-vs-LOD ties deterministic (see the blob
+        // sort above); the codec only requires the (zoom, hilbert, t) prefix.
+        self.entries
+            .sort_by_key(|e| (e.zoom, e.hilbert, e.time_start, e.temporal_bucket_ms));
         self.write_tail(metadata, dictionary_offset, dictionary_length)
     }
 
@@ -909,6 +923,7 @@ mod tests {
             vertex_times: None,
             vertex_values: None,
             triangles: None,
+            vertex_value_matrix: None,
             properties: vec![],
         }
     }
@@ -1182,6 +1197,7 @@ mod tests {
                 vertex_times: Some(vtimes),
                 vertex_values: None,
                 triangles: None,
+                vertex_value_matrix: None,
                 properties: vec![("kind".to_string(), PropertyColumn::Categorical(kind))],
             }])
             .unwrap()

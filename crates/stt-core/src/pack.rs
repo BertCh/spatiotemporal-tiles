@@ -75,16 +75,26 @@ fn blake3_128_hex(bytes: &[u8]) -> String {
 // Manifest
 // ----------------------------------------------------------------------------
 
+/// At-rest encoding value for a zstd-compressed directory object.
+pub const DIRECTORY_ENCODING_ZSTD: &str = "zstd";
+
 /// Pointer to the encoded directory object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectoryRef {
     /// Object key, relative to the dataset root (e.g. `index/<hash>.sttd`).
     pub key: String,
-    /// Directory object length in bytes.
+    /// Directory object length in bytes (the at-rest object, i.e. the
+    /// compressed length when `encoding` is set).
     pub length: u64,
     /// Directory codec version (`5` for the packed format).
     #[serde(rename = "directoryVersion")]
     pub directory_version: u8,
+    /// At-rest encoding of the directory object. `Some("zstd")` means the
+    /// object bytes are a zstd frame wrapping the codec bytes; absent (the
+    /// shape every pre-encoding manifest has) means raw codec bytes. The
+    /// content address and `length` always describe the at-rest bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
 }
 
 /// Pointer to one pack object. The position in `Manifest::packs` **is** the
@@ -265,17 +275,31 @@ impl PackWriter {
             }
             other => other,
         };
+        // The curve key alone is not total (base and temporal-LOD tiles of one
+        // cell tie; the 21-bit cube cap can collide), and `pending` arrives in
+        // whatever order the (possibly parallel) tiler produced — so a total
+        // tiebreak makes the blob byte order, and therefore every content
+        // address, reproducible across identical rebuilds. Immutable-pack CDN
+        // caching depends on that: a rebuild of unchanged data must re-derive
+        // the same pack names.
         pending.sort_by_key(|p| {
-            crate::curve::space_time_key(
-                ordering,
+            (
+                crate::curve::space_time_key(
+                    ordering,
+                    p.z,
+                    p.x,
+                    p.y,
+                    p.hilbert,
+                    p.time_start,
+                    tb(p),
+                    tb_min,
+                    tb_span,
+                ),
                 p.z,
                 p.x,
                 p.y,
-                p.hilbert,
                 p.time_start,
-                tb(p),
-                tb_min,
-                tb_span,
+                p.temporal_bucket_ms,
             )
         });
 
@@ -374,7 +398,10 @@ impl PackWriter {
                 cover_t_min: p.cover_t_min,
             });
         }
-        entries.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start));
+        // Directory codec order is (zoom, hilbert, time_start); the extra
+        // bucket key totalizes ties between a cell's base and temporal-LOD
+        // entries so the encoded directory is byte-reproducible too.
+        entries.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start, e.temporal_bucket_ms));
 
         // --- Write objects ----------------------------------------------
         fs::create_dir_all(&out_dir)?;
@@ -401,8 +428,13 @@ impl PackWriter {
             });
         }
 
-        // Encode + write the directory (content-addressed).
-        let index_bytes = crate::directory::encode_directory(&entries);
+        // Encode + zstd-compress the directory (content-addressed over the
+        // at-rest, i.e. compressed, bytes). Directories compress ~2x and sit
+        // on the cold-start critical path with no CDN content-encoding
+        // rescue; the manifest's `directory.encoding` field tells readers to
+        // decompress (absent = raw, the pre-encoding shape).
+        let index_plain = crate::directory::encode_directory(&entries);
+        let index_bytes = compression::compress_zstd_with_dict(&index_plain, None)?;
         let index_hex = blake3_128_hex(&index_bytes);
         let index_rel = format!("index/{index_hex}.sttd");
         let index_path = out_dir.join(&index_rel);
@@ -417,6 +449,7 @@ impl PackWriter {
                 key: index_rel,
                 length: index_bytes.len() as u64,
                 directory_version: crate::directory::DIRECTORY_VERSION,
+                encoding: Some(DIRECTORY_ENCODING_ZSTD.to_string()),
             },
             packs: pack_refs,
             metadata: metadata.clone(),
@@ -428,6 +461,19 @@ impl PackWriter {
         f.flush()?;
 
         Ok(manifest)
+    }
+}
+
+/// Unwrap a directory object's at-rest encoding into raw codec bytes.
+/// `encoding` is the manifest's `directory.encoding`: absent = raw (every
+/// pre-encoding manifest), `"zstd"` = one zstd frame around the codec bytes.
+fn decode_directory_object(bytes: &[u8], encoding: Option<&str>) -> Result<Vec<u8>> {
+    match encoding {
+        None => Ok(bytes.to_vec()),
+        Some(DIRECTORY_ENCODING_ZSTD) => compression::decompress_zstd_with_dict(bytes, None),
+        Some(other) => Err(Error::InvalidArchive(format!(
+            "unknown directory encoding {other:?} (this reader supports absent or \"zstd\")"
+        ))),
     }
 }
 
@@ -580,9 +626,15 @@ pub fn verify_packed_objects<P: AsRef<Path>>(manifest_path: P) -> Result<Vec<Str
         check_object(root, &p.key, p.length, "packs", "sttp", &mut issues);
     }
 
-    // Directory must decode and reference only packs that exist.
+    // Directory must decode (through its at-rest encoding, if any) and
+    // reference only packs that exist.
     match fs::read(root.join(&manifest.directory.key)) {
-        Ok(dir_bytes) => match crate::directory::decode_directory(&dir_bytes) {
+        Ok(dir_bytes) => match decode_directory_object(
+            &dir_bytes,
+            manifest.directory.encoding.as_deref(),
+        )
+        .and_then(|raw| crate::directory::decode_directory(&raw))
+        {
             Ok(entries) => {
                 if let Some(max_pid) = entries.iter().map(|e| e.pack_id).max() {
                     if max_pid as usize >= manifest.packs.len() {
@@ -661,10 +713,13 @@ impl PackedReader {
             }
         };
 
-        // Load + decode the directory object.
+        // Load + decode the directory object (unwrapping its at-rest
+        // encoding first; absent = raw, the pre-encoding manifest shape).
         let dir_path = root.join(&manifest.directory.key);
         let dir_bytes = fs::read(&dir_path)?;
-        let entries = crate::directory::decode_directory(&dir_bytes)?;
+        let dir_raw =
+            decode_directory_object(&dir_bytes, manifest.directory.encoding.as_deref())?;
+        let entries = crate::directory::decode_directory(&dir_raw)?;
 
         // Prepare (lazy) pack handles in pack_id order.
         let packs = manifest
@@ -791,6 +846,7 @@ mod tests {
             vertex_times: None,
             vertex_values: None,
             triangles: None,
+            vertex_value_matrix: None,
             properties: vec![],
         }
     }
@@ -819,6 +875,7 @@ mod tests {
                 key: "index/abc.sttd".to_string(),
                 length: 42,
                 directory_version: 5,
+                encoding: Some(DIRECTORY_ENCODING_ZSTD.to_string()),
             },
             packs: vec![
                 PackRef { key: "packs/a.sttp".to_string(), length: 100 },
@@ -837,7 +894,23 @@ mod tests {
         assert_eq!(back.format_version, m.format_version);
         assert_eq!(back.packs.len(), 2);
         assert_eq!(back.directory.directory_version, 5);
+        assert_eq!(back.directory.encoding.as_deref(), Some("zstd"));
         assert_eq!(back.metadata.name, "manifest-test");
+
+        // Backward compat: a pre-encoding manifest (no `encoding` key — the
+        // shape of every deployed dataset) must parse with `encoding: None`,
+        // and a None encoding must serialize without the key.
+        let mut legacy_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        legacy_json["directory"]
+            .as_object_mut()
+            .unwrap()
+            .remove("encoding");
+        let legacy_back =
+            Manifest::from_json_bytes(&serde_json::to_vec(&legacy_json).unwrap()).unwrap();
+        assert_eq!(legacy_back.directory.encoding, None);
+        let legacy_out =
+            String::from_utf8(legacy_back.to_json_bytes().unwrap()).unwrap();
+        assert!(!legacy_out.contains("\"encoding\""), "{legacy_out}");
     }
 
     /// Full round-trip: 30 synthetic tiles (a couple byte-identical to exercise
@@ -961,6 +1034,7 @@ mod tests {
             vertex_times: None,
             vertex_values: None,
             triangles: None,
+            vertex_value_matrix: None,
             properties: vec![],
         }])
         .unwrap();
@@ -974,12 +1048,121 @@ mod tests {
             let p = distinct_tile(k);
             w.add_tile_full(&TileId::new(10, k as u32, 0, 0), 0, 100, None, 6, None, &p).unwrap();
         }
-        let manifest = w.finalize(&Metadata::new("big")).unwrap();
+        let _manifest = w.finalize(&Metadata::new("big")).unwrap();
 
         // At least one pack exceeds the target (the loner). Reading proves it.
         let reader = PackedReader::open(out.join("manifest.json")).unwrap();
         let big_entry = reader.entries().iter().find(|e| e.x == 0).unwrap();
         assert_eq!(reader.read_payload(big_entry).unwrap(), big);
+    }
+
+    /// Two builds of the same input — added in different orders, including
+    /// curve-key ties (a base + temporal-LOD entry on one cell) — must produce
+    /// byte-identical objects: same pack hashes, same directory hash. This is
+    /// the immutable-pack CDN contract (a rebuild of unchanged data must not
+    /// invalidate the edge cache).
+    #[test]
+    fn rebuilds_are_byte_reproducible() {
+        // Tiles including a tie pair: same (z, x, y, time_start), one base
+        // (bucket None) and one LOD (bucket Some) — the curve key alone can't
+        // order them, the tiebreak must.
+        let bucket = 3_600_000i64;
+        let mut tiles: Vec<(TileId, i64, Option<u64>, Vec<u8>)> = Vec::new();
+        for k in 0..10u64 {
+            let t = (k % 4) as i64 * bucket;
+            tiles.push((
+                TileId::new(9, (k % 5) as u32, (k / 5) as u32, t as u64),
+                t,
+                None,
+                distinct_tile(k),
+            ));
+        }
+        // The tie pair on cell (1, 0): base + LOD aggregate at one time_start.
+        tiles.push((TileId::new(9, 1, 0, 0), 0, None, distinct_tile(100)));
+        tiles.push((
+            TileId::new(9, 1, 0, 0),
+            0,
+            Some(24 * bucket as u64),
+            distinct_tile(101),
+        ));
+
+        let meta = Metadata::new("repro").with_temporal_bucket_ms(bucket as u64);
+        let build = |order: &[usize]| {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("dataset");
+            let mut w = PackWriter::create(&out, BlobOrdering::Auto, 8 * 1024).unwrap();
+            for &i in order {
+                let (id, t, b, payload) = &tiles[i];
+                w.add_tile_full(id, *t, t + bucket - 1, Some(*t), 6, *b, payload)
+                    .unwrap();
+            }
+            let manifest = w.finalize(&meta).unwrap();
+            (dir, manifest)
+        };
+
+        let forward: Vec<usize> = (0..tiles.len()).collect();
+        let reverse: Vec<usize> = (0..tiles.len()).rev().collect();
+        let (_d1, m1) = build(&forward);
+        let (_d2, m2) = build(&reverse);
+
+        assert_eq!(m1.directory.key, m2.directory.key, "directory hash must be stable");
+        assert_eq!(
+            m1.packs.iter().map(|p| &p.key).collect::<Vec<_>>(),
+            m2.packs.iter().map(|p| &p.key).collect::<Vec<_>>(),
+            "pack hashes must be stable across rebuilds"
+        );
+        assert_eq!(m1.to_json_bytes().unwrap(), m2.to_json_bytes().unwrap());
+    }
+
+    /// The directory ships zstd-compressed at rest (declared via
+    /// `directory.encoding`), and a legacy manifest with a RAW directory and
+    /// no `encoding` key — the shape of every deployed dataset — must still
+    /// open and verify.
+    #[test]
+    fn directory_encoding_compressed_and_raw_both_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        let mut w = PackWriter::create(&out, BlobOrdering::Auto, 8 * 1024).unwrap();
+        for k in 0..8u64 {
+            let p = distinct_tile(k);
+            w.add_tile_full(&TileId::new(10, k as u32, 0, 0), 0, 100, None, 6, None, &p)
+                .unwrap();
+        }
+        let manifest = w.finalize(&Metadata::new("dir-enc")).unwrap();
+        let manifest_path = out.join("manifest.json");
+
+        // Fresh output declares the encoding and the at-rest bytes are a
+        // valid zstd frame that inflates to the codec bytes.
+        assert_eq!(manifest.directory.encoding.as_deref(), Some("zstd"));
+        let at_rest = fs::read(out.join(&manifest.directory.key)).unwrap();
+        assert_eq!(at_rest.len() as u64, manifest.directory.length);
+        let raw = compression::decompress_zstd_with_dict(&at_rest, None).unwrap();
+        assert!(crate::directory::decode_directory(&raw).is_ok());
+        assert!(verify_packed_objects(&manifest_path).unwrap().is_empty());
+        let entries_compressed = PackedReader::open(&manifest_path).unwrap().entries().to_vec();
+
+        // Rewrite the dataset as a legacy (raw-directory) manifest: store the
+        // raw codec bytes under their own content address and drop `encoding`.
+        let raw_hex = blake3_128_hex(&raw);
+        let raw_rel = format!("index/{raw_hex}.sttd");
+        fs::write(out.join(&raw_rel), &raw).unwrap();
+        let mut legacy = manifest.clone();
+        legacy.directory = DirectoryRef {
+            key: raw_rel,
+            length: raw.len() as u64,
+            directory_version: crate::directory::DIRECTORY_VERSION,
+            encoding: None,
+        };
+        fs::write(&manifest_path, legacy.to_json_bytes().unwrap()).unwrap();
+
+        assert!(verify_packed_objects(&manifest_path).unwrap().is_empty());
+        let entries_raw = PackedReader::open(&manifest_path).unwrap().entries().to_vec();
+        assert_eq!(entries_raw, entries_compressed);
+
+        // An unknown encoding must fail loudly, not decode garbage.
+        legacy.directory.encoding = Some("br".to_string());
+        fs::write(&manifest_path, legacy.to_json_bytes().unwrap()).unwrap();
+        assert!(PackedReader::open(&manifest_path).is_err());
     }
 
     /// A clean packed dataset verifies with no issues; corrupting a pack's

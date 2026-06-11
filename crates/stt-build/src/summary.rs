@@ -415,6 +415,7 @@ fn build_summary_layer(
         // tessellate, so the sidecar column added by the pre-tessellate
         // track is irrelevant.
         triangles: None,
+        vertex_value_matrix: None,
     }
 }
 
@@ -500,6 +501,7 @@ mod tests {
             end_timestamp: None,
             vertex_timestamps: None,
             vertex_values: None,
+            vertex_value_matrix: None,
             lon,
             lat,
         }

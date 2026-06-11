@@ -469,6 +469,7 @@ fn process_zoom_level(
                     clip_config,
                     feature.vertex_timestamps.as_deref(),
                     feature.vertex_values.as_deref(),
+                    feature.vertex_value_matrix.as_deref(),
                 );
                 if segments.is_empty() {
                     total_original.fetch_add(1, Ordering::Relaxed);
@@ -864,6 +865,7 @@ where
                         &clip_config,
                         feature.vertex_timestamps.as_deref(),
                         feature.vertex_values.as_deref(),
+                        feature.vertex_value_matrix.as_deref(),
                     );
                     if segments.is_empty() {
                         let (x, y) = projection::lonlat_to_tile(feature.lon, feature.lat, zoom)
@@ -1070,6 +1072,7 @@ mod tests {
             end_timestamp: None,
             vertex_timestamps: None,
             vertex_values: None,
+            vertex_value_matrix: None,
             lon,
             lat,
         }
@@ -1094,9 +1097,80 @@ mod tests {
             end_timestamp: Some(end),
             vertex_timestamps: None,
             vertex_values: None,
+            vertex_value_matrix: None,
             lon: first[0],
             lat: first[1],
         }
+    }
+
+    /// A static-geometry corridor carrying a per-vertex × per-bucket value
+    /// matrix must build into ONE tile per spatial cell spanning the WHOLE
+    /// range — never fragmented across temporal buckets by its interpolated
+    /// vertex times — so the client loads its geometry once and animates the
+    /// resident matrix. (The build bucket here is small enough that, without
+    /// the matrix time-pin, the corridor would fragment into several tiles.)
+    #[test]
+    fn matrix_corridor_builds_one_tile_spanning_range() {
+        let num_buckets = 4usize;
+        let bucket_ms = 900_000u64; // 15 min
+        let start = 1_420_070_400_000u64;
+        let end = start + num_buckets as u64 * bucket_ms;
+        // 3 vertices kept inside a single zoom-10 tile.
+        let coords: Vec<Vec<f64>> = vec![
+            vec![-73.980, 40.750],
+            vec![-73.979, 40.751],
+            vec![-73.978, 40.752],
+        ];
+        let nverts = coords.len();
+        let first = coords[0].clone();
+        // Flat vertex-major matrix: nverts * num_buckets.
+        let matrix: Vec<f32> = (0..nverts * num_buckets).map(|i| i as f32).collect();
+        let feature = ParsedFeature {
+            geojson: Feature {
+                bbox: None,
+                geometry: Some(Geometry::new(GeomValue::LineString(coords))),
+                id: None,
+                properties: None,
+                foreign_members: None,
+            },
+            shared_properties: None,
+            timestamp: start,
+            end_timestamp: Some(end),
+            vertex_timestamps: None,
+            vertex_values: None,
+            vertex_value_matrix: Some(matrix),
+            lon: first[0],
+            lat: first[1],
+        };
+        let config = TileConfig {
+            min_zoom: 10,
+            max_zoom: 10,
+            layer_name: "flows".to_string(),
+            temporal_bucket_ms: bucket_ms,
+            clip_trajectories: true,
+            clip_min_vertices: 2,
+            ..TileConfig::default()
+        };
+
+        let tiles = generate_tiles(&[feature], &config, 1).unwrap();
+        assert_eq!(
+            tiles.len(),
+            1,
+            "matrix corridor must build exactly one tile, got {}",
+            tiles.len()
+        );
+        let tile = &tiles[0];
+        // Spans the whole range so its time window matches every playback frame.
+        assert_eq!(tile.time_start, start as i64);
+        assert_eq!(tile.time_end, end as i64);
+        // The matrix survived clipping into the tile's columnar layer.
+        let layer = &tile.layers[0];
+        let vm = layer
+            .vertex_value_matrix
+            .as_ref()
+            .expect("tile layer must carry the per-vertex value matrix");
+        assert_eq!(vm.len(), 1);
+        assert_eq!(vm[0].len(), nverts * num_buckets);
     }
 
     /// The tight covering lower bound `cover_t_min` is the earliest feature
@@ -1518,6 +1592,7 @@ mod tests {
             end_timestamp: Some(2 * hour),
             vertex_timestamps: None,
             vertex_values: None,
+            vertex_value_matrix: None,
             lon: first[0],
             lat: first[1],
         };

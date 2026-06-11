@@ -99,7 +99,9 @@ pub fn build_layer_from_segments(
     let mut geometry: Vec<Vec<Coord>> = Vec::with_capacity(n);
     let mut vertex_times: Vec<Vec<i64>> = Vec::with_capacity(n);
     let mut vertex_values: Vec<Vec<f32>> = Vec::with_capacity(n);
+    let mut vertex_value_matrix: Vec<Vec<f32>> = Vec::with_capacity(n);
     let mut any_values = false;
+    let mut any_matrix = false;
 
     let mut props = PropertyAccumulator::new();
 
@@ -128,6 +130,21 @@ pub fn build_layer_from_segments(
             vals.push(seg.vertex_values.get(i).copied().unwrap_or(f32::NAN));
         }
 
+        // Per-vertex × per-bucket matrix, flattened vertex-major. Each segment
+        // row is `[vertex][bucket]`, aligned 1:1 with `coordinates` by the
+        // clipper, so concatenating rows yields the tile's vertex-major layout.
+        if !seg.vertex_value_matrix.is_empty() {
+            any_matrix = true;
+            let nb = seg.vertex_value_matrix[0].len();
+            let mut flat = Vec::with_capacity(coords.len() * nb);
+            for row in &seg.vertex_value_matrix {
+                flat.extend_from_slice(row);
+            }
+            vertex_value_matrix.push(flat);
+        } else {
+            vertex_value_matrix.push(Vec::new());
+        }
+
         geometry.push(coords);
         vertex_times.push(times);
         vertex_values.push(vals);
@@ -149,6 +166,7 @@ pub fn build_layer_from_segments(
         // Only attach per-vertex values if at least one segment carried them.
         vertex_values: any_values.then_some(vertex_values),
         triangles: None,
+        vertex_value_matrix: any_matrix.then_some(vertex_value_matrix),
         properties: props.finish(),
     })
 }
@@ -169,6 +187,7 @@ fn build_point_layer(features: &[&ParsedFeature], name: String) -> Result<Column
         vertex_times: None,
         vertex_values: None,
         triangles: None,
+        vertex_value_matrix: None,
         properties: props,
     })
 }
@@ -179,8 +198,10 @@ fn build_line_layer(features: &[&ParsedFeature], name: String) -> Result<Columna
     let mut geometry: Vec<Vec<Coord>> = Vec::with_capacity(features.len());
     let mut vertex_times: Vec<Vec<i64>> = Vec::with_capacity(features.len());
     let mut vertex_values: Vec<Vec<f32>> = Vec::with_capacity(features.len());
+    let mut vertex_value_matrix: Vec<Vec<f32>> = Vec::with_capacity(features.len());
     let mut any_duration = false;
     let mut any_values = false;
+    let mut any_matrix = false;
     let mut length_mismatch_warned = false;
 
     for f in features {
@@ -230,10 +251,20 @@ fn build_line_layer(features: &[&ParsedFeature], name: String) -> Result<Columna
             }
             _ => vec![f32::NAN; coords.len()],
         };
+        // Per-vertex × per-bucket matrix (flat vertex-major). Accepted only when
+        // the length is a clean multiple of the vertex count.
+        let matrix: Vec<f32> = match f.vertex_value_matrix.as_ref() {
+            Some(m) if !m.is_empty() && m.len() % coords.len() == 0 => {
+                any_matrix = true;
+                m.clone()
+            }
+            _ => Vec::new(),
+        };
 
         geometry.push(coords);
         vertex_times.push(times);
         vertex_values.push(vals);
+        vertex_value_matrix.push(matrix);
     }
 
     Ok(ColumnarLayer {
@@ -248,6 +279,7 @@ fn build_line_layer(features: &[&ParsedFeature], name: String) -> Result<Columna
         // Likewise only attach per-vertex values if a feature supplied them.
         vertex_values: any_values.then_some(vertex_values),
         triangles: None,
+        vertex_value_matrix: any_matrix.then_some(vertex_value_matrix),
         properties: props,
     })
 }
@@ -283,6 +315,7 @@ fn build_polygon_layer(
         vertex_times: None,
         vertex_values: None,
         triangles,
+        vertex_value_matrix: None,
         properties: props,
     })
 }
@@ -646,6 +679,7 @@ mod tests {
             end_timestamp: None,
             vertex_timestamps: None,
             vertex_values: None,
+            vertex_value_matrix: None,
             lon,
             lat,
         }
@@ -666,6 +700,7 @@ mod tests {
             end_timestamp: end,
             vertex_timestamps: None,
             vertex_values: None,
+            vertex_value_matrix: None,
             lon: coords[0][0],
             lat: coords[0][1],
         }
@@ -858,6 +893,7 @@ mod tests {
             end_timestamp: None,
             vertex_timestamps: None,
             vertex_values: None,
+            vertex_value_matrix: None,
             lon: x,
             lat: y,
         }

@@ -39,9 +39,11 @@ struct Args {
     #[arg(long)]
     end_time_field: Option<String>,
 
-    /// Time format: "unix-ms", "unix-sec", or "iso8601"
-    #[arg(long, default_value = "iso8601")]
-    time_format: String,
+    /// Time format of the `--time-field` column. Only consulted for integer
+    /// (Int64) columns — Arrow Timestamp columns are self-describing and
+    /// String columns are always parsed as ISO 8601.
+    #[arg(long, value_enum, default_value = "iso8601")]
+    time_format: input::TimeFormat,
 
     /// Minimum zoom level
     #[arg(long, default_value = "0")]
@@ -51,11 +53,9 @@ struct Args {
     #[arg(long, default_value = "14")]
     max_zoom: u8,
 
-    /// Compression method: none, gzip, zstd
-    ///
-    /// v3 archives default to zstd-3, which compresses ~5x faster than
-    /// gzip-6 for an equivalent or better ratio. Pick `gzip` only when
-    /// emitting a legacy v2 archive for compatibility with older readers.
+    /// Compression for tile payloads. The packed format is zstd-only (every
+    /// blob is compressed per-blob with zstd so the TS reader can decode it);
+    /// the legacy `gzip`/`none` choices were removed and now error.
     #[arg(long, default_value = "zstd")]
     compression: String,
 
@@ -171,8 +171,16 @@ struct Args {
 
     /// Fail the build on any row with a null or unparseable timestamp,
     /// rather than coercing it to Unix epoch 0 with a warning.
+    /// Negative (pre-1970) timestamps always fail the build — the temporal
+    /// index stores unsigned ms-since-epoch and cannot represent them.
     #[arg(long)]
     strict_times: bool,
+
+    /// Fail the build on any row with a null or unparseable geometry,
+    /// rather than skipping the row with a warning. (Skipped rows are never
+    /// tiled — there is no position to place them at.)
+    #[arg(long)]
+    strict_geometry: bool,
 
     /// Auto-tune zoom range, temporal bucket size, and compression by
     /// running stt-optimize's analyzer over the input before building.
@@ -189,8 +197,8 @@ struct Args {
     /// Summary tiles live in the same archive directory as raw tiles but use
     /// a distinct layer name (`summary` by default). Readers dispatch
     /// between the two tiers automatically.
-    #[arg(long)]
-    summary_tier: Option<String>,
+    #[arg(long, value_enum)]
+    summary_tier: Option<SummaryTierScheme>,
 
     /// Lowest zoom at which summary tiles are emitted. Defaults to the
     /// archive's `--min-zoom`.
@@ -268,17 +276,23 @@ struct Args {
     #[arg(long)]
     heatmap_class: Option<String>,
 
-    /// Emit a pre-rasterized density-grid tier (Phase D). Format
-    /// `WxH` (e.g. `128x128`). At low zooms, one textured quad per tile
-    /// renders in constant per-frame time regardless of feature count —
-    /// the only practical path for 100M+ datasets at zoom ≤ 6.
-    ///
-    /// **NOTE (scaffold)**: this flag currently RECORDS intent in archive
-    /// metadata only. The actual tile rasterization + sidecar payload is
-    /// deferred to a follow-up. The CLI surface + metadata schema land
-    /// here so downstream consumers can plan against the contract.
-    #[arg(long)]
-    heatmap_raster: Option<String>,
+    /// Ceiling (ms) on the per-vertex time quantization step. Vertex
+    /// timestamps ride a compact u16-delta encoding whose step is derived
+    /// from each tile layer's temporal span; a layer that would need a step
+    /// coarser than this ceiling is stored as exact i64 timestamps instead
+    /// (larger payload, zero precision loss). Default 1000 ms — below
+    /// anything playback can show. Raise it only to trade precision for
+    /// payload size on very wide temporal-LOD buckets.
+    #[arg(long, default_value_t = stt_core::arrow_tile::DEFAULT_VERTEX_TIME_MAX_STEP_MS, value_name = "MS")]
+    vertex_time_precision: u32,
+}
+
+/// Aggregation scheme for `--summary-tier`. `quadbin` is reserved (declared
+/// here so the CLI vocabulary is stable) but not implemented yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum SummaryTierScheme {
+    H3,
+    Quadbin,
 }
 
 fn main() -> Result<()> {
@@ -319,6 +333,11 @@ fn main() -> Result<()> {
         apply_auto_recommendations(&matches, &mut args)?;
     }
 
+    // Per-vertex time precision is a process-wide encoder setting (the
+    // encode sites sit behind generic tile-writer traits with no per-call
+    // options channel). Set once, before any tile is encoded.
+    stt_core::arrow_tile::set_vertex_time_max_step_ms(args.vertex_time_precision);
+
     // Parse compression
     let compression = parse_compression(&args.compression)?;
 
@@ -340,7 +359,12 @@ fn main() -> Result<()> {
         .saturating_mul(1024 * 1024)
         .max(1);
 
-    let strictness = if args.strict_times {
+    let time_strictness = if args.strict_times {
+        input::InputStrictness::Strict
+    } else {
+        input::InputStrictness::Warn
+    };
+    let geometry_strictness = if args.strict_geometry {
         input::InputStrictness::Strict
     } else {
         input::InputStrictness::Warn
@@ -368,9 +392,6 @@ fn main() -> Result<()> {
         }
         if args.heatmap_class.is_some() {
             unsupported.push("--heatmap-class");
-        }
-        if args.heatmap_raster.is_some() {
-            unsupported.push("--heatmap-raster");
         }
         if args.metadata_output.is_some() {
             unsupported.push("--metadata-output");
@@ -441,15 +462,16 @@ fn main() -> Result<()> {
         let input_path = args.input.clone();
         let time_field = args.time_field.clone();
         let end_time_field = args.end_time_field.clone();
-        let time_format = args.time_format.clone();
+        let time_format = args.time_format;
         let handle = std::thread::spawn(move || {
             let tx_clone = tx.clone();
             let res = input::stream_features(
                 &input_path,
                 &time_field,
                 end_time_field.as_deref(),
-                &time_format,
-                strictness,
+                time_format,
+                time_strictness,
+                geometry_strictness,
                 |batch| {
                     tx_clone
                         .send(Ok(batch))
@@ -563,8 +585,9 @@ fn main() -> Result<()> {
         &args.input,
         &args.time_field,
         args.end_time_field.as_deref(),
-        &args.time_format,
-        strictness,
+        args.time_format,
+        time_strictness,
+        geometry_strictness,
     )?;
 
     pb.finish_with_message(format!("Loaded {} features", features.len()));
@@ -637,13 +660,6 @@ fn main() -> Result<()> {
         info!("Pre-tessellation enabled (triangle indices written alongside polygon geometry)");
     }
 
-    if compression != stt_core::types::Compression::Zstd {
-        warn!(
-            "--compression {} ignored: the packed format compresses per-blob with \
-             zstd (no shared dict, so the TS reader can decode it).",
-            args.compression
-        );
-    }
     info!(
         "Pack ordering: {pack_ordering} (buffered — space-time blob layout + \
          byte-identical dedup, then cut into packs of ≤{} MiB; holds payloads \
@@ -755,15 +771,12 @@ fn main() -> Result<()> {
     // to summary tiles when the metadata declares the tier covers that zoom.
     // This is intentional — keeping the raw tier untouched means a v3-aware
     // reader that doesn't understand `summary_tier` falls back cleanly.
-    let summary_tier_descriptor = if let Some(scheme) = &args.summary_tier {
-        let scheme = match scheme.to_ascii_lowercase().as_str() {
-            "h3" => stt_core::metadata::SummaryScheme::H3,
-            "quadbin" => {
+    let summary_tier_descriptor = if let Some(scheme) = args.summary_tier {
+        let scheme = match scheme {
+            SummaryTierScheme::H3 => stt_core::metadata::SummaryScheme::H3,
+            SummaryTierScheme::Quadbin => {
                 anyhow::bail!("--summary-tier quadbin is not implemented yet (h3 only)");
             }
-            other => anyhow::bail!(
-                "--summary-tier must be 'h3' or 'quadbin', got '{other}'"
-            ),
         };
         let sm_min = args.summary_min_zoom.unwrap_or(args.min_zoom);
         let sm_max = args
@@ -855,22 +868,6 @@ fn main() -> Result<()> {
         metadata = metadata.with_heatmap_domain(domain);
     }
 
-    // Raster tier metadata scaffold (Phase D). Records intent only — the
-    // sidecar tile generation lands in a follow-up. Documented as
-    // declared-but-not-emitted in the field's comment.
-    if let Some(spec) = args.heatmap_raster.as_deref() {
-        match parse_raster_spec(spec, args.min_zoom, args.heatmap_class.as_deref()) {
-            Ok(tier) => {
-                info!(
-                    "Raster tier (scaffold): {}×{} × {} channels, zooms {}..={} (sidecar generation TODO)",
-                    tier.width, tier.height, tier.channels, tier.min_zoom, tier.max_zoom,
-                );
-                metadata = metadata.with_raster_tier(tier);
-            }
-            Err(e) => warn!("--heatmap-raster ignored: {e}"),
-        }
-    }
-
     let manifest = writer.finalize(&metadata)?;
 
     // Step 6: Write metadata JSON if requested
@@ -939,47 +936,6 @@ fn packed_output_dir(output: &std::path::Path) -> PathBuf {
     } else {
         output.to_path_buf()
     }
-}
-
-/// Parse a `--heatmap-raster WxH` spec into a [`RasterTier`] descriptor.
-/// Honours `min_zoom` from the build config and gates raster output to
-/// the bottom 5 zooms (raster value drops off fast — by zoom 6 the
-/// per-tile cell count makes the hex summary tier more accurate).
-fn parse_raster_spec(
-    spec: &str,
-    base_min_zoom: u8,
-    heatmap_class: Option<&str>,
-) -> anyhow::Result<stt_core::metadata::RasterTier> {
-    let (w_s, h_s) = spec
-        .split_once('x')
-        .or_else(|| spec.split_once('X'))
-        .ok_or_else(|| anyhow::anyhow!("expected `WxH` (e.g. `128x128`)"))?;
-    let width: u16 = w_s
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid raster width: {w_s}"))?;
-    let height: u16 = h_s
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid raster height: {h_s}"))?;
-    if width == 0 || height == 0 || width > 1024 || height > 1024 {
-        anyhow::bail!("raster dims {width}×{height} out of range (1..=1024 per side)");
-    }
-    // Default to 1 channel; --heatmap-class would let us bump to N at
-    // bake time once the rasterizer wires per-class accumulators.
-    let (channels, class_ids) = match heatmap_class {
-        Some(_) => (1u8, vec!["default".to_string()]),
-        None => (1u8, vec!["default".to_string()]),
-    };
-    Ok(stt_core::metadata::RasterTier {
-        min_zoom: base_min_zoom,
-        max_zoom: base_min_zoom + 4,
-        width,
-        height,
-        channels,
-        class_ids,
-        layer_name: "density_raster".to_string(),
-    })
 }
 
 /// Compute the build-time HeatmapLayer intensity domain for the archive.
@@ -1092,7 +1048,7 @@ fn apply_auto_recommendations(matches: &ArgMatches, args: &mut Args) -> Result<(
     let source = stt_optimize::DataSource::GeoParquet {
         path: args.input.clone(),
         time_field: args.time_field.clone(),
-        time_format: args.time_format.clone(),
+        time_format: args.time_format.as_str().to_string(),
     };
     let rec = stt_optimize::recommend_for(&source)
         .context("stt-optimize analyzer failed")?;
@@ -1109,10 +1065,8 @@ fn apply_auto_recommendations(matches: &ArgMatches, args: &mut Args) -> Result<(
         info!("  max-zoom: {} (auto)", rec.max_zoom);
         args.max_zoom = rec.max_zoom;
     }
-    if !user_set("compression") {
-        info!("  compression: {} (auto)", rec.compression);
-        args.compression = rec.compression.clone();
-    }
+    // rec.compression is NOT folded in: the packed format is zstd-only, so
+    // an analyzer recommendation of gzip/none would just fail validation.
     if !user_set("temporal_bucket") && rec.temporal_bucket_ms > 0 {
         let human = rec.temporal_bucket_human.clone();
         info!("  temporal-bucket: {} (auto)", human);
@@ -1155,13 +1109,20 @@ fn aligned_time_range(
     stt_core::types::TimeRange::new(start, tr.end)
 }
 
+/// The packed format compresses per-blob with zstd (no shared dict, so the
+/// TS reader can decode it); the vestigial `gzip`/`none` choices were
+/// removed — they were already ignored-with-warning.
 fn parse_compression(s: &str) -> Result<stt_core::types::Compression> {
     match s.to_lowercase().as_str() {
-        "none" => Ok(stt_core::types::Compression::None),
-        "gzip" => Ok(stt_core::types::Compression::Gzip),
         "zstd" | "zstandard" => Ok(stt_core::types::Compression::Zstd),
+        "gzip" | "none" => anyhow::bail!(
+            "--compression {} has been removed: the packed format always \
+             compresses tile payloads per-blob with zstd. Drop the flag \
+             (zstd is the default).",
+            s
+        ),
         _ => anyhow::bail!(
-            "Invalid compression method: {}. Use 'none', 'gzip', or 'zstd'",
+            "Invalid compression method: {}. Only 'zstd' is supported",
             s
         ),
     }

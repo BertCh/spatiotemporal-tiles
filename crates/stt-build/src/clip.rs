@@ -31,6 +31,12 @@ pub struct ClippedSegment {
     /// `coordinates`. Empty when the producer supplied none; `NaN` marks an
     /// individual vertex with no value.
     pub vertex_values: Vec<f32>,
+    /// Per-vertex × per-bucket value matrix for this segment, `[vertex][bucket]`,
+    /// aligned with `coordinates`. Empty when the producer supplied none. Each
+    /// bucket channel is resampled at clip boundaries exactly like
+    /// `vertex_values`. Flattened vertex-major into the tile's
+    /// `vertex_value_matrix` column.
+    pub vertex_value_matrix: Vec<Vec<f32>>,
     /// Start timestamp of this segment
     pub start_time: u64,
     /// End timestamp of this segment
@@ -450,19 +456,39 @@ fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 ///
 /// Returns the clipped coordinates and timestamps for the portion of the
 /// trajectory that falls within the tile bounds.
+#[allow(clippy::type_complexity)]
 fn clip_trajectory_to_tile(
     coords: &[(f64, f64, f64)],
     timestamps: &[u64],
     values: &[f32],
+    // Per-vertex × per-bucket value matrix, `[vertex][bucket]`. Empty when the
+    // producer supplied none; each bucket channel is interpolated at clip
+    // boundaries exactly like `values`.
+    matrix: &[Vec<f32>],
     bounds: &TileBounds,
-) -> Option<(Vec<(f64, f64, f64)>, Vec<u64>, Vec<f32>)> {
+) -> Option<(Vec<(f64, f64, f64)>, Vec<u64>, Vec<f32>, Vec<Vec<f32>>)> {
     if coords.len() < 2 {
         return None;
     }
+    let has_matrix = !matrix.is_empty();
+
+    // Interpolate one matrix row (all buckets) between vertices i and i+1.
+    let interp_row = |i: usize, t: f64| -> Vec<f32> {
+        if !has_matrix {
+            return Vec::new();
+        }
+        let a = &matrix[i];
+        let b = &matrix[i + 1];
+        a.iter()
+            .zip(b.iter())
+            .map(|(&va, &vb)| interpolate_value(va, vb, t))
+            .collect()
+    };
 
     let mut clipped_coords: Vec<(f64, f64, f64)> = Vec::new();
     let mut clipped_times: Vec<u64> = Vec::new();
     let mut clipped_values: Vec<f32> = Vec::new();
+    let mut clipped_matrix: Vec<Vec<f32>> = Vec::new();
 
     // Process each line segment
     for i in 0..coords.len() - 1 {
@@ -504,6 +530,9 @@ fn clip_trajectory_to_tile(
                 clipped_coords.push((start_x, start_y, start_alt));
                 clipped_times.push(start_time);
                 clipped_values.push(start_value);
+                if has_matrix {
+                    clipped_matrix.push(interp_row(i, t0));
+                }
             }
 
             // Add end point if different from start point
@@ -511,12 +540,15 @@ fn clip_trajectory_to_tile(
                 clipped_coords.push((end_x, end_y, end_alt));
                 clipped_times.push(end_time);
                 clipped_values.push(end_value);
+                if has_matrix {
+                    clipped_matrix.push(interp_row(i, t1));
+                }
             }
         }
     }
 
     if clipped_coords.len() >= 2 {
-        Some((clipped_coords, clipped_times, clipped_values))
+        Some((clipped_coords, clipped_times, clipped_values, clipped_matrix))
     } else {
         None
     }
@@ -536,6 +568,12 @@ fn slice_segment_temporally(
 ) -> Vec<ClippedSegment> {
     let n = segment.coordinates.len();
     if n < 2 || granularity_ms == 0 {
+        return vec![segment];
+    }
+    // Matrix-bearing segments animate by selecting a bucket column, not by time
+    // slicing — splitting them would desync the per-vertex matrix from the
+    // geometry. They span the whole range as a single feature by design.
+    if !segment.vertex_value_matrix.is_empty() {
         return vec![segment];
     }
     let g = granularity_ms;
@@ -605,6 +643,8 @@ fn slice_segment_temporally(
             } else {
                 Vec::new()
             },
+            // Matrix-bearing segments never reach here (guarded above).
+            vertex_value_matrix: Vec::new(),
             start_time: pts.first().unwrap().1,
             end_time: pts.last().unwrap().1,
             properties: properties.clone(),
@@ -669,6 +709,12 @@ pub fn clip_trajectory(
     // vertex count and the supplied length matches; otherwise no value channel
     // is emitted for this trajectory.
     supplied_vertex_values: Option<&[f32]>,
+    // Optional producer-supplied per-vertex × per-bucket value matrix, flat
+    // vertex-major (`matrix[v * num_buckets + b]`). Reshaped to `[vertex][bucket]`
+    // and resampled per bucket at clip boundaries. Only accepted when
+    // simplification is OFF (it changes the vertex set) — flow corridors build
+    // with `simplify: false`.
+    supplied_vertex_value_matrix: Option<&[f32]>,
 ) -> Vec<ClippedSegment> {
     // Extract coordinates
     let geometry = match &feature.geometry {
@@ -699,6 +745,20 @@ pub fn clip_trajectory(
         supplied_vertex_values.unwrap().to_vec()
     } else {
         vec![f32::NAN; coords.len()]
+    };
+
+    // Reshape the flat vertex-major matrix into `[vertex][bucket]` on the FULL
+    // geometry. Accepted only when the length is a clean multiple of the vertex
+    // count AND simplification is off (simplify changes the vertex set, which
+    // would desync the matrix). Empty otherwise.
+    let full_matrix: Vec<Vec<f32>> = match supplied_vertex_value_matrix {
+        Some(m) if !config.simplify && !m.is_empty() && m.len() % coords.len() == 0 => {
+            let nb = m.len() / coords.len();
+            (0..coords.len())
+                .map(|v| m[v * nb..(v + 1) * nb].to_vec())
+                .collect()
+        }
+        _ => Vec::new(),
     };
 
     // Apply simplification for lower zoom levels if enabled.
@@ -765,6 +825,11 @@ pub fn clip_trajectory(
         let run_coords = &coords[run_start..split];
         let run_times = &timestamps[run_start..split];
         let run_values = &values[run_start..split];
+        let run_matrix: &[Vec<f32>] = if full_matrix.is_empty() {
+            &[]
+        } else {
+            &full_matrix[run_start..split]
+        };
         run_start = split;
         if run_coords.len() < 2 {
             continue;
@@ -789,11 +854,33 @@ pub fn clip_trajectory(
             }
 
             // Clip to this tile
-            if let Some((clipped_coords, clipped_times, clipped_values)) =
-                clip_trajectory_to_tile(run_coords, run_times, run_values, &buffered_bounds)
+            if let Some((clipped_coords, clipped_times, clipped_values, clipped_matrix)) =
+                clip_trajectory_to_tile(
+                    run_coords,
+                    run_times,
+                    run_values,
+                    run_matrix,
+                    &buffered_bounds,
+                )
             {
-                let seg_start_time = *clipped_times.first().unwrap();
-                let seg_end_time = *clipped_times.last().unwrap();
+                // Matrix corridors are timeless: they exist across the WHOLE
+                // range, animated by selecting a bucket column rather than by
+                // their geometry's (interpolated) vertex times. Pin every
+                // clipped piece to the feature's full [start, end] so all the
+                // cell's corridors land in ONE temporal bucket — one tile per
+                // cell spanning the range, whose time window matches every
+                // playback frame (instead of fragmenting by interpolated time).
+                let has_matrix = !clipped_matrix.is_empty();
+                let seg_start_time = if has_matrix {
+                    start_time
+                } else {
+                    *clipped_times.first().unwrap()
+                };
+                let seg_end_time = if has_matrix {
+                    end_time
+                } else {
+                    *clipped_times.last().unwrap()
+                };
 
                 let segment = ClippedSegment {
                     tile_x,
@@ -803,6 +890,8 @@ pub fn clip_trajectory(
                     timestamps: clipped_times,
                     // Drop the value channel for trajectories that carry none.
                     vertex_values: if has_values { clipped_values } else { Vec::new() },
+                    // Already empty when no matrix was supplied.
+                    vertex_value_matrix: clipped_matrix,
                     start_time: seg_start_time,
                     end_time: seg_end_time,
                     // Use Arc::clone for zero-copy property sharing
@@ -928,7 +1017,7 @@ mod tests {
         ]);
 
         let config = ClipConfig::default();
-        let segments = clip_trajectory(&feature, None, 0, 1000, 10, &config, None, None);
+        let segments = clip_trajectory(&feature, None, 0, 1000, 10, &config, None, None, None);
 
         // Should produce at least one segment
         assert!(!segments.is_empty());
@@ -950,7 +1039,7 @@ mod tests {
         ]);
 
         let config = ClipConfig::default();
-        let segments = clip_trajectory(&feature, None, 0, 10000, 12, &config, None, None);
+        let segments = clip_trajectory(&feature, None, 0, 10000, 12, &config, None, None, None);
 
         // At zoom 12, this should cross at least 2 tiles
         assert!(
@@ -986,7 +1075,7 @@ mod tests {
         // Zoom 0: the whole world is a single tile, so nothing is clipped at a
         // tile boundary — the antimeridian split is the only thing that can
         // prevent the artifact here.
-        let segments = clip_trajectory(&feature, None, 0, 3000, 0, &config, None, None);
+        let segments = clip_trajectory(&feature, None, 0, 3000, 0, &config, None, None, None);
 
         assert!(!segments.is_empty(), "expected at least one segment");
         for seg in &segments {
@@ -1060,7 +1149,7 @@ mod tests {
         };
 
         // Trajectory spanning 5 seconds (should create at least 2 temporal slices)
-        let segments = clip_trajectory(&feature, None, 0, 5000, 10, &config, None, None);
+        let segments = clip_trajectory(&feature, None, 0, 5000, 10, &config, None, None, None);
 
         // Should have at least one segment
         assert!(!segments.is_empty());
@@ -1083,6 +1172,7 @@ mod tests {
             coordinates: vec![(0.0, 0.0, 0.0), (5.0, 0.0, 0.0)],
             timestamps: vec![0, 5000],
             vertex_values: Vec::new(),
+            vertex_value_matrix: Vec::new(),
             start_time: 0,
             end_time: 5000,
             properties: None,

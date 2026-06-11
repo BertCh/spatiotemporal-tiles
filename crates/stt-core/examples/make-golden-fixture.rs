@@ -45,6 +45,7 @@ fn payload_for(id_seed: u64) -> Vec<u8> {
         vertex_times: None,
         vertex_values: None,
         triangles: None,
+        vertex_value_matrix: None,
         properties: vec![],
     }])
     .unwrap()
@@ -95,7 +96,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let meta = Metadata::new("packed-golden")
         .with_description("Deterministic STT packed-format cross-impl fixture")
         .with_zoom_levels(10, 10)
-        .with_temporal_bucket_ms(1000);
+        .with_temporal_bucket_ms(1000)
+        // Tile k spans [1000*k, 1000*k + 100]; cover the lot so the fixture
+        // passes `stt-validate`'s temporal-extent cross-check.
+        .with_time_range(stt_core::types::TimeRange::new(0, 1000 * (n_tiles - 1) + 100));
 
     let manifest = w.finalize(&meta)?;
     let total: u64 = manifest.packs.iter().map(|p| p.length).sum();

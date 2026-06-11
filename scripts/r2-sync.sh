@@ -20,14 +20,30 @@
 #   (a) immutable pass — `packs/**` + `index/**` with max-age=1y, immutable
 #   (b) manifest pass  — `manifest.json` with max-age=60, must-revalidate
 #
+# Both passes use `rclone copy` (NEVER `sync`): a deploy must not delete the
+# previous deploy's packs out from under live sessions. Manifests are cached
+# up to 60 s, and an open tab holds its manifest in memory for the whole
+# session — a pruned-on-sync pack 404s exactly those readers.
+#
+# Garbage collection is a separate, retention-aware pass (c): an immutable
+# object (packs/** or index/**) is deleted only when it is BOTH
+#   - unreferenced by the dataset's CURRENT local manifest, AND
+#   - older than the retention window (R2_PRUNE_RETENTION, default 7d) —
+#     long enough for every cached manifest and live session to drain.
+# `--prune-now` drops the age requirement (delete unreferenced immediately;
+# for disaster cleanup only — it CAN 404 open sessions). `--no-prune` skips
+# the pass. `manifest.json` itself is never pruned.
+#
 # Reads credentials from .env (see .env.r2.example). rclone is configured
 # entirely from env vars, so nothing is written to ~/.config/rclone/rclone.conf
 # and no secret is persisted on disk by this script.
 #
 # Usage:
-#   scripts/r2-sync.sh                 # sync all of public/data -> r2:<bucket>/data
-#   scripts/r2-sync.sh --dry-run       # show what would change, transfer nothing
-#   scripts/r2-sync.sh flights         # sync a single dataset dir data/flights/ (e.g. after regen)
+#   scripts/r2-sync.sh                 # copy all of public/data -> r2:<bucket>/data, then GC
+#   scripts/r2-sync.sh --dry-run       # show what would change, transfer/delete nothing
+#   scripts/r2-sync.sh flights         # one dataset dir data/flights/ (e.g. after regen)
+#   scripts/r2-sync.sh --no-prune      # copy only, skip GC
+#   scripts/r2-sync.sh --prune-now     # GC ignores the retention window
 #
 set -euo pipefail
 
@@ -82,24 +98,31 @@ COMMON_FLAGS=(
 IMMUTABLE_HEADER='Cache-Control: public, max-age=31536000, immutable'
 MANIFEST_HEADER='Cache-Control: public, max-age=60, must-revalidate'
 
-# Pass any flags (e.g. --dry-run) straight through; treat a bare arg as a
-# single dataset STEM (its directory data/<stem>/).
+# GC retention window: an unreferenced immutable object younger than this is
+# kept (cached manifests + live sessions may still reference it).
+PRUNE_RETENTION="${R2_PRUNE_RETENTION:-7d}"
+
+# Pass any unrecognized flags (e.g. --dry-run) straight through to rclone;
+# treat a bare arg as a single dataset STEM (its directory data/<stem>/).
 EXTRA_FLAGS=()
 SINGLE_STEM=""
+PRUNE=1
+PRUNE_NOW=0
 for arg in "$@"; do
   case "${arg}" in
+    --no-prune)  PRUNE=0 ;;
+    --prune-now) PRUNE_NOW=1 ;;
     --*) EXTRA_FLAGS+=("${arg}") ;;
     *)   SINGLE_STEM="${arg%/}" ;;  # tolerate a trailing slash
   esac
 done
 
-# Sync one local tree -> one remote prefix in two header passes.
-#   pass (a): immutable assets — every */packs/** and */index/**
-#   pass (b): mutable manifest — every */manifest.json
-# Each `rclone sync` is scoped by --include so it carries exactly the objects
-# that pass's --header-upload applies to. `sync` (not `copy`) so a removed pack
-# on the source is pruned remotely; the per-pass --include keeps each pass from
-# deleting the OTHER pass's objects.
+# Copy one local tree -> one remote prefix in two header passes, then GC.
+#   pass (a): immutable assets — every */packs/** and */index/** (copy, additive)
+#   pass (b): mutable manifest — every */manifest.json (copy overwrites changed)
+#   pass (c): retention-aware prune of unreferenced immutable objects
+# Each pass is scoped by --include/--filter so it carries exactly the objects
+# that pass's --header-upload (or deletion policy) applies to.
 #
 # The include globs are written to match at ANY depth so one function works for
 # both call shapes:
@@ -111,17 +134,74 @@ sync_tree() {
   local src="$1" dst="$2"
 
   echo ">> [immutable] ${src} (packs/index) -> ${dst}"
-  rclone sync "${COMMON_FLAGS[@]}" ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
+  rclone copy "${COMMON_FLAGS[@]}" ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
     --header-upload "${IMMUTABLE_HEADER}" \
     --include "packs/**" --include "index/**" \
     --include "**/packs/**" --include "**/index/**" \
     "${src}" "${dst}"
 
   echo ">> [manifest]  ${src} (manifest.json) -> ${dst}"
-  rclone sync "${COMMON_FLAGS[@]}" ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
+  rclone copy "${COMMON_FLAGS[@]}" ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
     --header-upload "${MANIFEST_HEADER}" \
     --include "manifest.json" --include "**/manifest.json" \
     "${src}" "${dst}"
+
+  if [[ "${PRUNE}" -eq 1 ]]; then
+    prune_tree "${src}" "${dst}"
+  else
+    echo ">> [prune]     skipped (--no-prune)"
+  fi
+}
+
+# Pass (c): delete remote packs/index objects that no CURRENT local manifest
+# references, but only once they are older than the retention window (so
+# cached manifests / open sessions referencing the previous deploy keep
+# resolving). The filter file lists every referenced object as an exclusion
+# (first match wins in rclone filters), then includes the immutable trees,
+# then excludes everything else — `manifest.json` is therefore never deleted.
+prune_tree() {
+  local src="$1" dst="$2"
+  local filter_file
+  filter_file="$(mktemp)"
+
+  # Referenced set = directory.key + every packs[].key of each local manifest,
+  # anchored at the manifest's directory relative to the transfer root.
+  local manifest rel
+  while IFS= read -r manifest; do
+    rel="$(dirname "${manifest#"${src}"/}")"
+    [[ "${rel}" == "." ]] && rel=""
+    [[ -n "${rel}" ]] && rel="${rel}/"
+    python3 - "$manifest" "$rel" <<'PY' >> "${filter_file}"
+import json, sys
+manifest_path, rel = sys.argv[1], sys.argv[2]
+with open(manifest_path) as f:
+    m = json.load(f)
+keys = [m["directory"]["key"]] + [p["key"] for p in m.get("packs", [])]
+for key in keys:
+    print(f"- /{rel}{key}")
+PY
+  done < <(find "${src}" -name manifest.json)
+
+  {
+    echo "+ /packs/**"
+    echo "+ /index/**"
+    echo "+ /**/packs/**"
+    echo "+ /**/index/**"
+    echo "- **"
+  } >> "${filter_file}"
+
+  local age_flags=(--min-age "${PRUNE_RETENTION}")
+  if [[ "${PRUNE_NOW}" -eq 1 ]]; then
+    age_flags=()
+    echo ">> [prune]     ${dst}: deleting ALL unreferenced packs/index objects (--prune-now)"
+  else
+    echo ">> [prune]     ${dst}: deleting unreferenced packs/index objects older than ${PRUNE_RETENTION}"
+  fi
+  rclone delete ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
+    ${age_flags[@]+"${age_flags[@]}"} \
+    --filter-from "${filter_file}" \
+    "${dst}"
+  rm -f "${filter_file}"
 }
 
 if [[ -n "${SINGLE_STEM}" ]]; then

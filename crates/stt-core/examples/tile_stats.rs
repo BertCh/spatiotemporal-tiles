@@ -141,11 +141,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         None => println!("  temporal_lod: NONE"),
     }
-    println!(
-        "  summary_tier={} raster_tier={}",
-        meta.summary_tier.is_some(),
-        meta.raster_tier.is_some()
-    );
+    println!("  summary_tier={}", meta.summary_tier.is_some());
 
     // ---- global blob accounting ----
     let mut distinct_off: std::collections::HashSet<u64> = std::collections::HashSet::new();

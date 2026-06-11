@@ -89,49 +89,6 @@ impl SummaryTier {
     }
 }
 
-/// Description of an optional pre-rasterized density-grid tier.
-///
-/// At very low zooms a per-tile RGBA density raster (~64-256 wide per side)
-/// renders a planet-scale point dataset in constant per-frame time: one
-/// textured quad per visible tile + one palette LUT lookup, regardless of
-/// the underlying feature count. This is the only practical path for
-/// 100M+ datasets at zoom ≤ 6 — pre-aggregating into hex/quadbin cells
-/// works in the middle zooms but the cell count itself starts to dominate
-/// at planet scale, while a 256×256 raster is fixed-cost.
-///
-/// The tier emits one tile per (zoom, x, y, time-bucket). Tile payloads
-/// carry an extra `density_raster` layer with a `FixedSizeList<UInt16,
-/// width*height*channels>` column — up to 4 categorical classes pack into
-/// the RGBA channels.
-///
-/// **Build wiring is TODO** as of this scaffold — the metadata + CLI flag
-/// are in place to lock down the contract; raster generation lands in a
-/// dedicated follow-up.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RasterTier {
-    /// Inclusive minimum zoom level at which raster tiles are emitted.
-    pub min_zoom: u8,
-    /// Inclusive maximum zoom level at which raster tiles are emitted.
-    pub max_zoom: u8,
-    /// Width of each density raster, in pixels.
-    pub width: u16,
-    /// Height of each density raster, in pixels.
-    pub height: u16,
-    /// Number of RGBA channels used (1..=4). One class per channel.
-    pub channels: u8,
-    /// Per-channel class ids (ordered to match channel index 0..channels-1).
-    /// Used by the renderer to bind a `colorRange` to each channel.
-    pub class_ids: Vec<String>,
-    /// Layer name carried in the emitted raster-tile frames. Defaults to
-    /// `density_raster`.
-    #[serde(default = "default_raster_layer_name")]
-    pub layer_name: String,
-}
-
-fn default_raster_layer_name() -> String {
-    "density_raster".to_string()
-}
-
 /// Bake-time per-class intensity domain for the GPU-splat HeatmapLayer.
 ///
 /// The HeatmapLayer maps `(weight × gaussian_falloff × intensity)` through a
@@ -230,12 +187,6 @@ pub struct Metadata {
     /// (earthquake magnitudes, AIS speed, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heatmap_domain: Option<HeatmapDomain>,
-
-    /// Optional pre-rasterized density-grid tier. The lowest-zoom path for
-    /// 100M+ point datasets — per-frame cost is independent of feature
-    /// count. See [`RasterTier`] for details.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raster_tier: Option<RasterTier>,
 }
 
 impl Default for Metadata {
@@ -261,7 +212,6 @@ impl Default for Metadata {
             summary_tier: None,
             temporal_lod: None,
             heatmap_domain: None,
-            raster_tier: None,
         }
     }
 }
@@ -351,12 +301,6 @@ impl Metadata {
     /// Attach a bake-time HeatmapLayer intensity-domain block.
     pub fn with_heatmap_domain(mut self, domain: HeatmapDomain) -> Self {
         self.heatmap_domain = Some(domain);
-        self
-    }
-
-    /// Attach a pre-rasterized density-tier descriptor.
-    pub fn with_raster_tier(mut self, tier: RasterTier) -> Self {
-        self.raster_tier = Some(tier);
         self
     }
 
@@ -567,28 +511,16 @@ mod tests {
     }
 
     #[test]
-    fn test_raster_tier_roundtrip() {
-        let tier = RasterTier {
-            min_zoom: 0,
-            max_zoom: 5,
-            width: 128,
-            height: 128,
-            channels: 2,
-            class_ids: vec!["pickup".to_string(), "dropoff".to_string()],
-            layer_name: "density_raster".to_string(),
-        };
-        let metadata = Metadata::new("raster-test").with_raster_tier(tier.clone());
-        let bytes = metadata.to_json_bytes().unwrap();
-        let decoded = Metadata::from_json_bytes(&bytes).unwrap();
-        let d = decoded.raster_tier.unwrap();
-        assert_eq!(d, tier);
-    }
-
-    #[test]
-    fn test_raster_tier_field_omitted_when_unset() {
-        let metadata = Metadata::new("no-raster");
-        let s = String::from_utf8(metadata.to_json_bytes().unwrap()).unwrap();
-        assert!(!s.contains("raster_tier"), "got: {s}");
+    fn test_metadata_ignores_unknown_fields() {
+        // Forward compat: metadata written by a newer builder (or carrying
+        // since-removed fields like the old `raster_tier` scaffold) must
+        // still decode — serde skips unknown keys by default.
+        let metadata = Metadata::new("fwd");
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&metadata.to_json_bytes().unwrap()).unwrap();
+        v["raster_tier"] = serde_json::json!({ "min_zoom": 0, "max_zoom": 5 });
+        let decoded = Metadata::from_json_bytes(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(decoded.name, "fwd");
     }
 
     #[test]

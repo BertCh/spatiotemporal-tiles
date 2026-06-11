@@ -40,6 +40,7 @@ fn point_layer() -> ColumnarLayer {
         vertex_times: None,
         vertex_values: None,
         triangles: None,
+        vertex_value_matrix: None,
         properties: vec![
             (
                 "speed".to_string(),
@@ -71,6 +72,7 @@ fn line_layer() -> ColumnarLayer {
         vertex_times: Some(vec![vec![0, 25, 50], vec![100, 200]]),
         vertex_values: None,
         triangles: None,
+        vertex_value_matrix: None,
         properties: vec![],
     }
 }
@@ -91,6 +93,7 @@ fn polygon_layer(triangles: Option<Vec<Vec<u32>>>) -> ColumnarLayer {
         vertex_times: None,
         vertex_values: None,
         triangles,
+        vertex_value_matrix: None,
         properties: vec![],
     }
 }

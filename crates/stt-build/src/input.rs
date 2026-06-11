@@ -1,10 +1,12 @@
 //! GeoParquet input parsing and feature loading
 
 use anyhow::{Context, Result};
-use arrow::array::{Array, Float32Array, Float64Array, Int64Array, ListArray, StringArray, TimestampMillisecondArray, TimestampMicrosecondArray};
+use arrow::array::{Array, BinaryViewArray, Float32Array, Float64Array, Int64Array, LargeBinaryArray, ListArray, StringArray, TimestampMillisecondArray, TimestampMicrosecondArray};
 use arrow::datatypes::DataType;
 use geojson::{Feature, Geometry, Value as GeomValue};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::file::metadata::KeyValue;
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -36,6 +38,13 @@ pub struct ParsedFeature {
     /// `vertex_timestamps`; flows through clipping and into the tile's
     /// `vertex_value` column so renderers can color the line by it.
     pub vertex_values: Option<Vec<f32>>,
+    /// Optional per-vertex × per-bucket value matrix, flattened **vertex-major**
+    /// (`matrix[v * num_buckets + b]`). Length is `coord_count * num_buckets`.
+    /// Carried through clipping (each bucket channel resampled like
+    /// `vertex_values`) into the tile's `vertex_value_matrix` column so a
+    /// static-geometry overview can animate per-bucket without re-emitting
+    /// geometry. Mutually exclusive with `vertex_values` in practice.
+    pub vertex_value_matrix: Option<Vec<f32>>,
     pub lon: f64,
     pub lat: f64,
 }
@@ -44,25 +53,53 @@ pub struct ParsedFeature {
 ///
 /// This is the simple in-memory approach that works well for datasets
 /// that fit in RAM (up to several million features on a typical machine).
-/// Strictness for input parsing. `Warn` keeps the legacy "coerce bad
-/// timestamps to epoch 0 and log" behaviour; `Strict` aborts the build on
-/// the first parse failure with a row-counted error.
+/// Strictness for input parsing, applied independently to timestamps
+/// (`--strict-times`) and geometries (`--strict-geometry`). For timestamps,
+/// `Warn` keeps the legacy "coerce bad timestamps to epoch 0 and log"
+/// behaviour; for geometries, `Warn` skips the row entirely (a feature with
+/// no parseable position cannot be tiled). `Strict` aborts the build on the
+/// first parse failure with a row-counted error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputStrictness {
     Warn,
     Strict,
 }
 
+/// Wire format of the `--time-field` column. Only consulted for integer
+/// (Int64) time columns — Arrow Timestamp columns are self-describing and
+/// String columns are always parsed as ISO 8601 regardless of this flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum TimeFormat {
+    /// ISO 8601 strings (e.g. `2024-06-21T12:00:00Z`).
+    Iso8601,
+    /// Integer seconds since the Unix epoch.
+    UnixSec,
+    /// Integer milliseconds since the Unix epoch.
+    UnixMs,
+}
+
+impl TimeFormat {
+    /// Canonical CLI spelling — matches the clap `ValueEnum` value names.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TimeFormat::Iso8601 => "iso8601",
+            TimeFormat::UnixSec => "unix-sec",
+            TimeFormat::UnixMs => "unix-ms",
+        }
+    }
+}
+
 pub fn load_features(
     path: &Path,
     time_field: &str,
     end_time_field: Option<&str>,
-    time_format: &str,
-    strictness: InputStrictness,
+    time_format: TimeFormat,
+    time_strictness: InputStrictness,
+    geometry_strictness: InputStrictness,
 ) -> Result<Vec<ParsedFeature>> {
     let mut features = Vec::new();
     let mut row_count = 0usize;
-    stream_features(path, time_field, end_time_field, time_format, strictness, |batch| {
+    stream_features(path, time_field, end_time_field, time_format, time_strictness, geometry_strictness, |batch| {
         row_count += batch.len();
         features.extend(batch);
         if row_count.is_multiple_of(100_000) {
@@ -88,8 +125,9 @@ pub fn stream_features<F>(
     path: &Path,
     time_field: &str,
     end_time_field: Option<&str>,
-    time_format: &str,
-    strictness: InputStrictness,
+    time_format: TimeFormat,
+    time_strictness: InputStrictness,
+    geometry_strictness: InputStrictness,
     mut on_batch: F,
 ) -> Result<()>
 where
@@ -99,12 +137,34 @@ where
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let schema = builder.schema().clone();
 
-    let geom_col_name = find_geometry_column(&schema)?;
+    // GeoParquet `geo` footer metadata (absent for plain Parquet inputs with
+    // lon/lat columns — those keep working through the name heuristics).
+    let geo_meta = parse_geo_metadata(
+        builder.metadata().file_metadata().key_value_metadata(),
+        &schema,
+    );
+    let geom_col_name = find_geometry_column(&schema, geo_meta.as_ref())?;
+    if let Some(meta) = geo_meta.as_ref() {
+        validate_geo_column(meta, &geom_col_name)?;
+    }
     let time_col_idx = schema
         .fields()
         .iter()
         .position(|f| f.name() == time_field)
         .ok_or_else(|| anyhow::anyhow!("Time field '{}' not found", time_field))?;
+    // An Int64 time column can't hold ISO 8601 strings; the values fall back
+    // to the unix-ms interpretation. Surface the mismatch instead of letting
+    // the documented default silently mean unix-ms.
+    if time_format == TimeFormat::Iso8601
+        && matches!(schema.field(time_col_idx).data_type(), DataType::Int64)
+    {
+        tracing::warn!(
+            "--time-format iso8601 but time column '{}' is Int64; integer \
+             values are interpreted as unix-ms (pass --time-format unix-ms \
+             or unix-sec to make this explicit)",
+            time_field
+        );
+    }
     let end_time_col_idx = end_time_field
         .and_then(|field| schema.fields().iter().position(|f| f.name() == field));
 
@@ -118,6 +178,12 @@ where
     // e.g. sea-surface temperature for the ocean-drifter dataset. Aligned with
     // the geometry vertices like `vertex_timestamps`.
     let vertex_values_col_idx = schema.fields().iter().position(|f| f.name() == "vertex_values");
+
+    // Optional per-vertex × per-bucket value matrix (List<Float32>), flattened
+    // vertex-major. Present for static-geometry overviews (flow corridors);
+    // animated by selecting the active bucket column at render time.
+    let vertex_value_matrix_col_idx =
+        schema.fields().iter().position(|f| f.name() == "vertex_value_matrix");
 
     let reader = builder.build()?;
 
@@ -133,6 +199,7 @@ where
                 || end_time_field.map(|f| name == f).unwrap_or(false)
                 || name == "vertex_timestamps"
                 || name == "vertex_values"
+                || name == "vertex_value_matrix"
                 || matches!(name.as_str(), "lon" | "lat" | "longitude" | "latitude" | "x" | "y");
             if is_meta {
                 None
@@ -153,9 +220,11 @@ where
             end_time_col_idx,
             vertex_times_col_idx,
             vertex_values_col_idx,
+            vertex_value_matrix_col_idx,
             &property_cols,
             time_format,
-            strictness,
+            time_strictness,
+            geometry_strictness,
             row_count,
         )?;
         row_count += batch.num_rows();
@@ -176,30 +245,52 @@ fn parse_batch(
     end_time_col_idx: Option<usize>,
     vertex_times_col_idx: Option<usize>,
     vertex_values_col_idx: Option<usize>,
+    vertex_value_matrix_col_idx: Option<usize>,
     property_cols: &[usize],
-    time_format: &str,
-    strictness: InputStrictness,
+    time_format: TimeFormat,
+    time_strictness: InputStrictness,
+    geometry_strictness: InputStrictness,
     row_offset: usize,
 ) -> Result<Vec<ParsedFeature>> {
     let geometries = extract_geometries_from_batch(batch, geom_col_name)?;
     let timestamps =
-        extract_timestamps_from_batch(batch, time_col_idx, time_format, strictness)?;
+        extract_timestamps_from_batch(batch, time_col_idx, time_format, time_strictness, row_offset)?;
     let end_timestamps = end_time_col_idx
-        .map(|idx| extract_timestamps_from_batch(batch, idx, time_format, strictness))
+        .map(|idx| extract_timestamps_from_batch(batch, idx, time_format, time_strictness, row_offset))
         .transpose()?;
     let vertex_times = vertex_times_col_idx
-        .map(|idx| extract_vertex_timestamps_from_batch(batch, idx))
+        .map(|idx| extract_vertex_timestamps_from_batch(batch, idx, row_offset))
         .transpose()?;
     let vertex_values = vertex_values_col_idx
         .map(|idx| extract_vertex_values_from_batch(batch, idx))
         .transpose()?;
+    // Matrix rows are flat List<Float32> just like vertex_values — reuse the
+    // same extractor; the bucket reshape happens at the renderer.
+    let vertex_value_matrices = vertex_value_matrix_col_idx
+        .map(|idx| extract_vertex_values_from_batch(batch, idx))
+        .transpose()?;
 
     let mut features = Vec::with_capacity(batch.num_rows());
+    let mut geometry_failures = 0usize;
     for i in 0..batch.num_rows() {
-        let (geometry, lon, lat) = geometries
+        let slot = geometries
             .get(i)
-            .cloned()
             .ok_or_else(|| anyhow::anyhow!("Missing geometry at row {}", row_offset + i))?;
+        // A row whose geometry is null or unparseable has no position to tile
+        // at. Strict mode fails the build; Warn mode skips the row (it must
+        // NOT fall through as a (0,0) point — that tiled garbage at Null
+        // Island and dragged it into every zoom level).
+        let Some((geometry, lon, lat)) = slot.clone() else {
+            geometry_failures += 1;
+            if geometry_strictness == InputStrictness::Strict {
+                anyhow::bail!(
+                    "row {}: null or unparseable geometry (rerun without \
+                     --strict-geometry to skip such rows)",
+                    row_offset + i
+                );
+            }
+            continue;
+        };
         let timestamp = timestamps
             .get(i)
             .copied()
@@ -209,6 +300,9 @@ fn parse_batch(
             .as_ref()
             .and_then(|v| v.get(i).cloned().flatten());
         let row_vertex_values = vertex_values
+            .as_ref()
+            .and_then(|v| v.get(i).cloned().flatten());
+        let row_vertex_value_matrix = vertex_value_matrices
             .as_ref()
             .and_then(|v| v.get(i).cloned().flatten());
 
@@ -242,10 +336,12 @@ fn parse_batch(
             end_timestamp,
             vertex_timestamps: row_vertex_times,
             vertex_values: row_vertex_values,
+            vertex_value_matrix: row_vertex_value_matrix,
             lon,
             lat,
         });
     }
+    warn_geometry_failures(geometry_failures, batch.num_rows());
     Ok(features)
 }
 
@@ -256,6 +352,7 @@ fn parse_batch(
 fn extract_vertex_timestamps_from_batch(
     batch: &arrow::record_batch::RecordBatch,
     col_idx: usize,
+    row_offset: usize,
 ) -> Result<Vec<Option<Vec<u64>>>> {
     let column = batch.column(col_idx);
     let list = column
@@ -276,13 +373,27 @@ fn extract_vertex_timestamps_from_batch(
         let row_times: Vec<u64> = if let Some(ts) =
             values.as_any().downcast_ref::<TimestampMillisecondArray>()
         {
-            (0..ts.len())
-                .map(|i| if ts.is_valid(i) { ts.value(i) as u64 } else { 0 })
-                .collect()
+            let mut v = Vec::with_capacity(ts.len());
+            for i in 0..ts.len() {
+                if ts.is_valid(i) {
+                    reject_negative_timestamp(row_offset + row, ts.value(i))?;
+                    v.push(ts.value(i) as u64);
+                } else {
+                    v.push(0);
+                }
+            }
+            v
         } else if let Some(ints) = values.as_any().downcast_ref::<Int64Array>() {
-            (0..ints.len())
-                .map(|i| if ints.is_valid(i) { ints.value(i) as u64 } else { 0 })
-                .collect()
+            let mut v = Vec::with_capacity(ints.len());
+            for i in 0..ints.len() {
+                if ints.is_valid(i) {
+                    reject_negative_timestamp(row_offset + row, ints.value(i))?;
+                    v.push(ints.value(i) as u64);
+                } else {
+                    v.push(0);
+                }
+            }
+            v
         } else {
             anyhow::bail!(
                 "vertex_timestamps child must be Timestamp(Millisecond) or Int64; got {:?}",
@@ -354,11 +465,13 @@ pub fn calculate_bounds(features: &[ParsedFeature]) -> Result<(BoundingBox, Time
         max_time = max_time.max(f.end_timestamp.unwrap_or(f.timestamp));
     }
 
-    // Spatial bounds exclude the null-island sentinel. Geometry parse failures
-    // and null lon/lat are coerced to exactly (0.0, 0.0) upstream; including
-    // them would let a single bad row widen the archive bbox to the whole
-    // globe (and make the showcase open zoomed all the way out). Real data at
-    // precisely (0,0) to full f64 precision is effectively never legitimate.
+    // Spatial bounds exclude the null-island sentinel. The reader now skips
+    // rows with unparseable/null geometry entirely, but features built
+    // programmatically (tests, generators) can still carry the (0.0, 0.0)
+    // sentinel; including them would let a single bad row widen the archive
+    // bbox to the whole globe (and make the showcase open zoomed all the way
+    // out). Real data at precisely (0,0) to full f64 precision is effectively
+    // never legitimate.
     let mut min_lon = f64::MAX;
     let mut max_lon = f64::MIN;
     let mut min_lat = f64::MAX;
@@ -405,53 +518,239 @@ pub fn calculate_bounds(features: &[ParsedFeature]) -> Result<(BoundingBox, Time
 // Helper Functions
 // =============================================================================
 
-/// Find the geometry column in a Parquet schema
-fn find_geometry_column(schema: &arrow::datatypes::Schema) -> Result<String> {
+/// Parsed subset of the GeoParquet `geo` footer key-value metadata. Only the
+/// fields the reader acts on (geometry-column selection, CRS gate, encoding
+/// gate) are kept; everything else is ignored.
+#[derive(Debug, Default, serde::Deserialize)]
+struct GeoFileMeta {
+    #[serde(default)]
+    primary_column: Option<String>,
+    #[serde(default)]
+    columns: HashMap<String, GeoColumnMeta>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct GeoColumnMeta {
+    #[serde(default)]
+    encoding: Option<String>,
+    /// PROJJSON object, an `"AUTH:CODE"` string, or absent/`null`
+    /// (= OGC:CRS84 per the GeoParquet spec).
+    #[serde(default)]
+    crs: Option<serde_json::Value>,
+}
+
+/// Read the GeoParquet `geo` entry from the Parquet footer key-value
+/// metadata (falling back to the Arrow schema metadata map). Returns `None`
+/// for plain Parquet inputs without the entry; malformed JSON is logged and
+/// treated as absent so non-GeoParquet producers can't brick a build.
+fn parse_geo_metadata(
+    kv: Option<&Vec<KeyValue>>,
+    schema: &arrow::datatypes::Schema,
+) -> Option<GeoFileMeta> {
+    let raw = kv
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|e| e.key == "geo")
+                .and_then(|e| e.value.clone())
+        })
+        .or_else(|| schema.metadata().get("geo").cloned())?;
+    match serde_json::from_str::<GeoFileMeta>(&raw) {
+        Ok(meta) => Some(meta),
+        Err(e) => {
+            tracing::warn!(
+                "ignoring malformed GeoParquet 'geo' footer metadata ({e}); \
+                 falling back to geometry-column name heuristics"
+            );
+            None
+        }
+    }
+}
+
+/// Check that a GeoParquet column CRS is lon/lat WGS 84 (OGC:CRS84 /
+/// EPSG:4326). Returns a human-readable name of the offending CRS otherwise.
+/// Absent / `null` means CRS84 per the GeoParquet spec.
+fn crs_is_lonlat_wgs84(crs: &serde_json::Value) -> std::result::Result<(), String> {
+    let auth_code_ok = |auth: &str, code: &str| -> bool {
+        (auth.eq_ignore_ascii_case("OGC") && code.eq_ignore_ascii_case("CRS84"))
+            || (auth.eq_ignore_ascii_case("EPSG") && code == "4326")
+    };
+    match crs {
+        serde_json::Value::Null => Ok(()),
+        serde_json::Value::String(s) => {
+            // "EPSG:4326" / "OGC:CRS84" / urn:ogc:def:crs:OGC:1.3:CRS84 forms.
+            let norm = s.trim();
+            let ok = match norm.rsplit_once(':') {
+                Some((head, code)) => {
+                    let auth = head.rsplit(':').find(|p| !p.is_empty()).unwrap_or(head);
+                    auth_code_ok(auth, code)
+                        || (norm.to_ascii_lowercase().contains("ogc")
+                            && code.eq_ignore_ascii_case("CRS84"))
+                }
+                None => false,
+            };
+            if ok { Ok(()) } else { Err(format!("'{norm}'")) }
+        }
+        serde_json::Value::Object(obj) => {
+            // PROJJSON: prefer the authority id, fall back to the name.
+            let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(id) = obj.get("id").and_then(|v| v.as_object()) {
+                let auth = id.get("authority").and_then(|v| v.as_str()).unwrap_or("");
+                let code = match id.get("code") {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(serde_json::Value::Number(n)) => n.to_string(),
+                    _ => String::new(),
+                };
+                if auth_code_ok(auth, &code) {
+                    return Ok(());
+                }
+                return Err(if name.is_empty() {
+                    format!("{auth}:{code}")
+                } else {
+                    format!("{auth}:{code} ({name})")
+                });
+            }
+            // No authority id — accept only the canonical CRS84 names.
+            if matches!(name, "WGS 84 (CRS84)" | "WGS 84") {
+                Ok(())
+            } else if name.is_empty() {
+                Err("an unrecognized PROJJSON CRS without an authority id".to_string())
+            } else {
+                Err(format!("'{name}'"))
+            }
+        }
+        other => Err(format!("{other}")),
+    }
+}
+
+/// Enforce the GeoParquet column constraints the rest of the reader assumes:
+/// lon/lat WGS 84 coordinates, and an encoding the extractors can actually
+/// ingest (WKB or native point — the native linestring/polygon/multi*
+/// layouts have no extraction path here).
+fn validate_geo_column(meta: &GeoFileMeta, geom_col_name: &str) -> Result<()> {
+    let Some(col) = meta.columns.get(geom_col_name) else {
+        return Ok(());
+    };
+    if let Some(crs) = &col.crs {
+        if let Err(found) = crs_is_lonlat_wgs84(crs) {
+            anyhow::bail!(
+                "GeoParquet geometry column '{geom_col_name}' declares CRS {found}, \
+                 but stt-build requires lon/lat degrees (OGC:CRS84 / EPSG:4326). \
+                 Reproject the input before export (e.g. geopandas: \
+                 gdf.to_crs(4326).to_parquet(...))."
+            );
+        }
+    }
+    if let Some(encoding) = col.encoding.as_deref() {
+        let unsupported = matches!(
+            encoding.to_ascii_lowercase().as_str(),
+            "linestring" | "polygon" | "multipoint" | "multilinestring" | "multipolygon"
+        );
+        if unsupported {
+            anyhow::bail!(
+                "GeoParquet geometry column '{geom_col_name}' uses the native \
+                 geoarrow '{encoding}' encoding, which this reader cannot ingest. \
+                 Re-export with WKB geometry encoding (e.g. geopandas: \
+                 gdf.to_parquet(..., geometry_encoding='WKB'))."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Find the geometry column in a Parquet schema. The GeoParquet
+/// `primary_column` declaration wins when present and resolvable; the name /
+/// type heuristics below cover plain Parquet inputs without `geo` metadata.
+fn find_geometry_column(
+    schema: &arrow::datatypes::Schema,
+    geo_meta: Option<&GeoFileMeta>,
+) -> Result<String> {
+    if let Some(primary) = geo_meta.and_then(|m| m.primary_column.as_deref()) {
+        if schema.field_with_name(primary).is_ok() {
+            return Ok(primary.to_string());
+        }
+        tracing::warn!(
+            "GeoParquet metadata names primary_column '{primary}' but the \
+             schema has no such column; falling back to name heuristics"
+        );
+    }
+
     // Common geometry column names
     let common_names = ["geometry", "geom", "wkb_geometry", "the_geom", "shape"];
-    
+
     for name in common_names {
         if schema.field_with_name(name).is_ok() {
             return Ok(name.to_string());
         }
     }
-    
+
     // Look for binary columns that might contain WKB
     for field in schema.fields() {
-        if matches!(field.data_type(), DataType::Binary | DataType::LargeBinary) {
+        if matches!(
+            field.data_type(),
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+        ) {
             return Ok(field.name().clone());
         }
     }
-    
+
     // Look for struct columns (GeoArrow native encoding)
     for field in schema.fields() {
         if matches!(field.data_type(), DataType::Struct(_)) {
             return Ok(field.name().clone());
         }
     }
-    
+
     // Check for separate lon/lat columns
-    let has_lon = schema.field_with_name("lon").is_ok() 
+    let has_lon = schema.field_with_name("lon").is_ok()
         || schema.field_with_name("longitude").is_ok()
         || schema.field_with_name("x").is_ok();
     let has_lat = schema.field_with_name("lat").is_ok()
         || schema.field_with_name("latitude").is_ok()
         || schema.field_with_name("y").is_ok();
-    
+
     if has_lon && has_lat {
         return Ok("__lon_lat__".to_string());
     }
-    
+
     anyhow::bail!("Could not find geometry column in Parquet schema. Expected columns: {:?}", common_names)
 }
 
-/// Extract geometries from a batch
+/// Extract geometries from a batch. A `None` slot means the row's geometry
+/// is null or unparseable — the caller decides whether to skip or bail
+/// (`--strict-geometry`). Such rows must never be materialised as (0,0)
+/// points: that tiles garbage at Null Island.
 fn extract_geometries_from_batch(
     batch: &arrow::record_batch::RecordBatch,
     geom_col_name: &str,
-) -> Result<Vec<(Geometry, f64, f64)>> {
-    let mut geometries = Vec::with_capacity(batch.num_rows());
-    
+) -> Result<Vec<Option<(Geometry, f64, f64)>>> {
+    // Point rows from a pair of x/y Float64 arrays (top-level lon/lat
+    // columns or the legs of a separated GeoArrow point struct).
+    fn points_from_xy(
+        x_arr: &Float64Array,
+        y_arr: &Float64Array,
+        num_rows: usize,
+    ) -> Vec<Option<(Geometry, f64, f64)>> {
+        (0..num_rows)
+            .map(|i| {
+                if x_arr.is_valid(i) && y_arr.is_valid(i) {
+                    let x = x_arr.value(i);
+                    let y = y_arr.value(i);
+                    Some((Geometry::new(GeomValue::Point(vec![x, y])), x, y))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    // WKB rows from any binary-flavoured array (Binary/LargeBinary/BinaryView).
+    fn points_from_wkb<'a>(
+        rows: impl Iterator<Item = Option<&'a [u8]>>,
+    ) -> Vec<Option<(Geometry, f64, f64)>> {
+        rows.map(|wkb| wkb.and_then(parse_wkb_geometry)).collect()
+    }
+
     // Handle separate lon/lat columns
     if geom_col_name == "__lon_lat__" {
         let lon_col = batch.column_by_name("lon")
@@ -460,36 +759,21 @@ fn extract_geometries_from_batch(
         let lat_col = batch.column_by_name("lat")
             .or_else(|| batch.column_by_name("latitude"))
             .or_else(|| batch.column_by_name("y"));
-        
+
         if let (Some(lon), Some(lat)) = (lon_col, lat_col) {
             if let (Some(lon_arr), Some(lat_arr)) = (
                 lon.as_any().downcast_ref::<Float64Array>(),
                 lat.as_any().downcast_ref::<Float64Array>(),
             ) {
-                for i in 0..batch.num_rows() {
-                    if lon_arr.is_valid(i) && lat_arr.is_valid(i) {
-                        let x = lon_arr.value(i);
-                        let y = lat_arr.value(i);
-                        geometries.push((
-                            Geometry::new(GeomValue::Point(vec![x, y])),
-                            x, y
-                        ));
-                    } else {
-                        geometries.push((
-                            Geometry::new(GeomValue::Point(vec![0.0, 0.0])),
-                            0.0, 0.0
-                        ));
-                    }
-                }
-                return Ok(geometries);
+                return Ok(points_from_xy(lon_arr, lat_arr, batch.num_rows()));
             }
         }
         anyhow::bail!("Expected lon/lat columns but could not read them");
     }
-    
+
     let geom_col = batch.column_by_name(geom_col_name)
         .ok_or_else(|| anyhow::anyhow!("Geometry column '{}' not found", geom_col_name))?;
-    
+
     // Try GeoArrow struct
     if let Some(struct_array) = geom_col.as_any().downcast_ref::<arrow::array::StructArray>() {
         let x_col = struct_array.column_by_name("x")
@@ -498,55 +782,34 @@ fn extract_geometries_from_batch(
         let y_col = struct_array.column_by_name("y")
             .or_else(|| struct_array.column_by_name("latitude"))
             .or_else(|| struct_array.column_by_name("lat"));
-        
+
         if let (Some(x), Some(y)) = (x_col, y_col) {
             if let (Some(x_arr), Some(y_arr)) = (
                 x.as_any().downcast_ref::<Float64Array>(),
                 y.as_any().downcast_ref::<Float64Array>(),
             ) {
-                for i in 0..batch.num_rows() {
-                    if x_arr.is_valid(i) && y_arr.is_valid(i) {
-                        let x = x_arr.value(i);
-                        let y = y_arr.value(i);
-                        geometries.push((
-                            Geometry::new(GeomValue::Point(vec![x, y])),
-                            x, y
-                        ));
-                    } else {
-                        geometries.push((
-                            Geometry::new(GeomValue::Point(vec![0.0, 0.0])),
-                            0.0, 0.0
-                        ));
-                    }
-                }
-                return Ok(geometries);
+                return Ok(points_from_xy(x_arr, y_arr, batch.num_rows()));
             }
         }
     }
-    
-    // Try WKB binary column
-    if let Some(binary_array) = geom_col.as_any().downcast_ref::<arrow::array::BinaryArray>() {
-        for i in 0..batch.num_rows() {
-            if binary_array.is_valid(i) {
-                let wkb = binary_array.value(i);
-                if let Some((geom, lon, lat)) = parse_wkb_geometry(wkb) {
-                    geometries.push((geom, lon, lat));
-                } else {
-                    geometries.push((
-                        Geometry::new(GeomValue::Point(vec![0.0, 0.0])),
-                        0.0, 0.0
-                    ));
-                }
-            } else {
-                geometries.push((
-                    Geometry::new(GeomValue::Point(vec![0.0, 0.0])),
-                    0.0, 0.0
-                ));
-            }
-        }
-        return Ok(geometries);
+
+    // Try WKB binary column — all three binary layouts carry the same bytes.
+    if let Some(arr) = geom_col.as_any().downcast_ref::<arrow::array::BinaryArray>() {
+        return Ok(points_from_wkb(
+            (0..batch.num_rows()).map(|i| arr.is_valid(i).then(|| arr.value(i))),
+        ));
     }
-    
+    if let Some(arr) = geom_col.as_any().downcast_ref::<LargeBinaryArray>() {
+        return Ok(points_from_wkb(
+            (0..batch.num_rows()).map(|i| arr.is_valid(i).then(|| arr.value(i))),
+        ));
+    }
+    if let Some(arr) = geom_col.as_any().downcast_ref::<BinaryViewArray>() {
+        return Ok(points_from_wkb(
+            (0..batch.num_rows()).map(|i| arr.is_valid(i).then(|| arr.value(i))),
+        ));
+    }
+
     // Fallback: separate lon/lat columns
     let lon_col = batch.column_by_name("lon")
         .or_else(|| batch.column_by_name("longitude"))
@@ -554,40 +817,48 @@ fn extract_geometries_from_batch(
     let lat_col = batch.column_by_name("lat")
         .or_else(|| batch.column_by_name("latitude"))
         .or_else(|| batch.column_by_name("y"));
-    
+
     if let (Some(lon), Some(lat)) = (lon_col, lat_col) {
         if let (Some(lon_arr), Some(lat_arr)) = (
             lon.as_any().downcast_ref::<Float64Array>(),
             lat.as_any().downcast_ref::<Float64Array>(),
         ) {
-            for i in 0..batch.num_rows() {
-                if lon_arr.is_valid(i) && lat_arr.is_valid(i) {
-                    let x = lon_arr.value(i);
-                    let y = lat_arr.value(i);
-                    geometries.push((
-                        Geometry::new(GeomValue::Point(vec![x, y])),
-                        x, y
-                    ));
-                } else {
-                    geometries.push((
-                        Geometry::new(GeomValue::Point(vec![0.0, 0.0])),
-                        0.0, 0.0
-                    ));
-                }
-            }
-            return Ok(geometries);
+            return Ok(points_from_xy(lon_arr, lat_arr, batch.num_rows()));
         }
     }
-    
-    anyhow::bail!("Could not extract geometries from column '{}'", geom_col_name)
+
+    anyhow::bail!(
+        "Could not extract geometries from column '{}' (Arrow type {:?}). \
+         Supported encodings: WKB (Binary/LargeBinary/BinaryView), separated \
+         x/y point structs, or top-level lon/lat columns",
+        geom_col_name,
+        geom_col.data_type()
+    )
 }
 
-/// Extract timestamps from a column
+/// Pre-1970 timestamps cannot be represented — the temporal index stores
+/// unsigned ms-since-epoch, so a negative value would wrap to a huge
+/// positive one (`as u64`) and silently corrupt the index. This hard-errors
+/// in BOTH strictness modes; coercion is never sound here.
+fn reject_negative_timestamp(row: usize, value: i64) -> Result<()> {
+    if value < 0 {
+        anyhow::bail!(
+            "row {row}: negative timestamp {value} (pre-1970). The STT temporal \
+             index stores unsigned ms-since-epoch and cannot represent pre-1970 \
+             times; filter or re-epoch these rows before building."
+        );
+    }
+    Ok(())
+}
+
+/// Extract timestamps from a column. `row_offset` is the batch's absolute
+/// row position in the file, used for error context.
 fn extract_timestamps_from_batch(
     batch: &arrow::record_batch::RecordBatch,
     col_idx: usize,
-    time_format: &str,
+    time_format: TimeFormat,
     strictness: InputStrictness,
+    row_offset: usize,
 ) -> Result<Vec<u64>> {
     let column = batch.column(col_idx);
     let mut timestamps = Vec::with_capacity(batch.num_rows());
@@ -611,9 +882,10 @@ fn extract_timestamps_from_batch(
     if let Some(ts_array) = column.as_any().downcast_ref::<TimestampMillisecondArray>() {
         for i in 0..batch.num_rows() {
             if ts_array.is_valid(i) {
+                reject_negative_timestamp(row_offset + i, ts_array.value(i))?;
                 timestamps.push(ts_array.value(i) as u64);
             } else {
-                timestamps.push(record_failure(i, &mut parse_failures, "null timestamp")?);
+                timestamps.push(record_failure(row_offset + i, &mut parse_failures, "null timestamp")?);
             }
         }
         warn_timestamp_failures(parse_failures, batch.num_rows());
@@ -624,9 +896,10 @@ fn extract_timestamps_from_batch(
     if let Some(ts_array) = column.as_any().downcast_ref::<TimestampMicrosecondArray>() {
         for i in 0..batch.num_rows() {
             if ts_array.is_valid(i) {
+                reject_negative_timestamp(row_offset + i, ts_array.value(i))?;
                 timestamps.push((ts_array.value(i) / 1000) as u64);
             } else {
-                timestamps.push(record_failure(i, &mut parse_failures, "null timestamp")?);
+                timestamps.push(record_failure(row_offset + i, &mut parse_failures, "null timestamp")?);
             }
         }
         warn_timestamp_failures(parse_failures, batch.num_rows());
@@ -637,14 +910,22 @@ fn extract_timestamps_from_batch(
     if let Some(int_array) = column.as_any().downcast_ref::<Int64Array>() {
         for i in 0..batch.num_rows() {
             if int_array.is_valid(i) {
+                reject_negative_timestamp(row_offset + i, int_array.value(i))?;
                 let value = int_array.value(i) as u64;
                 let ts = match time_format {
-                    "unix-sec" => value * 1000,
-                    _ => value, // Assume unix-ms
+                    TimeFormat::UnixSec => value.checked_mul(1000).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "row {}: unix-sec timestamp {value} overflows ms range",
+                            row_offset + i
+                        )
+                    })?,
+                    // Int64 + iso8601 falls back to unix-ms (warned once at
+                    // schema time in stream_features).
+                    TimeFormat::UnixMs | TimeFormat::Iso8601 => value,
                 };
                 timestamps.push(ts);
             } else {
-                timestamps.push(record_failure(i, &mut parse_failures, "null timestamp")?);
+                timestamps.push(record_failure(row_offset + i, &mut parse_failures, "null timestamp")?);
             }
         }
         warn_timestamp_failures(parse_failures, batch.num_rows());
@@ -657,14 +938,17 @@ fn extract_timestamps_from_batch(
             if str_array.is_valid(i) {
                 let s = str_array.value(i);
                 match parse_iso8601(s) {
-                    Ok(ts) => timestamps.push(ts),
+                    Ok(ms) => {
+                        reject_negative_timestamp(row_offset + i, ms)?;
+                        timestamps.push(ms as u64);
+                    }
                     Err(_) => {
                         let reason = format!("unparseable ISO8601 timestamp {s:?}");
-                        timestamps.push(record_failure(i, &mut parse_failures, &reason)?);
+                        timestamps.push(record_failure(row_offset + i, &mut parse_failures, &reason)?);
                     }
                 }
             } else {
-                timestamps.push(record_failure(i, &mut parse_failures, "null timestamp")?);
+                timestamps.push(record_failure(row_offset + i, &mut parse_failures, "null timestamp")?);
             }
         }
         warn_timestamp_failures(parse_failures, batch.num_rows());
@@ -681,6 +965,19 @@ fn warn_timestamp_failures(failures: usize, total: usize) {
         tracing::warn!(
             "{} of {} rows had null or unparseable timestamps; \
              these were coerced to Unix epoch 0 (1970-01-01)",
+            failures,
+            total
+        );
+    }
+}
+
+/// Emit a warning summary if any rows had null/unparseable geometries and
+/// were skipped (pass --strict-geometry to fail the build instead).
+fn warn_geometry_failures(failures: usize, total: usize) {
+    if failures > 0 {
+        tracing::warn!(
+            "{} of {} rows had null or unparseable geometries and were \
+             skipped (pass --strict-geometry to fail the build instead)",
             failures,
             total
         );
@@ -721,24 +1018,26 @@ fn extract_property_value(
     None
 }
 
-/// Parse ISO 8601 timestamp to Unix milliseconds
-fn parse_iso8601(s: &str) -> Result<u64> {
+/// Parse ISO 8601 timestamp to Unix milliseconds. Returns the signed value
+/// so the caller can reject pre-1970 (negative) instants explicitly rather
+/// than letting them wrap through `as u64`.
+fn parse_iso8601(s: &str) -> Result<i64> {
     use chrono::{DateTime, NaiveDateTime};
 
     // Try parsing as DateTime with timezone
     if let Ok(dt) = s.parse::<DateTime<chrono::Utc>>() {
-        return Ok(dt.timestamp_millis() as u64);
+        return Ok(dt.timestamp_millis());
     }
 
     // Try parsing as NaiveDateTime
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        return Ok(dt.and_utc().timestamp_millis() as u64);
+        return Ok(dt.and_utc().timestamp_millis());
     }
 
     // Try parsing as date only
     if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         let dt = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-        return Ok(dt.timestamp_millis() as u64);
+        return Ok(dt.timestamp_millis());
     }
 
     anyhow::bail!("Failed to parse timestamp: {}", s)
