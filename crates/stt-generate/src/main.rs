@@ -52,6 +52,9 @@ enum Commands {
     /// Generate NYC rideshare trajectory data from TLC records + OSRM routing
     NycRideshare(datasets::nyc_rideshare::Args),
 
+    /// Generate a Montreal BIXI origin→destination flowmap from open-data trips
+    Bixi(datasets::bixi::Args),
+
     /// Derive a NYC taxi POINT dataset by interpolating an existing path .stt
     NycTaxiPoints(datasets::nyc_taxi_points::Args),
 
@@ -87,6 +90,7 @@ fn main() -> Result<()> {
         Commands::Hurricanes(args) => datasets::hurricanes::run(args),
         Commands::Wildfires(args) => datasets::wildfires::run(args),
         Commands::NycRideshare(args) => datasets::nyc_rideshare::run(args),
+        Commands::Bixi(args) => datasets::bixi::run(args),
         Commands::NycTaxiPoints(args) => datasets::nyc_taxi_points::run(args),
         Commands::Satellites(args) => datasets::satellites::run(args),
         Commands::Drifters(args) => datasets::drifters::run(args),
