@@ -77,6 +77,36 @@ struct Args {
     #[arg(long, default_value = "64")]
     pack_size: u64,
 
+    /// Opt OUT of the paged directory and emit a single whole-load `.sttd`
+    /// instead. The directory is **paged by default**: a tiny root page + leaf
+    /// pages so a cold reader fetches only the leaves its viewport / time-window
+    /// touches. For small datasets paging is ~free (one leaf, whole-loaded by
+    /// the reader); the single shape only saves a few hundred bytes of root.
+    #[arg(long, default_value = "false")]
+    single_directory: bool,
+
+    /// Entries per leaf page (default 4096 — the sim-validated 1024–4096 sweet
+    /// spot). Ignored with `--single-directory`.
+    #[arg(long, default_value = "4096")]
+    page_entries: usize,
+
+    /// zstd level for tile blobs + directory (1..=22). Default 3 is zstd's
+    /// "fast" tier; a **publish** build should pass 19 — the format is
+    /// write-once / serve-many, so the higher (one-time, offline) build CPU buys
+    /// −10..19% on every client fetch, and decode is level-independent (free on
+    /// the client). 19 ≈ 22 on STT tiles, so there's no reason to go past 19.
+    #[arg(long, default_value = "3")]
+    zstd_level: i32,
+
+    /// Deploy-ready build: raise the zstd level to 19 (−10..19% on the wire,
+    /// decode-free) for serve-as-is output. The directory is already paged by
+    /// default, so this only bumps the level; `--zstd-level` overrides it. This
+    /// is what the dataset-generation workflow (`stt-generate`) uses, so a
+    /// from-source build is publish-quality without a separate re-transcode.
+    /// (Coordinate quantization stays a per-dataset opt-in via `--quantize-coords`.)
+    #[arg(long, default_value = "false")]
+    publish: bool,
+
     /// Temporal bucket size for chunking tiles (e.g., "1h", "6h", "1d", "30m")
     /// Features are grouped into fixed temporal intervals, creating predictable tile boundaries
     /// that align with natural time units for efficient animation and prefetching.
@@ -293,6 +323,17 @@ struct Args {
     #[arg(long, default_value_t = stt_core::arrow_tile::DEFAULT_VERTEX_TIME_MAX_STEP_MS, value_name = "MS")]
     vertex_time_precision: u32,
 
+    /// Opt-in coordinate quantization: store geometry as fixed-point integers at
+    /// this ground precision in **meters** instead of Float64 lon/lat. `0` (the
+    /// default) keeps Float64 GeoArrow coords. Coordinates are the dominant,
+    /// near-incompressible tile column, so e.g. `--quantize-coords 1` (sub-meter
+    /// error) is the largest size lever — measured −25..47% on trip/path
+    /// datasets. Trade-off: a quantized tile is no longer self-describing
+    /// Float64 GeoArrow (the per-tile affine rides in geometry field metadata;
+    /// the STT reader reconstructs Float64).
+    #[arg(long, default_value_t = 0.0, value_name = "METERS")]
+    quantize_coords: f64,
+
     // --- Per-tile budgets (OPT-IN; default OFF) ----------------------------
     // The project follows a documented "no thinning / comprehensive data by
     // default" principle. These caps are inert unless explicitly set, and when
@@ -395,10 +436,34 @@ fn main() -> Result<()> {
         apply_auto_recommendations(&matches, &mut args)?;
     }
 
+    // --publish bundles the lossless deploy wins into the core build path so a
+    // from-source build is deploy-ready (no separate re-transcode). Each bundled
+    // setting yields to an explicit override on the command line.
+    if args.publish {
+        let explicit =
+            |name: &str| matches!(matches.value_source(name), Some(ValueSource::CommandLine));
+        if !explicit("zstd_level") {
+            args.zstd_level = 19;
+        }
+        // (The directory is paged by default, so --publish only bumps the level.)
+        info!("Publish build: zstd-{}", args.zstd_level);
+    }
+
     // Per-vertex time precision is a process-wide encoder setting (the
     // encode sites sit behind generic tile-writer traits with no per-call
     // options channel). Set once, before any tile is encoded.
     stt_core::arrow_tile::set_vertex_time_max_step_ms(args.vertex_time_precision);
+
+    // Coordinate quantization is likewise a process-wide encoder setting, read
+    // by both the streaming and in-memory builders. Off (0) unless opted in.
+    stt_core::arrow_tile::set_quantize_coords_m(args.quantize_coords);
+    if args.quantize_coords > 0.0 {
+        info!(
+            "Coordinate quantization ENABLED: {} m fixed-point geometry (non-GeoArrow-Float64; \
+             reader reconstructs)",
+            args.quantize_coords
+        );
+    }
 
     // Parse compression
     let compression = parse_compression(&args.compression)?;
@@ -646,8 +711,14 @@ fn main() -> Result<()> {
         // Transcode the bounded-RAM temp archive into the packed dataset dir,
         // then drop the temp file. Shared with the pack-transcode example.
         info!("Transcoding temp archive -> packed dir {}", out_dir.display());
-        let manifest =
-            stt_core::transcode_archive_to_packs(&temp_archive_path, &out_dir, pack_ordering, pack_target_bytes)?;
+        let manifest = stt_core::transcode_archive_to_packs_paged_level(
+            &temp_archive_path,
+            &out_dir,
+            pack_ordering,
+            pack_target_bytes,
+            (!args.single_directory).then_some(args.page_entries),
+            args.zstd_level,
+        )?;
         drop(temp_archive); // delete the temp .stt
         let total_pack_bytes: u64 = manifest.packs.iter().map(|p| p.length).sum();
         info!(
@@ -789,7 +860,25 @@ fn main() -> Result<()> {
          in RAM until finalize)",
         args.pack_size
     );
-    let mut writer = stt_core::PackWriter::create(&out_dir, pack_ordering, pack_target_bytes)?;
+    let mut writer = stt_core::PackWriter::create(&out_dir, pack_ordering, pack_target_bytes)?
+        .with_paging((!args.single_directory).then_some(args.page_entries))
+        .with_zstd_level(args.zstd_level);
+    if args.zstd_level != stt_core::compression::ZSTD_LEVEL {
+        info!(
+            "zstd level {} (publish tuning; default {})",
+            args.zstd_level,
+            stt_core::compression::ZSTD_LEVEL
+        );
+    }
+    if args.single_directory {
+        info!("Single whole-load directory (paging opted out via --single-directory)");
+    } else {
+        info!(
+            "Paged directory: root page + leaf pages of ≤{} entries (cold reader fetches \
+             only visited leaves)",
+            args.page_entries
+        );
+    }
 
     let tile_count = if !temporal_lod.is_empty() {
         // --temporal-lod path: emit base tiles + per-level aggregate tiles.

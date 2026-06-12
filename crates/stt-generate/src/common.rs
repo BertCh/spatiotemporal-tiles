@@ -1095,6 +1095,14 @@ pub fn run_stt_build_with_full_options(opts: SttBuildOptions) -> Result<()> {
         .arg("--compression")
         .arg(&opts.compression);
 
+    // The dataset-generation workflow produces DEPLOY-READY output: `--publish`
+    // bundles the lossless wins (zstd-19 + paged directory) into the core build
+    // so a generated dataset needs no separate re-transcode before an R2 sync.
+    // `STT_GEN_DEV=1` opts out for fast dev iteration (dev-level zstd, single dir).
+    if std::env::var_os("STT_GEN_DEV").is_none() {
+        cmd.arg("--publish");
+    }
+
     if let Some(bucket) = &opts.temporal_bucket {
         cmd.arg("--temporal-bucket").arg(bucket);
     }

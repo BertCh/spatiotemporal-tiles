@@ -116,5 +116,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  pack[{i}] {} ({} bytes)", p.key, p.length);
     }
     println!("  directory {} ({} bytes)", manifest.directory.key, manifest.directory.length);
+
+    // --- Paged-directory cross-impl fixtures --------------------------------
+    // A richer grid dataset (spatial spread × time buckets × two zooms) emitted
+    // BOTH paged (`paged-golden/`) and single (`paged-golden-single/`) from the
+    // SAME shared payloads — so the TS differential test can assert the paged
+    // query path returns byte-identical results to a whole-load directory while
+    // fetching only a fraction of the leaf pages.
+    let base = manifest_dir.join("..").join("..").join("packages").join("core").join("test").join("fixtures");
+    let grid = build_grid_tiles();
+    let grid_meta = Metadata::new("paged-golden")
+        .with_description("Deterministic STT paged-directory cross-impl fixture")
+        .with_zoom_levels(10, 12)
+        .with_temporal_bucket_ms(3_600_000)
+        .with_time_range(stt_core::types::TimeRange::new(0, 3 * 3_600_000));
+    for (sub, paging) in [("paged-golden", Some(8usize)), ("paged-golden-single", None)] {
+        let dir = base.join(sub);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        // SpatialMajor → deterministic order + stable content hashes; identical
+        // shared payload bytes → the two builds' packs are byte-identical and
+        // only the directory container differs.
+        let mut gw = PackWriter::create(&dir, BlobOrdering::SpatialMajor, 8 * 1024)?.with_paging(paging);
+        for (id, ts, te, payload) in &grid {
+            gw.add_tile_full(id, *ts, *te, Some(*ts), 3, Some(3_600_000), payload)?;
+        }
+        let gm = gw.finalize(&grid_meta)?;
+        println!(
+            "wrote {} to {}: {} tiles, {} packs, dir {} bytes{}",
+            sub,
+            dir.display(),
+            grid.len(),
+            gm.packs.len(),
+            gm.directory.length,
+            gm.directory
+                .page_count
+                .map(|p| format!(" (paged: {p} leaf pages, root {} B)", gm.directory.root_length.unwrap_or(0)))
+                .unwrap_or_default(),
+        );
+    }
     Ok(())
+}
+
+/// A spread-out grid of tiles across two zooms and three time buckets, with
+/// deterministic per-tile payloads built once (so paged + single builds share
+/// byte-identical blobs). ~250 entries → several leaf pages at page size 8.
+fn build_grid_tiles() -> Vec<(TileId, i64, i64, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut seed = 1_000u64;
+    let bucket = 3_600_000i64;
+    // Zoom 10: an 18×12 block over Europe-ish tile coords.
+    for gx in 0..18u32 {
+        for gy in 0..12u32 {
+            let (x, y) = (520 + gx, 384 + gy);
+            let b = ((gx + gy) % 3) as i64;
+            let t = b * bucket;
+            out.push((TileId::new(10, x, y, t.max(0) as u64), t, t + bucket - 1, payload_for(seed)));
+            seed += 1;
+        }
+    }
+    // Zoom 12: a 6×6 block (distinct zoom exercises zoom-range pruning).
+    for gx in 0..6u32 {
+        for gy in 0..6u32 {
+            let (x, y) = (2084 + gx, 1536 + gy);
+            let b = ((gx * 7 + gy) % 3) as i64;
+            let t = b * bucket;
+            out.push((TileId::new(12, x, y, t.max(0) as u64), t, t + bucket - 1, payload_for(seed)));
+            seed += 1;
+        }
+    }
+    out
 }

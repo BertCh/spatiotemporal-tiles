@@ -39,8 +39,8 @@ use crate::error::{Error, Result};
 use crate::types::GeometryType;
 use arrow::array::{
     Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Builder,
-    Float64Array, Int64Array, Int64Builder, ListArray, ListBuilder, RecordBatch, StringArray,
-    UInt16Array, UInt16Builder, UInt32Builder, UInt64Array,
+    Float64Array, Int32Array, Int64Array, Int64Builder, ListArray, ListBuilder, RecordBatch,
+    StringArray, UInt16Array, UInt16Builder, UInt32Builder, UInt64Array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, UInt16Type};
@@ -276,9 +276,143 @@ fn offsets_from_counts(counts: impl Iterator<Item = usize>) -> OffsetBuffer<i32>
     OffsetBuffer::new(offsets.into())
 }
 
-/// Construct the GeoArrow geometry array for a [`GeometryColumn`].
+/// Meters per degree of latitude (WGS84 mean) — the constant the coordinate
+/// quantizer sizes its grid from. Longitude scales by `cos(lat)`.
+const M_PER_DEG_LAT: f64 = 111_320.0;
+
+/// Schema-metadata key (on the `geometry` field) that flags a tile whose
+/// coordinates are fixed-point `i32` grid indices rather than GeoArrow Float64
+/// lon/lat. Its value is the [`QuantAffine`] JSON; absent ⇒ standard Float64.
+pub const STT_QUANT_META_KEY: &str = "stt:quant";
+
+/// Per-layer coordinate-quantization affine. Coordinates ship as `i32` grid
+/// indices; the decoder reconstructs `lon = x0 + qx*sx`, `lat = y0 + qy*sy`.
+/// `sx`/`sy` (degrees per quantum) are sized from a target ground precision in
+/// meters at the layer's mid-latitude, so the worst-case error is ≤ half a
+/// quantum (~`meters/2`). This trades GeoArrow self-describing Float64 for size
+/// (coords are the dominant, near-incompressible column) and is opt-in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuantAffine {
+    pub x0: f64,
+    pub y0: f64,
+    pub sx: f64,
+    pub sy: f64,
+}
+
+impl QuantAffine {
+    fn to_json(&self) -> String {
+        // Full f64 round-trip precision (17 sig digits) so decode is exact.
+        format!(
+            r#"{{"x0":{:.17e},"y0":{:.17e},"sx":{:.17e},"sy":{:.17e}}}"#,
+            self.x0, self.y0, self.sx, self.sy
+        )
+    }
+
+    /// Parse the affine from its [`STT_QUANT_META_KEY`] JSON value. The TS
+    /// reader applies the identical reconstruction (`tile.ts`).
+    pub fn from_json(s: &str) -> Option<QuantAffine> {
+        let v: serde_json::Value = serde_json::from_str(s).ok()?;
+        let f = |k: &str| v.get(k).and_then(|x| x.as_f64());
+        Some(QuantAffine {
+            x0: f("x0")?,
+            y0: f("y0")?,
+            sx: f("sx")?,
+            sy: f("sy")?,
+        })
+    }
+
+    /// Reconstruct longitude from a quantized x grid index.
+    #[inline]
+    pub fn lon(&self, qx: i32) -> f64 {
+        self.x0 + qx as f64 * self.sx
+    }
+    /// Reconstruct latitude from a quantized y grid index.
+    #[inline]
+    pub fn lat(&self, qy: i32) -> f64 {
+        self.y0 + qy as f64 * self.sy
+    }
+
+    #[inline]
+    fn qx(&self, lon: f64) -> i32 {
+        (((lon - self.x0) / self.sx).round() as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }
+    #[inline]
+    fn qy(&self, lat: f64) -> i32 {
+        (((lat - self.y0) / self.sy).round() as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }
+}
+
+/// The fixed, dataset-independent quantization grid for a target ground
+/// precision in meters, or `None` when off (`meters <= 0`).
+///
+/// The origin is the world corner `(-180, -90)` and the step is uniform in
+/// degrees (`meters / M_PER_DEG_LAT`) — deliberately **not** a per-tile
+/// bbox-relative grid. A per-tile grid gives the same coordinate different
+/// indices in different tiles, which destroys the packed format's
+/// content-addressed blob dedup (measured: +61% on a dedup-heavy dataset). A
+/// single world grid keeps identical geometry byte-identical across tiles.
+///
+/// Latitude precision is exactly `meters`; longitude is `meters * cos(lat)` —
+/// i.e. always ≤ `meters` (finer toward the poles), never coarser than asked.
+/// At 1 m the largest index is `360 * M_PER_DEG_LAT ≈ 4.0e7`, well within i32.
+fn world_grid_affine(meters: f64) -> Option<QuantAffine> {
+    if !(meters > 0.0) {
+        return None;
+    }
+    let step = meters / M_PER_DEG_LAT;
+    Some(QuantAffine {
+        x0: -180.0,
+        y0: -90.0,
+        sx: step,
+        sy: step,
+    })
+}
+
+/// Construct the GeoArrow geometry array for a [`GeometryColumn`] (Float64).
 fn build_geometry_array(geom: &GeometryColumn) -> ArrayRef {
-    let coord_field = || Arc::new(Field::new("xy", DataType::Float64, false));
+    build_geometry_array_q(geom, None)
+}
+
+/// [`build_geometry_array`], optionally quantizing coordinates to an `i32` grid
+/// (when `quant` is `Some`). The List/FixedSizeList nesting and offset buffers
+/// are identical either way — only the leaf changes from `Float64` to `Int32`,
+/// so `quant = None` is byte-identical to the historical encoder.
+fn build_geometry_array_q(geom: &GeometryColumn, quant: Option<&QuantAffine>) -> ArrayRef {
+    let coord_field = || {
+        let dt = if quant.is_some() {
+            DataType::Int32
+        } else {
+            DataType::Float64
+        };
+        Arc::new(Field::new("xy", dt, false))
+    };
+    // Turn a flat `[x,y,x,y,...]` f64 run into the FixedSizeList<_,2> leaf,
+    // quantizing to i32 grid indices when an affine is supplied.
+    let make_leaf = |flat: Vec<f64>| -> ArrayRef {
+        match quant {
+            Some(q) => {
+                let mut iv = Vec::with_capacity(flat.len());
+                let mut i = 0;
+                while i + 1 < flat.len() {
+                    iv.push(q.qx(flat[i]));
+                    iv.push(q.qy(flat[i + 1]));
+                    i += 2;
+                }
+                Arc::new(FixedSizeListArray::new(
+                    coord_field(),
+                    2,
+                    Arc::new(Int32Array::from(iv)),
+                    None,
+                ))
+            }
+            None => Arc::new(FixedSizeListArray::new(
+                coord_field(),
+                2,
+                Arc::new(Float64Array::from(flat)),
+                None,
+            )),
+        }
+    };
 
     match geom {
         GeometryColumn::Point(points) => {
@@ -287,8 +421,7 @@ fn build_geometry_array(geom: &GeometryColumn) -> ArrayRef {
                 flat.push(*x);
                 flat.push(*y);
             }
-            let values = Arc::new(Float64Array::from(flat));
-            Arc::new(FixedSizeListArray::new(coord_field(), 2, values, None))
+            make_leaf(flat)
         }
         GeometryColumn::LineString(lines) => {
             let mut flat: Vec<f64> = Vec::new();
@@ -298,10 +431,7 @@ fn build_geometry_array(geom: &GeometryColumn) -> ArrayRef {
                     flat.push(*y);
                 }
             }
-            let coords: ArrayRef = {
-                let values = Arc::new(Float64Array::from(flat));
-                Arc::new(FixedSizeListArray::new(coord_field(), 2, values, None))
-            };
+            let coords = make_leaf(flat);
             let offsets = offsets_from_counts(lines.iter().map(|l| l.len()));
             let vertex_field = Arc::new(Field::new("vertices", coords.data_type().clone(), false));
             Arc::new(ListArray::new(vertex_field, offsets, coords, None))
@@ -321,10 +451,7 @@ fn build_geometry_array(geom: &GeometryColumn) -> ArrayRef {
                     }
                 }
             }
-            let coords: ArrayRef = {
-                let values = Arc::new(Float64Array::from(flat));
-                Arc::new(FixedSizeListArray::new(coord_field(), 2, values, None))
-            };
+            let coords = make_leaf(flat);
             // Ring level: List<FixedSizeList>.
             let ring_offsets = offsets_from_counts(ring_sizes.into_iter());
             let vertex_field = Arc::new(Field::new("vertices", coords.data_type().clone(), false));
@@ -379,6 +506,32 @@ pub fn set_vertex_time_max_step_ms(ms: u32) {
 /// The currently configured u16-delta `vertex_time` step ceiling (ms).
 pub fn vertex_time_max_step_ms() -> u32 {
     VERTEX_TIME_MAX_STEP_MS.load(Ordering::Relaxed)
+}
+
+/// Build-global coordinate quantization precision, in **micrometers** (lets the
+/// `AtomicU32` carry sub-mm..km without a float). `0` = off (Float64 coords).
+/// Set once per build (e.g. `stt-build --quantize-coords`); read by the default
+/// [`encode_tile`] / [`encode_layer`] path so it covers both the streaming and
+/// in-memory builders without threading through every tile.
+static QUANTIZE_COORDS_UM: AtomicU32 = AtomicU32::new(0);
+
+/// Set the build-global coordinate quantization precision in meters for every
+/// subsequent default [`encode_tile`] call. `<= 0` (the default) turns it off —
+/// coordinates stay Float64 GeoArrow. See [`encode_layer_quantized`] for the
+/// size/precision trade-off.
+pub fn set_quantize_coords_m(meters: f64) {
+    let um = if meters > 0.0 {
+        (meters * 1.0e6).round().clamp(1.0, u32::MAX as f64) as u32
+    } else {
+        0
+    };
+    QUANTIZE_COORDS_UM.store(um, Ordering::Relaxed);
+}
+
+/// The build-global quantization precision in meters, or `None` when off.
+pub fn quantize_coords_m() -> Option<f64> {
+    let um = QUANTIZE_COORDS_UM.load(Ordering::Relaxed);
+    (um > 0).then(|| um as f64 / 1.0e6)
 }
 
 /// Build a (key_array, value_array) pair for a Dictionary<UInt16, Utf8>
@@ -596,6 +749,18 @@ fn infer_vertex_value_buckets(matrix: &[Vec<f32>], geometry: &GeometryColumn) ->
 
 /// Encode a single layer to an Arrow IPC stream.
 pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
+    encode_layer_quantized(layer, quantize_coords_m())
+}
+
+/// [`encode_layer`] with optional fixed-point coordinate quantization.
+///
+/// `quantize_m = Some(meters)` stores coordinates as `i32` grid indices at that
+/// ground precision (default-off `None` is byte-identical to [`encode_layer`]).
+/// Coordinates are the dominant, near-incompressible tile column, so quantizing
+/// them is the single largest size lever — at the cost of GeoArrow Float64
+/// self-description, hence opt-in. The per-layer affine rides in the geometry
+/// field metadata under [`STT_QUANT_META_KEY`]; the reader reconstructs Float64.
+pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) -> Result<Vec<u8>> {
     layer.validate()?;
     let n = layer.feature_count();
 
@@ -612,17 +777,33 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
     columns.push(Arc::new(Int64Array::from(layer.end_times.clone())));
 
     // Geometry column carries the GeoArrow extension name in field metadata.
-    let geom_array = build_geometry_array(&layer.geometry);
+    let quant = quantize_m.and_then(world_grid_affine);
+    let geom_array = build_geometry_array_q(&layer.geometry, quant.as_ref());
     let mut geom_meta = HashMap::new();
     geom_meta.insert(
         GEOARROW_EXT_KEY.to_string(),
         layer.geometry.geoarrow_name().to_string(),
     );
-    // Advertise the CRS so the tile is self-describing to GeoArrow consumers.
-    geom_meta.insert(
-        GEOARROW_EXT_META_KEY.to_string(),
-        GEOARROW_CRS_METADATA.to_string(),
-    );
+    match &quant {
+        // A quantized tile's `xy` leaf is i32 grid indices, not Float64 lon/lat,
+        // so the GeoArrow CRS doesn't apply — swap it for the reconstruction
+        // affine (whose presence is the reader's quantization signal). Keeping
+        // the field-metadata entry COUNT at two matters: arrow serializes field
+        // metadata in nondeterministic HashMap order, and a third key would cut
+        // the odds that two identical tiles encode byte-identically (and thus
+        // dedup) from ~1/2 to ~1/6 — measured as a large size regression on
+        // dedup-heavy datasets.
+        Some(q) => {
+            geom_meta.insert(STT_QUANT_META_KEY.to_string(), q.to_json());
+        }
+        // Advertise the CRS so the tile is self-describing to GeoArrow consumers.
+        None => {
+            geom_meta.insert(
+                GEOARROW_EXT_META_KEY.to_string(),
+                GEOARROW_CRS_METADATA.to_string(),
+            );
+        }
+    }
     fields.push(Arc::new(
         Field::new("geometry", geom_array.data_type().clone(), false)
             .with_metadata(geom_meta),
@@ -775,6 +956,13 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
 /// `ipc_len` records the exact IPC byte length (padding excluded); readers
 /// derive the pad from alignment math alone.
 pub fn encode_tile(layers: &[ColumnarLayer]) -> Result<Vec<u8>> {
+    encode_tile_quantized(layers, quantize_coords_m())
+}
+
+/// [`encode_tile`] with optional fixed-point coordinate quantization applied to
+/// every layer (see [`encode_layer_quantized`]). `quantize_m = None` is
+/// byte-identical to [`encode_tile`].
+pub fn encode_tile_quantized(layers: &[ColumnarLayer], quantize_m: Option<f64>) -> Result<Vec<u8>> {
     if layers.len() >= ALIGNED_FRAME_FLAG as usize {
         return Err(Error::Other(format!(
             "tile has {} layers, exceeds the {} frame limit",
@@ -789,7 +977,7 @@ pub fn encode_tile(layers: &[ColumnarLayer]) -> Result<Vec<u8>> {
         if name.len() > u16::MAX as usize {
             return Err(Error::Other("layer name too long".into()));
         }
-        let ipc = encode_layer(layer)?;
+        let ipc = encode_layer_quantized(layer, quantize_m)?;
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name);
         out.extend_from_slice(&(ipc.len() as u32).to_le_bytes());
@@ -1106,6 +1294,88 @@ mod tests {
             .unwrap();
         assert!(speed.is_null(1));
         assert_eq!(speed.value(0), 10.0);
+    }
+
+    #[test]
+    fn quantized_point_layer_roundtrips_within_precision() {
+        let layer = sample_point_layer();
+        let ipc = encode_layer_quantized(&layer, Some(1.0)).unwrap();
+        let batch = decode_layer(&ipc).unwrap();
+
+        // Geometry leaf is now i32 grid indices, and the affine rides in metadata.
+        let geom_field = batch.schema().field_with_name("geometry").unwrap().clone();
+        let affine = QuantAffine::from_json(
+            geom_field
+                .metadata()
+                .get(STT_QUANT_META_KEY)
+                .expect("quantized tile must carry the affine"),
+        )
+        .unwrap();
+
+        let geom = batch
+            .column_by_name("geometry")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(geom.value_type(), DataType::Int32);
+        let coords = geom
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        let original = [[-122.4, 37.7], [-122.5, 37.8], [-122.6, 37.9]];
+        for (i, [lon, lat]) in original.iter().enumerate() {
+            let rlon = affine.lon(coords.value(i * 2));
+            let rlat = affine.lat(coords.value(i * 2 + 1));
+            // Worst-case reconstruction error ≤ ~half a quantum (~0.5 m).
+            let dlon_m = (rlon - lon).abs() * M_PER_DEG_LAT * lat.to_radians().cos();
+            let dlat_m = (rlat - lat).abs() * M_PER_DEG_LAT;
+            assert!(dlon_m < 1.0, "lon err {dlon_m} m at point {i}");
+            assert!(dlat_m < 1.0, "lat err {dlat_m} m at point {i}");
+        }
+    }
+
+    #[test]
+    fn quantization_shrinks_geometry_and_is_opt_in() {
+        // A many-vertex line is coordinate-dominated; quantization should shrink
+        // the IPC, and the default (None) path must stay byte-identical.
+        let line: Vec<[f64; 2]> = (0..400)
+            .map(|k| [-73.95 + k as f64 * 1e-4, 40.75 + k as f64 * 7e-5])
+            .collect();
+        let layer = ColumnarLayer {
+            name: "q".into(),
+            feature_ids: vec![1],
+            start_times: vec![0],
+            end_times: vec![1],
+            geometry: GeometryColumn::LineString(vec![line]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![],
+        };
+        let plain = encode_layer_quantized(&layer, None).unwrap();
+        let quant = encode_layer_quantized(&layer, Some(1.0)).unwrap();
+
+        // None keeps the Float64 GeoArrow leaf and carries no affine.
+        let pb = decode_layer(&plain).unwrap();
+        let pf = pb.schema().field_with_name("geometry").unwrap().clone();
+        assert!(pf.metadata().get(STT_QUANT_META_KEY).is_none());
+
+        // Some(_) switches the leaf to Int32 and emits the affine.
+        let qb = decode_layer(&quant).unwrap();
+        let qf = qb.schema().field_with_name("geometry").unwrap().clone();
+        assert!(qf.metadata().get(STT_QUANT_META_KEY).is_some());
+
+        // i32 coords (4 B) replace f64 (8 B) for a coordinate-dominated layer.
+        assert!(
+            quant.len() < plain.len(),
+            "quantized {} should be smaller than f64 {}",
+            quant.len(),
+            plain.len()
+        );
     }
 
     #[test]

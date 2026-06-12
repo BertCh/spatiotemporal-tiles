@@ -94,15 +94,13 @@ impl TimeRange {
     }
 }
 
-/// Compression method for tiles.
+/// Compression method for tiles. The format ships **zstd-only**; `None` is for
+/// already-incompressible blobs. (gzip was never shipped and is gone.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Compression {
     /// No compression.
     None,
-    /// Gzip (DEFLATE).
-    Gzip,
-    /// Zstandard (typically 10-20% better ratio than gzip with faster
-    /// browser-side decompression via WASM).
+    /// Zstandard.
     Zstd,
 }
 

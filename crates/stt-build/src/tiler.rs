@@ -1360,7 +1360,7 @@ mod tests {
         );
 
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = Archive::create(&path, Compression::Gzip).unwrap();
+        let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
         for tile in &tiles {
             writer.write_tile(tile).unwrap();
         }
@@ -1402,7 +1402,7 @@ mod tests {
         assert!(!tiles.is_empty(), "expected tiles to be generated");
 
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = Archive::create(&path, Compression::Gzip).unwrap();
+        let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
         for tile in &tiles {
             writer.write_tile(tile).unwrap();
         }
@@ -1450,7 +1450,7 @@ mod tests {
         );
 
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = Archive::create(&path, Compression::Gzip).unwrap();
+        let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
         for tile in &tiles {
             writer.write_tile(tile).unwrap();
         }
@@ -1498,7 +1498,7 @@ mod tests {
             batches.push(Ok(chunk.to_vec()));
         }
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = Archive::create(&path, Compression::Gzip).unwrap();
+        let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
         let stats =
             build_streaming_from_batches(batches.into_iter(), &config, &mut writer, 2, 1024 * 1024)
                 .unwrap();
@@ -1541,7 +1541,7 @@ mod tests {
         };
 
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = Archive::create(&path, Compression::Gzip).unwrap();
+        let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
         let stats = build_streaming_from_batches(
             std::iter::once(Ok(features)),
             &config,
@@ -1697,7 +1697,7 @@ mod tests {
         let tagged = generate_tiles_with_lod(&features, &config, 1).unwrap();
 
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = Archive::create(&path, Compression::Gzip).unwrap();
+        let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
         for t in &tagged {
             writer.write_lod_tile(&t.tile, t.temporal_bucket_ms).unwrap();
         }

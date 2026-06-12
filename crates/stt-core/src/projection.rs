@@ -132,6 +132,23 @@ pub fn tile_to_lonlat(tile_x: u32, tile_y: u32, zoom: u8) -> Point<f64> {
     Point::new(lon, lat)
 }
 
+/// Geographic bounding box `(min_lon, min_lat, max_lon, max_lat)` of a tile.
+///
+/// The tile's NW corner is `tile_to_lonlat(x, y)` and its SE corner is
+/// `tile_to_lonlat(x + 1, y + 1)` (lon grows eastward with x; lat shrinks
+/// southward with y, which is Web-Mercator-flipped). `x + 1` / `y + 1` are the
+/// adjacent tile *edges* — at the last column/row they evaluate to the world
+/// edge (lon 180 / lat ≈ -85.05), which is exactly the tile's far edge.
+///
+/// Used to build the paged-directory page descriptors (geo-bbox pruning) and is
+/// the inverse-projection counterpart the TS reader does not need (the reader
+/// compares stored bboxes against its lon/lat viewport directly).
+pub fn tile_geo_bounds(zoom: u8, tile_x: u32, tile_y: u32) -> (f64, f64, f64, f64) {
+    let nw = tile_to_lonlat(tile_x, tile_y, zoom);
+    let se = tile_to_lonlat(tile_x + 1, tile_y + 1, zoom);
+    (nw.x(), se.y(), se.x(), nw.y())
+}
+
 /// Convert tile-relative coordinates to WGS84 lon/lat
 ///
 /// # Arguments

@@ -133,7 +133,6 @@ pub struct ArchiveHeader {
 fn compression_to_byte(c: Compression) -> u8 {
     match c {
         Compression::None => 0,
-        Compression::Gzip => 1,
         Compression::Zstd => 2,
     }
 }
@@ -141,7 +140,7 @@ fn compression_to_byte(c: Compression) -> u8 {
 fn compression_from_byte(b: u8) -> Result<Compression> {
     match b {
         0 => Ok(Compression::None),
-        1 => Ok(Compression::Gzip),
+        // 1 was gzip (removed; never shipped).
         2 => Ok(Compression::Zstd),
         other => Err(Error::InvalidArchive(format!(
             "unknown compression code {other}"

@@ -106,7 +106,7 @@ fn streaming_pipeline_bounds_peak_rss_for_5m_features() {
     };
 
     let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let mut writer = Archive::create(&path, Compression::Gzip).unwrap();
+    let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
 
     let rss_before = peak_rss_bytes();
     let t0 = std::time::Instant::now();
@@ -201,7 +201,7 @@ fn streaming_pipeline_runs_and_emits_tiles() {
     };
 
     let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let mut writer = Archive::create(&path, Compression::Gzip).unwrap();
+    let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
     let stats =
         build_streaming_from_batches(iter, &config, &mut writer, 4, 4 * 1024 * 1024).unwrap();
     writer.finalize(&Metadata::new("rss-test-small")).unwrap();

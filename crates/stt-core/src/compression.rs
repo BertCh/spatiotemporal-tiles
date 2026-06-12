@@ -1,16 +1,14 @@
-//! Compression utilities for tiles
+//! Compression utilities for tiles. The format is **zstd-only** — there is no
+//! gzip path (it was never shipped; zstd beats it on both ratio and browser
+//! decode). `Compression::None` exists only for already-incompressible blobs.
 
 use crate::error::{Error, Result};
 use crate::types::Compression;
-use flate2::read::{GzDecoder, GzEncoder};
-use flate2::Compression as GzipLevel;
-use std::io::Read;
 
 /// Compress data using the specified compression method
 pub fn compress(data: &[u8], compression: Compression) -> Result<Vec<u8>> {
     match compression {
         Compression::None => Ok(data.to_vec()),
-        Compression::Gzip => compress_gzip(data),
         Compression::Zstd => compress_zstd(data),
     }
 }
@@ -19,35 +17,21 @@ pub fn compress(data: &[u8], compression: Compression) -> Result<Vec<u8>> {
 pub fn decompress(data: &[u8], compression: Compression) -> Result<Vec<u8>> {
     match compression {
         Compression::None => Ok(data.to_vec()),
-        Compression::Gzip => decompress_gzip(data),
         Compression::Zstd => decompress_zstd(data),
     }
-}
-
-fn compress_gzip(data: &[u8]) -> Result<Vec<u8>> {
-    // Level 6 (zlib default): ~3-5x faster than level 9 for <1% larger output
-    // — the right trade-off when compressing thousands of tiles.
-    let mut encoder = GzEncoder::new(data, GzipLevel::new(6));
-    let mut compressed = Vec::new();
-    encoder
-        .read_to_end(&mut compressed)
-        .map_err(|e| Error::Compression(e.to_string()))?;
-    Ok(compressed)
-}
-
-fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = GzDecoder::new(data);
-    let mut decompressed = Vec::new();
-    decoder
-        .read_to_end(&mut decompressed)
-        .map_err(|e| Error::Decompression(e.to_string()))?;
-    Ok(decompressed)
 }
 
 /// Default zstd level. Level 3 is zstd's documented "fast" sweet spot —
 /// roughly gzip-6 ratio at ~5x the encode speed; higher levels save a few
 /// percent at significant CPU cost.
-const ZSTD_LEVEL: i32 = 3;
+/// Default zstd level for the packed format — see the constant doc above.
+/// `compress_zstd_with_dict` and the writers use this unless an explicit level
+/// is threaded through (e.g. `stt-build --zstd-level`).
+pub const ZSTD_LEVEL: i32 = 3;
+
+/// Highest level we expose. zstd defines 1..=22; level 19 is the practical
+/// ceiling (19 ≈ 22 on STT tiles, measured) but we accept up to 22.
+pub const ZSTD_LEVEL_MAX: i32 = 22;
 
 fn compress_zstd(data: &[u8]) -> Result<Vec<u8>> {
     zstd::stream::encode_all(data, ZSTD_LEVEL).map_err(|e| Error::Compression(e.to_string()))
@@ -57,16 +41,34 @@ fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>> {
     zstd::stream::decode_all(data).map_err(|e| Error::Decompression(e.to_string()))
 }
 
-/// Compress a payload with zstd using an optional pre-shared dictionary.
-///
-/// When `dict` is `Some`, the encoder primes itself with the dictionary
-/// before compressing — the decoder needs the same dictionary to round-trip.
+/// Compress a payload with zstd using an optional pre-shared dictionary, at the
+/// default level ([`ZSTD_LEVEL`]). Thin wrapper over
+/// [`compress_zstd_with_dict_level`] — kept as the stable call site for the
+/// many writers that don't tune the level.
 pub fn compress_zstd_with_dict(data: &[u8], dict: Option<&[u8]>) -> Result<Vec<u8>> {
+    compress_zstd_with_dict_level(data, dict, ZSTD_LEVEL)
+}
+
+/// Compress a payload with zstd at an explicit `level`, with an optional
+/// pre-shared dictionary.
+///
+/// The packed format is **write-once / serve-many**: build CPU is paid once,
+/// offline, while the bytes are paid on every client fetch. Decompression speed
+/// is independent of the level the frame was written at, so a higher build-time
+/// level is a pure win on the wire (measured −10..19% at level 19 vs 3). When
+/// `dict` is `Some`, the encoder primes itself with the dictionary — the decoder
+/// needs the same dictionary to round-trip.
+pub fn compress_zstd_with_dict_level(
+    data: &[u8],
+    dict: Option<&[u8]>,
+    level: i32,
+) -> Result<Vec<u8>> {
+    let level = level.clamp(1, ZSTD_LEVEL_MAX);
     let Some(dict) = dict else {
-        return compress_zstd(data);
+        return zstd::stream::encode_all(data, level).map_err(|e| Error::Compression(e.to_string()));
     };
     let mut out = Vec::with_capacity(data.len() / 2 + 64);
-    let mut encoder = zstd::stream::Encoder::with_dictionary(&mut out, ZSTD_LEVEL, dict)
+    let mut encoder = zstd::stream::Encoder::with_dictionary(&mut out, level, dict)
         .map_err(|e| Error::Compression(e.to_string()))?;
     use std::io::Write;
     encoder
@@ -121,20 +123,6 @@ pub fn train_zstd_dictionary_from_slices(samples: &[&[u8]], max_size: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_gzip_roundtrip() {
-        // Use a payload large and repetitive enough to overcome gzip's
-        // fixed ~18-byte header/footer overhead. A short non-repetitive
-        // string would (correctly) fail to shrink.
-        let data = b"Hello, world! This is a test string that should compress well."
-            .repeat(50);
-        let compressed = compress(&data, Compression::Gzip).unwrap();
-        assert!(compressed.len() < data.len());
-
-        let decompressed = decompress(&compressed, Compression::Gzip).unwrap();
-        assert_eq!(decompressed, data);
-    }
 
     #[test]
     fn test_zstd_roundtrip() {

@@ -23,9 +23,15 @@
 use stt_core::archive::TileEntry;
 use stt_core::directory::encode_directory;
 use stt_core::pack::PackedReader;
+use stt_core::projection::tile_geo_bounds as tile_geo_bbox;
 
 fn zstd_len(bytes: &[u8]) -> usize {
     zstd::bulk::compress(bytes, 9).map(|v| v.len()).unwrap_or(bytes.len())
+}
+
+/// 2D bbox overlap test.
+fn bbox_overlap(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> bool {
+    a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -78,20 +84,61 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             .map(|p| zstd_len(&encode_directory(p)))
             .collect();
         let paged_total: usize = page_sizes.iter().sum();
-        // Root page: ~32 B/page entry (key + offset/len + t-bounds), zstd'd at
-        // a conservative 2x.
-        let root_bytes = pages.len() * 32 / 2;
 
-        // Per-query: pages overlapping the 5x5 hilbert range at the anchor's
-        // zoom (hilbert box approximated as the min..max hilbert of the 25
-        // tile keys), then time-pruned by page [t_min,t_max].
-        let mut fetched: Vec<usize> = Vec::with_capacity(anchors.len());
+        // Precompute, per page, both candidate D3 descriptors:
+        //  - Hilbert key range (first/last (zoom,hilbert)) — the sim's original
+        //    model; spatially tight but needs a Hilbert port in the TS reader.
+        //  - Geographic bbox + zoom range — zoom-correct, no Hilbert needed.
+        // Plus the shared temporal [t_min, t_max] page bound.
+        struct PageMeta {
+            key_lo: (u8, u64),
+            key_hi: (u8, u64),
+            zmin: u8,
+            zmax: u8,
+            geo: (f64, f64, f64, f64),
+            t0: i64,
+            t1: i64,
+        }
+        let metas: Vec<PageMeta> = pages
+            .iter()
+            .map(|p| {
+                let mut geo = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+                let (mut zmin, mut zmax) = (u8::MAX, 0u8);
+                for e in p.iter() {
+                    let b = tile_geo_bbox(e.zoom, e.x, e.y);
+                    geo.0 = geo.0.min(b.0);
+                    geo.1 = geo.1.min(b.1);
+                    geo.2 = geo.2.max(b.2);
+                    geo.3 = geo.3.max(b.3);
+                    zmin = zmin.min(e.zoom);
+                    zmax = zmax.max(e.zoom);
+                }
+                PageMeta {
+                    key_lo: (p.first().unwrap().zoom, p.first().unwrap().hilbert),
+                    key_hi: (p.last().unwrap().zoom, p.last().unwrap().hilbert),
+                    zmin,
+                    zmax,
+                    geo,
+                    t0: p.iter().map(|e| e.cover_t_min.unwrap_or(e.time_start)).min().unwrap(),
+                    t1: p.iter().map(|e| e.time_end).max().unwrap(),
+                }
+            })
+            .collect();
+
+        // Root page: geo-bbox descriptor ~50 B/page (offset/len/count + zoom
+        // range + 4×i32 bbox + 2×i64 t-bounds), zstd'd at a conservative 2×.
+        let root_bytes = pages.len() * 50 / 2;
+
+        // Per-query: a 5×5 tile box at the anchor's zoom × a 1h window.
+        let mut fetched_hil: Vec<usize> = Vec::with_capacity(anchors.len());
+        let mut fetched_geo: Vec<usize> = Vec::with_capacity(anchors.len());
         for a in &anchors {
             let (z, t0) = (a.zoom, a.time_start);
             let t1 = t0 + 3_600_000;
-            // Hilbert indices of the 5x5 box around the anchor tile.
+            // Hilbert indices + geographic bbox of the 5×5 box around the anchor.
             let mut hmin = u64::MAX;
             let mut hmax = 0u64;
+            let mut qgeo = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
             for dx in 0..5i64 {
                 for dy in 0..5i64 {
                     let x = (a.x as i64 + dx - 2).max(0) as u32;
@@ -99,41 +146,55 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     let h = stt_core::tile::TileId::new(z, x, y, 0).hilbert_index();
                     hmin = hmin.min(h);
                     hmax = hmax.max(h);
+                    let b = tile_geo_bbox(z, x, y);
+                    qgeo.0 = qgeo.0.min(b.0);
+                    qgeo.1 = qgeo.1.min(b.1);
+                    qgeo.2 = qgeo.2.max(b.2);
+                    qgeo.3 = qgeo.3.max(b.3);
                 }
             }
-            let mut bytes = root_bytes;
-            for (pi, p) in pages.iter().enumerate() {
-                let pz0 = p.first().unwrap();
-                let pz1 = p.last().unwrap();
-                // Page key range overlaps the query's (zoom, hilbert) range?
-                let key_lo = (pz0.zoom, pz0.hilbert);
-                let key_hi = (pz1.zoom, pz1.hilbert);
-                if key_hi < (z, hmin) || key_lo > (z, hmax) {
+            let mut bytes_hil = root_bytes;
+            let mut bytes_geo = root_bytes;
+            for (pi, m) in metas.iter().enumerate() {
+                // Shared temporal prune (the COPC-temporal trick).
+                let time_hit = !(m.t1 < t0 || m.t0 > t1);
+                if !time_hit {
                     continue;
                 }
-                // Time prune on page t-bounds (the COPC-temporal trick).
-                let pt0 = p.iter().map(|e| e.cover_t_min.unwrap_or(e.time_start)).min().unwrap();
-                let pt1 = p.iter().map(|e| e.time_end).max().unwrap();
-                if pt1 < t0 || pt0 > t1 {
-                    continue;
+                // Hilbert key-range overlap.
+                if !(m.key_hi < (z, hmin) || m.key_lo > (z, hmax)) {
+                    bytes_hil += page_sizes[pi];
                 }
-                bytes += page_sizes[pi];
+                // Geo-bbox + zoom-membership overlap.
+                if z >= m.zmin && z <= m.zmax && bbox_overlap(m.geo, qgeo) {
+                    bytes_geo += page_sizes[pi];
+                }
             }
-            fetched.push(bytes);
+            fetched_hil.push(bytes_hil);
+            fetched_geo.push(bytes_geo);
         }
-        fetched.sort_unstable();
-        let med = fetched[fetched.len() / 2];
-        let p90 = fetched[fetched.len() * 9 / 10];
+        let pct = |v: &mut Vec<usize>| -> (usize, usize) {
+            v.sort_unstable();
+            (v[v.len() / 2], v[v.len() * 9 / 10])
+        };
+        let (hmed, hp90) = pct(&mut fetched_hil);
+        let (gmed, gp90) = pct(&mut fetched_geo);
         println!(
-            "pages of {:>5}: {:>4} pages, paged total {:>9} B (+{:>4.1}% vs whole) | query bytes med {:>8} p90 {:>8} ({:.1}% / {:.1}% of whole-load)",
+            "pages of {:>5}: {:>4} pages, paged total {:>9} B (+{:>4.1}% vs whole)\n  \
+             hilbert-range: med {:>8} p90 {:>8} ({:.1}% / {:.1}% of whole-load)\n  \
+             geo-bbox+zoom: med {:>8} p90 {:>8} ({:.1}% / {:.1}% of whole-load)",
             page_entries,
             pages.len(),
             paged_total + root_bytes,
             ((paged_total + root_bytes) as f64 / whole_zstd as f64 - 1.0) * 100.0,
-            med,
-            p90,
-            med as f64 * 100.0 / whole_zstd as f64,
-            p90 as f64 * 100.0 / whole_zstd as f64,
+            hmed,
+            hp90,
+            hmed as f64 * 100.0 / whole_zstd as f64,
+            hp90 as f64 * 100.0 / whole_zstd as f64,
+            gmed,
+            gp90,
+            gmed as f64 * 100.0 / whole_zstd as f64,
+            gp90 as f64 * 100.0 / whole_zstd as f64,
         );
     }
     Ok(())

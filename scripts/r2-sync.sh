@@ -49,7 +49,12 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${REPO_ROOT}/.env"
-DATA_DIR="${REPO_ROOT}/examples/showcase/public/data"
+# Source tree to sync. Defaults to the live showcase data dir; override with
+# STT_DATA_DIR to deploy the publish-build STAGING tree (data-publish/) straight
+# to R2 without a destructive local swap, e.g.
+#   STT_DATA_DIR=examples/showcase/public/data-publish scripts/r2-sync.sh
+DATA_DIR="${STT_DATA_DIR:-${REPO_ROOT}/examples/showcase/public/data}"
+case "$DATA_DIR" in /*) ;; *) DATA_DIR="${REPO_ROOT}/${DATA_DIR}";; esac
 
 if [[ ! -f "${ENV_FILE}" ]]; then
   echo "error: ${ENV_FILE} not found. See .env.r2.example for the required keys." >&2

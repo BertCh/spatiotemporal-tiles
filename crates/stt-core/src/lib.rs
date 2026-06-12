@@ -27,6 +27,7 @@ pub mod budget;
 pub mod compression;
 pub mod curve;
 pub mod directory;
+pub mod directory_page;
 pub mod error;
 pub mod geometry;
 pub mod metadata;
@@ -38,7 +39,13 @@ pub mod types;
 // Re-export commonly used types.
 // Packed format — the canonical container.
 pub use pack::{
-    transcode_archive_to_packs, verify_packed_objects, Manifest, PackWriter, PackedReader,
+    repack_directory, transcode_archive_to_packs, transcode_archive_to_packs_paged,
+    transcode_archive_to_packs_paged_level, transcode_packs_to_packs_paged_level,
+    verify_packed_objects, Manifest, PackWriter, PackedReader,
+};
+pub use directory_page::{
+    decode_paged_directory, encode_paged_directory, verify_paged_structure, PageDescriptor,
+    PagedRoot, DEFAULT_PAGE_ENTRIES,
 };
 // Single-file archive — legacy/intermediate surface (see the module doc above).
 pub use archive::{Archive, ArchiveReader, ArchiveWriter};
