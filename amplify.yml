@@ -10,11 +10,12 @@ frontend:
         - pnpm install --frozen-lockfile
     build:
       commands:
-        # Turbo builds @stt/showcase and its workspace deps (@stt/core,
-        # @stt/deck.gl, @stt/maplibre) via the `^build` dependency. Tile data is
-        # not in the repo (gitignored) and is served from R2 at runtime via
-        # examples/showcase/.env.production (VITE_DATA_BASE_URL).
-        - pnpm exec turbo run build --filter=@stt/showcase
+        # Turbo builds @poopdeck.gl/showcase and its workspace deps
+        # (@poopdeck.gl/core, @poopdeck.gl/layers, @poopdeck.gl/maplibre) via the
+        # `^build` dependency. Tile data is not in the repo (gitignored) and is
+        # served from R2 at runtime via examples/showcase/.env.production
+        # (VITE_DATA_BASE_URL).
+        - pnpm exec turbo run build --filter=@poopdeck.gl/showcase
   artifacts:
     baseDirectory: examples/showcase/dist
     files:
