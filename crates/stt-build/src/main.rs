@@ -290,6 +290,15 @@ struct Args {
     #[arg(long)]
     min_zoom_field: Option<String>,
 
+    /// Per-feature numeric property naming the DEEPEST zoom a feature appears
+    /// at (LOD ceiling). A feature is skipped at any zoom above its value.
+    /// Paired with `--min-zoom-field` it confines a feature to a zoom band
+    /// `[min_zoom, max_zoom]` — e.g. coarse-zoom clustered/aggregated overviews
+    /// that must not bleed into full-resolution deep zooms. Whole-feature
+    /// filtering only; geometry/attributes are untouched.
+    #[arg(long)]
+    max_zoom_field: Option<String>,
+
     /// Feature property used to drive the HeatmapLayer's per-splat weight.
     /// When set, the build computes the property's [min, 95th percentile]
     /// across all features and bakes it into the archive metadata as the
@@ -585,6 +594,7 @@ fn main() -> Result<()> {
             // streaming path keeps fixed buckets, so this is ignored here.
             adaptive_target_features: None,
             min_zoom_field: args.min_zoom_field.clone(),
+            max_zoom_field: args.max_zoom_field.clone(),
             // Per-tile budgets + attribute control are in-memory-only; the
             // streaming-arrow combination is rejected above, so these stay at
             // their inert defaults here.
@@ -846,6 +856,7 @@ fn main() -> Result<()> {
         time_aware_simplify: args.time_aware_simplify,
         adaptive_target_features: args.adaptive_temporal,
         min_zoom_field: args.min_zoom_field.clone(),
+        max_zoom_field: args.max_zoom_field.clone(),
         tile_budget,
         attribute_filter,
     };
@@ -1418,6 +1429,9 @@ fn build_attribute_filter(args: &Args) -> Result<stt_build::columnar::AttributeF
     if let Some(z) = &args.min_zoom_field {
         required.push(z.clone());
     }
+    if let Some(z) = &args.max_zoom_field {
+        required.push(z.clone());
+    }
     // Summary aggregation source columns (the `name` of each `name:agg` entry).
     for col in summary::parse_summary_columns(&args.summary_columns)? {
         if !col.name.is_empty() && col.name != "_count" {
@@ -1434,8 +1448,8 @@ fn build_attribute_filter(args: &Args) -> Result<stt_build::columnar::AttributeF
         anyhow::bail!(
             "attribute filter would drop column(s) still needed by another build \
              feature (--heatmap-weight/--heatmap-class/--summary-columns/\
-             --min-zoom-field): {}. Add them to --include (or drop the \
-             conflicting flag).",
+             --min-zoom-field/--max-zoom-field): {}. Add them to --include (or \
+             drop the conflicting flag).",
             names.join(", ")
         );
     }

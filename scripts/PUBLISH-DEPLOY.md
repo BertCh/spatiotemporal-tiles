@@ -43,7 +43,7 @@ The paged directory needs the paged-capable reader **live before** the new
 data, so "new reader + old data on R2" is a safe intermediate state.
 
 ```
-npx turbo run build --filter='./packages/*'   # @stt/core (+deck.gl/maplibre)
+npx turbo run build --filter='./packages/*'   # core, playback, layers, maplibre, react (dep-ordered)
 ```
 
 Deploy the showcase (Amplify builds it against these packages — see `amplify.yml`).

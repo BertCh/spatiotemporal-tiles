@@ -63,7 +63,7 @@ For format v3 (zstd + Dictionary categoricals + u16 vertex-time deltas):
   in <10 ms (was minutes on 1M-tile archives).
 - **Point-layer cache key** now includes `colorPalette` / `colorMapping`
   identity. Palette swaps no longer return stale colors.
-- **`__sttProbe` telemetry channel** in both `@stt/core` and `@stt/deck.gl`
+- **`__sttProbe` telemetry channel** in both `@poopdeck.gl/core` and `@poopdeck.gl/layers`
   (`emit`, `measure`, `snapshot`, `getSnapshot`, `enableProbe`,
   `disableProbe`). No-op in production; Playwright probes and the HUD opt in.
 - **PerformanceMonitor HUD** reads from the snapshot channel; cache panel
@@ -74,7 +74,7 @@ For format v3 (zstd + Dictionary categoricals + u16 vertex-time deltas):
   plus a 733 KB CI fixture (`earthquakes-ci.stt` + `.json`) so the
   bench-regression CI gate actually runs.
 
-### Track D — @stt/deck.gl layer rewrite (1c21cf5)
+### Track D — @poopdeck.gl/layers layer rewrite (1c21cf5)
 
 - **Dropped cross-tile consolidation for `AnimatedPointLayer`** in favour
   of per-tile sublayers (matching paths/trips). 200k features prepare+build
@@ -87,7 +87,7 @@ For format v3 (zstd + Dictionary categoricals + u16 vertex-time deltas):
   Eliminates `getVisibleFeatureIndices` + `extractVisiblePolygons`.
 - **`dataComparator: (a, b) => a === b`** on every per-tile sublayer.
 
-### Track E — @stt/maplibre parity (4d30bf3)
+### Track E — @poopdeck.gl/maplibre parity (4d30bf3)
 
 - **VAOs** collapse per-frame `bindBuffer` × N to one `bindVertexArray`.
   Roughly 1400 → 60 GL calls/frame at 20 visible tiles × 3 layers.
@@ -158,8 +158,8 @@ These are tracked as tasks #22–#28 for the next sprint.
 - **Rust workspace**: 56 stt-core + 29 stt-build + 9 stt-validate = 94
   tests pass. `stt-generate test_gmst_calculation` is a pre-existing
   flaky test unrelated to the sprint.
-- **TypeScript workspace**: 16 @stt/core + 88 @stt/deck.gl + 43
-  @stt/maplibre = **147 tests pass**.
+- **TypeScript workspace**: 16 @poopdeck.gl/core + 88 @poopdeck.gl/layers + 43
+  @poopdeck.gl/maplibre = **147 tests pass**.
 - **`tsc --noEmit`** clean on every package.
 - **CI bench-regression** runs against committed fixture; passes at ±15%
   tolerance.

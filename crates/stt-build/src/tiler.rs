@@ -112,6 +112,14 @@ pub struct TileConfig {
     /// feature's geometry/attributes (incl. the value matrix) are untouched.
     /// `None` = no filter (every feature at every zoom in range).
     pub min_zoom_field: Option<String>,
+    /// When set, the named per-feature numeric property is a LOD *ceiling*: a
+    /// feature is SKIPPED at any zoom ABOVE its value. Paired with
+    /// [`Self::min_zoom_field`] it confines a feature to a zoom BAND
+    /// `[min_zoom, max_zoom]` — e.g. coarse-zoom clustered/aggregated features
+    /// that must NOT bleed into the full-resolution deep zooms. Whole-feature
+    /// inclusion only — geometry/attributes (incl. the value matrix) untouched.
+    /// `None` = no ceiling (a feature appears at every zoom ≥ its `min_zoom`).
+    pub max_zoom_field: Option<String>,
     /// Opt-in per-tile size/feature budget (tippecanoe
     /// `--maximum-tile-bytes`/`--maximum-tile-features`). `None` (the default)
     /// means NO budget — every feature gathered for a tile is emitted, byte-for-
@@ -144,6 +152,7 @@ impl Default for TileConfig {
             time_aware_simplify: false,
             adaptive_target_features: None,
             min_zoom_field: None,
+            max_zoom_field: None,
             tile_budget: None,
             attribute_filter: AttributeFilter::KeepAll,
         }
@@ -472,6 +481,18 @@ fn clip_config_from(config: &TileConfig) -> ClipConfig {
 /// Read a feature's LOD floor from the configured `min_zoom_field` property:
 /// the shallowest zoom the feature appears at. `None` = always shown.
 fn feature_min_zoom(feature: &ParsedFeature, field: &Option<String>) -> Option<u8> {
+    feature_zoom_bound(feature, field)
+}
+
+/// Read a feature's LOD ceiling from the configured `max_zoom_field` property:
+/// the deepest zoom the feature appears at. `None` = no ceiling.
+fn feature_max_zoom(feature: &ParsedFeature, field: &Option<String>) -> Option<u8> {
+    feature_zoom_bound(feature, field)
+}
+
+/// Shared reader for the per-feature numeric zoom-bound properties
+/// (`min_zoom_field` / `max_zoom_field`).
+fn feature_zoom_bound(feature: &ParsedFeature, field: &Option<String>) -> Option<u8> {
     let field = field.as_deref()?;
     feature
         .shared_properties
@@ -479,6 +500,23 @@ fn feature_min_zoom(feature: &ParsedFeature, field: &Option<String>) -> Option<u
         .get(field)
         .and_then(|v| v.as_f64())
         .map(|z| z.round() as u8)
+}
+
+/// `true` when `zoom` falls outside a feature's configured `[min_zoom,
+/// max_zoom]` band (either bound absent = open on that side). Whole-feature
+/// skip — callers return before any clip so the value matrix is never touched.
+fn feature_out_of_band(feature: &ParsedFeature, zoom: u8, config: &TileConfig) -> bool {
+    if let Some(mz) = feature_min_zoom(feature, &config.min_zoom_field) {
+        if zoom < mz {
+            return true;
+        }
+    }
+    if let Some(mx) = feature_max_zoom(feature, &config.max_zoom_field) {
+        if zoom > mx {
+            return true;
+        }
+    }
+    false
 }
 
 fn process_zoom_level(
@@ -493,12 +531,11 @@ fn process_zoom_level(
     let placed: Vec<(u32, u32, TileFeature)> = features
         .par_iter()
         .flat_map(|feature| {
-            // Road-class LOD: hide a feature at zooms below its min_zoom floor.
-            // Whole-feature skip BEFORE clip — the value matrix is never touched.
-            if let Some(mz) = feature_min_zoom(feature, &config.min_zoom_field) {
-                if zoom < mz {
-                    return Vec::new();
-                }
+            // Road-class LOD: hide a feature outside its [min_zoom, max_zoom]
+            // band. Whole-feature skip BEFORE clip — the value matrix is never
+            // touched.
+            if feature_out_of_band(feature, zoom, config) {
+                return Vec::new();
             }
             let should_clip = config.clip_trajectories
                 && is_clippable_trajectory(&feature.geojson, feature.end_timestamp);
@@ -994,11 +1031,10 @@ where
         // still happens on the writer side.
         for (zi, &zoom) in zooms.iter().enumerate() {
             for feature in &features {
-                // Road-class LOD: hide a feature below its min_zoom floor.
-                if let Some(mz) = feature_min_zoom(feature, &config.min_zoom_field) {
-                    if zoom < mz {
-                        continue;
-                    }
+                // Road-class LOD: hide a feature outside its [min_zoom,
+                // max_zoom] band.
+                if feature_out_of_band(feature, zoom, config) {
+                    continue;
                 }
                 let should_clip = config.clip_trajectories
                     && is_clippable_trajectory(&feature.geojson, feature.end_timestamp);
@@ -1323,6 +1359,35 @@ mod tests {
             .expect("tile layer must carry the per-vertex value matrix");
         assert_eq!(vm.len(), 1);
         assert_eq!(vm[0].len(), nverts * num_buckets);
+    }
+
+    /// A `max_zoom_field` ceiling (paired with `min_zoom_field`) confines a
+    /// feature to a single-zoom band: present at zoom == its band, absent above
+    /// AND below. This is what keeps coarse-zoom clustered corridors out of the
+    /// full-resolution deep zooms.
+    #[test]
+    fn max_zoom_field_confines_feature_to_band() {
+        let mut p = point(-73.98, 40.75, 1_600_000_000_000);
+        {
+            let props = std::sync::Arc::make_mut(p.shared_properties.as_mut().unwrap());
+            props.insert("min_zoom".to_string(), serde_json::json!(11));
+            props.insert("max_zoom".to_string(), serde_json::json!(11));
+        }
+        let config = TileConfig {
+            min_zoom: 10,
+            max_zoom: 12,
+            layer_name: "flows".to_string(),
+            min_zoom_field: Some("min_zoom".to_string()),
+            max_zoom_field: Some("max_zoom".to_string()),
+            ..TileConfig::default()
+        };
+        let tiles = generate_tiles(&[p], &config, 1).unwrap();
+        let zooms: Vec<u8> = tiles.iter().map(|t| t.id.z).collect();
+        assert_eq!(
+            zooms,
+            vec![11],
+            "feature must appear only at its single-zoom band, got {zooms:?}"
+        );
     }
 
     /// The tight covering lower bound `cover_t_min` is the earliest feature

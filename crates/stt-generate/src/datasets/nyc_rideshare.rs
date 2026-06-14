@@ -507,6 +507,7 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
             summary_sub_buckets: None,
             min_features_per_tile: None,
             min_zoom_field: Some("min_zoom".to_string()),
+            max_zoom_field: None,
         })?;
     } else {
         common::run_stt_build_with_options(

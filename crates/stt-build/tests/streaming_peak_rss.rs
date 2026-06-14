@@ -101,6 +101,7 @@ fn streaming_pipeline_bounds_peak_rss_for_5m_features() {
         time_aware_simplify: false,
         adaptive_target_features: None,
         min_zoom_field: None,
+        max_zoom_field: None,
         tile_budget: None,
         attribute_filter: Default::default(),
     };
@@ -196,6 +197,7 @@ fn streaming_pipeline_runs_and_emits_tiles() {
         time_aware_simplify: false,
         adaptive_target_features: None,
         min_zoom_field: None,
+        max_zoom_field: None,
         tile_budget: None,
         attribute_filter: Default::default(),
     };

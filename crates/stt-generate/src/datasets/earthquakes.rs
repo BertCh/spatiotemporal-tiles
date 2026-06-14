@@ -224,6 +224,7 @@ pub fn run(args: Args) -> Result<()> {
             // markers that scale by magnitude in pixels.
             min_features_per_tile: Some(2),
             min_zoom_field: None,
+            max_zoom_field: None,
             summary,
         })?;
 

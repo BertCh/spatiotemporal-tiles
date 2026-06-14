@@ -1017,6 +1017,7 @@ pub fn run_stt_build_with_options(
         summary_sub_buckets: None,
         min_features_per_tile: None,
         min_zoom_field: None,
+        max_zoom_field: None,
     })
 }
 
@@ -1065,6 +1066,12 @@ pub struct SttBuildOptions {
     /// property that is the road-class LOD floor: a feature is hidden at zooms
     /// below its value. `None` = no filter.
     pub min_zoom_field: Option<String>,
+    /// Forwarded to `stt-build --max-zoom-field`. Names a per-feature numeric
+    /// property that is the LOD ceiling: a feature is hidden at zooms above its
+    /// value. Paired with `min_zoom_field` it confines a feature to a zoom band
+    /// (coarse-zoom aggregates that must not bleed into deep zooms). `None` = no
+    /// ceiling.
+    pub max_zoom_field: Option<String>,
 }
 
 /// Single entry point that drives the stt-build CLI with every option,
@@ -1117,6 +1124,10 @@ pub fn run_stt_build_with_full_options(opts: SttBuildOptions) -> Result<()> {
 
     if let Some(field) = &opts.min_zoom_field {
         cmd.arg("--min-zoom-field").arg(field);
+    }
+
+    if let Some(field) = &opts.max_zoom_field {
+        cmd.arg("--max-zoom-field").arg(field);
     }
 
     if let Some(sm) = &opts.summary {

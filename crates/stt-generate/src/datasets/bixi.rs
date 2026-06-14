@@ -89,6 +89,21 @@ pub struct Args {
     #[arg(long, default_value = "13")]
     pub max_zoom: u8,
 
+    /// Disable build-time station clustering and fall back to the legacy
+    /// volume-based LOD (full-resolution corridors at every zoom, minor pairs
+    /// dropped at low zoom). By default the generator clusters stations into
+    /// hubs per zoom and aggregates flows between them (flowmap.gl-style),
+    /// baking the per-zoom aggregation into the tile pyramid.
+    #[arg(long)]
+    pub no_cluster: bool,
+
+    /// Cluster merge radius in screen pixels at tile extent 512 (Supercluster's
+    /// scale). Larger = coarser hubs at a given zoom. The per-zoom merge radius
+    /// is `cluster_radius / (512 · 2^zoom)` in world units, so hubs refine as
+    /// you zoom in; the deepest zoom is always full per-station resolution.
+    #[arg(long, default_value = "40")]
+    pub cluster_radius: f64,
+
     /// Skip the stt-build step (write only the intermediate GeoParquet).
     #[arg(long)]
     pub skip_build: bool,
@@ -114,7 +129,12 @@ pub fn run(args: Args) -> Result<()> {
     println!("   Bin:       {} ({} ms)", args.bin, bin_ms);
     println!("   Span:      {} → {}", args.from.as_deref().unwrap_or("(start)"), args.to.as_deref().unwrap_or("(end)"));
     println!("   Min trips: {}", args.min_trips);
-    println!("   Zoom:      {}-{}\n", args.min_zoom, args.max_zoom);
+    println!("   Zoom:      {}-{}", args.min_zoom, args.max_zoom);
+    if args.no_cluster {
+        println!("   Cluster:   off (legacy volume LOD)\n");
+    } else {
+        println!("   Cluster:   on (radius {} px)\n", args.cluster_radius);
+    }
 
     let mut agg = BixiAggregator::new(bin_ms, from_ms, to_ms);
 
@@ -147,8 +167,14 @@ pub fn run(args: Args) -> Result<()> {
         args.output.with_extension("parquet")
     };
 
-    let (features, num_buckets, bucket0, range_end) =
-        agg.write_parquet(&intermediate_path, args.min_trips)?;
+    let cluster_radius = if args.no_cluster { None } else { Some(args.cluster_radius) };
+    let (features, num_buckets, bucket0, range_end) = agg.write_parquet(
+        &intermediate_path,
+        args.min_trips,
+        cluster_radius,
+        args.min_zoom,
+        args.max_zoom,
+    )?;
     println!("\n   ✓ {features} OD-pair corridors · {num_buckets} buckets");
     println!("   ⏱  matrix span (set showcase timeRange to this):");
     println!("       start = {bucket0}");
@@ -176,7 +202,16 @@ pub fn run(args: Args) -> Result<()> {
         summary: None,
         summary_sub_buckets: None,
         min_features_per_tile: None,
+        // Per-zoom clustered corridors are confined to a single-zoom band
+        // [min_zoom, max_zoom] = [z, z]; --no-cluster falls back to the
+        // open-ended volume LOD (min only, no max column → appears at all zooms
+        // ≥ min). The build reads both property columns to enforce the band.
         min_zoom_field: Some("min_zoom".to_string()),
+        max_zoom_field: if args.no_cluster {
+            None
+        } else {
+            Some("max_zoom".to_string())
+        },
     })?;
 
     println!("\n✅ BIXI flowmap built: {}", args.output.display());
@@ -283,10 +318,37 @@ impl BixiAggregator {
         self.trips_kept += 1;
     }
 
-    /// Emit one 2-vertex OD LineString per kept pair, carrying a `[2 ×
-    /// num_buckets]` vertex-major matrix (both vertices = the pair's per-bucket
-    /// count). Returns (features, num_buckets, bucket0_ms, range_end_ms).
+    /// Emit OD-corridor LineStrings to GeoParquet, each carrying a `[2 ×
+    /// num_buckets]` vertex-major matrix (both vertices = the corridor's
+    /// per-bucket count). Returns (features, num_buckets, bucket0_ms,
+    /// range_end_ms).
+    ///
+    /// `cluster_radius`:
+    /// - `None` → legacy full-resolution emit with a volume-based `min_zoom`
+    ///   LOD (busiest corridors city-wide; minor pairs reveal on zoom-in).
+    /// - `Some(r)` → flowmap.gl-style build-time clustering: stations are merged
+    ///   into hubs per zoom (Supercluster radius `r / (512·2^z)`) and flows
+    ///   aggregated between hub pairs. Each zoom's corridors are confined to a
+    ///   single-zoom band (`min_zoom == max_zoom == z`) so coarse hubs never
+    ///   bleed into the deeper zooms; the deepest zoom is full per-station
+    ///   resolution.
     fn write_parquet(
+        &self,
+        output: &Path,
+        min_trips: u32,
+        cluster_radius: Option<f64>,
+        min_zoom: u8,
+        max_zoom: u8,
+    ) -> Result<(usize, usize, i64, i64)> {
+        match cluster_radius {
+            Some(r) => self.write_parquet_clustered(output, min_trips, r, min_zoom, max_zoom),
+            None => self.write_parquet_flat(output, min_trips),
+        }
+    }
+
+    /// Legacy path: one corridor per kept OD pair with a volume-based `min_zoom`
+    /// floor and no ceiling (the corridor appears at every zoom ≥ its floor).
+    fn write_parquet_flat(
         &self,
         output: &Path,
         min_trips: u32,
@@ -363,6 +425,120 @@ impl BixiAggregator {
         writer.finish()?;
         Ok((features, num_buckets, bucket0, range_end))
     }
+
+    /// Clustered path (flowmap.gl-style baked-in aggregation). See
+    /// [`Self::write_parquet`]. Builds a per-zoom station→hub hierarchy once,
+    /// then for each zoom aggregates directed flows between hub pairs and emits
+    /// one corridor per hub pair, banded to that single zoom.
+    fn write_parquet_clustered(
+        &self,
+        output: &Path,
+        min_trips: u32,
+        cluster_radius: f64,
+        min_zoom: u8,
+        max_zoom: u8,
+    ) -> Result<(usize, usize, i64, i64)> {
+        let property_columns = vec![
+            PropertyColumn::numeric("total_count"),
+            PropertyColumn::numeric("min_zoom"),
+            PropertyColumn::numeric("max_zoom"),
+            PropertyColumn::string("origin"),
+            PropertyColumn::string("destination"),
+        ];
+        let mut writer = StreamingLineStringParquetWriter::with_columns(output, property_columns)?;
+
+        if self.counts.is_empty() || max_zoom < min_zoom {
+            writer.finish()?;
+            return Ok((0, 0, 0, 0));
+        }
+
+        let num_buckets = (self.max_bin - self.min_bin + 1) as usize;
+        let bucket0 = self.min_bin * self.bin_ms;
+        let range_end = bucket0 + num_buckets as i64 * self.bin_ms;
+
+        let hierarchy = ClusterHierarchy::build(self, cluster_radius, min_zoom, max_zoom);
+
+        let pb = ProgressBar::new((max_zoom - min_zoom + 1) as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("[{bar:40}] zoom {pos}/{len}")?
+                .progress_chars("=>-"),
+        );
+
+        let mut features = 0usize;
+        for z in min_zoom..=max_zoom {
+            let assign = hierarchy.assignment(z);
+            let clusters = hierarchy.clusters(z);
+
+            // Aggregate directed flows between hubs at this zoom (summation is
+            // commutative → independent of HashMap iteration order).
+            let mut hub_counts: HashMap<(usize, usize), HashMap<i64, u32>> = HashMap::new();
+            for ((o_key, d_key), bins) in &self.counts {
+                let (co, cd) = (
+                    assign[hierarchy.index_of(o_key)],
+                    assign[hierarchy.index_of(d_key)],
+                );
+                if co == cd {
+                    continue; // both endpoints collapsed into the same hub
+                }
+                let acc = hub_counts.entry((co, cd)).or_default();
+                for (&bin, &c) in bins {
+                    *acc.entry(bin).or_insert(0) += c;
+                }
+            }
+
+            // Deterministic (content-addressable) emit: sort by (origin id,
+            // destination id) then hub indices.
+            let names: Vec<String> = clusters.iter().map(|c| hierarchy.rep_key(c)).collect();
+            let mut pairs: Vec<&(usize, usize)> = hub_counts.keys().collect();
+            pairs.sort_unstable_by(|a, b| {
+                names[a.0]
+                    .cmp(&names[b.0])
+                    .then_with(|| names[a.1].cmp(&names[b.1]))
+                    .then_with(|| a.cmp(b))
+            });
+
+            for pair in pairs {
+                let bins = &hub_counts[pair];
+                let total: u32 = bins.values().copied().sum();
+                if total < min_trips {
+                    continue;
+                }
+                let o = clusters[pair.0].lonlat;
+                let d = clusters[pair.1].lonlat;
+
+                let mut matrix = vec![0.0f32; 2 * num_buckets];
+                for (&bin, &c) in bins {
+                    let b = (bin - self.min_bin) as usize;
+                    matrix[b] = c as f32; // vertex 0
+                    matrix[num_buckets + b] = c as f32; // vertex 1
+                }
+
+                let mut properties = Map::new();
+                properties.insert("total_count".to_string(), json!(total));
+                // Single-zoom band: the corridor exists at exactly this zoom.
+                properties.insert("min_zoom".to_string(), json!(z));
+                properties.insert("max_zoom".to_string(), json!(z));
+                properties.insert("origin".to_string(), json!(names[pair.0]));
+                properties.insert("destination".to_string(), json!(names[pair.1]));
+
+                writer.write_linestring(&LineStringRecord {
+                    coordinates: vec![o, d],
+                    timestamp_ms: bucket0,
+                    end_timestamp_ms: Some(range_end),
+                    vertex_timestamps_ms: None,
+                    vertex_values: None,
+                    vertex_value_matrix: Some(matrix),
+                    properties,
+                })?;
+                features += 1;
+            }
+            pb.inc(1);
+        }
+        pb.finish_and_clear();
+        writer.finish()?;
+        Ok((features, num_buckets, bucket0, range_end))
+    }
 }
 
 /// Volume-based legibility LOD: busiest corridors visible city-wide (low zoom),
@@ -370,11 +546,206 @@ impl BixiAggregator {
 /// [`super::nyc_rideshare_flows`]. Thresholds tuned against measured pair counts.
 fn volume_min_zoom(total: u32) -> u8 {
     match total {
-        t if t >= 2000 => 10,
-        t if t >= 800 => 11,
-        t if t >= 250 => 12,
+        t if t >= 1200 => 10,
+        t if t >= 400 => 11,
+        t if t >= 100 => 12,
         _ => 13,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Build-time station clustering (flowmap.gl-style, baked per zoom)
+// ---------------------------------------------------------------------------
+
+/// One station in the hierarchy's stable index space.
+struct StationEntry {
+    key: StationKey,
+    lonlat: [f64; 2],
+    /// `max(total_out, total_in)` flow — flowmap.gl's location weight; heavy
+    /// hubs pull the cluster centroid toward themselves and seed merges first.
+    weight: f64,
+}
+
+/// A hub at one zoom: the original stations it covers, their summed weight, and
+/// the flow-weighted centroid used as the corridor endpoint + node position.
+struct ClusterNode {
+    members: Vec<usize>,
+    weight: f64,
+    lonlat: [f64; 2],
+}
+
+/// Per-zoom station→hub assignment, built top-down (Supercluster-style): the
+/// deepest zoom is the identity (full resolution); each coarser zoom merges the
+/// next-finer level's hubs within a zoom-scaled radius, giving stable nesting.
+struct ClusterHierarchy {
+    stations: Vec<StationEntry>,
+    key_to_idx: HashMap<StationKey, usize>,
+    /// zoom → hubs
+    levels: HashMap<u8, Vec<ClusterNode>>,
+    /// zoom → (station index → hub index)
+    assign: HashMap<u8, Vec<usize>>,
+}
+
+impl ClusterHierarchy {
+    fn build(agg: &BixiAggregator, radius: f64, min_zoom: u8, max_zoom: u8) -> Self {
+        // Per-station flow totals → weight.
+        let mut out_tot: HashMap<&StationKey, f64> = HashMap::new();
+        let mut in_tot: HashMap<&StationKey, f64> = HashMap::new();
+        for ((o, d), bins) in &agg.counts {
+            let t: f64 = bins.values().copied().sum::<u32>() as f64;
+            *out_tot.entry(o).or_insert(0.0) += t;
+            *in_tot.entry(d).or_insert(0.0) += t;
+        }
+
+        // Stable index space: stations sorted by key (deterministic packs).
+        let mut keys: Vec<&StationKey> = agg.station_pos.keys().collect();
+        keys.sort_unstable();
+        let mut stations = Vec::with_capacity(keys.len());
+        let mut key_to_idx = HashMap::with_capacity(keys.len());
+        for (i, k) in keys.iter().enumerate() {
+            let w = out_tot
+                .get(*k)
+                .copied()
+                .unwrap_or(0.0)
+                .max(in_tot.get(*k).copied().unwrap_or(0.0))
+                .max(1.0);
+            stations.push(StationEntry {
+                key: (*k).clone(),
+                lonlat: agg.station_pos[*k],
+                weight: w,
+            });
+            key_to_idx.insert((*k).clone(), i);
+        }
+
+        let n = stations.len();
+        let mut levels: HashMap<u8, Vec<ClusterNode>> = HashMap::new();
+        let mut assign: HashMap<u8, Vec<usize>> = HashMap::new();
+
+        // Deepest zoom = identity → full per-station resolution.
+        let identity: Vec<ClusterNode> = (0..n)
+            .map(|s| ClusterNode {
+                members: vec![s],
+                weight: stations[s].weight,
+                lonlat: stations[s].lonlat,
+            })
+            .collect();
+        assign.insert(max_zoom, (0..n).collect());
+        levels.insert(max_zoom, identity);
+
+        // Merge downward: each coarser zoom clusters the next-finer hubs.
+        for z in (min_zoom..max_zoom).rev() {
+            let r = radius / (512.0 * 2f64.powi(z as i32));
+            let merged = merge_clusters(&levels[&(z + 1)], r);
+            let mut a = vec![0usize; n];
+            for (ci, c) in merged.iter().enumerate() {
+                for &m in &c.members {
+                    a[m] = ci;
+                }
+            }
+            assign.insert(z, a);
+            levels.insert(z, merged);
+        }
+
+        ClusterHierarchy {
+            stations,
+            key_to_idx,
+            levels,
+            assign,
+        }
+    }
+
+    fn assignment(&self, z: u8) -> &[usize] {
+        &self.assign[&z]
+    }
+
+    fn clusters(&self, z: u8) -> &[ClusterNode] {
+        &self.levels[&z]
+    }
+
+    fn index_of(&self, key: &StationKey) -> usize {
+        self.key_to_idx[key]
+    }
+
+    /// The heaviest member's station key (tie-break: smallest key) — a stable,
+    /// human-readable label for the hub used as the corridor origin/destination.
+    fn rep_key(&self, node: &ClusterNode) -> String {
+        let mut best = node.members[0];
+        for &m in &node.members[1..] {
+            let (mw, bw) = (self.stations[m].weight, self.stations[best].weight);
+            if mw > bw || (mw == bw && self.stations[m].key < self.stations[best].key) {
+                best = m;
+            }
+        }
+        self.stations[best].key.clone()
+    }
+}
+
+/// Greedy single-pass radius merge over `nodes` (à la Supercluster): seed by
+/// descending weight, absorb every unvisited node within `r` of the seed's
+/// web-mercator unit position into a flow-weighted centroid.
+fn merge_clusters(nodes: &[ClusterNode], r: f64) -> Vec<ClusterNode> {
+    let n = nodes.len();
+    let unit: Vec<[f64; 2]> = nodes.iter().map(|c| project_unit(c.lonlat)).collect();
+
+    // Deterministic seed order: heaviest first, tie-break by smallest member.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        nodes[b]
+            .weight
+            .partial_cmp(&nodes[a].weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| min_member(&nodes[a]).cmp(&min_member(&nodes[b])))
+    });
+
+    let r2 = r * r;
+    let mut visited = vec![false; n];
+    let mut out = Vec::new();
+    for &i in &order {
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        let mut members = nodes[i].members.clone();
+        let mut wsum = nodes[i].weight;
+        let mut lon = nodes[i].lonlat[0] * nodes[i].weight;
+        let mut lat = nodes[i].lonlat[1] * nodes[i].weight;
+        for &j in &order {
+            if visited[j] {
+                continue;
+            }
+            let dx = unit[i][0] - unit[j][0];
+            let dy = unit[i][1] - unit[j][1];
+            if dx * dx + dy * dy <= r2 {
+                visited[j] = true;
+                members.extend_from_slice(&nodes[j].members);
+                wsum += nodes[j].weight;
+                lon += nodes[j].lonlat[0] * nodes[j].weight;
+                lat += nodes[j].lonlat[1] * nodes[j].weight;
+            }
+        }
+        members.sort_unstable();
+        out.push(ClusterNode {
+            members,
+            weight: wsum,
+            lonlat: [lon / wsum, lat / wsum],
+        });
+    }
+    out
+}
+
+fn min_member(node: &ClusterNode) -> usize {
+    node.members.iter().copied().min().unwrap_or(0)
+}
+
+/// Project lon/lat to web-mercator unit space `[0,1]²` (Supercluster's `lngX`/
+/// `latY`), so the merge radius `r = radius/(512·2^z)` scales like screen pixels.
+fn project_unit(lonlat: [f64; 2]) -> [f64; 2] {
+    let x = lonlat[0] / 360.0 + 0.5;
+    let s = (lonlat[1] * std::f64::consts::PI / 180.0)
+        .sin()
+        .clamp(-0.9999, 0.9999);
+    let y = 0.5 - 0.25 * ((1.0 + s) / (1.0 - s)).ln() / std::f64::consts::PI;
+    [x, y]
 }
 
 // ---------------------------------------------------------------------------
@@ -814,7 +1185,8 @@ mod tests {
         assert_eq!(ab[&2], 1);
 
         let dir = std::env::temp_dir().join("bixi-test-out.parquet");
-        let (features, buckets, bucket0, range_end) = agg.write_parquet(&dir, 1).unwrap();
+        let (features, buckets, bucket0, range_end) =
+            agg.write_parquet(&dir, 1, None, 10, 13).unwrap();
         assert_eq!(features, 2);
         assert_eq!(buckets, 3); // bins 0,1,2
         assert_eq!(bucket0, 0);
@@ -832,7 +1204,7 @@ mod tests {
         }
         agg.add_trip(ParsedTrip { origin_key: "C".into(), dest_key: "D".into(), origin_pos: [0.0, 0.0], dest_pos: [2.0, 2.0], start_ms: 0 });
         let dir = std::env::temp_dir().join("bixi-test-thresh.parquet");
-        let (features, _, _, _) = agg.write_parquet(&dir, 3).unwrap();
+        let (features, _, _, _) = agg.write_parquet(&dir, 3, None, 10, 13).unwrap();
         assert_eq!(features, 1); // only A→B (5) clears min_trips=3
         let _ = std::fs::remove_file(&dir);
     }
@@ -864,5 +1236,52 @@ mod tests {
         assert_eq!(volume_min_zoom(1000), 11);
         assert_eq!(volume_min_zoom(300), 12);
         assert_eq!(volume_min_zoom(10), 13);
+    }
+
+    /// Build an aggregator with two nearby downtown docks (S1≈S2, ~500 m apart)
+    /// both flowing to a far dock S3 (~6 km), all in bin 0.
+    fn downtown_agg() -> BixiAggregator {
+        let h = 3_600_000i64;
+        let mut agg = BixiAggregator::new(h, None, None);
+        let s1 = [-73.561, 45.508];
+        let s2 = [-73.566, 45.512];
+        let s3 = [-73.500, 45.560];
+        agg.add_trip(ParsedTrip { origin_key: "S1".into(), dest_key: "S3".into(), origin_pos: s1, dest_pos: s3, start_ms: 0 });
+        agg.add_trip(ParsedTrip { origin_key: "S2".into(), dest_key: "S3".into(), origin_pos: s2, dest_pos: s3, start_ms: 0 });
+        agg
+    }
+
+    #[test]
+    fn clustering_is_identity_at_deepest_zoom() {
+        let hier = ClusterHierarchy::build(&downtown_agg(), 40.0, 10, 13);
+        // Deepest zoom = full resolution: one hub per station, identity assign.
+        assert_eq!(hier.clusters(13).len(), 3);
+        assert_eq!(hier.assignment(13), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn clustering_merges_nearby_stations_at_coarse_zoom() {
+        let hier = ClusterHierarchy::build(&downtown_agg(), 40.0, 10, 13);
+        // The two downtown docks collapse into one hub at low zoom; S3 stays.
+        let coarse = hier.clusters(10);
+        assert_eq!(coarse.len(), 2);
+        let merged = coarse.iter().find(|c| c.members.len() == 2).expect("a 2-member hub");
+        // Tie weights → smallest key seeds the hub name.
+        assert_eq!(hier.rep_key(merged), "S1");
+    }
+
+    #[test]
+    fn clustered_write_bands_each_zoom_and_aggregates() {
+        let h = 3_600_000i64;
+        let dir = std::env::temp_dir().join("bixi-test-cluster.parquet");
+        let (features, buckets, bucket0, range_end) =
+            downtown_agg().write_parquet(&dir, 1, Some(40.0), 10, 13).unwrap();
+        // z13+z12 keep both corridors (2+2); z11+z10 aggregate the two docks
+        // into one merged→S3 corridor (1+1) → 6 banded features total.
+        assert_eq!(features, 6);
+        assert_eq!(buckets, 1);
+        assert_eq!(bucket0, 0);
+        assert_eq!(range_end, h);
+        let _ = std::fs::remove_file(&dir);
     }
 }
