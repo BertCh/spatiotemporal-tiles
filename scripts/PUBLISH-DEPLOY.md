@@ -46,7 +46,7 @@ data, so "new reader + old data on R2" is a safe intermediate state.
 npx turbo run build --filter='./packages/*'   # core, playback, layers, maplibre, react (dep-ordered)
 ```
 
-Deploy the showcase (Amplify builds it against these packages — see `amplify.yml`).
+Deploy the showcase (Cloudflare Pages builds it against these packages — see `wrangler.jsonc`).
 Confirm the live site loads current datasets before step 4.
 
 ## 4. Sync the new data to R2
