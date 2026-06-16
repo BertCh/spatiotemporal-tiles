@@ -7,6 +7,7 @@
 
 mod common;
 mod datasets;
+mod edge_bundle;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

@@ -508,6 +508,8 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
             min_features_per_tile: None,
             min_zoom_field: Some("min_zoom".to_string()),
             max_zoom_field: None,
+            no_clip: false,
+            quantize_coords: None,
         })?;
     } else {
         common::run_stt_build_with_options(

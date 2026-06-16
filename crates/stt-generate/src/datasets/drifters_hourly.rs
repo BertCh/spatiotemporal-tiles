@@ -272,6 +272,8 @@ pub fn run(args: Args) -> Result<()> {
             min_features_per_tile: None,
             min_zoom_field: None,
             max_zoom_field: None,
+            no_clip: false,
+            quantize_coords: None,
         })?;
         let _ = fs::remove_file(&intermediate);
     }

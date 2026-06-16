@@ -1018,6 +1018,8 @@ pub fn run_stt_build_with_options(
         min_features_per_tile: None,
         min_zoom_field: None,
         max_zoom_field: None,
+        no_clip: false,
+        quantize_coords: None,
     })
 }
 
@@ -1072,6 +1074,19 @@ pub struct SttBuildOptions {
     /// (coarse-zoom aggregates that must not bleed into deep zooms). `None` = no
     /// ceiling.
     pub max_zoom_field: Option<String>,
+    /// Forwarded to `stt-build --no-clip`. For OD / flowmap datasets whose
+    /// 2-vertex source→target lines must NOT be cut at tile boundaries —
+    /// clipping replaces the true station endpoints with tile-edge points, which
+    /// breaks the source→target semantics (false "stations" on seams). When
+    /// true, whole features are stored in their centroid tile instead.
+    pub no_clip: bool,
+    /// Forwarded to `stt-build --quantize-coords <meters>`. Stores coordinates as
+    /// `i32` grid indices at this precision instead of Float64 — roughly halves
+    /// the geometry column and delta-compresses well, at the cost of a
+    /// self-describing tile. `None` keeps full Float64 precision. Use for
+    /// coordinate-heavy builds (e.g. baked bundled corridors) where sub-meter
+    /// precision is invisible at the rendered zooms.
+    pub quantize_coords: Option<f64>,
 }
 
 /// Single entry point that drives the stt-build CLI with every option,
@@ -1128,6 +1143,14 @@ pub fn run_stt_build_with_full_options(opts: SttBuildOptions) -> Result<()> {
 
     if let Some(field) = &opts.max_zoom_field {
         cmd.arg("--max-zoom-field").arg(field);
+    }
+
+    if opts.no_clip {
+        cmd.arg("--no-clip");
+    }
+
+    if let Some(m) = opts.quantize_coords {
+        cmd.arg("--quantize-coords").arg(m.to_string());
     }
 
     if let Some(sm) = &opts.summary {

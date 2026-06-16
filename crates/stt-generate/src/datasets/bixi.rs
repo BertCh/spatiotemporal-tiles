@@ -42,6 +42,7 @@ use crate::common::{
     self, LineStringRecord, PropertyColumn, SttBuildOptions, StreamingLineStringParquetWriter,
 };
 use crate::datasets::nyc_rideshare_flows::parse_bin_ms;
+use crate::edge_bundle::{self, BundleParams};
 
 /// Public BIXI GBFS station feed (stable, no auth) — fallback for resolving
 /// legacy station codes to lat/lon when no stations CSV is present.
@@ -104,6 +105,35 @@ pub struct Args {
     #[arg(long, default_value = "40")]
     pub cluster_radius: f64,
 
+    /// **Bake** KDEEB edge bundling into the tile geometry at build time: each
+    /// zoom's clustered hub-pair corridors are bundled GLOBALLY (one density
+    /// field per zoom) into smooth multi-vertex rivers and stored as polylines,
+    /// so the client renders a static curve — no GPU edge bundler, no float-blend
+    /// capability, works on mobile, deterministic. Requires clustering (the
+    /// default; incompatible with `--no-cluster`, since bundling is a global
+    /// per-zoom operation). Render with `BundledFlowmapLayer({ preBundled: true })`.
+    #[arg(long)]
+    pub bake_bundling: bool,
+
+    /// Control points per baked bundled corridor (P ≥ 3). Each vertex carries a
+    /// time-series matrix row, so fewer points = smaller tiles, more = smoother
+    /// curves. Only used with `--bake-bundling`.
+    #[arg(long, default_value = "24")]
+    pub bundle_points: usize,
+
+    /// Initial KDEEB kernel bandwidth as a fraction of the zoom's extent for
+    /// baked bundling — the headline knob (larger bundles more aggressively).
+    #[arg(long, default_value = "0.05")]
+    pub bundle_kernel: f64,
+
+    /// KDEEB density-advection iterations for baked bundling (≈15 converges).
+    #[arg(long, default_value = "15")]
+    pub bundle_iterations: usize,
+
+    /// Per-iteration Laplacian smoothing strength `[0,1]` for baked bundling.
+    #[arg(long, default_value = "0.5")]
+    pub bundle_smoothing: f64,
+
     /// Skip the stt-build step (write only the intermediate GeoParquet).
     #[arg(long)]
     pub skip_build: bool,
@@ -131,10 +161,36 @@ pub fn run(args: Args) -> Result<()> {
     println!("   Min trips: {}", args.min_trips);
     println!("   Zoom:      {}-{}", args.min_zoom, args.max_zoom);
     if args.no_cluster {
-        println!("   Cluster:   off (legacy volume LOD)\n");
+        println!("   Cluster:   off (legacy volume LOD)");
     } else {
-        println!("   Cluster:   on (radius {} px)\n", args.cluster_radius);
+        println!("   Cluster:   on (radius {} px)", args.cluster_radius);
     }
+
+    // Baked bundling is a GLOBAL per-zoom operation, so it rides on the clustered
+    // path (each zoom is a complete edge set); reject the multi-zoom volume LOD.
+    let bundle = if args.bake_bundling {
+        if args.no_cluster {
+            return Err(anyhow!(
+                "--bake-bundling requires clustering (remove --no-cluster): edge \
+                 bundling is a global per-zoom operation and the volume LOD spans zooms"
+            ));
+        }
+        let bp = BundleParams {
+            points: args.bundle_points.max(3),
+            iterations: args.bundle_iterations,
+            kernel_fraction: args.bundle_kernel,
+            smoothing: args.bundle_smoothing,
+            anneal: 0.8,
+        };
+        println!(
+            "   Bundle:    BAKED (P={}, kernel={}, iters={}, smooth={})\n",
+            bp.points, bp.kernel_fraction, bp.iterations, bp.smoothing
+        );
+        Some(bp)
+    } else {
+        println!();
+        None
+    };
 
     let mut agg = BixiAggregator::new(bin_ms, from_ms, to_ms);
 
@@ -174,6 +230,7 @@ pub fn run(args: Args) -> Result<()> {
         cluster_radius,
         args.min_zoom,
         args.max_zoom,
+        bundle.as_ref(),
     )?;
     println!("\n   ✓ {features} OD-pair corridors · {num_buckets} buckets");
     println!("   ⏱  matrix span (set showcase timeRange to this):");
@@ -212,6 +269,15 @@ pub fn run(args: Args) -> Result<()> {
         } else {
             Some("max_zoom".to_string())
         },
+        // OD corridors are 2-vertex source→target lines: clipping them at tile
+        // boundaries replaces the true station endpoints with tile-edge points
+        // (false "stations" on seams, and broken bundling). Keep whole corridors.
+        no_clip: true,
+        // Baked bundles are coordinate-heavy (P control points per corridor) and
+        // rendered only at city-overview zooms, where 1 m precision is invisible —
+        // quantize to roughly halve the geometry column so the comprehensive
+        // (relaxed `--min-trips`) network stays affordable on the wire.
+        quantize_coords: bundle.as_ref().map(|_| 1.0),
     })?;
 
     println!("\n✅ BIXI flowmap built: {}", args.output.display());
@@ -339,9 +405,12 @@ impl BixiAggregator {
         cluster_radius: Option<f64>,
         min_zoom: u8,
         max_zoom: u8,
+        bundle: Option<&BundleParams>,
     ) -> Result<(usize, usize, i64, i64)> {
         match cluster_radius {
-            Some(r) => self.write_parquet_clustered(output, min_trips, r, min_zoom, max_zoom),
+            Some(r) => {
+                self.write_parquet_clustered(output, min_trips, r, min_zoom, max_zoom, bundle)
+            }
             None => self.write_parquet_flat(output, min_trips),
         }
     }
@@ -430,6 +499,13 @@ impl BixiAggregator {
     /// [`Self::write_parquet`]. Builds a per-zoom station→hub hierarchy once,
     /// then for each zoom aggregates directed flows between hub pairs and emits
     /// one corridor per hub pair, banded to that single zoom.
+    ///
+    /// When `bundle` is `Some`, each zoom's kept hub-pair corridors are bundled
+    /// GLOBALLY (one KDEEB density field over that zoom's whole edge set — never
+    /// per tile, which would seam) into smooth multi-vertex rivers and emitted as
+    /// `P`-vertex polylines instead of straight 2-vertex arcs. The per-bucket
+    /// count series is replicated across all `P` vertices (vertex-major matrix);
+    /// the rows are identical so zstd collapses the redundancy on the wire.
     fn write_parquet_clustered(
         &self,
         output: &Path,
@@ -437,6 +513,7 @@ impl BixiAggregator {
         cluster_radius: f64,
         min_zoom: u8,
         max_zoom: u8,
+        bundle: Option<&BundleParams>,
     ) -> Result<(usize, usize, i64, i64)> {
         let property_columns = vec![
             PropertyColumn::numeric("total_count"),
@@ -498,32 +575,59 @@ impl BixiAggregator {
                     .then_with(|| a.cmp(b))
             });
 
+            // Collect this zoom's KEPT hub-pair corridors (those clearing
+            // min_trips) — the complete edge set the bundler relaxes against.
+            #[allow(clippy::type_complexity)]
+            let mut kept: Vec<([f64; 2], [f64; 2], &HashMap<i64, u32>, u32, String, String)> =
+                Vec::new();
             for pair in pairs {
                 let bins = &hub_counts[pair];
                 let total: u32 = bins.values().copied().sum();
                 if total < min_trips {
                     continue;
                 }
-                let o = clusters[pair.0].lonlat;
-                let d = clusters[pair.1].lonlat;
+                kept.push((
+                    clusters[pair.0].lonlat,
+                    clusters[pair.1].lonlat,
+                    bins,
+                    total,
+                    names[pair.0].clone(),
+                    names[pair.1].clone(),
+                ));
+            }
 
-                let mut matrix = vec![0.0f32; 2 * num_buckets];
-                for (&bin, &c) in bins {
+            // Bundled multi-vertex rivers (one GLOBAL density field over this
+            // whole zoom's edge set) or straight 2-vertex arcs.
+            let geoms: Vec<Vec<[f64; 2]>> = match bundle {
+                Some(bp) => {
+                    let edges: Vec<Vec<[f64; 2]>> = kept.iter().map(|k| vec![k.0, k.1]).collect();
+                    edge_bundle::bundle_edges(&edges, bp)
+                }
+                None => kept.iter().map(|k| vec![k.0, k.1]).collect(),
+            };
+
+            for (k, coords) in kept.iter().zip(geoms) {
+                // Vertex-major matrix: replicate the corridor's per-bucket count
+                // across all P vertices (identical rows → zstd collapses them).
+                let p = coords.len();
+                let mut matrix = vec![0.0f32; p * num_buckets];
+                for (&bin, &c) in k.2 {
                     let b = (bin - self.min_bin) as usize;
-                    matrix[b] = c as f32; // vertex 0
-                    matrix[num_buckets + b] = c as f32; // vertex 1
+                    for v in 0..p {
+                        matrix[v * num_buckets + b] = c as f32;
+                    }
                 }
 
                 let mut properties = Map::new();
-                properties.insert("total_count".to_string(), json!(total));
+                properties.insert("total_count".to_string(), json!(k.3));
                 // Single-zoom band: the corridor exists at exactly this zoom.
                 properties.insert("min_zoom".to_string(), json!(z));
                 properties.insert("max_zoom".to_string(), json!(z));
-                properties.insert("origin".to_string(), json!(names[pair.0]));
-                properties.insert("destination".to_string(), json!(names[pair.1]));
+                properties.insert("origin".to_string(), json!(k.4));
+                properties.insert("destination".to_string(), json!(k.5));
 
                 writer.write_linestring(&LineStringRecord {
-                    coordinates: vec![o, d],
+                    coordinates: coords,
                     timestamp_ms: bucket0,
                     end_timestamp_ms: Some(range_end),
                     vertex_timestamps_ms: None,
@@ -1186,7 +1290,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join("bixi-test-out.parquet");
         let (features, buckets, bucket0, range_end) =
-            agg.write_parquet(&dir, 1, None, 10, 13).unwrap();
+            agg.write_parquet(&dir, 1, None, 10, 13, None).unwrap();
         assert_eq!(features, 2);
         assert_eq!(buckets, 3); // bins 0,1,2
         assert_eq!(bucket0, 0);
@@ -1204,7 +1308,7 @@ mod tests {
         }
         agg.add_trip(ParsedTrip { origin_key: "C".into(), dest_key: "D".into(), origin_pos: [0.0, 0.0], dest_pos: [2.0, 2.0], start_ms: 0 });
         let dir = std::env::temp_dir().join("bixi-test-thresh.parquet");
-        let (features, _, _, _) = agg.write_parquet(&dir, 3, None, 10, 13).unwrap();
+        let (features, _, _, _) = agg.write_parquet(&dir, 3, None, 10, 13, None).unwrap();
         assert_eq!(features, 1); // only A→B (5) clears min_trips=3
         let _ = std::fs::remove_file(&dir);
     }
@@ -1275,13 +1379,27 @@ mod tests {
         let h = 3_600_000i64;
         let dir = std::env::temp_dir().join("bixi-test-cluster.parquet");
         let (features, buckets, bucket0, range_end) =
-            downtown_agg().write_parquet(&dir, 1, Some(40.0), 10, 13).unwrap();
+            downtown_agg().write_parquet(&dir, 1, Some(40.0), 10, 13, None).unwrap();
         // z13+z12 keep both corridors (2+2); z11+z10 aggregate the two docks
         // into one merged→S3 corridor (1+1) → 6 banded features total.
         assert_eq!(features, 6);
         assert_eq!(buckets, 1);
         assert_eq!(bucket0, 0);
         assert_eq!(range_end, h);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn baked_bundling_keeps_feature_banding_with_clustering() {
+        // Baking must not change WHICH corridors are emitted per zoom — only
+        // their geometry (2 verts → P verts). Same banded count as the
+        // unbundled clustered write above.
+        let dir = std::env::temp_dir().join("bixi-test-baked.parquet");
+        let bp = BundleParams { points: 12, ..Default::default() };
+        let (features, buckets, _, _) =
+            downtown_agg().write_parquet(&dir, 1, Some(40.0), 10, 13, Some(&bp)).unwrap();
+        assert_eq!(features, 6, "baking preserves per-zoom feature banding");
+        assert_eq!(buckets, 1);
         let _ = std::fs::remove_file(&dir);
     }
 }

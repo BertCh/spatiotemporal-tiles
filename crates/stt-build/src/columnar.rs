@@ -206,7 +206,10 @@ pub fn build_layer_from_segments(
         start_times,
         end_times,
         geometry: GeometryColumn::LineString(geometry),
-        vertex_times: Some(vertex_times),
+        // Matrix corridors are timeless (animated by the matrix, not per-vertex
+        // times) — drop the dead per-vertex time column for them; keep it for
+        // ordinary trajectory segments that drive the trail animation.
+        vertex_times: (!any_matrix).then_some(vertex_times),
         // Only attach per-vertex values if at least one segment carried them.
         vertex_values: any_values.then_some(vertex_values),
         triangles: None,
@@ -325,9 +328,13 @@ fn build_line_layer(
         start_times: start,
         end_times: end,
         geometry: GeometryColumn::LineString(geometry),
-        // Only attach per-vertex times if at least one feature has a real
-        // duration — otherwise they carry no information.
-        vertex_times: any_duration.then_some(vertex_times),
+        // Attach per-vertex times only when a feature has a real duration AND the
+        // layer carries no value matrix. A matrix corridor is TIMELESS — its
+        // geometry is static and the animation comes from the matrix, not from
+        // per-vertex times — so the interpolated times are dead weight no
+        // consumer reads (the decoder + trips layers synthesize them when absent).
+        // Dropping them keeps flow-corridor / baked-bundle tiles small.
+        vertex_times: (any_duration && !any_matrix).then_some(vertex_times),
         // Likewise only attach per-vertex values if a feature supplied them.
         vertex_values: any_values.then_some(vertex_values),
         triangles: None,
@@ -1030,6 +1037,25 @@ mod tests {
         let refs = vec![&line];
         let layers = build_layers_from_features(&refs, "default").unwrap();
         assert!(layers[0].vertex_times.is_none());
+    }
+
+    #[test]
+    fn matrix_corridor_drops_dead_vertex_times() {
+        // A flow corridor carries a per-vertex×bucket matrix and spans the whole
+        // range (start..end), so build_line_layer WOULD interpolate per-vertex
+        // times — but a matrix corridor is timeless (animated by the matrix), so
+        // those times are dead weight and must be suppressed.
+        let mut line = line_feature(vec![[0.0, 0.0], [0.0, 1.0], [0.0, 2.0]], 1000, Some(3000));
+        // 3 vertices × 2 buckets, vertex-major (matrix.len() % verts == 0).
+        line.vertex_value_matrix = Some(vec![5.0, 7.0, 5.0, 7.0, 5.0, 7.0]);
+        let refs = vec![&line];
+        let layers = build_layers_from_features(&refs, "default").unwrap();
+        assert!(
+            layers[0].vertex_times.is_none(),
+            "matrix corridor must not carry a per-vertex time column"
+        );
+        // The matrix itself is still attached (it's the time signal).
+        assert!(layers[0].vertex_value_matrix.is_some());
     }
 
     /// Build a square polygon feature for the pre-tessellation tests.

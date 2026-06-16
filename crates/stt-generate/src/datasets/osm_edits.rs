@@ -278,6 +278,8 @@ fn run_nodes(
             min_features_per_tile: Some(2),
             min_zoom_field: None,
             max_zoom_field: None,
+            no_clip: false,
+            quantize_coords: None,
         })?;
         let _ = std::fs::remove_file(intermediate);
     }
@@ -525,6 +527,8 @@ fn run_changesets(
             min_features_per_tile: None,
             min_zoom_field: None,
             max_zoom_field: None,
+            no_clip: false,
+            quantize_coords: None,
         })?;
         let _ = std::fs::remove_file(intermediate);
     }
