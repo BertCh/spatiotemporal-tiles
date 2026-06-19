@@ -19,8 +19,23 @@ use std::path::Path;
 /// Undirected OSM edge: a node-id pair in ascending order.
 pub type EdgeKey = (i64, i64);
 
+/// Which highway tags to admit into the network, i.e. which mode's routing this
+/// graph must mirror. OSRM routes on a specific profile; the network we match
+/// its routed geometry against must include the same way classes or the routed
+/// segments won't find an edge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NetworkMode {
+    /// Car/road network (NYC taxi `--flows`): drivable roads only, no cycle
+    /// infrastructure. Excludes footway/cycleway/path/pedestrian/track.
+    Roads,
+    /// Bicycle network (Montréal BIXI `--streets`): drivable roads *plus*
+    /// cycleways and paths, but **excludes** motorways/trunks (bikes don't ride
+    /// there). Mirrors OSRM's `bicycle` profile so routed bike geometry matches.
+    Bike,
+}
+
 /// Road classes, coarsened into LOD tiers. `min_zoom()` is the shallowest zoom
-/// the class appears at in the flows pyramid (z8–14) — the LOD lever.
+/// the class appears at in the flows pyramid (z8–13) — the LOD lever.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RoadClass {
     /// motorway(_link), trunk(_link)
@@ -31,25 +46,54 @@ pub enum RoadClass {
     Secondary,
     /// tertiary(_link)
     Tertiary,
+    /// Dedicated bike infrastructure (cycleway, path) — only admitted in
+    /// [`NetworkMode::Bike`]. A mid-zoom tier so major bike arteries (the REV,
+    /// de Maisonneuve, the canal path) surface in the city overview.
+    Cycleway,
     /// unclassified, residential, living_street, road
     Residential,
-    /// service
+    /// service (+ footway/pedestrian/track in bike mode)
     Service,
 }
 
 impl RoadClass {
-    /// Map an OSM `highway=*` tag value to a class tier, or `None` to exclude
-    /// (footways/cycleways/paths/non-roads).
+    /// Map an OSM `highway=*` tag value to a class tier for the **road** network
+    /// (NYC car mode), or `None` to exclude. Kept as the back-compat default;
+    /// see [`Self::from_highway_with_mode`] for the bike network.
     pub fn from_highway(v: &str) -> Option<RoadClass> {
+        Self::from_highway_with_mode(v, NetworkMode::Roads)
+    }
+
+    /// Map an OSM `highway=*` tag value to a class tier for the given mode, or
+    /// `None` to exclude. In [`NetworkMode::Bike`] motorways/trunks are dropped
+    /// and cycleways/paths/footways are admitted; everything else mirrors the
+    /// road mapping.
+    pub fn from_highway_with_mode(v: &str, mode: NetworkMode) -> Option<RoadClass> {
         Some(match v {
-            "motorway" | "motorway_link" | "trunk" | "trunk_link" => RoadClass::Motorway,
+            "motorway" | "motorway_link" | "trunk" | "trunk_link" => match mode {
+                // Bikes can't ride limited-access roads — exclude so a stray
+                // routed vertex can't false-match onto a motorway edge.
+                NetworkMode::Bike => return None,
+                NetworkMode::Roads => RoadClass::Motorway,
+            },
             "primary" | "primary_link" => RoadClass::Primary,
             "secondary" | "secondary_link" => RoadClass::Secondary,
             "tertiary" | "tertiary_link" => RoadClass::Tertiary,
+            "cycleway" | "path" => match mode {
+                NetworkMode::Bike => RoadClass::Cycleway,
+                // Roads mode excludes cycle infrastructure (unchanged).
+                NetworkMode::Roads => return None,
+            },
             "unclassified" | "residential" | "living_street" | "road" => RoadClass::Residential,
             "service" => RoadClass::Service,
-            // Excluded: footway, cycleway, path, steps, pedestrian, track,
-            // bridleway, corridor, construction, proposed, raceway, …
+            "footway" | "pedestrian" | "track" => match mode {
+                // Minor shared/foot ways a bike route can clip — admit at the
+                // deepest tier so they don't clutter the overview.
+                NetworkMode::Bike => RoadClass::Service,
+                NetworkMode::Roads => return None,
+            },
+            // Excluded: steps, bridleway, corridor, construction, proposed,
+            // raceway, … (and, in road mode, the cycle/foot ways above).
             _ => return None,
         })
     }
@@ -61,6 +105,7 @@ impl RoadClass {
             RoadClass::Primary => 9,
             RoadClass::Secondary => 10,
             RoadClass::Tertiary => 11,
+            RoadClass::Cycleway => 11,
             RoadClass::Residential => 12,
             RoadClass::Service => 13,
         }
@@ -84,8 +129,6 @@ const EDGE_GRID_DEG: f64 = 5.0e-5;
 /// Nearest-edge fallback acceptance threshold (~25 m), in scaled-degree² (lon
 /// scaled by cos(lat) so the metric is roughly isotropic). 25 m ≈ 2.25e-4°.
 const SNAP_THRESH_SCALED_DEG: f64 = 2.25e-4;
-/// Longitude scale at NYC latitude (~40.7°): cos(40.7°) ≈ 0.758.
-const LON_SCALE: f64 = 0.758;
 
 fn quant(lon: f64, lat: f64, grid: f64) -> (i32, i32) {
     ((lon / grid).round() as i32, (lat / grid).round() as i32)
@@ -103,6 +146,10 @@ pub struct OsmNetwork {
     coord_to_node: HashMap<(i32, i32), i64>,
     /// ~5 m cell → edges whose midpoint falls in it (nearest-edge fallback).
     edge_grid: HashMap<(i32, i32), Vec<EdgeKey>>,
+    /// Longitude scale `cos(mean_lat)` for the fallback distance metric, derived
+    /// from this network's own latitude so matching is isotropic anywhere
+    /// (≈0.76 at NYC, ≈0.70 at Montréal) — no hardcoded region assumption.
+    lon_scale: f64,
 }
 
 /// Undirected edge key with endpoints in ascending order.
@@ -115,9 +162,16 @@ fn edge_key(a: i64, b: i64) -> EdgeKey {
 }
 
 impl OsmNetwork {
-    /// Parse a `.osm.pbf` road network. Two passes: ways (collect highway refs +
-    /// class + wanted node-id set), then nodes (resolve coords for wanted ids).
+    /// Parse a `.osm.pbf` **road** network ([`NetworkMode::Roads`]) — the
+    /// back-compat default used by NYC taxi `--flows`.
     pub fn from_pbf(path: &Path) -> Result<OsmNetwork> {
+        Self::from_pbf_with_mode(path, NetworkMode::Roads)
+    }
+
+    /// Parse a `.osm.pbf` network admitting the highway classes for `mode`. Two
+    /// passes: ways (collect highway refs + class + wanted node-id set), then
+    /// nodes (resolve coords for wanted ids).
+    pub fn from_pbf_with_mode(path: &Path, mode: NetworkMode) -> Result<OsmNetwork> {
         // ---- Pass A: ways ----
         let mut ways: HashMap<i64, WayRec> = HashMap::new();
         let mut wanted: HashSet<i64> = HashSet::new();
@@ -128,7 +182,7 @@ impl OsmNetwork {
                 let mut class: Option<RoadClass> = None;
                 for (k, v) in w.tags() {
                     if k == "highway" {
-                        class = RoadClass::from_highway(v);
+                        class = RoadClass::from_highway_with_mode(v, mode);
                         break;
                     }
                 }
@@ -220,12 +274,23 @@ impl OsmNetwork {
             edge_grid.entry(cell).or_default().push((a, b));
         }
 
+        // Longitude scale from this network's mean latitude, so the fallback
+        // metric is isotropic regardless of region (NYC ~40.7°, Montréal ~45.5°).
+        let lon_scale = if node_coords.is_empty() {
+            1.0
+        } else {
+            let mean_lat =
+                node_coords.values().map(|&(_, lat)| lat).sum::<f64>() / node_coords.len() as f64;
+            mean_lat.to_radians().cos()
+        };
+
         OsmNetwork {
             node_coords,
             edge_way,
             ways,
             coord_to_node,
             edge_grid,
+            lon_scale,
         }
     }
 
@@ -282,7 +347,7 @@ impl OsmNetwork {
                     for &e in cands {
                         let (ax, ay) = self.node_coords[&e.0];
                         let (bx, by) = self.node_coords[&e.1];
-                        let d2 = point_seg_dist2_scaled(mx, my, ax, ay, bx, by);
+                        let d2 = point_seg_dist2_scaled(mx, my, ax, ay, bx, by, self.lon_scale);
                         if best.map_or(true, |(bd, _)| d2 < bd) {
                             best = Some((d2, e));
                         }
@@ -295,10 +360,11 @@ impl OsmNetwork {
     }
 }
 
-/// Squared distance from point to segment, with longitude scaled by cos(lat)
-/// so the metric is ~isotropic in metres (good enough at city scale).
-fn point_seg_dist2_scaled(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
-    let s = LON_SCALE;
+/// Squared distance from point to segment, with longitude scaled by `lon_scale`
+/// (= cos(mean_lat)) so the metric is ~isotropic in metres (good enough at city
+/// scale) regardless of the network's latitude.
+fn point_seg_dist2_scaled(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64, lon_scale: f64) -> f64 {
+    let s = lon_scale;
     let (px, ax, bx) = (px * s, ax * s, bx * s);
     let (abx, aby) = (bx - ax, by - ay);
     let (apx, apy) = (px - ax, py - ay);
@@ -383,5 +449,43 @@ mod tests {
         assert_eq!(RoadClass::from_highway("service").unwrap().min_zoom(), 13);
         assert!(RoadClass::from_highway("footway").is_none());
         assert!(RoadClass::from_highway("cycleway").is_none());
+    }
+
+    #[test]
+    fn bike_mode_admits_cycleways_and_drops_motorways() {
+        use NetworkMode::Bike;
+        // Cycle infrastructure is admitted (and surfaces at a mid zoom).
+        assert_eq!(
+            RoadClass::from_highway_with_mode("cycleway", Bike),
+            Some(RoadClass::Cycleway)
+        );
+        assert_eq!(RoadClass::from_highway_with_mode("path", Bike).unwrap().min_zoom(), 11);
+        // Minor foot/shared ways land at the deepest tier.
+        assert_eq!(
+            RoadClass::from_highway_with_mode("footway", Bike),
+            Some(RoadClass::Service)
+        );
+        // Bikes don't ride limited-access roads.
+        assert!(RoadClass::from_highway_with_mode("motorway", Bike).is_none());
+        assert!(RoadClass::from_highway_with_mode("trunk_link", Bike).is_none());
+        // Shared roads still classify as in road mode.
+        assert_eq!(
+            RoadClass::from_highway_with_mode("residential", Bike),
+            Some(RoadClass::Residential)
+        );
+    }
+
+    #[test]
+    fn lon_scale_tracks_network_latitude() {
+        // A Montréal-latitude network gets ~cos(45.5°) ≈ 0.70, not NYC's 0.758.
+        let mut node_coords = HashMap::new();
+        node_coords.insert(1, (-73.585, 45.500));
+        node_coords.insert(2, (-73.580, 45.500));
+        let mut ways = HashMap::new();
+        ways.insert(10, WayRec { refs: vec![1, 2], class: RoadClass::Cycleway });
+        let n = OsmNetwork::build_indices(node_coords, ways);
+        assert!((n.lon_scale - 45.5_f64.to_radians().cos()).abs() < 1e-9);
+        // Exact match still resolves at this latitude.
+        assert_eq!(n.match_segment([-73.585, 45.500], [-73.580, 45.500]), Some((1, 2)));
     }
 }

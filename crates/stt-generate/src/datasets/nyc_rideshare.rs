@@ -4,6 +4,9 @@
 //! and routes trips through OSRM for realistic trajectories.
 
 use crate::common::{self, LineStringRecord, PropertyColumn, StreamingLineStringParquetWriter};
+use crate::datasets::osrm::{
+    check_osrm_connectivity, get_osrm_route, get_osrm_route_pooled, OsrmRoute,
+};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use clap::Parser;
@@ -149,44 +152,6 @@ struct Trip {
     passenger_count: u8,
     trip_distance: f64,
     fare_amount: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct OsrmRouteResponse {
-    code: String,
-    routes: Option<Vec<OsrmRoute>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OsrmRoute {
-    geometry: OsrmGeometry,
-    /// Present when the request includes `annotations=duration,distance`.
-    /// Contains per-leg (segment) durations/distances along the route.
-    /// `legs[i].annotation.duration[j]` is the OSRM-estimated seconds to
-    /// traverse the j-th edge in leg i — reflects road class / speed limit,
-    /// so highway runs are short and urban-grid blocks are long.
-    #[serde(default)]
-    legs: Vec<OsrmLeg>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OsrmGeometry {
-    coordinates: Vec<Vec<f64>>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct OsrmLeg {
-    #[serde(default)]
-    annotation: Option<OsrmAnnotation>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct OsrmAnnotation {
-    #[serde(default)]
-    duration: Vec<f64>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    distance: Vec<f64>,
 }
 
 const NYC_MIN_LON: f64 = -74.05;
@@ -991,53 +956,6 @@ fn parse_tlc_datetime(s: &str) -> Result<DateTime<Utc>> {
     Err(anyhow!("Could not parse datetime: {}", s))
 }
 
-fn check_osrm_connectivity(osrm_url: &str) -> Result<()> {
-    println!("🔍 Checking OSRM connectivity...");
-
-    let test_url = format!(
-        "{}/route/v1/driving/-73.99,40.73;-73.98,40.74?overview=full&geometries=geojson",
-        osrm_url
-    );
-
-    let response = reqwest::blocking::get(&test_url)
-        .context("Failed to connect to OSRM server. Is it running?")?;
-
-    if !response.status().is_success() {
-        return Err(anyhow!("OSRM server returned error status: {}", response.status()));
-    }
-
-    let body: serde_json::Value = response.json()?;
-    let code = body.get("code").and_then(|c| c.as_str()).unwrap_or("");
-    if code != "Ok" {
-        return Err(anyhow!("OSRM returned code: {}", code));
-    }
-
-    println!("✓ OSRM server is ready");
-    Ok(())
-}
-
-fn get_osrm_route(osrm_url: &str, from_lon: f64, from_lat: f64, to_lon: f64, to_lat: f64) -> Result<Option<OsrmRoute>> {
-    // `annotations=duration,distance` returns per-leg per-edge durations so
-    // we can compute real per-vertex timestamps that reflect street class
-    // (highway vs. urban grid). Without this OSRM still returns the full
-    // polyline but with no per-edge timing, forcing us to distribute the
-    // trip duration uniformly by distance → "flash" artifacts on long
-    // segments in the animated-trips renderer.
-    let url = format!(
-        "{}/route/v1/driving/{:.6},{:.6};{:.6},{:.6}?overview=full&geometries=geojson&annotations=duration,distance",
-        osrm_url, from_lon, from_lat, to_lon, to_lat
-    );
-
-    let response = reqwest::blocking::get(&url)?;
-    let body: OsrmRouteResponse = response.json()?;
-
-    if body.code != "Ok" {
-        return Ok(None);
-    }
-
-    Ok(body.routes.and_then(|mut r| r.pop()))
-}
-
 /// Compute true per-vertex absolute timestamps from OSRM annotation data.
 ///
 /// OSRM's `annotations=duration` returns one duration per edge (between
@@ -1684,36 +1602,6 @@ fn generate_od_parquet(trips: &[Trip], args: &Args, output: &PathBuf) -> Result<
 }
 
 /// Thread-local HTTP client for connection pooling
-fn get_osrm_route_pooled(osrm_url: &str, from_lon: f64, from_lat: f64, to_lon: f64, to_lat: f64) -> Result<Option<OsrmRoute>> {
-    use std::cell::RefCell;
-    
-    thread_local! {
-        static CLIENT: RefCell<reqwest::blocking::Client> = RefCell::new(
-            reqwest::blocking::Client::builder()
-                .pool_max_idle_per_host(10)
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap()
-        );
-    }
-    
-    let url = format!(
-        "{}/route/v1/driving/{:.6},{:.6};{:.6},{:.6}?overview=full&geometries=geojson&annotations=duration,distance",
-        osrm_url, from_lon, from_lat, to_lon, to_lat
-    );
-
-    CLIENT.with(|client| {
-        let response = client.borrow().get(&url).send()?;
-        let body: OsrmRouteResponse = response.json()?;
-
-        if body.code != "Ok" {
-            return Ok(None);
-        }
-
-        Ok(body.routes.and_then(|mut r| r.pop()))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

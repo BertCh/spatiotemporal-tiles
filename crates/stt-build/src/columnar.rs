@@ -353,10 +353,23 @@ fn build_polygon_layer(
     for f in features {
         geometry.push(extract_polygon_rings(f)?);
     }
-    // Build the optional triangle index sidecar by running earcut over each
-    // feature's rings. The same coords feed both the geometry column and the
-    // tessellator — indices are local to the feature.
-    let triangles = if opts.pre_tessellate {
+    // Build the triangle index sidecar by running earcut over each feature's
+    // rings. The same coords feed both the geometry column and the tessellator —
+    // indices are local to the feature.
+    //
+    // We bake triangles when explicitly requested (`--pre-tessellate`) OR
+    // whenever ANY feature is multi-ring (a polygon with holes, or a perimeter
+    // carrying interior rings). Multi-ring polygons CANNOT render correctly
+    // through deck.gl's binary earcut path: with `_normalize:false` and no
+    // index buffer it triangulates the feature's concatenated ring run as a
+    // SINGLE boundary, bridging disjoint rings with spanning triangles — the
+    // storm-radar isoband streaks and wildfire-perimeter spikes. Supplying the
+    // baked, hole-aware `indices` buffer makes the renderer skip earcut, so the
+    // sidecar is MANDATORY for these layers, not just a perf win. Layers whose
+    // every feature is a single ring stay lean (no sidecar).
+    let needs_triangles =
+        opts.pre_tessellate || geometry.iter().any(|rings| rings.len() > 1);
+    let triangles = if needs_triangles {
         let mut tris: Vec<Vec<u32>> = Vec::with_capacity(geometry.len());
         for rings in &geometry {
             tris.push(tessellate_polygon(rings));
@@ -1087,6 +1100,42 @@ mod tests {
         }
     }
 
+    /// A square polygon with a square hole (two rings) — exercises the
+    /// multi-ring auto-tessellation path.
+    fn polygon_feature_with_hole() -> ParsedFeature {
+        let exterior: Vec<Vec<f64>> = vec![
+            vec![0.0, 0.0],
+            vec![4.0, 0.0],
+            vec![4.0, 4.0],
+            vec![0.0, 4.0],
+            vec![0.0, 0.0],
+        ];
+        let hole: Vec<Vec<f64>> = vec![
+            vec![1.0, 1.0],
+            vec![2.0, 1.0],
+            vec![2.0, 2.0],
+            vec![1.0, 2.0],
+            vec![1.0, 1.0],
+        ];
+        ParsedFeature {
+            geojson: Feature {
+                bbox: None,
+                geometry: Some(Geometry::new(GeomValue::Polygon(vec![exterior, hole]))),
+                id: None,
+                properties: None,
+                foreign_members: None,
+            },
+            shared_properties: None,
+            timestamp: 1000,
+            end_timestamp: None,
+            vertex_timestamps: None,
+            vertex_values: None,
+            vertex_value_matrix: None,
+            lon: 2.0,
+            lat: 2.0,
+        }
+    }
+
     #[test]
     fn polygon_layer_omits_triangles_by_default() {
         let p = polygon_feature([0.0, 0.0], 1.0);
@@ -1094,6 +1143,34 @@ mod tests {
         let layers = build_layers_from_features(&refs, "default").unwrap();
         assert_eq!(layers.len(), 1);
         assert!(layers[0].triangles.is_none());
+    }
+
+    #[test]
+    fn multi_ring_polygon_auto_bakes_triangles_without_flag() {
+        // A hole-bearing polygon CANNOT render through deck.gl's binary earcut
+        // path (it bridges the exterior and hole rings with spanning
+        // triangles). The builder must bake the hole-aware index sidecar even
+        // when --pre-tessellate is OFF. A single-ring feature sharing the layer
+        // is tessellated too (consistent per-tile index buffer).
+        let holed = polygon_feature_with_hole();
+        let simple = polygon_feature([10.0, 10.0], 1.0);
+        let refs = vec![&holed, &simple];
+        let layers = build_layers_from_features(&refs, "default").unwrap();
+        assert_eq!(layers.len(), 1);
+        let tri = layers[0]
+            .triangles
+            .as_ref()
+            .expect("multi-ring layer must auto-bake triangles even without the flag");
+        assert_eq!(tri.len(), 2);
+        // The holed square (8 distinct verts across two rings) tessellates into
+        // a ring of quads = 8 triangles = 24 indices; every index stays within
+        // the feature's 10 vertices (5 per closed ring), never bridging out.
+        assert!(!tri[0].is_empty() && tri[0].len() % 3 == 0);
+        for &i in &tri[0] {
+            assert!((i as usize) < 10, "triangle index escapes the feature");
+        }
+        // The simple square still earcuts to two triangles.
+        assert_eq!(tri[1].len(), 6);
     }
 
     #[test]

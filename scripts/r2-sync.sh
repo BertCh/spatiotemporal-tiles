@@ -151,6 +151,21 @@ sync_tree() {
     --include "manifest.json" --include "**/manifest.json" \
     "${src}" "${dst}"
 
+  # AV "scene bundle" sidecars (type:'av' datasets): scene.json / telemetry.json /
+  # cameras.json + the camera JPGs under cam/. These are NOT content-addressed
+  # (stable filenames whose bytes change on a re-extract), so they ride the
+  # mutable/short-TTL regime like manifest.json. No-op for non-AV datasets (none
+  # match these globs). The prune pass below only deletes packs/index, so these
+  # are never garbage-collected.
+  echo ">> [av-sidecar] ${src} (scene/telemetry/cameras/cam) -> ${dst}"
+  rclone copy "${COMMON_FLAGS[@]}" ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
+    --header-upload "${MANIFEST_HEADER}" \
+    --include "scene.json" --include "**/scene.json" \
+    --include "telemetry.json" --include "**/telemetry.json" \
+    --include "cameras.json" --include "**/cameras.json" \
+    --include "cam/**" --include "**/cam/**" \
+    "${src}" "${dst}"
+
   if [[ "${PRUNE}" -eq 1 ]]; then
     prune_tree "${src}" "${dst}"
   else

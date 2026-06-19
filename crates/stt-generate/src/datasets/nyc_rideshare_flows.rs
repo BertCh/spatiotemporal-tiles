@@ -150,6 +150,48 @@ impl FlowAggregator {
         self.trips_added += 1;
     }
 
+    /// Add one routed OD corridor carrying a per-bin trip count (the
+    /// **route-once-then-distribute** path used by BIXI `--streets`): route a
+    /// unique origin→destination pair through OSRM once, then for every
+    /// `(bin, count)` it served, add `count` to each OSM edge the route
+    /// traverses in that bin. `bins` keys are absolute bin indices on the same
+    /// `bin_ms` axis as this aggregator (i.e. `start_ms.div_euclid(bin_ms)`).
+    ///
+    /// Unlike [`Self::add_trip`], the whole route lands in each served bin — no
+    /// intra-route timing — which suits bike trips that are short relative to a
+    /// coarse (e.g. 1 h) bucket.
+    pub fn add_route_bins(&mut self, coords: &[[f64; 2]], bins: &HashMap<i64, u32>) {
+        if coords.len() < 2 || bins.is_empty() {
+            self.trips_skipped += 1;
+            return;
+        }
+        for i in 1..coords.len() {
+            let p0 = coords[i - 1];
+            let p1 = coords[i];
+            let edge = match self.network.match_segment(p0, p1) {
+                Some(e) => {
+                    if self.network.is_exact_pair(p0, p1) {
+                        self.matched_exact += 1;
+                    } else {
+                        self.matched_fallback += 1;
+                    }
+                    e
+                }
+                None => {
+                    self.unmatched += 1;
+                    continue;
+                }
+            };
+            let edge_counts = self.counts.entry(edge).or_default();
+            for (&bin, &count) in bins {
+                *edge_counts.entry(bin).or_insert(0) += count;
+                self.min_bin = self.min_bin.min(bin);
+                self.max_bin = self.max_bin.max(bin);
+            }
+        }
+        self.trips_added += 1;
+    }
+
     /// (trips added, trips skipped, exact matches, fallback matches, misses).
     pub fn stats(&self) -> (usize, usize, usize, usize, usize) {
         (
@@ -159,6 +201,19 @@ impl FlowAggregator {
             self.matched_fallback,
             self.unmatched,
         )
+    }
+
+    /// The densified bucket axis `(bucket0_ms, range_end_ms)` the corridors span,
+    /// or `None` if nothing was aggregated. Matches the `timestamp`/`end_timestamp`
+    /// written by [`Self::write_parquet`] — use it to set the showcase `timeRange`.
+    pub fn bucket_span_ms(&self) -> Option<(i64, i64)> {
+        if self.counts.is_empty() {
+            return None;
+        }
+        let num_buckets = self.max_bin - self.min_bin + 1;
+        let bucket0 = self.min_bin * self.bin_ms;
+        let range_end = bucket0 + num_buckets * self.bin_ms;
+        Some((bucket0, range_end))
     }
 
     /// Emit one corridor per trafficked OSM way (chunked at `MAX_CHAIN_SEGMENTS`)
@@ -473,6 +528,38 @@ mod tests {
             .collect();
         vals.sort_unstable();
         assert_eq!(vals, vec![1, 1, 2, 2]);
+    }
+
+    #[test]
+    fn add_route_bins_distributes_weighted_counts() {
+        let mut agg = FlowAggregator::new(3_600_000, net());
+        // One OD corridor along nodes 1→2→3 serving bin 0 (×5 trips) and
+        // bin 10 (×2 trips): each of the two edges gets the full per-bin weight.
+        let coords = [[-74.000, 40.000], [-73.999, 40.000], [-73.998, 40.000]];
+        let mut bins = HashMap::new();
+        bins.insert(0i64, 5u32);
+        bins.insert(10i64, 2u32);
+        agg.add_route_bins(&coords, &bins);
+
+        let (added, skipped, _, _, miss) = agg.stats();
+        assert_eq!((added, skipped, miss), (1, 0, 0));
+        assert_eq!(agg.counts.len(), 2); // edges (1,2) and (2,3)
+        for edge in agg.counts.values() {
+            assert_eq!(edge.get(&0).copied(), Some(5));
+            assert_eq!(edge.get(&10).copied(), Some(2));
+        }
+        assert_eq!((agg.min_bin, agg.max_bin), (0, 10));
+
+        // A second corridor over the same edges accumulates.
+        agg.add_route_bins(&coords, &bins);
+        for edge in agg.counts.values() {
+            assert_eq!(edge.get(&0).copied(), Some(10));
+        }
+
+        // Degenerate inputs are skipped, not panicked on.
+        agg.add_route_bins(&coords, &HashMap::new());
+        agg.add_route_bins(&[[-74.0, 40.0]], &bins);
+        assert_eq!(agg.stats().1, 2);
     }
 
     #[test]

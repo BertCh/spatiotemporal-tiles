@@ -9,7 +9,7 @@ use clap::Parser;
 use geojson::{Feature, Geometry, Value as GeoValue};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
-use serde_json::{json, Map};
+use serde_json::{json, Map, Value as JsonValue};
 use std::path::PathBuf;
 
 const NIFC_SERVICE_URL: &str = "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/InterAgencyFirePerimeterHistory_All_Years_View/FeatureServer/0/query";
@@ -337,14 +337,16 @@ fn fetch_wildfire_data(args: &Args) -> Result<Vec<Feature>> {
         }
 
         for arcgis_feature in response.features {
-            if let Some(feature) = convert_to_geojson(&arcgis_feature) {
-                all_features.push(feature);
-                pb.inc(1);
+            let features = convert_to_geojson(&arcgis_feature);
+            if features.is_empty() {
+                continue;
+            }
+            all_features.extend(features);
+            pb.inc(1);
 
-                if args.max_fires > 0 && all_features.len() >= args.max_fires {
-                    pb.finish_with_message("Limit reached");
-                    return Ok(all_features);
-                }
+            if args.max_fires > 0 && all_features.len() >= args.max_fires {
+                pb.finish_with_message("Limit reached");
+                return Ok(all_features);
             }
         }
 
@@ -361,32 +363,23 @@ fn fetch_wildfire_data(args: &Args) -> Result<Vec<Feature>> {
     Ok(all_features)
 }
 
-fn convert_to_geojson(arcgis: &ArcGISFeature) -> Option<Feature> {
-    let geometry = arcgis.geometry.as_ref()?;
-    let rings = geometry.rings.as_ref()?;
+fn convert_to_geojson(arcgis: &ArcGISFeature) -> Vec<Feature> {
+    let Some(geometry) = arcgis.geometry.as_ref() else {
+        return Vec::new();
+    };
+    let Some(rings) = geometry.rings.as_ref() else {
+        return Vec::new();
+    };
 
     if rings.is_empty() || rings[0].is_empty() {
-        return None;
+        return Vec::new();
     }
 
-    let coords: Vec<Vec<Vec<f64>>> = rings
-        .iter()
-        .map(|ring| {
-            ring.iter()
-                .filter_map(|coord| {
-                    if coord.len() >= 2 {
-                        Some(vec![coord[0], coord[1]])
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .filter(|ring: &Vec<Vec<f64>>| ring.len() >= 4)
-        .collect();
-
-    if coords.is_empty() {
-        return None;
+    // Same winding-aware split as the parquet path: one single-exterior polygon
+    // feature per fire part (avoids the flattened-multipolygon spike).
+    let polygons = arcgis_rings_to_polygons(rings);
+    if polygons.is_empty() {
+        return Vec::new();
     }
 
     let attrs = &arcgis.attributes;
@@ -400,63 +393,38 @@ fn convert_to_geojson(arcgis: &ArcGISFeature) -> Option<Feature> {
             } else if let Some(year) = attrs.fire_year {
                 Utc.with_ymd_and_hms(year, 7, 1, 0, 0, 0).unwrap()
             } else {
-                return None;
+                return Vec::new();
             }
         } else if let Some(year) = attrs.fire_year {
             Utc.with_ymd_and_hms(year, 7, 1, 0, 0, 0).unwrap()
         } else {
-            return None;
+            return Vec::new();
         }
     } else if let Some(year) = attrs.fire_year {
         Utc.with_ymd_and_hms(year, 7, 1, 0, 0, 0).unwrap()
     } else {
-        return None;
+        return Vec::new();
     };
 
-    let mut properties = Map::new();
+    let mut properties = build_fire_properties(attrs);
     properties.insert("timestamp".to_string(), json!(timestamp.to_rfc3339()));
 
-    if let Some(ref name) = attrs.incident {
-        properties.insert("name".to_string(), json!(name));
-    }
-    if let Some(year) = attrs.fire_year {
-        properties.insert("year".to_string(), json!(year));
-    }
-    if let Some(acres) = attrs.gis_acres {
-        properties.insert("acres".to_string(), json!(acres.round() as i64));
-    }
-    if let Some(ref agency) = attrs.agency {
-        properties.insert("agency".to_string(), json!(agency));
-    }
-    if let Some(ref unit_id) = attrs.unit_id {
-        properties.insert("unit_id".to_string(), json!(unit_id));
-    }
-    if let Some(ref category) = attrs.feature_category {
-        properties.insert("fire_type".to_string(), json!(category));
-    }
-    if let Some(ref irwin_id) = attrs.irwin_id {
-        properties.insert("irwin_id".to_string(), json!(irwin_id));
-    }
-    if let Some(id) = attrs.object_id {
-        properties.insert("object_id".to_string(), json!(id));
-    }
-
-    let severity = match attrs.gis_acres {
-        Some(acres) if acres >= 100_000.0 => "catastrophic",
-        Some(acres) if acres >= 50_000.0 => "extreme",
-        Some(acres) if acres >= 10_000.0 => "high",
-        Some(acres) if acres >= 1_000.0 => "moderate",
-        _ => "low",
-    };
-    properties.insert("severity".to_string(), json!(severity));
-
-    Some(Feature {
-        bbox: None,
-        geometry: Some(Geometry::new(GeoValue::Polygon(coords))),
-        id: None,
-        properties: Some(properties),
-        foreign_members: None,
-    })
+    polygons
+        .into_iter()
+        .map(|poly| {
+            let coords: Vec<Vec<Vec<f64>>> = poly
+                .into_iter()
+                .map(|ring| ring.into_iter().map(|p| vec![p[0], p[1]]).collect())
+                .collect();
+            Feature {
+                bbox: None,
+                geometry: Some(Geometry::new(GeoValue::Polygon(coords))),
+                id: None,
+                properties: Some(properties.clone()),
+                foreign_members: None,
+            }
+        })
+        .collect()
 }
 
 /// Fetch wildfire data directly to GeoParquet format (streaming)
@@ -543,14 +511,19 @@ fn fetch_wildfire_data_parquet(args: &Args, output: &PathBuf) -> Result<usize> {
         }
 
         for arcgis_feature in response.features {
-            if let Some(polygon_record) = convert_to_polygon_record(&arcgis_feature) {
-                writer.write_polygon(&polygon_record)?;
-                pb.inc(1);
+            let records = convert_to_polygon_records(&arcgis_feature);
+            if records.is_empty() {
+                continue;
+            }
+            for polygon_record in &records {
+                writer.write_polygon(polygon_record)?;
+            }
+            // Progress tracks fires, not the (≥1) polygon parts each splits into.
+            pb.inc(1);
 
-                if args.max_fires > 0 && writer.row_count() >= args.max_fires {
-                    pb.finish_with_message("Limit reached");
-                    return writer.finish();
-                }
+            if args.max_fires > 0 && writer.row_count() >= args.max_fires {
+                pb.finish_with_message("Limit reached");
+                return writer.finish();
             }
         }
 
@@ -567,34 +540,82 @@ fn fetch_wildfire_data_parquet(args: &Args, output: &PathBuf) -> Result<usize> {
     writer.finish()
 }
 
-/// Convert ArcGIS feature to PolygonRecord for Parquet output
-fn convert_to_polygon_record(arcgis: &ArcGISFeature) -> Option<PolygonRecord> {
-    let geometry = arcgis.geometry.as_ref()?;
-    let rings = geometry.rings.as_ref()?;
+/// Shoelace signed area of a closed ring (lon/lat as x/y). Positive ⇒
+/// counter-clockwise. ArcGIS winds **exterior** rings clockwise (negative) and
+/// **holes** counter-clockwise (positive) — the only signal distinguishing them
+/// in the flat `rings` array.
+fn ring_signed_area(ring: &[[f64; 2]]) -> f64 {
+    if ring.len() < 3 {
+        return 0.0;
+    }
+    let mut a = 0.0;
+    for w in ring.windows(2) {
+        a += w[0][0] * w[1][1] - w[1][0] * w[0][1];
+    }
+    a / 2.0
+}
+
+/// Split an ArcGIS `rings` array into one polygon per **exterior** ring.
+///
+/// ArcGIS Esri-JSON packs every ring of a (possibly multi-part) feature into a
+/// single flat list, distinguished only by winding: clockwise = an exterior
+/// ring that starts a new polygon, counter-clockwise = a hole of the most
+/// recent exterior. The previous code copied the whole list into one polygon,
+/// so every extra exterior of a multi-part fire (e.g. the 11 perimeters of the
+/// SCU Lightning Complex) became a phantom "hole" — the renderer then bridged
+/// the disjoint exteriors with spanning triangles (the giant spike artifact).
+///
+/// Returns one `Vec<ring>` per polygon, exterior first then its holes. A
+/// leading hole with no exterior yet is promoted to an exterior so no vertices
+/// are silently dropped.
+fn arcgis_rings_to_polygons(rings: &[Vec<Vec<f64>>]) -> Vec<Vec<Vec<[f64; 2]>>> {
+    let mut polygons: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
+    for ring in rings {
+        let pts: Vec<[f64; 2]> = ring
+            .iter()
+            .filter_map(|coord| {
+                if coord.len() >= 2 {
+                    Some([coord[0], coord[1]])
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // A valid closed ring needs ≥ 4 vertices (first == last).
+        if pts.len() < 4 {
+            continue;
+        }
+        // CCW (positive area) is a hole of the current polygon; CW (or
+        // degenerate) starts a new exterior.
+        if ring_signed_area(&pts) > 0.0 {
+            if let Some(current) = polygons.last_mut() {
+                current.push(pts);
+                continue;
+            }
+        }
+        polygons.push(vec![pts]);
+    }
+    polygons
+}
+
+/// Convert one ArcGIS feature to PolygonRecords for Parquet output — one record
+/// per exterior ring (multi-part fires become multiple single-exterior polygon
+/// features that share the same timestamp + properties).
+fn convert_to_polygon_records(arcgis: &ArcGISFeature) -> Vec<PolygonRecord> {
+    let Some(geometry) = arcgis.geometry.as_ref() else {
+        return Vec::new();
+    };
+    let Some(rings) = geometry.rings.as_ref() else {
+        return Vec::new();
+    };
 
     if rings.is_empty() || rings[0].is_empty() {
-        return None;
+        return Vec::new();
     }
 
-    // Convert to our ring format: Vec<Vec<[f64; 2]>>
-    let polygon_rings: Vec<Vec<[f64; 2]>> = rings
-        .iter()
-        .map(|ring| {
-            ring.iter()
-                .filter_map(|coord| {
-                    if coord.len() >= 2 {
-                        Some([coord[0], coord[1]])
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .filter(|ring: &Vec<[f64; 2]>| ring.len() >= 4)
-        .collect();
-
-    if polygon_rings.is_empty() {
-        return None;
+    let polygons = arcgis_rings_to_polygons(rings);
+    if polygons.is_empty() {
+        return Vec::new();
     }
 
     let attrs = &arcgis.attributes;
@@ -608,19 +629,30 @@ fn convert_to_polygon_record(arcgis: &ArcGISFeature) -> Option<PolygonRecord> {
             } else if let Some(year) = attrs.fire_year {
                 Utc.with_ymd_and_hms(year, 7, 1, 0, 0, 0).unwrap()
             } else {
-                return None;
+                return Vec::new();
             }
         } else if let Some(year) = attrs.fire_year {
             Utc.with_ymd_and_hms(year, 7, 1, 0, 0, 0).unwrap()
         } else {
-            return None;
+            return Vec::new();
         }
     } else if let Some(year) = attrs.fire_year {
         Utc.with_ymd_and_hms(year, 7, 1, 0, 0, 0).unwrap()
     } else {
-        return None;
+        return Vec::new();
     };
 
+    let properties = build_fire_properties(attrs);
+
+    // One single-exterior polygon feature per part; share timestamp + properties.
+    polygons
+        .into_iter()
+        .map(|rings| PolygonRecord::new(rings, timestamp, properties.clone()))
+        .collect()
+}
+
+/// Build the shared property map for a fire feature.
+fn build_fire_properties(attrs: &ArcGISAttributes) -> Map<String, JsonValue> {
     let mut properties = Map::new();
 
     if let Some(ref name) = attrs.incident {
@@ -656,8 +688,78 @@ fn convert_to_polygon_record(arcgis: &ArcGISFeature) -> Option<PolygonRecord> {
         _ => "low",
     };
     properties.insert("severity".to_string(), json!(severity));
-
-    Some(PolygonRecord::new(polygon_rings, timestamp, properties))
+    properties
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Clockwise unit square (ArcGIS exterior winding, negative signed area).
+    fn cw_square(ox: f64, oy: f64, s: f64) -> Vec<Vec<f64>> {
+        vec![
+            vec![ox, oy],
+            vec![ox, oy + s],
+            vec![ox + s, oy + s],
+            vec![ox + s, oy],
+            vec![ox, oy],
+        ]
+    }
+
+    /// Counter-clockwise square (ArcGIS hole winding, positive signed area).
+    fn ccw_square(ox: f64, oy: f64, s: f64) -> Vec<Vec<f64>> {
+        vec![
+            vec![ox, oy],
+            vec![ox + s, oy],
+            vec![ox + s, oy + s],
+            vec![ox, oy + s],
+            vec![ox, oy],
+        ]
+    }
+
+    #[test]
+    fn signed_area_sign_matches_winding() {
+        let cw: Vec<[f64; 2]> = cw_square(0.0, 0.0, 1.0).iter().map(|c| [c[0], c[1]]).collect();
+        let ccw: Vec<[f64; 2]> = ccw_square(0.0, 0.0, 1.0).iter().map(|c| [c[0], c[1]]).collect();
+        assert!(ring_signed_area(&cw) < 0.0, "CW exterior must be negative");
+        assert!(ring_signed_area(&ccw) > 0.0, "CCW hole must be positive");
+    }
+
+    #[test]
+    fn exterior_with_hole_stays_one_polygon() {
+        // CW exterior followed by a CCW hole inside it → one polygon, two rings.
+        let rings = vec![cw_square(0.0, 0.0, 4.0), ccw_square(1.0, 1.0, 1.0)];
+        let polys = arcgis_rings_to_polygons(&rings);
+        assert_eq!(polys.len(), 1);
+        assert_eq!(polys[0].len(), 2, "exterior + its hole");
+    }
+
+    #[test]
+    fn multiple_exteriors_split_into_separate_polygons() {
+        // The SCU-complex shape: several CW exteriors (each a distinct fire
+        // perimeter) plus a hole on the first. Must NOT collapse into one
+        // polygon whose extra exteriors are treated as holes.
+        let rings = vec![
+            cw_square(0.0, 0.0, 4.0),   // exterior A
+            ccw_square(1.0, 1.0, 1.0),  // hole of A
+            cw_square(10.0, 0.0, 3.0),  // exterior B (disjoint)
+            cw_square(20.0, 0.0, 2.0),  // exterior C (disjoint)
+        ];
+        let polys = arcgis_rings_to_polygons(&rings);
+        assert_eq!(polys.len(), 3, "three distinct exteriors");
+        assert_eq!(polys[0].len(), 2, "first polygon keeps its hole");
+        assert_eq!(polys[1].len(), 1);
+        assert_eq!(polys[2].len(), 1);
+    }
+
+    #[test]
+    fn leading_hole_is_promoted_not_dropped() {
+        // A CCW ring with no exterior yet becomes its own polygon rather than
+        // silently dropping vertices.
+        let rings = vec![ccw_square(0.0, 0.0, 1.0)];
+        let polys = arcgis_rings_to_polygons(&rings);
+        assert_eq!(polys.len(), 1);
+        assert_eq!(polys[0].len(), 1);
+    }
+}
 

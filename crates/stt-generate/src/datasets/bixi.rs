@@ -9,6 +9,12 @@
 //! the deck.gl `FlowmapLayer` reads as flowmap.gl-style weighted arrows whose
 //! width tracks volume, plus node circles sized by total flow.
 //!
+//! With `--streets` the same ingested OD-pair × bucket counts are instead routed
+//! onto Montréal's **bicycle** street network (OSRM bicycle profile +
+//! [`super::osm_streets`] / [`super::nyc_rideshare_flows`]) and baked into
+//! per-segment street corridors — the BIXI counterpart of `nyc-rideshare
+//! --flows`, rendered by `FlowCorridorLayer` as a street-network heatmap.
+//!
 //! Because the representation is `OD-pair × bucket` counts, on-the-wire size is
 //! bounded by *(kept pairs) × (buckets)* — independent of the ~13M raw
 //! trips/year — so a long span fits comfortably. Aggregation IS the
@@ -134,6 +140,28 @@ pub struct Args {
     #[arg(long, default_value = "0.5")]
     pub bundle_smoothing: f64,
 
+    /// Aggregate trips onto the Montréal **street/bike network** instead of
+    /// straight OD arcs: route each unique OD pair once through a local OSRM
+    /// **bicycle** server (`--osrm-url`) and bake per-segment ridership into
+    /// street corridors carrying a per-bucket count matrix — the BIXI
+    /// counterpart of `nyc-rideshare --flows`. Renders with `FlowCorridorLayer`.
+    /// Incompatible with the OD-arc options `--bake-bundling` / `--no-cluster` /
+    /// `--cluster-radius` (those shape straight arcs, not routed streets).
+    #[arg(long)]
+    pub streets: bool,
+
+    /// OSM `.osm.pbf` bicycle network for `--streets` (required with it). Use
+    /// the same extract OSRM's bicycle profile was built from
+    /// (e.g. `scripts/data-generation/osrm-data/quebec-latest.osm.pbf`).
+    #[arg(long)]
+    pub osm_pbf: Option<PathBuf>,
+
+    /// OSRM server URL for `--streets` routing (a bicycle-profile server). The
+    /// Montréal bike server defaults to port 5001 so it can coexist with the
+    /// NYC car server on 5000.
+    #[arg(long, default_value = "http://localhost:5001")]
+    pub osrm_url: String,
+
     /// Skip the stt-build step (write only the intermediate GeoParquet).
     #[arg(long)]
     pub skip_build: bool,
@@ -151,6 +179,16 @@ pub fn run(args: Args) -> Result<()> {
         if t <= f {
             return Err(anyhow!("--to ({}) must be after --from ({})", args.to.as_deref().unwrap_or(""), args.from.as_deref().unwrap_or("")));
         }
+    }
+
+    // Street-network mode shapes routed corridors, not straight arcs, so the
+    // OD-arc bundling/clustering knobs don't apply.
+    if args.streets && args.bake_bundling {
+        return Err(anyhow!(
+            "--streets and --bake-bundling are mutually exclusive: --bake-bundling \
+             relaxes straight OD arcs, while --streets routes trips onto the bike \
+             network (street corridors, no bundling)"
+        ));
     }
 
     println!("📋 Configuration:");
@@ -210,18 +248,13 @@ pub fn run(args: Args) -> Result<()> {
         return Err(anyhow!("No trips fell within the requested span"));
     }
 
-    // stt-build only consumes GeoParquet. A `*.parquet`/`*.geojson` output means
-    // the caller wants only the intermediate (no build); a `.stt` or
-    // directory-like output (the showcase default) is built into a packed
-    // directory, with the intermediate written to a sibling `.parquet`.
-    let ext = args.output.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
-    let output_is_intermediate =
-        matches!(ext.as_deref(), Some("parquet") | Some("geoparquet") | Some("geojson"));
-    let intermediate_path = if output_is_intermediate {
-        args.output.clone()
-    } else {
-        args.output.with_extension("parquet")
-    };
+    // Street-network overview: route the OD pairs onto the bike network and bake
+    // per-segment counts into corridors (a different geometry + build path).
+    if args.streets {
+        return generate_streets(&args, &agg, bin_ms);
+    }
+
+    let (intermediate_path, output_is_intermediate) = resolve_intermediate(&args.output);
 
     let cluster_radius = if args.no_cluster { None } else { Some(args.cluster_radius) };
     let (features, num_buckets, bucket0, range_end) = agg.write_parquet(
@@ -290,6 +323,167 @@ fn parse_date_utc_ms(s: &str) -> Result<i64> {
     let d = NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
         .with_context(|| format!("invalid date '{s}' (expected YYYY-MM-DD)"))?;
     Ok(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis())
+}
+
+/// Where the intermediate GeoParquet goes, and whether the caller wants only
+/// the intermediate. stt-build only consumes GeoParquet: a `*.parquet`/
+/// `*.geojson` output means stop at the intermediate; a `.stt` or directory
+/// output (the showcase default) is built into a packed directory with the
+/// intermediate written to a sibling `.parquet`.
+fn resolve_intermediate(output: &Path) -> (PathBuf, bool) {
+    let ext = output.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
+    let is_intermediate =
+        matches!(ext.as_deref(), Some("parquet") | Some("geoparquet") | Some("geojson"));
+    let path = if is_intermediate {
+        output.to_path_buf()
+    } else {
+        output.with_extension("parquet")
+    };
+    (path, is_intermediate)
+}
+
+/// `--streets`: route each unique OD pair once through the OSRM **bicycle**
+/// server, then distribute its per-bucket trip count onto every street edge the
+/// route traverses, emitting one corridor per trafficked OSM way carrying a
+/// `vertex_value_matrix` — the BIXI counterpart of `nyc-rideshare --flows`,
+/// reusing [`OsmNetwork`] + [`FlowAggregator`]. Build mirrors that flows path:
+/// road-class `min_zoom` LOD, the matrix bin as temporal bucket, corridors
+/// clipped at tile seams (real street geometry, unlike OD arcs).
+fn generate_streets(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Result<()> {
+    use crate::datasets::nyc_rideshare_flows::FlowAggregator;
+    use crate::datasets::osm_streets::{NetworkMode, OsmNetwork};
+    use crate::datasets::osrm::{check_osrm_connectivity, get_osrm_route_pooled};
+    use rayon::prelude::*;
+
+    let osm_pbf = args.osm_pbf.as_ref().ok_or_else(|| {
+        anyhow!(
+            "--streets routes BIXI trips onto the OSM bicycle network; pass \
+             --osm-pbf <file.osm.pbf> (e.g. \
+             scripts/data-generation/osrm-data/quebec-latest.osm.pbf — the \
+             extract OSRM's bicycle profile was built from)"
+        )
+    })?;
+
+    // Fail fast if the routing server isn't up before loading a large network.
+    check_osrm_connectivity(&args.osrm_url)?;
+
+    println!("🗺  Loading OSM bicycle network from {} …", osm_pbf.display());
+    let network = OsmNetwork::from_pbf_with_mode(osm_pbf, NetworkMode::Bike)?;
+
+    // Unique OD pairs above the legibility threshold, with endpoints + per-bin
+    // counts. Routing one geometry per *pair* (not per trip) is the cheap lever:
+    // counts already collapse millions of trips onto a bounded pair set.
+    let pairs: Vec<([f64; 2], [f64; 2], &HashMap<i64, u32>)> = agg
+        .counts
+        .iter()
+        .filter(|(_, bins)| bins.values().sum::<u32>() >= args.min_trips)
+        .filter_map(|((o, d), bins)| {
+            let op = agg.station_pos.get(o)?;
+            let dp = agg.station_pos.get(d)?;
+            Some((*op, *dp, bins))
+        })
+        .collect();
+    println!(
+        "🚲 Routing {} OD pairs (≥{} trips) through OSRM (bicycle) on {} …",
+        pairs.len(),
+        args.min_trips,
+        args.osrm_url
+    );
+
+    // Route every pair once, in parallel over a pooled client. Unroutable pairs
+    // (OSRM can't connect the docks) are dropped rather than crow-flied — a
+    // straight line would smear counts onto edges no rider used.
+    let routed: Vec<(Vec<[f64; 2]>, &HashMap<i64, u32>)> = pairs
+        .par_iter()
+        .filter_map(|(op, dp, bins)| match get_osrm_route_pooled(
+            &args.osrm_url,
+            op[0],
+            op[1],
+            dp[0],
+            dp[1],
+        ) {
+            Ok(Some(route)) => {
+                let coords: Vec<[f64; 2]> =
+                    route.geometry.coordinates.iter().map(|c| [c[0], c[1]]).collect();
+                (coords.len() >= 2).then_some((coords, *bins))
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Distribute sequentially (the aggregator mutates shared edge counts).
+    let mut flow_agg = FlowAggregator::new(bin_ms, network);
+    for (coords, bins) in &routed {
+        flow_agg.add_route_bins(coords, bins);
+    }
+
+    let (added, _skipped, exact, fallback, miss) = flow_agg.stats();
+    let seg_total = exact + fallback + miss;
+    let match_pct = if seg_total > 0 {
+        100.0 * (exact + fallback) as f64 / seg_total as f64
+    } else {
+        0.0
+    };
+    println!(
+        "   ✓ routed {} / {} pairs · segments {:.1}% matched ({} exact, {} fallback, {} unmatched)",
+        added,
+        pairs.len(),
+        match_pct,
+        exact,
+        fallback,
+        miss
+    );
+    if added == 0 {
+        return Err(anyhow!(
+            "No OD pairs routed — is the OSRM bicycle server at {} loaded with the \
+             Montréal extract?",
+            args.osrm_url
+        ));
+    }
+
+    let span = flow_agg.bucket_span_ms();
+    let (intermediate_path, output_is_intermediate) = resolve_intermediate(&args.output);
+    let (features, num_buckets) = flow_agg.write_parquet(&intermediate_path)?;
+    let (bucket0, range_end) = span.unwrap_or((0, 0));
+    println!("\n   ✓ {features} street corridors · {num_buckets} buckets");
+    println!("   ⏱  matrix span (set showcase timeRange to this):");
+    println!("       start = {bucket0}");
+    println!("       end   = {range_end}");
+
+    if args.skip_build || output_is_intermediate {
+        println!(
+            "\n📦 Skipping stt-build (intermediate written to {})",
+            intermediate_path.display()
+        );
+        return Ok(());
+    }
+
+    // Build the packed `.stt`. Mirrors `nyc-rideshare --flows`: road-class
+    // `min_zoom` LOD (open-ended, no max field — every street ≥ its class zoom),
+    // the matrix bin as the temporal bucket, end-time for the whole-range span.
+    // Street corridors are multi-vertex real geometry, so tile clipping is fine.
+    common::run_stt_build_with_full_options(SttBuildOptions {
+        input: intermediate_path.clone(),
+        output: args.output.clone(),
+        time_field: "timestamp".to_string(),
+        end_time_field: Some("end_timestamp".to_string()),
+        min_zoom: 8,
+        max_zoom: 15,
+        compression: "zstd".to_string(),
+        temporal_bucket: Some(args.bin.clone()),
+        temporal_lod: None,
+        summary: None,
+        summary_sub_buckets: None,
+        min_features_per_tile: None,
+        min_zoom_field: Some("min_zoom".to_string()),
+        max_zoom_field: None,
+        no_clip: false,
+        quantize_coords: None,
+    })?;
+
+    println!("\n✅ BIXI street network built: {}", args.output.display());
+    println!("   Set datasets.ts timeRange to {{ start: {bucket0}, end: {range_end} }}");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

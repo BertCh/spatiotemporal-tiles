@@ -8,6 +8,7 @@
 mod common;
 mod datasets;
 mod edge_bundle;
+mod radar;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -73,6 +74,9 @@ enum Commands {
 
     /// Generate an OSM editing-history dataset (node creations or changesets)
     OsmEdits(datasets::osm_edits::Args),
+
+    /// Generate NEXRAD storm-radar tiles for the 2020-08-10 Iowa derecho
+    Storms(datasets::storms::Args),
 }
 
 fn main() -> Result<()> {
@@ -98,6 +102,7 @@ fn main() -> Result<()> {
         Commands::DriftersHourly(args) => datasets::drifters_hourly::run(args),
         Commands::Animals(args) => datasets::animals::run(args),
         Commands::OsmEdits(args) => datasets::osm_edits::run(args),
+        Commands::Storms(args) => datasets::storms::run(args),
     }
 }
 
