@@ -39,8 +39,8 @@ use crate::error::{Error, Result};
 use crate::types::GeometryType;
 use arrow::array::{
     Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Builder,
-    Float64Array, Int32Array, Int64Array, Int64Builder, ListArray, ListBuilder, RecordBatch,
-    StringArray, UInt16Array, UInt16Builder, UInt32Builder, UInt64Array,
+    Float64Array, Int32Array, Int32Builder, Int64Array, Int64Builder, ListArray, ListBuilder,
+    RecordBatch, StringArray, UInt16Array, UInt16Builder, UInt32Builder, UInt64Array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, UInt16Type};
@@ -48,7 +48,7 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Top bit of the layer frame's leading u16: marks an *aligned* frame whose
 /// IPC streams are padded to 8-byte boundaries (see the module docs). The
@@ -534,6 +534,196 @@ pub fn quantize_coords_m() -> Option<f64> {
     (um > 0).then(|| um as f64 / 1.0e6)
 }
 
+/// Field-metadata key flagging a *numeric property* column that ships as
+/// fixed-point integer indices (smallest of `UInt16`/`Int32`) instead of
+/// `Float64`. Its value is the [`AttrQuant`] JSON (`value = o + q*s`). Sibling
+/// of [`STT_QUANT_META_KEY`] for geometry; lives on the property field, so a
+/// reader reconstructs Float64 the same way it does coordinates.
+pub const STT_QUANT_ATTR_META_KEY: &str = "stt:qa";
+
+/// Per-numeric-property quantization affine: `value = o + q * s`, where `o` is
+/// the column minimum (the dequantization offset) and `s` the requested ground
+/// precision (the step). Reconstruction is lossy to ≤ `s/2`; the reader applies
+/// the identical math (`tile.ts`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttrQuant {
+    pub o: f64,
+    pub s: f64,
+}
+
+impl AttrQuant {
+    fn to_json(&self) -> String {
+        // Full f64 round-trip precision so the offset/step decode exactly.
+        format!(r#"{{"o":{:.17e},"s":{:.17e}}}"#, self.o, self.s)
+    }
+
+    /// Parse the affine from its [`STT_QUANT_ATTR_META_KEY`] JSON value.
+    pub fn from_json(s: &str) -> Option<AttrQuant> {
+        let v: serde_json::Value = serde_json::from_str(s).ok()?;
+        Some(AttrQuant {
+            o: v.get("o")?.as_f64()?,
+            s: v.get("s")?.as_f64()?,
+        })
+    }
+
+    /// Reconstruct the original value from a quantized index.
+    #[inline]
+    pub fn value(&self, q: i64) -> f64 {
+        self.o + q as f64 * self.s
+    }
+}
+
+/// Build-global map of `property-name → ground precision (units)`. A numeric
+/// property named here is stored quantized (see [`build_quantized_numeric`]);
+/// every other numeric property stays `Float64`. Set once per build from
+/// `stt-build --quantize-attr name=prec`. Empty (the default) ⇒ all numeric
+/// properties stay `Float64`, byte-identical to the historical encoder.
+fn quant_attrs_cell() -> &'static RwLock<HashMap<String, f64>> {
+    static A: OnceLock<RwLock<HashMap<String, f64>>> = OnceLock::new();
+    A.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Replace the build-global numeric-property quantization map.
+pub fn set_quantize_attrs(map: HashMap<String, f64>) {
+    *quant_attrs_cell().write().unwrap() = map;
+}
+
+/// The current numeric-property quantization map (a clone).
+pub fn quantize_attrs() -> HashMap<String, f64> {
+    quant_attrs_cell().read().unwrap().clone()
+}
+
+fn quantize_attr_precision(name: &str) -> Option<f64> {
+    quant_attrs_cell()
+        .read()
+        .unwrap()
+        .get(name)
+        .copied()
+        .filter(|p| *p > 0.0)
+}
+
+/// When set, EVERY `Float64` numeric property not given an explicit precision in
+/// the [`set_quantize_attrs`] map is quantized automatically: its step is sized
+/// so the column's full `[min, max]` range spans the 16-bit index space
+/// (`step = (max-min)/65535`), i.e. a range-adaptive `UInt16` with ~65k levels.
+/// This is the "born-optimized" generation default — no per-column precision to
+/// pick, and >=16 bits of dynamic range is visually lossless for the scalar
+/// fields STT carries (magnitude, depth, altitude, speed, SST, dBZ, ...). The
+/// default-off keeps `stt-build` byte-identical unless a caller opts in.
+static QUANTIZE_ATTRS_AUTO: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable automatic range-adaptive quantization of every otherwise-raw
+/// `Float64` numeric property (see [`QUANTIZE_ATTRS_AUTO`]). Explicit precisions
+/// in [`set_quantize_attrs`] always win.
+pub fn set_quantize_attrs_auto(on: bool) {
+    QUANTIZE_ATTRS_AUTO.store(on, Ordering::Relaxed);
+}
+
+/// Whether automatic numeric-property quantization is enabled.
+pub fn quantize_attrs_auto() -> bool {
+    QUANTIZE_ATTRS_AUTO.load(Ordering::Relaxed)
+}
+
+/// Range-adaptive auto quantization: size the step from the column's own span so
+/// `[min, max]` maps onto `[0, 65535]`. ALWAYS returns a `UInt16` column (never
+/// `None`, never `Int32`) so a column is quantized to the *same type in every
+/// tile* — a per-tile range-adaptive choice would otherwise leave constant /
+/// all-null tiles as `Float64` and drift the layer schema across tiles. A
+/// constant column quantizes to all-zeros and an all-null column to all-nulls;
+/// both compress to nothing, so the uniform `UInt16` costs nothing and keeps the
+/// schema consistent.
+fn build_quantized_numeric_auto(values: &[Option<f64>]) -> Option<(ArrayRef, String)> {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for v in values.iter().flatten() {
+        if v.is_finite() {
+            min = min.min(*v);
+            max = max.max(*v);
+        }
+    }
+    // o = offset (column min, or 0 when no finite value); s = step. A zero span
+    // (constant / no-data) uses step 1 → every present value maps to index 0,
+    // which reconstructs to `o` exactly.
+    let (o, s) = if min.is_finite() {
+        if max > min {
+            (min, (max - min) / u16::MAX as f64)
+        } else {
+            (min, 1.0)
+        }
+    } else {
+        (0.0, 1.0)
+    };
+    let affine = AttrQuant { o, s };
+    let mut b = UInt16Builder::with_capacity(values.len());
+    for v in values {
+        match v {
+            Some(x) if x.is_finite() => {
+                let q = (((*x - o) / s).round()).clamp(0.0, u16::MAX as f64) as u16;
+                b.append_value(q);
+            }
+            _ => b.append_null(),
+        }
+    }
+    Some((Arc::new(b.finish()), affine.to_json()))
+}
+
+/// Quantize a numeric property column to the smallest integer leaf at `prec`
+/// units, with the offset pinned to the column minimum. Returns
+/// `(array, affine_json)` — a `UInt16` leaf when the quantized range fits 16
+/// bits, else `Int32` — or `None` when no finite value exists (caller keeps the
+/// `Float64` column). Nulls and non-finite values become Arrow nulls. The
+/// offset is the per-column minimum: identical columns quantize identically, so
+/// the packed format's content-addressed dedup is preserved.
+fn build_quantized_numeric(values: &[Option<f64>], prec: f64) -> Option<(ArrayRef, String)> {
+    if !(prec > 0.0) {
+        return None;
+    }
+    let mut min = f64::INFINITY;
+    for v in values.iter().flatten() {
+        if v.is_finite() && *v < min {
+            min = *v;
+        }
+    }
+    if !min.is_finite() {
+        return None; // no finite values — keep Float64
+    }
+    let affine = AttrQuant { o: min, s: prec };
+    let mut q: Vec<Option<i64>> = Vec::with_capacity(values.len());
+    let mut max_q: i64 = 0;
+    for v in values {
+        match v {
+            Some(x) if x.is_finite() => {
+                let qi = (((*x - affine.o) / affine.s).round() as i64).max(0);
+                if qi > max_q {
+                    max_q = qi;
+                }
+                q.push(Some(qi));
+            }
+            _ => q.push(None),
+        }
+    }
+    let array: ArrayRef = if max_q <= u16::MAX as i64 {
+        let mut b = UInt16Builder::with_capacity(q.len());
+        for qi in &q {
+            match qi {
+                Some(v) => b.append_value(*v as u16),
+                None => b.append_null(),
+            }
+        }
+        Arc::new(b.finish())
+    } else {
+        let mut b = Int32Builder::with_capacity(q.len());
+        for qi in &q {
+            match qi {
+                Some(v) => b.append_value((*v).clamp(0, i32::MAX as i64) as i32),
+                None => b.append_null(),
+            }
+        }
+        Arc::new(b.finish())
+    };
+    Some((array, affine.to_json()))
+}
+
 /// Build a (key_array, value_array) pair for a Dictionary<UInt16, Utf8>
 /// column. Null inputs become null keys (the corresponding string is not
 /// inserted into the dictionary); strings are deduplicated in first-seen
@@ -789,10 +979,13 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
         // so the GeoArrow CRS doesn't apply — swap it for the reconstruction
         // affine (whose presence is the reader's quantization signal). Keeping
         // the field-metadata entry COUNT at two matters: arrow serializes field
-        // metadata in nondeterministic HashMap order, and a third key would cut
-        // the odds that two identical tiles encode byte-identically (and thus
-        // dedup) from ~1/2 to ~1/6 — measured as a large size regression on
-        // dedup-heavy datasets.
+        // metadata in nondeterministic HashMap order (arrow-ipc
+        // `convert::metadata_to_fb` iterates the HashMap without sorting), and a
+        // third key would cut the odds that two identical tiles encode
+        // byte-identically (and thus dedup) from ~1/2 to ~1/6 — measured as a
+        // large size regression on dedup-heavy datasets. This is the documented
+        // cross-process reproducibility gap: see docs/spec/stt-packed-format.md
+        // §7-D6 and docs/spec/conformance.md §3.
         Some(q) => {
             geom_meta.insert(STT_QUANT_META_KEY.to_string(), q.to_json());
         }
@@ -884,8 +1077,35 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
     for (name, col) in &layer.properties {
         match col {
             PropertyColumn::Numeric(values) => {
-                fields.push(Arc::new(Field::new(name, DataType::Float64, true)));
-                columns.push(Arc::new(Float64Array::from(values.clone())));
+                // Opt-in: a numeric property named in the build-global
+                // quantization map ships as fixed-point ints + a per-column
+                // affine in field metadata (the reader reconstructs Float64).
+                // For a LiDAR `z` column this is the single largest size lever
+                // after `id` — a raw Float64 elevation barely compresses, while
+                // the i16 grid is both smaller and far more compressible.
+                let quantized = quantize_attr_precision(name)
+                    .and_then(|p| build_quantized_numeric(values, p))
+                    .or_else(|| {
+                        // No explicit precision — fall back to the build-global
+                        // automatic range-adaptive quantization when enabled.
+                        quantize_attrs_auto()
+                            .then(|| build_quantized_numeric_auto(values))
+                            .flatten()
+                    });
+                match quantized {
+                    Some((array, affine_json)) => {
+                        let mut m = HashMap::new();
+                        m.insert(STT_QUANT_ATTR_META_KEY.to_string(), affine_json);
+                        fields.push(Arc::new(
+                            Field::new(name, array.data_type().clone(), true).with_metadata(m),
+                        ));
+                        columns.push(array);
+                    }
+                    None => {
+                        fields.push(Arc::new(Field::new(name, DataType::Float64, true)));
+                        columns.push(Arc::new(Float64Array::from(values.clone())));
+                    }
+                }
             }
             PropertyColumn::Categorical(values) => {
                 // Build a Dictionary<UInt16, Utf8>: deduplicate strings once
@@ -913,6 +1133,12 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
     // vertex_time column is u16-delta encoded we add `origin_ms` and
     // `step_ms` so the reader can reconstruct absolute timestamps as
     // `origin + delta * step`.
+    //
+    // NOTE: arrow serializes this metadata in HashMap iteration order, which is
+    // per-process; identical tiles encode byte-identically WITHIN a build run
+    // (so dedup works) but not necessarily across runs. The canonical
+    // (lexicographic) key order a fully reproducible build would need is the
+    // tracked gap in docs/spec/stt-packed-format.md §7-D6.
     let mut schema_meta = HashMap::new();
     schema_meta.insert("stt:layer".to_string(), layer.name.clone());
     schema_meta.insert(
@@ -1335,6 +1561,115 @@ mod tests {
             assert!(dlon_m < 1.0, "lon err {dlon_m} m at point {i}");
             assert!(dlat_m < 1.0, "lat err {dlat_m} m at point {i}");
         }
+    }
+
+    #[test]
+    fn quantized_numeric_attr_roundtrips_within_precision_and_is_opt_in() {
+        // A LiDAR-style `z` elevation column: high-entropy Float64 by default,
+        // but fixed-point UInt16 when the build opts the column in. The reader
+        // reconstructs `value = o + q*s`, lossy to <= s/2.
+        let zvals: Vec<Option<f64>> =
+            vec![Some(1.07), Some(-2.4), Some(15.9), None, Some(40.02)];
+        let make = || ColumnarLayer {
+            name: "lidar".into(),
+            feature_ids: vec![1, 2, 3, 4, 5],
+            start_times: vec![0; 5],
+            end_times: vec![1; 5],
+            geometry: GeometryColumn::Point(vec![[-122.4, 37.7]; 5]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![("z".into(), PropertyColumn::Numeric(zvals.clone()))],
+        };
+
+        // Default (no attr-quant configured): `z` stays Float64, byte-identical
+        // to the historical encoder.
+        set_quantize_attrs(HashMap::new());
+        let plain = decode_layer(&encode_layer(&make()).unwrap()).unwrap();
+        let zf = plain.schema().field_with_name("z").unwrap().clone();
+        assert_eq!(zf.data_type(), &DataType::Float64);
+        assert!(zf.metadata().get(STT_QUANT_ATTR_META_KEY).is_none());
+
+        // Opt the `z` column in at 0.05-unit precision.
+        set_quantize_attrs(HashMap::from([("z".to_string(), 0.05f64)]));
+        let q = encode_layer(&make()).unwrap();
+        set_quantize_attrs(HashMap::new()); // reset so other tests are unaffected
+
+        let batch = decode_layer(&q).unwrap();
+        let field = batch.schema().field_with_name("z").unwrap().clone();
+        // Range (-2.4..40.02)/0.05 ~= 848 fits 16 bits → UInt16 leaf.
+        assert_eq!(field.data_type(), &DataType::UInt16);
+        let affine = AttrQuant::from_json(
+            field
+                .metadata()
+                .get(STT_QUANT_ATTR_META_KEY)
+                .expect("quantized attr must carry the affine"),
+        )
+        .unwrap();
+
+        let col = batch
+            .column_by_name("z")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .unwrap();
+        for (i, want) in zvals.iter().enumerate() {
+            match want {
+                Some(v) => {
+                    assert!(!col.is_null(i), "row {i} should be present");
+                    let got = affine.value(col.value(i) as i64);
+                    assert!((got - v).abs() <= 0.05 / 2.0 + 1e-9, "z[{i}] {got} vs {v}");
+                }
+                None => assert!(col.is_null(i), "row {i} should be null"),
+            }
+        }
+    }
+
+    #[test]
+    fn auto_numeric_quantization_is_range_adaptive_and_opt_in() {
+        // With auto-quant enabled, a raw Float64 property is quantized to a
+        // UInt16 sized from its own [min,max] span (no precision configured),
+        // and reconstructs to <= span/65535. Default-off keeps it Float64.
+        let depth: Vec<Option<f64>> = vec![Some(0.0), Some(10.0), Some(123.4), Some(700.0)];
+        let make = || ColumnarLayer {
+            name: "q".into(),
+            feature_ids: vec![1, 2, 3, 4],
+            start_times: vec![0; 4],
+            end_times: vec![1; 4],
+            geometry: GeometryColumn::Point(vec![[0.0, 0.0]; 4]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![("depth".into(), PropertyColumn::Numeric(depth.clone()))],
+        };
+
+        // Default: auto off → Float64.
+        set_quantize_attrs_auto(false);
+        let plain = decode_layer(&encode_layer(&make()).unwrap()).unwrap();
+        assert_eq!(
+            plain.schema().field_with_name("depth").unwrap().data_type(),
+            &DataType::Float64
+        );
+
+        // Auto on → range-adaptive UInt16 + affine.
+        set_quantize_attrs_auto(true);
+        let batch = decode_layer(&encode_layer(&make()).unwrap()).unwrap();
+        set_quantize_attrs_auto(false); // reset for other tests
+
+        let field = batch.schema().field_with_name("depth").unwrap().clone();
+        assert_eq!(field.data_type(), &DataType::UInt16);
+        let aff = AttrQuant::from_json(field.metadata().get(STT_QUANT_ATTR_META_KEY).unwrap()).unwrap();
+        let col = batch.column_by_name("depth").unwrap().as_any().downcast_ref::<UInt16Array>().unwrap();
+        let tol = (700.0 - 0.0) / u16::MAX as f64 / 2.0 + 1e-9;
+        for (i, want) in depth.iter().enumerate() {
+            let got = aff.value(col.value(i) as i64);
+            assert!((got - want.unwrap()).abs() <= tol, "depth[{i}] {got} vs {want:?}");
+        }
+        // Min and max land on the index endpoints (full 16-bit span used).
+        assert_eq!(col.value(0), 0);
+        assert_eq!(col.value(3), u16::MAX);
     }
 
     #[test]

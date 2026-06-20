@@ -441,6 +441,7 @@ fn build_field(input: &Path, output: &Path, min_zoom: u8, max_zoom: u8) -> Resul
         // Polygons SHOULD clip at tile boundaries.
         no_clip: false,
         quantize_coords: None,
+        quantize_attrs: Vec::new(),
     })
 }
 
@@ -462,6 +463,7 @@ fn build_cells(input: &Path, output: &Path, min_zoom: u8, max_zoom: u8) -> Resul
         max_zoom_field: None,
         no_clip: false,
         quantize_coords: None,
+        quantize_attrs: Vec::new(),
     })
 }
 
@@ -485,5 +487,6 @@ fn build_tracks(input: &Path, output: &Path, min_zoom: u8, max_zoom: u8) -> Resu
         max_zoom_field: None,
         no_clip: false,
         quantize_coords: None,
+        quantize_attrs: Vec::new(),
     })
 }

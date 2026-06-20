@@ -311,6 +311,7 @@ pub fn run(args: Args) -> Result<()> {
         // quantize to roughly halve the geometry column so the comprehensive
         // (relaxed `--min-trips`) network stays affordable on the wire.
         quantize_coords: bundle.as_ref().map(|_| 1.0),
+        quantize_attrs: Vec::new(),
     })?;
 
     println!("\n✅ BIXI flowmap built: {}", args.output.display());
@@ -479,6 +480,7 @@ fn generate_streets(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Result<()
         max_zoom_field: None,
         no_clip: false,
         quantize_coords: None,
+        quantize_attrs: Vec::new(),
     })?;
 
     println!("\n✅ BIXI street network built: {}", args.output.display());

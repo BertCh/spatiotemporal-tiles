@@ -475,6 +475,7 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
             max_zoom_field: None,
             no_clip: false,
             quantize_coords: None,
+            quantize_attrs: Vec::new(),
         })?;
     } else {
         common::run_stt_build_with_options(

@@ -248,6 +248,7 @@ pub fn run(args: Args) -> Result<()> {
             max_zoom_field: None,
             no_clip: false,
             quantize_coords: None,
+            quantize_attrs: Vec::new(),
         })?;
         let _ = fs::remove_file(&intermediate);
     }

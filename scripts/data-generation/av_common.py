@@ -68,9 +68,7 @@ NUSCENES_MAP_ORIGINS: dict[str, tuple[float, float]] = {
 }
 
 
-def local_to_lonlat(
-    x_m, y_m, origin_lat: float, origin_lon: float, mercator: bool = False
-):
+def local_to_lonlat(x_m, y_m, origin_lat: float, origin_lon: float):
     """Local map-frame metres → (lon, lat) degrees, equirectangular about origin.
 
     Vectorised: ``x_m`` / ``y_m`` may be scalars or numpy arrays; returns
@@ -79,26 +77,23 @@ def local_to_lonlat(
         lat = originLat + (y_m / 111320)
         lon = originLon + (x_m / (111320 * cos(originLat)))
 
-    ``mercator`` (default ``False``) — the **nuScenes map fix** (av-refinement.md
-    §R2.1). nuScenes records its map-frame coordinates in EPSG:3857 *web-mercator*
-    metres, which are inflated away from the equator by ``1/cos(lat)`` relative to
-    true ground metres (Boston ≈ ×1.3528, Singapore ≈ ×1.0). Treating a mercator
-    metre as a ground metre therefore *compresses* a Boston scene by ~26 % in both
-    axes. When ``mercator=True`` we multiply the ground-metre conversion by
-    ``k = 1/cos(radians(origin_lat))`` to undo that inflation, recovering true
-    ground span before the equirectangular projection. The default ``False`` keeps
-    the original behaviour byte-for-byte — the synthetic + comma frames are already
-    in true ground metres, so they must NOT be scaled.
+    The map-frame metres are TRUE GROUND METRES in a local tangent plane about the
+    origin — this is the convention every AV source uses (nuScenes ego/map
+    translations, the Argoverse/comma/synthetic frames). nuScenes specifically is
+    handled the same way the official devkit ``export_poses.derive_latlon`` does:
+    the per-city reference coordinate is the map's SW-corner origin and ego/map
+    translations are ground metres from it (haversine in the devkit; the
+    equirectangular form here is sub-metre-equivalent over a ~2 km scene).
+
+    NOTE: an earlier ``mercator=True`` mode (treating nuScenes coords as EPSG:3857
+    web-mercator metres and deflating by ``1/cos(lat)``) was REMOVED — nuScenes maps
+    use a *local* metric frame, not the global EPSG:3857 projection, so that
+    deflation shifted Boston scenes ~450 m and shrank them ~26 % (off the basemap).
     """
     x_m = np.asarray(x_m, dtype="float64")
     y_m = np.asarray(y_m, dtype="float64")
-    # EPSG:3857 mercator metres are inflated by 1/cos(lat); divide it back out to
-    # recover true ground metres before the local equirectangular projection.
-    k = 1.0 / math.cos(math.radians(origin_lat)) if mercator else 1.0
-    x_g = x_m / k
-    y_g = y_m / k
-    lat = origin_lat + (y_g / M_PER_DEG_LAT)
-    lon = origin_lon + (x_g / (M_PER_DEG_LAT * math.cos(math.radians(origin_lat))))
+    lat = origin_lat + (y_m / M_PER_DEG_LAT)
+    lon = origin_lon + (x_m / (M_PER_DEG_LAT * math.cos(math.radians(origin_lat))))
     return lon, lat
 
 
@@ -403,12 +398,20 @@ def lidarseg_class(name: str) -> str:
 
 
 # ── GeoParquet writers ───────────────────────────────────────────────────────
-def _wkb_points(lon: Sequence[float], lat: Sequence[float]) -> list[bytes]:
-    """WKB-encode parallel lon/lat arrays as POINT geometries."""
-    from shapely import wkb
-    from shapely.geometry import Point
+def _wkb_points(lon: Sequence[float], lat: Sequence[float]):
+    """WKB-encode parallel lon/lat arrays as POINT geometries (vectorised).
 
-    return [wkb.dumps(Point(float(x), float(y))) for x, y in zip(lon, lat)]
+    Uses shapely 2.x's array API (``shapely.points`` + ``shapely.to_wkb``) instead
+    of a Python per-point ``wkb.dumps(Point(...))`` loop — ~100× faster, which
+    matters for the multi-million-point AV LIDAR clouds (a ~29M-point full-res tier
+    encodes in seconds, not minutes). Returns an ndarray of WKB bytes, which
+    pyarrow accepts directly as a ``binary`` column.
+    """
+    import shapely
+
+    lon = np.asarray(lon, dtype="float64")
+    lat = np.asarray(lat, dtype="float64")
+    return shapely.to_wkb(shapely.points(lon, lat))
 
 
 def write_lidar_points(
@@ -418,19 +421,44 @@ def write_lidar_points(
     lat,
     timestamp,
     z,
-    intensity,
+    intensity=None,
     seg_class=None,
+    rgb=None,
+    surfels=None,
 ) -> int:
     """Write the ``lidar/`` POINT GeoParquet (av-cockpit.md §2a).
 
     Columns: ``geometry`` (WKB Point), ``timestamp`` (Int64 unix-ms),
-    ``height_band`` (Utf8 categorical range label), ``z`` (Float64),
-    ``intensity`` (Float64). When ``seg_class`` is given (a per-point array of
+    ``height_band`` (Utf8 categorical range label), ``z`` (Float64). NOTE:
+    ``intensity`` is accepted for call-site compatibility but **no longer
+    written** — measured on Waymo LiDAR it was ~8% of every tile's compressed
+    bytes (a near-incompressible Float64) yet nothing in the render path reads
+    it (the cloud colors by ``height_band`` / ``seg_class`` / camera RGB). When
+    ``seg_class`` is given (a per-point array of
     coarse ``LIDARSEG_CLASSES`` labels, e.g. nuScenes-lidarseg collapsed via
     ``lidarseg_class``), an extra ``seg_class`` (Utf8 categorical) column is
     written so the cloud can be colored by SEMANTIC CLASS. ``height_band`` is
-    always written too, so a scene can fall back to the height ramp. Returns the
-    row count written.
+    always written too, so a scene can fall back to the height ramp.
+
+    When ``rgb`` is given (an ``(N, 3)`` uint8-ish array of per-point RGB sampled
+    by projecting each return into a camera image — see
+    ``waymo_extract.CameraColorizer``), three NUMERIC ``r`` / ``g`` / ``b`` (Int16
+    0–255) columns are written. These flow through stt-build like ``z`` /
+    ``intensity`` and reach the client as ``numericProps``, where the layer can
+    paint each point its own color (``AnimatedPointLayer.rgbColorColumns``)
+    instead of a categorical ramp. ``height_band`` is still written, so the same
+    bundle can fall back to the height ramp.
+
+    When ``surfels`` is given (an ``(N, 7)`` float array
+    ``[qx, qy, qz, qw, s_major, s_minor, opacity]`` from the per-sweep k-NN
+    covariance pass — see ``waymo_extract.compute_surfels``), seven NUMERIC
+    Float64 columns are written: the orientation quaternion ``qx``/``qy``/``qz``/
+    ``qw`` (its rotation-matrix COLUMNS are the surfel ``[tangent|bitangent|
+    normal]`` in the render ENU frame), the in-plane half-extents ``s_major`` /
+    ``s_minor`` (metres), and a per-surfel confidence ``surfel_opacity``
+    (``[0,1]``). The client's ``SplatLayer`` reads these as ``numericProps`` to
+    render each return as an oriented anisotropic Gaussian disk instead of a flat
+    dot. Returns the row count written.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -438,16 +466,16 @@ def write_lidar_points(
     lon = np.asarray(lon, dtype="float64")
     lat = np.asarray(lat, dtype="float64")
     z = np.asarray(z, dtype="float64")
-    intensity = np.asarray(intensity, dtype="float64")
     timestamp = np.asarray(timestamp, dtype="int64")
     bands = height_band(z)  # vectorised → str array
 
+    # `intensity` is intentionally NOT written — it is dead weight in the tile
+    # (no consumer reads it) and the largest avoidable Float64 column after `z`.
     cols = {
         "geometry": pa.array(_wkb_points(lon, lat), type=pa.binary()),
         "timestamp": pa.array(timestamp, type=pa.int64()),
         "height_band": pa.array([str(b) for b in bands], type=pa.string()),
         "z": pa.array(z, type=pa.float64()),
-        "intensity": pa.array(intensity, type=pa.float64()),
     }
     if seg_class is not None:
         seg = np.asarray(seg_class, dtype=object)
@@ -456,11 +484,48 @@ def write_lidar_points(
                 f"lidar: seg_class length {len(seg)} != point count {len(lon)}"
             )
         cols["seg_class"] = pa.array([str(s) for s in seg], type=pa.string())
+    if rgb is not None:
+        rgb = np.asarray(rgb)
+        if rgb.shape != (len(lon), 3):
+            raise ValueError(
+                f"lidar: rgb shape {rgb.shape} != (point count {len(lon)}, 3)"
+            )
+        # Int64 (NOT int16/uint8): stt-build's `extract_property_value`
+        # (crates/stt-build/src/input.rs) only reads Float64/Int64/Float32/Int32/
+        # String/Bool — an Int16 column is SILENTLY DROPPED (returns None per row),
+        # so the per-point color never reaches the client and the cloud falls back
+        # to the height ramp. Int64 is the proven path (== num_interior_pts); the
+        # tile stores it as Float64 either way, so the client reads 0–255 floats.
+        rgb = np.clip(rgb, 0, 255).astype("int64")
+        cols["r"] = pa.array(rgb[:, 0], type=pa.int64())
+        cols["g"] = pa.array(rgb[:, 1], type=pa.int64())
+        cols["b"] = pa.array(rgb[:, 2], type=pa.int64())
+    if surfels is not None:
+        surfels = np.asarray(surfels, dtype="float64")
+        if surfels.shape != (len(lon), 7):
+            raise ValueError(
+                f"lidar: surfels shape {surfels.shape} != (point count {len(lon)}, 7)"
+            )
+        # Float64 (NOT a packed list column): stt-build's per-column property
+        # extractor reads scalar Float64/Int64 columns, like ``z`` / ``intensity``,
+        # and hands them to the client as ``numericProps``. The quaternion is unit
+        # length and the extents are small metre values, all f32-exact downstream.
+        for j, name in enumerate(
+            ("qx", "qy", "qz", "qw", "s_major", "s_minor", "surfel_opacity")
+        ):
+            cols[name] = pa.array(surfels[:, j], type=pa.float64())
 
     table = pa.table(cols)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, out_path, compression="snappy")
-    suffix = " (+seg_class)" if seg_class is not None else ""
+    extras = []
+    if seg_class is not None:
+        extras.append("seg_class")
+    if rgb is not None:
+        extras.append("rgb")
+    if surfels is not None:
+        extras.append("surfels")
+    suffix = f" (+{', '.join(extras)})" if extras else ""
     print(f"  wrote {table.num_rows} LIDAR points{suffix} → {out_path}")
     return table.num_rows
 
@@ -750,6 +815,46 @@ def write_scene_json(
 
 
 # ── stt-build ────────────────────────────────────────────────────────────────
+def lidar_quantize_attrs(z_prec: float) -> dict[str, float]:
+    """Canonical ``--quantize-attr`` map for EVERY LiDAR archive / tier / variant.
+
+    Each entry stores a near-incompressible Float64 column as fixed-point ints
+    (``UInt16`` leaf + a per-column affine the reader reconstructs as
+    ``value = offset + q·step``); a raw Float64 barely compresses. Keeping ONE
+    canonical map here (rather than a literal per extractor) is deliberate — the
+    surfel/colour columns drifting out of sync across waymo/nuscenes/argoverse is
+    exactly the dual-copy hazard this repo keeps hitting.
+
+    Safe to pass WHOLE to any LiDAR build: stt-build looks each name up per
+    column, so entries with no matching column (``r``/``g``/``b`` on an uncoloured
+    cloud, the surfel columns on a raw cloud) are silently ignored, and a range
+    that overflows ``u16`` degrades to ``Int32`` rather than erroring.
+
+    * ``z`` — elevation (m) → ``z_prec`` cm grid (same precision as the coords).
+    * ``r``/``g``/``b`` — camera-projected per-point colour, integers 0–255 stored
+      as Float64 (see ``write_lidar_points``); ``step=1`` is lossless → ``u16``
+      (256 distinct values compress trivially), 8 B/pt → 2 B/pt each.
+    * ``qx``/``qy``/``qz``/``qw`` — unit surfel quaternion ∈ [-1,1]; ``1e-4`` is
+      ~0.01° of orientation error (imperceptible) and fits ``u16`` (range 2 / 1e-4
+      = 20 000 < 65 535). 8 B/pt → 2 B/pt each.
+    * ``s_major``/``s_minor`` — in-plane extents (m) at cm precision.
+    * ``surfel_opacity`` — confidence ∈ [0,1] at ~1/250 precision.
+    """
+    return {
+        "z": z_prec,
+        "r": 1.0,
+        "g": 1.0,
+        "b": 1.0,
+        "qx": 1e-4,
+        "qy": 1e-4,
+        "qz": 1e-4,
+        "qw": 1e-4,
+        "s_major": 0.01,
+        "s_minor": 0.01,
+        "surfel_opacity": 0.004,
+    }
+
+
 def run_stt_build(
     parquet_path: Path,
     out_dir: Path,
@@ -761,6 +866,7 @@ def run_stt_build(
     temporal_bucket: str = "1s",
     map_temporal_bucket: str = "1d",
     quantize_coords: float | None = None,
+    quantize_attrs: dict[str, float] | None = None,
     publish: bool = True,
 ) -> None:
     """Run ``stt-build`` on one archive's GeoParquet → a packed STT directory.
@@ -826,6 +932,15 @@ def run_stt_build(
     # the caller asks for it, so the default build is unchanged.
     if quantize_coords is not None and quantize_coords > 0:
         cmd += ["--quantize-coords", repr(float(quantize_coords))]
+    # Opt-in numeric-attribute quantization (e.g. LiDAR ``z`` elevation): store
+    # the named Float64 column as fixed-point ints + a per-column affine the
+    # reader reconstructs. A raw Float64 ``z`` barely compresses (~38% of a
+    # post-id-fix LiDAR tile); quantizing it to a cm grid is ~−90% on that
+    # column. Only emitted when asked, so other builds are byte-identical.
+    if quantize_attrs:
+        for name, prec in quantize_attrs.items():
+            if prec and prec > 0:
+                cmd += ["--quantize-attr", f"{name}={float(prec)!r}"]
     if kind == "trips":
         cmd += ["--end-time-field", "end_timestamp", "--simplify"]
     elif is_map:

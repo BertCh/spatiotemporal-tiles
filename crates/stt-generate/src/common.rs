@@ -1020,6 +1020,7 @@ pub fn run_stt_build_with_options(
         max_zoom_field: None,
         no_clip: false,
         quantize_coords: None,
+        quantize_attrs: Vec::new(),
     })
 }
 
@@ -1086,8 +1087,25 @@ pub struct SttBuildOptions {
     /// self-describing tile. `None` keeps full Float64 precision. Use for
     /// coordinate-heavy builds (e.g. baked bundled corridors) where sub-meter
     /// precision is invisible at the rendered zooms.
+    ///
+    /// **Born-optimized default:** `None` means "use the generation default"
+    /// ([`DEFAULT_QUANTIZE_COORDS_M`]), NOT "off". Pass `Some(0.0)` to force raw
+    /// Float64 coords, or `Some(m)` for an explicit precision.
     pub quantize_coords: Option<f64>,
+    /// Explicit per-property quantization precisions, forwarded as
+    /// `--quantize-attr name=prec`. Overrides the automatic range-adaptive
+    /// quantization for the named columns (use when a column needs a specific
+    /// precision, e.g. integer-exact). Empty = rely on the automatic pass.
+    pub quantize_attrs: Vec<String>,
 }
+
+/// Born-optimized coordinate-quantization default (meters) applied to every
+/// generated dataset unless the caller passes an explicit `quantize_coords`.
+/// 0.1 m is sub-pixel at any rendered zoom (the STT reader reconstructs
+/// Float64), so geometry — the dominant column on trip/path/line datasets —
+/// ships as compact `i32` grid indices for free. Set `STT_GEN_NO_QUANTIZE=1` to
+/// disable all generation-time quantization.
+pub const DEFAULT_QUANTIZE_COORDS_M: f64 = 0.1;
 
 /// Single entry point that drives the stt-build CLI with every option,
 /// including the optional summary tier.
@@ -1149,7 +1167,24 @@ pub fn run_stt_build_with_full_options(opts: SttBuildOptions) -> Result<()> {
         cmd.arg("--no-clip");
     }
 
-    if let Some(m) = opts.quantize_coords {
+    // Born-optimized generation: every dataset ships quantized geometry +
+    // automatically-quantized numeric properties + sequential point ids (the
+    // last is a stt-build default). This is intrinsic to generation, not a
+    // second-pass re-transcode. `STT_GEN_NO_QUANTIZE=1` opts out wholesale.
+    let quantize_off = std::env::var_os("STT_GEN_NO_QUANTIZE").is_some();
+    if !quantize_off {
+        // `None` → the generation default; `Some(0.0)` → an explicit opt-out.
+        let qc = opts.quantize_coords.unwrap_or(DEFAULT_QUANTIZE_COORDS_M);
+        if qc > 0.0 {
+            cmd.arg("--quantize-coords").arg(qc.to_string());
+        }
+        // Explicit per-column precisions win; everything else gets the automatic
+        // range-adaptive (Float64 → u16) pass.
+        for attr in &opts.quantize_attrs {
+            cmd.arg("--quantize-attr").arg(attr);
+        }
+        cmd.arg("--quantize-attrs-auto");
+    } else if let Some(m) = opts.quantize_coords {
         cmd.arg("--quantize-coords").arg(m.to_string());
     }
 

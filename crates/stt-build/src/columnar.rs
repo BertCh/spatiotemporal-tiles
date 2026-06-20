@@ -227,7 +227,22 @@ fn build_point_layer(
     name: String,
     opts: &ColumnarOptions,
 ) -> Result<ColumnarLayer> {
-    let (ids, start, end, props) = common_columns(features, &opts.attribute_filter);
+    let (mut ids, start, end, props) = common_columns(features, &opts.attribute_filter);
+    // Points are never split across tile boundaries, so a point feature needs no
+    // globally stable id (unlike a clipped line/polygon, which must keep one id
+    // across the tiles it spans). When the source carries no explicit id, the
+    // fallback in `determine_feature_id` is a hash of (time, lon, lat): a
+    // high-entropy u64 that zstd cannot compress and that — measured on Waymo
+    // LiDAR — is the single largest column in the tile (~40% of a point's
+    // compressed bytes). Replace those synthetic ids with the per-tile row
+    // index: still unique within the tile (picking stays correct) but monotonic,
+    // so the column compresses to a few bits per point. Explicit source ids
+    // (e.g. earthquake/storm-cell ids a consumer may surface) are preserved.
+    for (i, f) in features.iter().enumerate() {
+        if f.geojson.id.is_none() {
+            ids[i] = i as u64;
+        }
+    }
     let geometry: Vec<Coord> = features.iter().map(|f| [f.lon, f.lat]).collect();
     Ok(ColumnarLayer {
         name,

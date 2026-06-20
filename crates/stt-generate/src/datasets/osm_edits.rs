@@ -280,6 +280,7 @@ fn run_nodes(
             max_zoom_field: None,
             no_clip: false,
             quantize_coords: None,
+            quantize_attrs: Vec::new(),
         })?;
         let _ = std::fs::remove_file(intermediate);
     }
@@ -529,6 +530,7 @@ fn run_changesets(
             max_zoom_field: None,
             no_clip: false,
             quantize_coords: None,
+            quantize_attrs: Vec::new(),
         })?;
         let _ = std::fs::remove_file(intermediate);
     }

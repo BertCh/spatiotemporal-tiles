@@ -33,7 +33,7 @@
 //! from the `arrow` crate, not hardcoded strings.
 
 use arrow::datatypes::{DataType, Field};
-use stt_core::arrow_tile::DecodedLayer;
+use stt_core::arrow_tile::{DecodedLayer, STT_QUANT_ATTR_META_KEY};
 
 /// GeoArrow extension-name metadata key. Mirrors the private
 /// `GEOARROW_EXT_KEY` in `stt_core::arrow_tile`; this is the Arrow-standard
@@ -115,9 +115,10 @@ fn check_layer_schema(layer: &DecodedLayer, issues: &mut Vec<String>) {
         if is_reserved_column(n) {
             continue;
         }
-        if !is_valid_property_type(field.data_type()) {
+        if !is_valid_property_field(field) {
             issues.push(format!(
-                "layer '{name}': property column '{n}' has type {:?}, expected Float64 or Dictionary<UInt16,Utf8>",
+                "layer '{name}': property column '{n}' has type {:?}, expected Float64, \
+                 Dictionary<UInt16,Utf8>, or a quantized UInt16/Int32 carrying '{STT_QUANT_ATTR_META_KEY}'",
                 field.data_type()
             ));
         }
@@ -159,14 +160,21 @@ fn is_list_like(dt: &DataType) -> bool {
     )
 }
 
-/// A property column is either a plain `Float64` (numeric) or a
-/// `Dictionary<UInt16, Utf8>` (categorical) — the only two shapes `encode_layer`
-/// emits.
-fn is_valid_property_type(dt: &DataType) -> bool {
-    match dt {
+/// A property column is one of the shapes `encode_layer` emits: a plain
+/// `Float64` (numeric), a `Dictionary<UInt16, Utf8>` (categorical), or — when
+/// the build opts a numeric column into quantization (`--quantize-attr`) — a
+/// fixed-point `UInt16`/`Int32` leaf carrying the `stt:qa` reconstruction affine
+/// in its field metadata (the reader rebuilds Float64 from `{o,s}`).
+fn is_valid_property_field(field: &Field) -> bool {
+    match field.data_type() {
         DataType::Float64 => true,
         DataType::Dictionary(k, v) => {
             matches!(k.as_ref(), DataType::UInt16) && matches!(v.as_ref(), DataType::Utf8)
+        }
+        // Quantized numeric: only valid WITH the affine metadata — a bare
+        // UInt16/Int32 property with no `stt:qa` is producer drift.
+        DataType::UInt16 | DataType::Int32 => {
+            field.metadata().contains_key(STT_QUANT_ATTR_META_KEY)
         }
         _ => false,
     }

@@ -343,6 +343,26 @@ struct Args {
     #[arg(long, default_value_t = 0.0, value_name = "METERS")]
     quantize_coords: f64,
 
+    /// Opt-in numeric-attribute quantization: store the named Float64 property as
+    /// fixed-point integers at the given precision (in the property's own units)
+    /// instead of raw Float64, with a per-column affine in field metadata (the
+    /// reader reconstructs Float64). Repeatable: `--quantize-attr z=0.05
+    /// --quantize-attr speed=0.1`. A raw Float64 attribute is near-incompressible;
+    /// for a LiDAR `z` elevation this is the largest size lever after the geometry
+    /// — measured ~−80% on the `z` column. Default: none (all Float64).
+    #[arg(long = "quantize-attr", value_name = "NAME=PREC")]
+    quantize_attr: Vec<String>,
+
+    /// Automatically quantize EVERY Float64 numeric property (that has no
+    /// explicit `--quantize-attr` precision) to a range-adaptive `UInt16`: the
+    /// column's `[min,max]` span is mapped onto 16 bits (~65k levels), the reader
+    /// reconstructs Float64. A raw Float64 scalar column is near-incompressible;
+    /// 16 bits of dynamic range is visually lossless for STT's scalar fields, so
+    /// this is the "born-optimized" default for generated datasets. Off by
+    /// default (keeps `stt-build` output byte-identical unless opted in).
+    #[arg(long = "quantize-attrs-auto", default_value_t = false)]
+    quantize_attrs_auto: bool,
+
     // --- Per-tile budgets (OPT-IN; default OFF) ----------------------------
     // The project follows a documented "no thinning / comprehensive data by
     // default" principle. These caps are inert unless explicitly set, and when
@@ -472,6 +492,33 @@ fn main() -> Result<()> {
              reader reconstructs)",
             args.quantize_coords
         );
+    }
+
+    // Numeric-attribute quantization (e.g. LiDAR `z`) — also a process-wide
+    // encoder setting. Parse `NAME=PREC` pairs once, before any tile is encoded.
+    if !args.quantize_attr.is_empty() {
+        let mut attrs: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for spec in &args.quantize_attr {
+            let (name, prec) = spec
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--quantize-attr expects NAME=PREC, got {spec:?}"))?;
+            let prec: f64 = prec.trim().parse().map_err(|_| {
+                anyhow::anyhow!("--quantize-attr {spec:?}: PREC {prec:?} is not a number")
+            })?;
+            if prec <= 0.0 {
+                anyhow::bail!("--quantize-attr {spec:?}: PREC must be > 0");
+            }
+            attrs.insert(name.trim().to_string(), prec);
+        }
+        info!(
+            "Numeric-attribute quantization ENABLED: {:?} (fixed-point; reader reconstructs)",
+            attrs
+        );
+        stt_core::arrow_tile::set_quantize_attrs(attrs);
+    }
+    if args.quantize_attrs_auto {
+        info!("Automatic range-adaptive numeric-attribute quantization ENABLED (every Float64 prop → u16)");
+        stt_core::arrow_tile::set_quantize_attrs_auto(true);
     }
 
     // Parse compression

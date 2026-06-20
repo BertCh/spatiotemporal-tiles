@@ -73,6 +73,7 @@ Pipeline:  Argoverse 2  →  GeoParquet + JSON  →  stt-build  →  packed bund
 from __future__ import annotations
 
 import argparse
+import collections
 import math
 import shutil
 from pathlib import Path
@@ -84,6 +85,151 @@ import av_common as avc
 # AV2 ring_front_center runs ~20 Hz → ~320 frames / 15 s log. Keep every Nth so
 # the cockpit camera inset is ~20 keyframes (matches nuscenes_extract's band).
 CAMERA_DECIMATE = 16
+
+# ── camera-projection colorize (optional, --colorize) ─────────────────────────
+# AV2 ships SEVEN ring cameras covering ~360° around the car. We project each
+# EGO-frame LIDAR return into them via the devkit's own `PinholeCamera`
+# (intrinsics.feather + egovehicle_SE3_sensor.feather → project_ego_to_img), so
+# the camera model + extrinsics are exactly the av2-api's. A return seen by
+# several cameras takes the color of the one viewing it most centrally.
+AV2_RING_CAMERAS = (
+    "ring_front_center", "ring_front_left", "ring_front_right",
+    "ring_side_left", "ring_side_right", "ring_rear_left", "ring_rear_right",
+)
+# Cool slate for returns no camera sees — same value as the Waymo/nuScenes
+# colorizers so colored scenes read consistently across sources.
+FALLBACK_RGB = (70, 78, 96)
+
+
+class Av2Colorizer:
+    """Projects EGO-frame LIDAR returns into the 7 ring cameras to sample RGB.
+
+    Per sweep, each return is projected into every camera (via the devkit
+    ``PinholeCamera.project_ego_to_img``); the camera whose image is NEAREST in
+    time to the sweep is used, and a return visible to several cameras takes the
+    color of the one viewing it most CENTRALLY (smallest normalized radius from
+    the optical axis). Returns no camera sees keep ``got=False``.
+    """
+
+    def __init__(self, log_dir: Path):
+        from av2.geometry.camera.pinhole_camera import PinholeCamera
+
+        self.cams: dict = {}        # cam_name → PinholeCamera
+        self.frames: dict = {}      # cam_name → (ts_ns int64 array, [jpg Path])
+        for cam in AV2_RING_CAMERAS:
+            jpgs = sorted((log_dir / "sensors" / "cameras" / cam).glob("*.jpg"),
+                          key=lambda p: int(p.stem))
+            if not jpgs:
+                continue
+            try:
+                self.cams[cam] = PinholeCamera.from_feather(log_dir, cam)
+            except Exception as e:  # noqa: BLE001 — missing calib row for a cam
+                print(f"  ({cam} calibration unavailable: {e})")
+                continue
+            self.frames[cam] = (np.asarray([int(p.stem) for p in jpgs], dtype=np.int64),
+                                jpgs)
+        self._cache: "collections.OrderedDict[str, np.ndarray]" = \
+            collections.OrderedDict()
+
+    def _nearest_image(self, cam: str, t_ns: int):
+        """Decode (LRU ≤14) the cam frame nearest ``t_ns`` → HxWx3, or None."""
+        from PIL import Image
+
+        ts, jpgs = self.frames[cam]
+        j = int(np.searchsorted(ts, t_ns))
+        j = max(0, min(j, len(ts) - 1))
+        if j > 0 and abs(ts[j - 1] - t_ns) < abs(ts[j] - t_ns):
+            j -= 1
+        path = jpgs[j]
+        key = str(path)
+        arr = self._cache.get(key)
+        if arr is not None:
+            self._cache.move_to_end(key)
+            return arr
+        arr = np.asarray(Image.open(path).convert("RGB"))
+        self._cache[key] = arr
+        if len(self._cache) > 14:
+            self._cache.popitem(last=False)
+        return arr
+
+    def colorize(self, pts_ego: np.ndarray, sweep_t_ns: int):
+        """(ego-frame N×3 pts, sweep timestamp ns) → (rgb uint8 N×3, got N)."""
+        pts_ego = np.ascontiguousarray(pts_ego, dtype=np.float64)
+        n = len(pts_ego)
+        rgb = np.zeros((n, 3), dtype=np.uint8)
+        best_r2 = np.full(n, np.inf)
+        got = np.zeros(n, dtype=bool)
+        for cam, pc in self.cams.items():
+            img = self._nearest_image(cam, sweep_t_ns)
+            if img is None:
+                continue
+            uv, pts_cam, valid = pc.project_ego_to_img(pts_ego)
+            if not valid.any():
+                continue
+            h, w = img.shape[0], img.shape[1]
+            ui = np.round(uv[:, 0]).astype(np.int64)
+            vi = np.round(uv[:, 1]).astype(np.int64)
+            valid = valid & (ui >= 0) & (ui < w) & (vi >= 0) & (vi < h)
+            zc = np.where(pts_cam[:, 2] > 0.1, pts_cam[:, 2], 0.1)
+            r2 = (pts_cam[:, 0] / zc) ** 2 + (pts_cam[:, 1] / zc) ** 2
+            better = valid & (r2 < best_r2)
+            if better.any():
+                bi = np.where(better)[0]
+                rgb[bi] = img[vi[bi], ui[bi]]
+                best_r2[bi] = r2[bi]
+                got[bi] = True
+        return rgb, got
+
+
+def _depth_ramp(depth: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Jet-ish depth → RGB uint8 ramp for the debug overlay (no matplotlib)."""
+    t = np.clip((depth - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    r = np.clip(1.5 - np.abs(4.0 * t - 3.0), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4.0 * t - 2.0), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4.0 * t - 1.0), 0.0, 1.0)
+    return (np.stack([r, g, b], axis=1) * 255).astype(np.uint8)
+
+
+def debug_overlay_av2(log_dir: Path, out: Path, colorizer: "Av2Colorizer",
+                      sweep_index: int):
+    """Project one sweep into every ring camera, dots colored by DEPTH → PNGs.
+
+    Saves ``<out>/_debug_overlay_<CAM>.png`` per camera (projection-correctness
+    check: dots must land ON cars / road / buildings).
+    """
+    from PIL import Image
+
+    out.mkdir(parents=True, exist_ok=True)
+    sweeps = sorted((log_dir / "sensors" / "lidar").glob("*.feather"),
+                    key=lambda p: int(p.stem))
+    idx = max(0, min(sweep_index, len(sweeps) - 1))
+    sweep = sweeps[idx]
+    t_ns = int(sweep.stem)
+    df = _read_feather(sweep)
+    pts_ego = np.stack([df["x"].to_numpy(), df["y"].to_numpy(),
+                        df["z"].to_numpy()], axis=1).astype(np.float64)
+    print(f"  debug overlay: sweep {idx} (ts {t_ns}), {len(pts_ego)} returns")
+    for cam, pc in colorizer.cams.items():
+        img = colorizer._nearest_image(cam, t_ns)
+        if img is None:
+            continue
+        uv, pts_cam, valid = pc.project_ego_to_img(pts_ego)
+        h, w = img.shape[0], img.shape[1]
+        ui = np.round(uv[:, 0]).astype(np.int64)
+        vi = np.round(uv[:, 1]).astype(np.int64)
+        valid = valid & (ui >= 0) & (ui < w) & (vi >= 0) & (vi < h)
+        canvas = img.copy()
+        bi = np.where(valid)[0]
+        if len(bi):
+            depth = pts_cam[bi, 2]
+            colors = _depth_ramp(depth, depth.min(), np.percentile(depth, 95))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    canvas[np.clip(vi[bi] + dy, 0, h - 1),
+                           np.clip(ui[bi] + dx, 0, w - 1)] = colors
+        path = out / f"_debug_overlay_{cam}.png"
+        Image.fromarray(canvas).save(path)
+        print(f"    wrote {path}  ({len(bi)} projected returns)")
 
 # AV2 lane-marking colour → ``MAP_COLORS`` key (av-refinement.md §R2.2). The AV2
 # ``LaneMarkType`` enum encodes both colour and pattern (e.g.
@@ -109,10 +255,26 @@ def _lane_mark_layer(mark_type) -> str:
 # covers ALL six cities (ATX/DTW/MIA/PAO/PIT/WDC) with no approximation — every
 # city now registers on the basemap to within metres. See ``_make_city_to_lonlat``.
 
-# AV2 LIDAR is 64-beam @ ~10 Hz → ~90-95 k returns/sweep, ~150 sweeps/log ≈ 14 M
-# raw points per log. Keep every Nth return so the whole scene lands at a few
-# hundred-k points (the synthetic bundle is ~160 k) — light tiles, crisp sweeps.
-LIDAR_DECIMATE = 75
+# AV2 LIDAR is 64-beam dual @ ~10 Hz → ~90-95 k returns/sweep, ~150 sweeps/log ≈ 14 M
+# raw points per log. DENSITY TIERS (mirrors waymo_extract): decode every return
+# ONCE (FINEST_DECIMATE = 1) then stride down for the cockpit's runtime density
+# selector (Small→Full). AV2 is georeferenced (real UTM) + HD-mapped, so even the
+# dense tiers overlay actual streets.
+FINEST_DECIMATE = 1
+# (id, label, decimate, archive_dir, radius_px, radius_min_px) — ASCENDING density;
+# `small` → the default `lidar/`. Denser tiers ship SMALLER dots so the cloud reads
+# as 3D structure, not a solid mass.
+LIDAR_DENSITY_TIERS = [
+    ("small", "Small", 16, "lidar", 1.0, 0.8),          # ~0.9M  (default)
+    ("medium", "Medium", 8, "lidar-med", 0.8, 0.65),    # ~1.8M
+    ("large", "Large", 4, "lidar-high", 0.65, 0.55),    # ~3.5M
+    ("ultra", "Ultra", 2, "lidar-ultra", 0.5, 0.45),    # ~7M
+    ("full", "Full", FINEST_DECIMATE, "lidar-full", 0.4, 0.35),  # ~14M  (full sweep)
+]
+# Street-level cockpit: clamp the zoom-pyramid floor (z<14 tiers are wasted bytes,
+# the "z0 bomb") + quantize coords to a few cm (viz-exact). Both decode-free client-side.
+LIDAR_MIN_ZOOM = 14
+LIDAR_QUANTIZE_M = 0.05
 
 
 def downsample_ego_path(ego_t, ego_lon, ego_lat, target: int = 60):
@@ -286,14 +448,223 @@ def copy_camera_frames(log_dir: Path, camera: str, out: Path, decimate: int):
     return frames
 
 
-def extract(log_dir: Path, city: str, drop_empty_boxes: bool = True):
+# ── surfel covariance (build-time, per-sweep k-NN) ───────────────────────────
+# A "formal" splat needs ORIENTED anisotropic primitives, not round dots. For a
+# LIDAR scan the principled way to get them WITHOUT training a 3DGS model is
+# surface splatting (Pfister/Zwicker surfels): estimate each return's local
+# surface frame from its k nearest neighbours' covariance — the smallest
+# eigenvector is the surface normal, the two larger span the tangent plane, and
+# the eigenvalues give the patch extents. The client's `SplatLayer` then renders
+# each return as an oriented Gaussian disk lying on the surface. This mirrors
+# `waymo_extract.compute_surfels`, adapted to AV2's EGO-frame per-sweep feathers
+# (one file per sweep, so neighbourhoods are already a coherent range-image
+# sampling) and AV2's yaw-only city lift (the render keeps vehicle-frame z, so
+# disks are yawed — not full-pose-rotated — into the render frame).
+SURFEL_K = 12          # neighbours for the covariance estimate
+SURFEL_FILL = 0.70     # disk radius as a fraction of the decimated point spacing
+SURFEL_S_MIN = 0.03    # m — floor (avoid sub-cm slivers)
+SURFEL_S_MAX = 0.45    # m — ceil (far/sparse returns don't become giant blobs)
+SURFEL_ASPECT_FLOOR = 0.45  # keep disks from collapsing to needles on edges
+# Default render decimation for the surfel tier. Denser than the round-dot point
+# tiers (the default `small` is 1/16): at low density each SWEEP is too sparse to
+# tile, so the per-point disk is sized large and reads as blobs — a denser sample
+# makes each disk small and the surface crisp. The soft TEMPORAL Gaussian caps
+# per-frame cost to the ~±3σ window around the playhead (not the whole cloud), so
+# density is nearly free at render time. ~1/6 of the ~14M-return log ≈ 2.3M
+# oriented disks (~few hundred k drawn at any instant).
+SURFEL_DECIMATE = 6
+
+
+def mat3_to_quat(R: np.ndarray) -> np.ndarray:
+    """Batched rotation matrices ``(M,3,3)`` → unit quaternions ``(M,4)`` [x,y,z,w].
+
+    Shepperd's method (the numerically-stable four-case branch on which diagonal
+    term is largest), vectorised: compute all four candidate quaternions and
+    select per row by the same case mask, so a near-180° rotation never divides
+    by a vanishing ``sqrt(trace+1)``.
+    """
+    m00, m01, m02 = R[:, 0, 0], R[:, 0, 1], R[:, 0, 2]
+    m10, m11, m12 = R[:, 1, 0], R[:, 1, 1], R[:, 1, 2]
+    m20, m21, m22 = R[:, 2, 0], R[:, 2, 1], R[:, 2, 2]
+    trace = m00 + m11 + m22
+
+    def _sqrt(v):
+        return np.sqrt(np.maximum(v, 1e-12))
+
+    # case 0: trace positive
+    s0 = _sqrt(trace + 1.0) * 2.0  # = 4w
+    q0 = np.stack([(m21 - m12) / s0, (m02 - m20) / s0, (m10 - m01) / s0, 0.25 * s0], 1)
+    # case 1: m00 dominant
+    s1 = _sqrt(1.0 + m00 - m11 - m22) * 2.0  # = 4x
+    q1 = np.stack([0.25 * s1, (m01 + m10) / s1, (m02 + m20) / s1, (m21 - m12) / s1], 1)
+    # case 2: m11 dominant
+    s2 = _sqrt(1.0 + m11 - m00 - m22) * 2.0  # = 4y
+    q2 = np.stack([(m01 + m10) / s2, 0.25 * s2, (m12 + m21) / s2, (m02 - m20) / s2], 1)
+    # case 3: m22 dominant
+    s3 = _sqrt(1.0 + m22 - m00 - m11) * 2.0  # = 4z
+    q3 = np.stack([(m02 + m20) / s3, (m12 + m21) / s3, 0.25 * s3, (m10 - m01) / s3], 1)
+
+    use0 = trace > 0.0
+    use1 = (~use0) & (m00 >= m11) & (m00 >= m22)
+    use2 = (~use0) & (~use1) & (m11 >= m22)
+    q = np.where(use0[:, None], q0,
+        np.where(use1[:, None], q1,
+        np.where(use2[:, None], q2, q3)))
+    q /= np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-12)
+    return q
+
+
+def compute_surfels(pts: np.ndarray, sel: np.ndarray, yaw: float):
+    """Per-sweep surfels for the selected returns → (quat N×4, scale2 N×2, opacity N).
+
+    ``pts`` is the FULL-density EGO-frame sweep (N×3); ``sel`` indexes the
+    rendered (decimated) subset. Orientation is estimated from each selected
+    point's full-density neighbourhood, then rotated by the ego ``yaw`` into the
+    render frame. (Yaw only: the cloud is lifted to the city frame with world x,y
+    but VEHICLE-frame z — the same stable-height simplification the AV2 lidar lift
+    uses — so a full-pose rotation would tilt ground disks off the flattened
+    rendered ground.) Disk extents are scaled to the DECIMATED spacing so the
+    sparser rendered cloud still tiles the surface. Confidence (alpha) tracks
+    local planarity. Degenerate neighbourhoods fall back to a flat, up-facing,
+    low-confidence disk.
+    """
+    from scipy.spatial import cKDTree
+
+    m = len(sel)
+    sel_pts = pts[sel]
+    # Full-density neighbourhood → covariance → eigenframe (clean normals).
+    tree = cKDTree(pts)
+    k = min(SURFEL_K, len(pts) - 1)
+    _d, idx = tree.query(sel_pts, k=k + 1)  # includes self at column 0
+    neigh = pts[idx]                         # (m, k+1, 3)
+    centred = neigh - neigh.mean(axis=1, keepdims=True)
+    cov = np.einsum("mki,mkj->mij", centred, centred) / (k + 1)
+    evals, evecs = np.linalg.eigh(cov)       # ascending eigenvalues; cols = vecs
+    l0, l1, l2 = evals[:, 0], evals[:, 1], evals[:, 2]
+    normal = evecs[:, :, 0].copy()           # smallest eigenvalue → surface normal
+    tmaj = evecs[:, :, 2].copy()             # largest → in-plane major axis
+
+    # Orient the normal consistently toward the sensor (near the vehicle origin),
+    # then build a right-handed orthonormal frame [tmaj | tmin | normal].
+    view = -sel_pts
+    flip = np.sum(normal * view, axis=1) < 0.0
+    normal[flip] *= -1.0
+    normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-12)
+    tmaj -= np.sum(tmaj * normal, axis=1, keepdims=True) * normal  # orthogonalise
+    tmaj /= np.maximum(np.linalg.norm(tmaj, axis=1, keepdims=True), 1e-12)
+    tmin = np.cross(normal, tmaj)
+
+    # Surfel frame columns in the ego frame, then yawed into the render frame
+    # (yaw only — see the docstring; the render keeps vehicle-frame z).
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    R_yaw = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+    R_surfel = np.stack([tmaj, tmin, normal], axis=2)   # (m,3,3), columns
+    R_world = np.einsum("ij,mjk->mik", R_yaw, R_surfel)
+    quat = mat3_to_quat(R_world)
+
+    # Disk extents: base size from the DECIMATED spacing (fills the rendered
+    # gaps), in-plane anisotropy from the full-density eigenvalues.
+    tree_sel = cKDTree(sel_pts)
+    dsel, _ = tree_sel.query(sel_pts, k=min(2, m))
+    spacing = dsel[:, 1] if dsel.ndim == 2 and dsel.shape[1] > 1 else np.full(m, 0.1)
+    s_base = np.clip(SURFEL_FILL * spacing, SURFEL_S_MIN, SURFEL_S_MAX)
+    aspect = np.clip(np.sqrt(np.maximum(l1, 1e-9) / np.maximum(l2, 1e-9)),
+                     SURFEL_ASPECT_FLOOR, 1.0)
+    s_major = s_base
+    s_minor = np.clip(s_base * aspect, SURFEL_S_MIN, SURFEL_S_MAX)
+
+    # Confidence from planarity ((λ1−λ0)/λ2): flat well-sampled patches read
+    # opaque, noisy/edge ones translucent.
+    planarity = np.clip((l1 - l0) / np.maximum(l2, 1e-9), 0.0, 1.0)
+    opacity = np.clip(0.45 + 0.55 * planarity, 0.30, 1.0)
+
+    # Degenerate neighbourhoods (no surface to fit) → flat up-facing fallback.
+    bad = (l2 <= 1e-9) | ~np.isfinite(quat).all(axis=1)
+    if bad.any():
+        quat[bad] = np.array([0.0, 0.0, 0.0, 1.0])
+        s_minor[bad] = s_major[bad]
+        opacity[bad] = 0.30
+
+    scale2 = np.stack([s_major, s_minor], axis=1)
+    return quat, scale2, opacity
+
+
+def extract_lidar_surfels(sweep_dir: Path, ego_pose_at, to_lonlat, colorizer,
+                          decimate: int = SURFEL_DECIMATE):
+    """Per-sweep oriented-surfel cloud → (lon, lat, t_ms, z, intensity, rgb, surfels N×7).
+
+    Each AV2 lidar sweep is one ``<ts_ns>.feather`` in the EGO frame; per sweep we
+    read all returns at FULL density, fit surfels for the decimated subset (with
+    full-density neighbourhoods, see ``compute_surfels``), camera-colour that
+    subset via the 7 ring cameras, and lift it ego→city→lon/lat (yaw rotate +
+    translate; z kept vehicle-frame). ``surfels`` is the
+    ``[qx,qy,qz,qw,s_major,s_minor,opacity]`` block for ``avc.write_lidar_points``.
+    A ``colorizer`` is required (surfels are camera-coloured); ``generate`` forces
+    one on in surfel mode.
+    """
+    fallback = np.asarray(FALLBACK_RGB, dtype=np.uint8)
+    out_lon, out_lat, out_t, out_z, out_i, out_rgb, out_sf = [], [], [], [], [], [], []
+    for sweep in sorted(sweep_dir.glob("*.feather")):
+        t_ns = int(sweep.stem)
+        t_ms = t_ns // 1_000_000
+        ecx, ecy, eyaw = ego_pose_at(t_ms)
+        df = _read_feather(sweep)
+        full = np.stack([df["x"].to_numpy(), df["y"].to_numpy(),
+                         df["z"].to_numpy()], axis=1).astype(np.float64)
+        if len(full) < SURFEL_K + 2:
+            continue
+        sel = np.arange(0, len(full), decimate)
+        if len(sel) == 0:
+            continue
+        sel_pts = full[sel]
+        intensity = (df["intensity"].to_numpy()[sel].astype("float64")
+                     if "intensity" in df else np.full(len(sel), 128.0))
+        # Project the EGO-frame returns into the ring cameras (the cameras are
+        # calibrated to the ego frame, so this is BEFORE the city lift).
+        rgb, hit = colorizer.colorize(sel_pts, t_ns)
+        rgb[~hit] = fallback
+        quat, scale2, op = compute_surfels(full, sel, eyaw)
+        # ego-frame → city (rotate by ego yaw, translate by ego pos); z stays.
+        c, s = math.cos(eyaw), math.sin(eyaw)
+        cx = ecx + sel_pts[:, 0] * c - sel_pts[:, 1] * s
+        cy = ecy + sel_pts[:, 0] * s + sel_pts[:, 1] * c
+        lon, lat = to_lonlat(cx, cy)
+        out_lon.append(np.atleast_1d(lon))
+        out_lat.append(np.atleast_1d(lat))
+        out_t.append(np.full(len(sel), t_ms, dtype="int64"))
+        out_z.append(sel_pts[:, 2])
+        out_i.append(intensity)
+        out_rgb.append(rgb)
+        out_sf.append(np.concatenate([quat, scale2, op[:, None]], axis=1))
+    if not out_lon:
+        raise SystemExit("surfel extraction produced no points")
+    return (np.concatenate(out_lon), np.concatenate(out_lat),
+            np.concatenate(out_t), np.concatenate(out_z), np.concatenate(out_i),
+            np.concatenate(out_rgb), np.concatenate(out_sf))
+
+
+def extract(log_dir: Path, city: str, drop_empty_boxes: bool = True,
+            colorizer=None, surfel_decimate=None):
     """Pull ego / objects / lidar / telemetry / HD-map arrays out of one AV2 log.
 
     ``drop_empty_boxes`` (default ``True``) drops annotation cuboids with
     ``num_interior_pts == 0`` (fully-occluded / ghost ground-truth boxes that
     have no LIDAR returns inside them) so the rendered scene isn't littered with
-    boxes around nothing. Returns
-    ``(ego, objects, lidar, telemetry_fields, map_polys, map_lines)``.
+    boxes around nothing.
+
+    When ``colorizer`` (an ``Av2Colorizer``) is given, each decimated EGO-frame
+    return is projected into the 7 ring cameras and assigned an RGB color
+    (returns no camera sees take ``FALLBACK_RGB``); the returned ``lidar`` then
+    carries an ``rgb`` array (else ``None``).
+
+    When ``surfel_decimate`` is set, the LIDAR is extracted as an ORIENTED-SURFEL
+    cloud instead (per-sweep k-NN covariance → ``compute_surfels`` /
+    ``extract_lidar_surfels``); the ``lidar`` tuple's 7th element then carries the
+    ``(N,7)`` surfel block and a ``colorizer`` is required (surfels are
+    camera-coloured). Otherwise the 7th element is ``None``.
+
+    Returns ``(ego, objects, lidar, telemetry_fields, map_polys, map_lines)``
+    where ``lidar = (lon, lat, t_ms, z, intensity, rgb, surfels)``.
     """
     to_lonlat, frame_note = _make_city_to_lonlat(city)
     print(f"  city-frame → lon/lat via {frame_note}")
@@ -399,29 +770,47 @@ def extract(log_dir: Path, city: str, drop_empty_boxes: bool = True):
     if has_nip:
         objects["num_interior_pts"] = o_nip  # → optional Int64 column on the archive
 
-    # --- lidar sweeps (ego frame → city → lon/lat), decimated ---
-    l_lon, l_lat, l_t, l_z, l_i = [], [], [], [], []
+    # --- lidar sweeps (ego frame → city → lon/lat) ---
     sweep_dir = log_dir / "sensors" / "lidar"
-    for sweep in sorted(sweep_dir.glob("*.feather")):
-        t_ms = int(sweep.stem) // 1_000_000
-        ecx, ecy, eyaw = ego_pose_at(t_ms)
-        df = _read_feather(sweep)
-        x = df["x"].to_numpy()[::LIDAR_DECIMATE]
-        y = df["y"].to_numpy()[::LIDAR_DECIMATE]
-        z = df["z"].to_numpy()[::LIDAR_DECIMATE]
-        intensity = (df["intensity"].to_numpy()[::LIDAR_DECIMATE]
-                     if "intensity" in df else np.full(len(x), 128.0))
-        c, s = math.cos(eyaw), math.sin(eyaw)
-        cx = ecx + x * c - y * s
-        cy = ecy + x * s + y * c
-        lon, lat = to_lonlat(cx, cy)
-        l_lon.append(np.asarray(lon))
-        l_lat.append(np.asarray(lat))
-        l_z.append(z)
-        l_i.append(intensity.astype("float64"))
-        l_t.append(np.full(len(x), t_ms, dtype="int64"))
-    lidar = (np.concatenate(l_lon), np.concatenate(l_lat),
-             np.concatenate(l_t), np.concatenate(l_z), np.concatenate(l_i))
+    if surfel_decimate is not None:
+        # ORIENTED-SURFEL tier: per-sweep k-NN covariance → quaternion + extents +
+        # confidence for the client's SplatLayer (camera-coloured; a colorizer is
+        # required — generate() forces one on in surfel mode).
+        lidar = extract_lidar_surfels(sweep_dir, ego_pose_at, to_lonlat, colorizer,
+                                      decimate=surfel_decimate)
+    else:
+        l_lon, l_lat, l_t, l_z, l_i = [], [], [], [], []
+        l_rgb = [] if colorizer is not None else None
+        fallback = np.asarray(FALLBACK_RGB, dtype=np.uint8)
+        for sweep in sorted(sweep_dir.glob("*.feather")):
+            t_ns = int(sweep.stem)
+            t_ms = t_ns // 1_000_000
+            ecx, ecy, eyaw = ego_pose_at(t_ms)
+            df = _read_feather(sweep)
+            x = df["x"].to_numpy()[::FINEST_DECIMATE]
+            y = df["y"].to_numpy()[::FINEST_DECIMATE]
+            z = df["z"].to_numpy()[::FINEST_DECIMATE]
+            intensity = (df["intensity"].to_numpy()[::FINEST_DECIMATE]
+                         if "intensity" in df else np.full(len(x), 128.0))
+            if l_rgb is not None:
+                # Project the SAME decimated EGO-frame returns into the ring cameras
+                # (before the city lift — the cameras are calibrated to the ego frame).
+                rgb_chunk, got = colorizer.colorize(np.stack([x, y, z], axis=1), t_ns)
+                rgb_chunk[~got] = fallback
+                l_rgb.append(rgb_chunk)
+            c, s = math.cos(eyaw), math.sin(eyaw)
+            cx = ecx + x * c - y * s
+            cy = ecy + x * s + y * c
+            lon, lat = to_lonlat(cx, cy)
+            l_lon.append(np.asarray(lon))
+            l_lat.append(np.asarray(lat))
+            l_z.append(z)
+            l_i.append(intensity.astype("float64"))
+            l_t.append(np.full(len(x), t_ms, dtype="int64"))
+        lidar = (np.concatenate(l_lon), np.concatenate(l_lat),
+                 np.concatenate(l_t), np.concatenate(l_z), np.concatenate(l_i),
+                 np.concatenate(l_rgb) if l_rgb is not None else None,
+                 None)  # no surfels in the default (round-dot) path
 
     # --- HD map (static substrate, av-refinement.md §R2.2) ---
     map_polys, map_lines = extract_map(log_dir, to_lonlat)
@@ -512,8 +901,25 @@ def generate(args):
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
 
+    # Optional camera-projection colorize (+ its correctness overlay). The SURFEL
+    # path (--surfel) implies camera colour (the disks are painted from the ring
+    # cameras), so it forces a colorizer on regardless of --colorize.
+    surfel_mode = bool(args.surfel)
+    colorizer = None
+    if args.colorize or surfel_mode or args.debug_overlay is not None:
+        colorizer = Av2Colorizer(args.log_dir)
+    if args.debug_overlay is not None:
+        debug_overlay_av2(args.log_dir, out, colorizer, args.debug_overlay)
+        print("  (--debug-overlay) wrote projection overlays; stopping.")
+        return
+
+    if surfel_mode:
+        print(f"  fitting oriented surfels per sweep (1/{args.surfel_decimate}, "
+              f"k={SURFEL_K})…")
     ego, objects, lidar, telemetry_fields, map_polys, map_lines = extract(
-        args.log_dir, args.city, drop_empty_boxes=not args.keep_empty_boxes)
+        args.log_dir, args.city, drop_empty_boxes=not args.keep_empty_boxes,
+        colorizer=colorizer,
+        surfel_decimate=(args.surfel_decimate if surfel_mode else None))
     ego_t, ego_lon, ego_lat, ego_speed = ego
     t_start, t_end = int(ego_t[0]), int(ego_t[-1])
 
@@ -528,11 +934,55 @@ def generate(args):
     n_objects = avc.write_objects_points(obj_pq, **objects)
     obj_categories = sorted(set(objects["category"]))
 
-    # --- lidar (points) ---
-    l_lon, l_lat, l_t, l_z, l_i = lidar
-    lid_pq = out / "lidar.parquet"
-    n_lidar = avc.write_lidar_points(lid_pq, lon=l_lon, lat=l_lat,
-                                     timestamp=l_t, z=l_z, intensity=l_i)
+    # --- lidar ---
+    # SURFEL mode bakes a SINGLE oriented-Gaussian-surfel tier (per-sweep k-NN
+    # covariance → quaternion + extents + confidence) for the client's SplatLayer.
+    # The default path builds the round-dot density tiers (stride the finest cloud).
+    fl_lon, fl_lat, fl_t, fl_z, fl_i, fl_rgb, fl_surf = lidar
+    if fl_rgb is not None:
+        n_seen = int((fl_rgb != np.asarray(FALLBACK_RGB, np.uint8)).any(axis=1).sum())
+        print(f"  camera colorize: {n_seen}/{len(fl_rgb)} returns "
+              f"({100 * n_seen / max(len(fl_rgb), 1):.0f}%) got a camera color")
+    lidar_densities = []
+    if surfel_mode:
+        print(f"  surfels: {len(fl_surf)} oriented disks → single 'surfel' tier")
+        tier_pq = out / "lidar.parquet"
+        n = avc.write_lidar_points(tier_pq, lon=fl_lon, lat=fl_lat, timestamp=fl_t,
+                                   z=fl_z, intensity=fl_i, rgb=fl_rgb, surfels=fl_surf)
+        if not args.skip_build:
+            tier_out = out / "lidar"
+            shutil.rmtree(tier_out, ignore_errors=True)  # prune orphan packs on rebuild
+            avc.run_stt_build(tier_pq, tier_out, "point",
+                              stt_build=args.stt_build, temporal_bucket=args.temporal_bucket,
+                              min_zoom=LIDAR_MIN_ZOOM, quantize_coords=LIDAR_QUANTIZE_M,
+                              quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M))
+            tier_pq.unlink(missing_ok=True)
+        lidar_densities.append({"id": "surfel", "label": "Surfel", "points": int(n),
+                                "url": "lidar/manifest.json"})
+        n_lidar = int(n)
+    else:
+        skip_tiers = {t.strip() for t in args.skip_tiers.split(",") if t.strip()}
+        for tier_id, label, dec, dname, radius_px, radius_min_px in LIDAR_DENSITY_TIERS:
+            if tier_id in skip_tiers:
+                continue  # caller dropped this tier (e.g. the heavy 14M `full` on tight disk)
+            stride = dec // FINEST_DECIMATE  # exact every-Nth sample of the finest cloud
+            s = slice(None, None, stride)
+            tier_pq = out / f"{dname}.parquet"
+            n = avc.write_lidar_points(tier_pq, lon=fl_lon[s], lat=fl_lat[s],
+                                       timestamp=fl_t[s], z=fl_z[s], intensity=fl_i[s],
+                                       rgb=(fl_rgb[s] if fl_rgb is not None else None))
+            if not args.skip_build:
+                tier_out = out / dname
+                shutil.rmtree(tier_out, ignore_errors=True)  # prune orphan packs on rebuild
+                avc.run_stt_build(tier_pq, tier_out, "point",
+                                  stt_build=args.stt_build, temporal_bucket=args.temporal_bucket,
+                                  min_zoom=LIDAR_MIN_ZOOM, quantize_coords=LIDAR_QUANTIZE_M,
+                                  quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M))
+                tier_pq.unlink(missing_ok=True)  # drop the big intermediate (raw log is deleted anyway)
+            lidar_densities.append({"id": tier_id, "label": label, "points": int(n),
+                                    "url": f"{dname}/manifest.json",
+                                    "radius": radius_px, "radiusMinPixels": radius_min_px})
+        n_lidar = lidar_densities[0]["points"]  # default = small tier
 
     # --- HD map (static, full-range) parquet (av-refinement.md §R2.2) ---
     map_poly_pq = out / "map_poly.parquet"
@@ -563,7 +1013,15 @@ def generate(args):
                                    frames=cam_frames)
 
     streams = {
-        "lidar": {"url": "lidar/manifest.json", "points": int(n_lidar)},
+        "lidar": {"url": "lidar/manifest.json", "points": int(n_lidar),
+                  "densities": lidar_densities,
+                  # Per-point RGB sampled from the 7 ring cameras → the frontend
+                  # paints each return (see AnimatedPointLayer.rgbColorColumns).
+                  **({"colored": True} if fl_rgb is not None else {}),
+                  # Surfel mode bakes oriented-Gaussian columns (quaternion +
+                  # extents + confidence); the cockpit renders this tier with
+                  # SplatLayer instead of AnimatedPointLayer.
+                  **({"splat": "surfel"} if surfel_mode else {})},
         "ego": {"url": "ego/manifest.json", "path": ego_path},
         "objects": {"url": "objects/manifest.json", "categories": obj_categories},
         "map": {
@@ -578,8 +1036,7 @@ def generate(args):
 
     # --- build packed archives (telemetry + camera are sidecars, written above) ---
     if not args.skip_build:
-        avc.run_stt_build(lid_pq, out / "lidar", "point",
-                          stt_build=args.stt_build, temporal_bucket=args.temporal_bucket)
+        # (lidar density tiers were built above, per density.)
         avc.run_stt_build(obj_pq, out / "objects", "point",
                           stt_build=args.stt_build, temporal_bucket=args.temporal_bucket)
         avc.run_stt_build(ego_pq, out / "ego", "trips",
@@ -641,9 +1098,32 @@ def main():
                         "(default ring_front_center)")
     p.add_argument("--no-camera", action="store_true",
                    help="skip the camera inset (don't copy any JPGs)")
+    p.add_argument("--colorize", action="store_true",
+                   help="bake per-point RGB by projecting each LIDAR return into the "
+                        "7 ring cameras (adds r/g/b columns; needs the calibration/ + "
+                        "all ring-camera JPGs). Returns no camera sees get a slate "
+                        "fallback. Pairs with the cockpit's camera-colored splat.")
+    p.add_argument("--surfel", action="store_true",
+                   help="bake ORIENTED GAUSSIAN SURFELS instead of the round-dot "
+                        "density tiers: per-sweep k-NN covariance → orientation "
+                        "quaternion + in-plane extents + confidence per return, in a "
+                        "single 'surfel' tier the cockpit renders with SplatLayer "
+                        "(scene.json lidar.splat='surfel'). Forces camera colorize "
+                        "(surfels are camera-colored — needs calibration/ + all 7 "
+                        "ring-camera JPGs). Output a sibling '<id>-surfel' bundle.")
+    p.add_argument("--surfel-decimate", type=int, default=SURFEL_DECIMATE,
+                   help=f"render decimation for the surfel tier (default {SURFEL_DECIMATE}; "
+                        "orientation still uses the FULL-density neighbourhood)")
+    p.add_argument("--debug-overlay", type=int, default=None, metavar="SWEEP",
+                   help="project sweep SWEEP into every ring camera, dots colored by "
+                        "depth, save _debug_overlay_<CAM>.png, and STOP "
+                        "(projection-correctness check).")
     p.add_argument("--keep-empty-boxes", action="store_true",
                    help="keep annotation cuboids with num_interior_pts==0 "
                         "(default drops these occluded/ghost GT boxes)")
+    p.add_argument("--skip-tiers", default="",
+                   help="comma list of LIDAR density tier ids to NOT build "
+                        "(e.g. 'full' to drop the heavy ~14M / ~1.1GB tier on tight disk)")
     p.add_argument("--temporal-bucket", default="200ms",
                    help="stt-build temporal bucket (AV2 lidar ~10 Hz → 100-200ms)")
     p.add_argument("--stt-build", default="stt-build", help="stt-build binary path")

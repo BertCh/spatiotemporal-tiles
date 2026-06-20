@@ -40,15 +40,19 @@ COORDINATE NOTES (verified against the devkit schema)
 * ``sample['timestamp']``, ``ego_pose['timestamp']`` are **microseconds** since
   the Unix epoch → divide by 1000 for the Unix-ms the contract wants.
 * ``ego_pose['translation']`` / ``sample_annotation['translation']`` are in the
-  **global map frame**, which for nuScenes is EPSG:3857 **web-mercator** metres
-  (inflated ~1/cos(lat) away from the equator) → ``av_common.local_to_lonlat(...,
-  mercator=True)`` with the map's documented SW-corner origin (NUSCENES_MAP_ORIGINS).
-  EVERY nuScenes ``local_to_lonlat`` (ego, objects, lidar, HD map) passes
-  ``mercator=True`` (av-refinement.md §R2.1) — without it Boston scenes are ~26 %
-  compressed and slide off the basemap.
+  **global map frame** — a LOCAL metric frame (true ground metres) whose origin is
+  the map's documented SW corner (NUSCENES_MAP_ORIGINS), exactly as the official
+  devkit's ``export_poses.derive_latlon`` treats it. So
+  ``av_common.local_to_lonlat(x, y, origin_lat, origin_lon)`` (ground metres) with
+  that SW-corner origin places the scene on the real basemap. EVERY nuScenes
+  conversion (ego, objects, lidar, HD map) uses this same transform so map +
+  sensors stay aligned. (Do NOT treat these as EPSG:3857 web-mercator metres — the
+  nuScenes frame is local, not the global mercator projection; the old
+  ``mercator=True`` deflation shifted Boston scenes ~450 m off the basemap and
+  shrank them ~26 %.)
 * The HD-map vectors (``NuScenesMap.extract_polygon`` / ``extract_line``) live in
-  the SAME global map frame (web-mercator metres), so they share the exact same
-  ``local_to_lonlat(..., mercator=True)`` transform — map + sensors stay aligned.
+  the SAME global map frame (ground metres), so they share the exact same
+  ``local_to_lonlat`` transform — map + sensors stay aligned.
 * ``sample_annotation['size']`` is ``[width, length, height]`` — a well-known
   nuScenes ordering GOTCHA (NOT l,w,h).
 * yaw = ``Quaternion(rotation).yaw_pitch_roll[0]`` (radians, CCW about +z,
@@ -72,6 +76,7 @@ Pipeline:  nuScenes  →  GeoParquet + JSON  →  stt-build  →  packed bundle.
 from __future__ import annotations
 
 import argparse
+import collections
 import math
 import shutil
 from pathlib import Path
@@ -84,6 +89,14 @@ import av_common as avc
 # keyframes ≈ 1.2M raw → /8 ≈ 150k, in the contract's "few hundred k" band.
 LIDAR_DECIMATE = 8
 
+# Size levers for the LiDAR build, matching waymo/argoverse (av_common docstrings):
+# clamp the zoom pyramid (a nuScenes scene sits in ~one tile below z14, so z0-13
+# is the "z0 bomb") and store geometry + numeric attrs as fixed-point ints. These
+# were previously omitted here, so nuScenes shipped a full pyramid of raw-Float64
+# tiles — the heaviest LiDAR build in the showcase despite being the default demo.
+LIDAR_MIN_ZOOM = 14
+LIDAR_QUANTIZE_M = 0.05  # ~3.75 cm grid (av_common warns to keep AV quantize <= 0.1)
+
 # Decimate CAM_FRONT keyframes to ~20 frames in the cockpit's camera inset
 # (every Nth keyframe). 40 keyframes / 2 ≈ 20, the contract's camera band.
 CAMERA_DECIMATE = 2
@@ -91,7 +104,7 @@ CAMERA_DECIMATE = 2
 # HD-map substrate (av-refinement.md §R2.2). The polygon vs line layers of the
 # nuScenes map-expansion we surface, in the cockpit's painter order. ``MAP_PAD_M``
 # expands the ego bounding box by this many metres so the visible map extends a
-# little past the drive (clip patch is in map-frame web-mercator metres, same as
+# little past the drive (clip patch is in map-frame ground metres, same as
 # the ego/object coords).
 MAP_POLY_LAYERS = (
     "drivable_area",
@@ -104,6 +117,166 @@ MAP_POLY_LAYERS = (
 )
 MAP_LINE_LAYERS = ("road_divider", "lane_divider")
 MAP_PAD_M = 80.0
+
+# ── camera-projection colorize (optional, --colorize) ─────────────────────────
+# nuScenes ships SIX cameras covering the full 360° around the car (unlike Waymo's
+# ~252° front+sides), so a colorized cloud is nearly complete. Each camera's
+# `calibrated_sensor` carries a 3×3 `camera_intrinsic` (rectified pinhole, NO
+# distortion) + a sensor→ego rotation (quaternion w,x,y,z) + translation. The
+# optical axis is camera +z (standard CV convention).
+NUSCENES_CAMERAS = (
+    "CAM_FRONT", "CAM_FRONT_RIGHT", "CAM_FRONT_LEFT",
+    "CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT",
+)
+# Cool slate for returns no camera sees (above the FOV / occluded) — same value
+# as the Waymo colorizer so colored scenes read consistently across sources.
+FALLBACK_RGB = (70, 78, 96)
+# Returns nearer than this (m) to a camera are skipped (on the ego shell).
+MIN_CAM_DEPTH_M = 1.0
+
+
+class NuScenesColorizer:
+    """Projects GLOBAL-frame LIDAR returns into the 6 cameras to sample RGB.
+
+    Per keyframe, each return is projected into every camera; a return seen by
+    several cameras takes the color of the one viewing it most CENTRALLY (smallest
+    normalized angular radius from the optical axis ⇒ least oblique, most reliable
+    color). The transform chain is the canonical devkit one
+    (``map_pointcloud_to_image``): global → ego(camera ts) → camera → pixel via
+    ``camera_intrinsic``. Returns no camera sees keep ``got=False``.
+    """
+
+    def __init__(self, dataroot: Path):
+        self.dataroot = dataroot
+        self._cache: "collections.OrderedDict[str, np.ndarray]" = \
+            collections.OrderedDict()
+
+    def _image(self, filename: str):
+        """Decode (LRU-cached, ≤12) one camera JPG under the dataroot → HxWx3."""
+        from PIL import Image
+
+        arr = self._cache.get(filename)
+        if arr is not None:
+            self._cache.move_to_end(filename)
+            return arr
+        path = self.dataroot / filename
+        if not path.exists():
+            return None
+        arr = np.asarray(Image.open(path).convert("RGB"))
+        self._cache[filename] = arr
+        if len(self._cache) > 12:
+            self._cache.popitem(last=False)
+        return arr
+
+    def colorize(self, nusc, sample, pts_global: np.ndarray):
+        """(global-frame N×3 pts, the keyframe sample) → (rgb uint8 N×3, got N)."""
+        from pyquaternion import Quaternion
+
+        n = len(pts_global)
+        rgb = np.zeros((n, 3), dtype=np.uint8)
+        best_r2 = np.full(n, np.inf)
+        got = np.zeros(n, dtype=bool)
+        for cam in NUSCENES_CAMERAS:
+            tok = sample["data"].get(cam)
+            if tok is None:
+                continue
+            sd = nusc.get("sample_data", tok)
+            img = self._image(sd["filename"])
+            if img is None:
+                continue
+            h, w = img.shape[0], img.shape[1]
+            cs = nusc.get("calibrated_sensor", sd["calibrated_sensor_token"])
+            ep = nusc.get("ego_pose", sd["ego_pose_token"])
+            K = np.asarray(cs["camera_intrinsic"], dtype=np.float64)
+            R_ep = Quaternion(ep["rotation"]).rotation_matrix
+            t_ep = np.asarray(ep["translation"], dtype=np.float64)
+            R_cs = Quaternion(cs["rotation"]).rotation_matrix
+            t_cs = np.asarray(cs["translation"], dtype=np.float64)
+            # global → ego(cam ts) → camera frame (Rᵀ(p−t) == (p−t)@R).
+            pe = (pts_global - t_ep) @ R_ep
+            pc = (pe - t_cs) @ R_cs
+            depth = pc[:, 2]  # optical axis = +z
+            in_front = depth > MIN_CAM_DEPTH_M
+            ds = np.where(in_front, depth, 1.0)
+            xn = pc[:, 0] / ds
+            yn = pc[:, 1] / ds
+            ui = np.round(K[0, 0] * xn + K[0, 2]).astype(np.int64)
+            vi = np.round(K[1, 1] * yn + K[1, 2]).astype(np.int64)
+            valid = in_front & (ui >= 0) & (ui < w) & (vi >= 0) & (vi < h)
+            r2 = xn * xn + yn * yn  # angular distance² from the optical axis
+            better = valid & (r2 < best_r2)
+            if better.any():
+                bi = np.where(better)[0]
+                rgb[bi] = img[vi[bi], ui[bi]]
+                best_r2[bi] = r2[bi]
+                got[bi] = True
+        return rgb, got
+
+
+def _depth_ramp(depth: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Jet-ish depth → RGB uint8 ramp for the debug overlay (no matplotlib)."""
+    t = np.clip((depth - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    r = np.clip(1.5 - np.abs(4.0 * t - 3.0), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4.0 * t - 2.0), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4.0 * t - 1.0), 0.0, 1.0)
+    return (np.stack([r, g, b], axis=1) * 255).astype(np.uint8)
+
+
+def debug_overlay_nuscenes(nusc, scene, dataroot: Path, out: Path,
+                           colorizer: "NuScenesColorizer", sample_index: int):
+    """Project one keyframe's full sweep into every camera, dots colored by DEPTH.
+
+    Saves ``<out>/_debug_overlay_<CAM>.png`` per camera — the projection-
+    correctness check (dots must land ON cars/road/buildings).
+    """
+    from nuscenes.utils.data_classes import LidarPointCloud
+    from pyquaternion import Quaternion
+    from PIL import Image
+
+    out.mkdir(parents=True, exist_ok=True)
+    samples = list(_iter_samples(nusc, scene))
+    idx = max(0, min(sample_index, len(samples) - 1))
+    sample = samples[idx]
+    sd_lidar = nusc.get("sample_data", sample["data"]["LIDAR_TOP"])
+    pose = nusc.get("ego_pose", sd_lidar["ego_pose_token"])
+    cs_l = nusc.get("calibrated_sensor", sd_lidar["calibrated_sensor_token"])
+    pc = LidarPointCloud.from_file(str(dataroot / sd_lidar["filename"]))
+    pc.rotate(Quaternion(cs_l["rotation"]).rotation_matrix)
+    pc.translate(np.asarray(cs_l["translation"]))
+    pc.rotate(Quaternion(pose["rotation"]).rotation_matrix)
+    pc.translate(np.asarray(pose["translation"]))
+    pts_g = pc.points[:3].T  # (N,3) global, full density
+    print(f"  debug overlay: keyframe {idx}, {len(pts_g)} returns")
+    for cam in NUSCENES_CAMERAS:
+        tok = sample["data"].get(cam)
+        if tok is None:
+            continue
+        sd = nusc.get("sample_data", tok)
+        img = colorizer._image(sd["filename"])
+        if img is None:
+            continue
+        h, w = img.shape[0], img.shape[1]
+        cs = nusc.get("calibrated_sensor", sd["calibrated_sensor_token"])
+        ep = nusc.get("ego_pose", sd["ego_pose_token"])
+        K = np.asarray(cs["camera_intrinsic"], dtype=np.float64)
+        pe = (pts_g - np.asarray(ep["translation"])) @ Quaternion(ep["rotation"]).rotation_matrix
+        pcam = (pe - np.asarray(cs["translation"])) @ Quaternion(cs["rotation"]).rotation_matrix
+        depth = pcam[:, 2]
+        in_front = depth > MIN_CAM_DEPTH_M
+        ds = np.where(in_front, depth, 1.0)
+        ui = np.round(K[0, 0] * pcam[:, 0] / ds + K[0, 2]).astype(np.int64)
+        vi = np.round(K[1, 1] * pcam[:, 1] / ds + K[1, 2]).astype(np.int64)
+        valid = in_front & (ui >= 0) & (ui < w) & (vi >= 0) & (vi < h)
+        canvas = img.copy()
+        bi = np.where(valid)[0]
+        if len(bi):
+            colors = _depth_ramp(depth[bi], depth[bi].min(), np.percentile(depth[bi], 95))
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    canvas[np.clip(vi[bi] + dy, 0, h - 1), np.clip(ui[bi] + dx, 0, w - 1)] = colors
+        path = out / f"_debug_overlay_{cam}.png"
+        Image.fromarray(canvas).save(path)
+        print(f"    wrote {path}  ({len(bi)} projected returns)")
 
 
 def downsample_ego_path(ego_t, ego_lon, ego_lat, target=60):
@@ -186,7 +359,7 @@ def _iter_samples(nusc, scene):
 
 
 def extract(nusc, scene, dataroot: Path, origin_lat: float, origin_lon: float,
-            seg_lut=None):
+            seg_lut=None, colorizer=None):
     """Pull ego / objects / lidar / camera arrays out of one scene (global frame).
 
     When ``seg_lut`` is given (a numpy array mapping each lidarseg class index to
@@ -194,6 +367,11 @@ def extract(nusc, scene, dataroot: Path, origin_lat: float, origin_lon: float,
     is read from the scene's lidarseg ``.bin`` files and decimated in lockstep
     with the points, so the returned ``lidar`` carries a ``seg`` array; else
     ``seg`` is ``None`` and the cloud falls back to height-band coloring.
+
+    When ``colorizer`` (a ``NuScenesColorizer``) is given, each decimated return is
+    projected into the 6 cameras and assigned an RGB color (returns no camera sees
+    take ``FALLBACK_RGB``), so the cloud can be painted per-point from the imagery;
+    the returned ``lidar`` then carries an ``rgb`` array (else ``None``).
     """
     from nuscenes.utils.data_classes import LidarPointCloud
     from pyquaternion import Quaternion
@@ -203,6 +381,8 @@ def extract(nusc, scene, dataroot: Path, origin_lat: float, origin_lon: float,
     o_cat, o_head, o_len, o_wid, o_hgt, o_track, o_speed = [], [], [], [], [], [], []
     l_x, l_y, l_z, l_i, l_t = [], [], [], [], []
     l_seg = [] if seg_lut is not None else None
+    l_rgb = [] if colorizer is not None else None
+    fallback = np.asarray(FALLBACK_RGB, dtype=np.uint8)
     cam_frames = []
 
     prev_xy = None
@@ -229,7 +409,7 @@ def extract(nusc, scene, dataroot: Path, origin_lat: float, origin_lon: float,
         for ann_token in sample["anns"]:
             ann = nusc.get("sample_annotation", ann_token)
             ox, oy = float(ann["translation"][0]), float(ann["translation"][1])
-            lon, lat = avc.local_to_lonlat(ox, oy, origin_lat, origin_lon, mercator=True)
+            lon, lat = avc.local_to_lonlat(ox, oy, origin_lat, origin_lon)
             w, length, h = ann["size"]  # GOTCHA: nuScenes size is [w, l, h]
             vel = nusc.box_velocity(ann_token)  # [vx,vy,vz] m/s global, may be nan
             spd = float(np.hypot(vel[0], vel[1])) if np.all(np.isfinite(vel[:2])) else 0.0
@@ -256,8 +436,8 @@ def extract(nusc, scene, dataroot: Path, origin_lat: float, origin_lon: float,
         # they stay index-aligned (the label file is in raw sweep order, the
         # same order LidarPointCloud.from_file reads).
         dec = slice(None, None, LIDAR_DECIMATE)
-        pts = pc.points[:, dec]  # (4, N/dec): x,y,z,intensity
-        lon, lat = avc.local_to_lonlat(pts[0], pts[1], origin_lat, origin_lon, mercator=True)
+        pts = pc.points[:, dec]  # (4, N/dec): x,y,z,intensity (GLOBAL frame)
+        lon, lat = avc.local_to_lonlat(pts[0], pts[1], origin_lat, origin_lon)
         # z relative to the ego ground (global z minus sensor-height baseline).
         z = pts[2] - float(pose["translation"][2])
         l_x.append(np.asarray(lon))
@@ -265,6 +445,11 @@ def extract(nusc, scene, dataroot: Path, origin_lat: float, origin_lon: float,
         l_z.append(z)
         l_i.append(pts[3])
         l_t.append(np.full(pts.shape[1], t_ms, dtype="int64"))
+        if l_rgb is not None:
+            # Project the SAME decimated global-frame returns into the cameras.
+            rgb_chunk, got = colorizer.colorize(nusc, sample, pts[:3].T)
+            rgb_chunk[~got] = fallback
+            l_rgb.append(rgb_chunk)
         if l_seg is not None:
             # lidarseg label file = uint8 / point, same length + order as the
             # raw sweep; index the coarse-class LUT then decimate identically.
@@ -288,6 +473,7 @@ def extract(nusc, scene, dataroot: Path, origin_lat: float, origin_lon: float,
         np.concatenate(l_x), np.concatenate(l_y),
         np.concatenate(l_t), np.concatenate(l_z), np.concatenate(l_i),
         np.concatenate(l_seg) if l_seg is not None else None,
+        np.concatenate(l_rgb) if l_rgb is not None else None,
     )
     return ego, objects, lidar, cam_frames
 
@@ -359,22 +545,22 @@ def extract_can(nusc_can, scene_name: str):
 
 
 def _poly_to_lonlat(poly, origin_lat: float, origin_lon: float):
-    """Map-frame (web-mercator metres) shapely Polygon → lon/lat shapely Polygon.
+    """Map-frame (ground metres) shapely Polygon → lon/lat shapely Polygon.
 
     Transforms the exterior ring AND every interior ring (hole) through
-    ``local_to_lonlat(..., mercator=True)`` so the HD-map shares the exact georef
+    ``local_to_lonlat (ground metres)`` so the HD-map shares the exact georef
     of the ego/object/lidar streams. Returns ``None`` if the result is degenerate
     (empty / invalid after the transform).
     """
     from shapely.geometry import Polygon
 
     ex = np.asarray(poly.exterior.coords)  # (N, 2+) map-frame metres
-    elon, elat = avc.local_to_lonlat(ex[:, 0], ex[:, 1], origin_lat, origin_lon, mercator=True)
+    elon, elat = avc.local_to_lonlat(ex[:, 0], ex[:, 1], origin_lat, origin_lon)
     shell = list(zip(elon.tolist(), elat.tolist()))
     holes = []
     for ring in poly.interiors:
         h = np.asarray(ring.coords)
-        hlon, hlat = avc.local_to_lonlat(h[:, 0], h[:, 1], origin_lat, origin_lon, mercator=True)
+        hlon, hlat = avc.local_to_lonlat(h[:, 0], h[:, 1], origin_lat, origin_lon)
         holes.append(list(zip(hlon.tolist(), hlat.tolist())))
     out = Polygon(shell, holes)
     if out.is_empty or not out.is_valid:
@@ -383,11 +569,11 @@ def _poly_to_lonlat(poly, origin_lat: float, origin_lon: float):
 
 
 def _line_to_lonlat(line, origin_lat: float, origin_lon: float):
-    """Map-frame (web-mercator metres) shapely LineString → lon/lat LineString."""
+    """Map-frame (ground metres) shapely LineString → lon/lat LineString."""
     from shapely.geometry import LineString
 
     c = np.asarray(line.coords)
-    lon, lat = avc.local_to_lonlat(c[:, 0], c[:, 1], origin_lat, origin_lon, mercator=True)
+    lon, lat = avc.local_to_lonlat(c[:, 0], c[:, 1], origin_lat, origin_lon)
     if len(lon) < 2:
         return None
     return LineString(list(zip(lon.tolist(), lat.tolist())))
@@ -409,7 +595,7 @@ def extract_map(dataroot: Path, location: str, ego_x, ego_y, origin_lat, origin_
 
     Returns ``(polys, lines)`` where each is a list of ``(shapely geom in lon/lat,
     map_layer:str)`` — exactly the iterable ``av_common.write_map_polygons`` /
-    ``write_map_lines`` expect. Coordinates use the SAME ``mercator=True`` georef
+    ``write_map_lines`` expect. Coordinates use the SAME ground-metre georef
     as the sensor streams, so the map registers under the lidar/objects.
     """
     from nuscenes.map_expansion.map_api import NuScenesMap
@@ -480,16 +666,28 @@ def generate(args):
     if seg_lut is None:
         print("  no lidarseg labels → height-band LIDAR coloring")
 
-    print(f"Extracting {scene['name']} @ {location} → {args.out}")
+    # Optional camera-projection colorize (+ its correctness overlay).
+    colorizer = None
+    if args.colorize or args.debug_overlay is not None:
+        colorizer = NuScenesColorizer(dataroot)
+    if args.debug_overlay is not None:
+        debug_overlay_nuscenes(nusc, scene, dataroot, args.out, colorizer,
+                               args.debug_overlay)
+        print("  (--debug-overlay) wrote projection overlays; stopping.")
+        return
+
+    print(f"Extracting {scene['name']} @ {location} → {args.out}"
+          + ("  (+camera colorize)" if colorizer else ""))
     ego, objects, lidar, cam_frames = extract(
-        nusc, scene, dataroot, origin_lat, origin_lon, seg_lut=seg_lut)
+        nusc, scene, dataroot, origin_lat, origin_lon, seg_lut=seg_lut,
+        colorizer=colorizer)
     ego_t, ego_x, ego_y, ego_speed = ego
     t_start, t_end = int(ego_t[0]), int(ego_t[-1])
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
 
     # --- ego (trips) ---
-    ego_lon, ego_lat = avc.local_to_lonlat(ego_x, ego_y, origin_lat, origin_lon, mercator=True)
+    ego_lon, ego_lat = avc.local_to_lonlat(ego_x, ego_y, origin_lat, origin_lon)
     ego_pq = out / "ego.parquet"
     avc.write_ego_trips(ego_pq, lon=ego_lon, lat=ego_lat,
                         vertex_timestamps=ego_t.tolist(),
@@ -501,16 +699,20 @@ def generate(args):
     obj_categories = sorted(set(objects["category"]))
 
     # --- lidar (points) ---
-    l_lon, l_lat, l_t, l_z, l_i, l_seg = lidar
+    l_lon, l_lat, l_t, l_z, l_i, l_seg, l_rgb = lidar
+    if l_rgb is not None:
+        n_seen = int((l_rgb != np.asarray(FALLBACK_RGB, np.uint8)).any(axis=1).sum())
+        print(f"  camera colorize: {n_seen}/{len(l_rgb)} returns "
+              f"({100 * n_seen / max(len(l_rgb), 1):.0f}%) got a camera color")
     lid_pq = out / "lidar.parquet"
     n_lidar = avc.write_lidar_points(lid_pq, lon=l_lon, lat=l_lat,
                                      timestamp=l_t, z=l_z, intensity=l_i,
-                                     seg_class=l_seg)
+                                     seg_class=l_seg, rgb=l_rgb)
 
     # --- HD-map substrate (static, full-range — av-refinement.md §R2.2) ---
     # Clip the nuScenes map-expansion to the ego bbox+pad. ego_x/ego_y are raw
-    # map-frame (web-mercator) metres, the patch units get_records_in_patch wants;
-    # extract_map projects every geom through the same mercator=True georef.
+    # map-frame (ground) metres, the patch units get_records_in_patch wants;
+    # extract_map projects every geom through the same ground-metre georef.
     map_polys, map_lines = extract_map(
         dataroot, location, ego_x, ego_y, origin_lat, origin_lon)
     map_poly_pq = out / "map_poly.parquet"
@@ -530,7 +732,10 @@ def generate(args):
 
     # --- telemetry (CAN bus, optional) ---
     streams = {
-        "lidar": {"url": "lidar/manifest.json", "points": int(n_lidar)},
+        "lidar": {"url": "lidar/manifest.json", "points": int(n_lidar),
+                  # Per-point RGB sampled from the 6 cameras → the frontend paints
+                  # each return its own color (see AnimatedPointLayer.rgbColorColumns).
+                  **({"colored": True} if l_rgb is not None else {})},
         "ego": {"url": "ego/manifest.json", "path": ego_path},
         "objects": {"url": "objects/manifest.json", "categories": obj_categories},
         "map": {
@@ -560,7 +765,9 @@ def generate(args):
     # --- build packed archives ---
     if not args.skip_build:
         avc.run_stt_build(lid_pq, out / "lidar", "point",
-                          stt_build=args.stt_build, temporal_bucket=args.temporal_bucket)
+                          stt_build=args.stt_build, temporal_bucket=args.temporal_bucket,
+                          min_zoom=LIDAR_MIN_ZOOM, quantize_coords=LIDAR_QUANTIZE_M,
+                          quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M))
         avc.run_stt_build(obj_pq, out / "objects", "point",
                           stt_build=args.stt_build, temporal_bucket=args.temporal_bucket)
         avc.run_stt_build(ego_pq, out / "ego", "trips",
@@ -618,6 +825,14 @@ def main():
     p.add_argument("--stt-build", default="stt-build", help="stt-build binary path")
     p.add_argument("--no-lidarseg", action="store_true",
                    help="ignore nuScenes-lidarseg labels; color LIDAR by height band")
+    p.add_argument("--colorize", action="store_true",
+                   help="bake per-point RGB by projecting each LIDAR return into the "
+                        "6 cameras (adds r/g/b columns). Returns no camera sees get a "
+                        "slate fallback. Pairs with the cockpit's camera-colored splat.")
+    p.add_argument("--debug-overlay", type=int, default=None, metavar="KEYFRAME",
+                   help="project keyframe KEYFRAME's sweep into every camera, dots "
+                        "colored by depth, save _debug_overlay_<CAM>.png, and STOP "
+                        "(projection-correctness check).")
     p.add_argument("--skip-build", action="store_true",
                    help="stop at GeoParquet + JSON (don't run stt-build)")
     args = p.parse_args()
