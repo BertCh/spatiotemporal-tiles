@@ -20,9 +20,14 @@ OUT="../../examples/showcase/public/data"
 STT="${STT_BUILD:-$HERE/../../target/release/stt-build}"
 PY="venv-waymo/bin/python"
 
-# All 5 Waymo cockpit scenes (same set as waymo_surfel_batch.sh). High-XY-res
-# FLAT density overview (cell/decimate/sigma/simplify defaults in av_common.
-# add_contour_args); the 3D sibling is waymo_iso3d_batch.sh.
+# High-XY FLAT density overview recipe (matches argoverse_iso_all_batch.sh's flat
+# pass): with no height layers, flat spends its whole budget on a FINE horizontal
+# grid over ALL returns. The 3D sibling is waymo_iso3d_batch.sh. Override via env.
+CELL="${CELL:-0.10}"
+DECIMATE="${DECIMATE:-1}"
+SIGMA="${SIGMA:-3.0}"
+
+# All 5 Waymo cockpit scenes (same set as waymo_surfel_batch.sh).
 SCENES=(
   "waymo-sf-day:1943605865180232897_680_000_700_000"
   "waymo-phx-day:8956556778987472864_3404_790_3424_790"
@@ -38,7 +43,8 @@ for entry in "${SCENES[@]}"; do
   if [[ -f "$out/scene.json" && "${FORCE:-0}" != "1" ]]; then
     echo "  already built — skip (FORCE=1 to rebuild)"; continue
   fi
-  "$PY" waymo_extract.py --seg "$seg" --out "$out" --stt-build "$STT" --contours
+  "$PY" waymo_extract.py --seg "$seg" --out "$out" --stt-build "$STT" --contours \
+    --contour-cell "$CELL" --contour-decimate "$DECIMATE" --contour-sigma "$SIGMA"
   echo "  built $id-iso"
 done
 echo "ALL WAYMO ISO SCENES DONE"
