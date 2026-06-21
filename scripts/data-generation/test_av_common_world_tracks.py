@@ -234,6 +234,30 @@ def test_write_lidar_points_world_columns_roundtrip():
     print("PASS test_write_lidar_points_world_columns_roundtrip")
 
 
+def test_write_lidar_points_end_timestamp_roundtrip():
+    """Full-range STATIC stage: end_timestamp column = scene end (scalar broadcast)."""
+    import pyarrow.parquet as pq
+    import pyarrow as pa
+
+    n = 4
+    lon = np.linspace(0, 0.001, n)
+    lat = np.linspace(0, 0.001, n)
+    ts = np.array([1000, 1100, 1200, 1300], dtype="int64")  # first_seen per voxel
+    z = np.linspace(0, 2, n)
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "static.parquet"
+        avc.write_lidar_points(out, lon=lon, lat=lat, timestamp=ts,
+                               end_timestamp=9999, z=z)
+        tbl = pq.read_table(out)
+        assert "end_timestamp" in tbl.column_names
+        assert pa.types.is_integer(tbl.schema.field("end_timestamp").type)
+        # Scalar broadcast to every row → all == scene end.
+        assert tbl.column("end_timestamp").to_pylist() == [9999] * n
+        # timestamp keeps the per-voxel first_seen (validity [first_seen, end]).
+        assert tbl.column("timestamp").to_pylist() == ts.tolist()
+    print("PASS test_write_lidar_points_end_timestamp_roundtrip")
+
+
 def test_write_lidar_points_scan_phase_roundtrip():
     import pyarrow.parquet as pq
     import pyarrow as pa
@@ -273,6 +297,214 @@ def test_phase_to_rgb_ramp():
     # monotone-ish hue: not all the same colour.
     assert len({tuple(c) for c in rgb}) >= 5
     print("PASS test_phase_to_rgb_ramp")
+
+
+# ── Feature 6: scene-split (stage + actors) — finalize_* + erasor_scrub ───────
+def test_finalize_stage_columns_and_drop_mask():
+    sweeps, n_unique = _three_sweep_static_box_cloud()
+    acc = avc.WorldVoxelAccumulator(voxel_m=0.15)
+    for xy, z, t, rgb, hit in sweeps:
+        acc.add(xy, z, t, rgb=rgb, rgb_hit=hit)
+    # finalize ONCE and share with the drop mask (the index-alignment contract).
+    final = acc.finalize()
+    drop = np.zeros(n_unique, dtype=bool)
+    drop[:5] = True  # scrub the first 5 voxels
+    stage = avc.finalize_stage(final, drop_mask=drop)
+    kept = n_unique - 5
+    assert len(stage["z"]) == kept, f"{len(stage['z'])} != {kept}"
+    # Stage is entirely STATIC: is_dynamic all 0, world_class all "static".
+    assert int(stage["is_dynamic"].sum()) == 0, stage["is_dynamic"].sum()
+    assert set(map(str, stage["world_class"].tolist())) == {"static"}
+    # timestamp carries first_seen (== 1000 in the fixture, minus the dropped rows).
+    assert set(stage["timestamp"].tolist()) == {1000}, set(stage["timestamp"].tolist())
+    assert stage["surfels"].shape == (kept, 7), stage["surfels"].shape
+    assert stage["rgb"].shape == (kept, 3) and stage["rgb"].dtype == np.uint8
+    # No drop_mask → all voxels kept.
+    stage_all = avc.finalize_stage(final)
+    assert len(stage_all["z"]) == n_unique
+    print(f"PASS test_finalize_stage_columns_and_drop_mask "
+          f"({n_unique} → {kept} after scrub)")
+
+
+def test_finalize_actors_columns_and_empty():
+    d_xy = np.array([[10.0, 0.0]] * 4 + [[10.1, 0.0]] * 4)
+    d_z = np.linspace(0.0, 2.0, 8)
+    d_rgb = np.full((8, 3), [200, 50, 50], dtype="float64")
+    d_t = np.array([1000, 1000, 1000, 1000, 2000, 2000, 2000, 2000], dtype="int64")
+    actors = avc.finalize_actors(dict(xy=d_xy, z=d_z, rgb=d_rgb, t=d_t))
+    assert len(actors["z"]) == 8
+    # Actors are entirely DYNAMIC and keep their per-sweep time.
+    assert int(actors["is_dynamic"].sum()) == 8, actors["is_dynamic"].sum()
+    assert set(map(str, actors["world_class"].tolist())) == {"dynamic"}
+    assert set(actors["timestamp"].tolist()) == {1000, 2000}
+    assert actors["surfels"].shape == (8, 7), actors["surfels"].shape
+    assert actors["rgb"].shape == (8, 3) and actors["rgb"].dtype == np.uint8
+    # Empty actors (a scene with no movers) → all-zero-length, no crash.
+    empty = avc.finalize_actors(dict())
+    assert len(empty["z"]) == 0 and empty["surfels"].shape == (0, 7)
+    print("PASS test_finalize_actors_columns_and_empty")
+
+
+def _erasor_fixture():
+    """A static WALL + GROUND (every sweep) + a GHOST car seen in ONE sweep.
+
+    The accumulated MAP holds the wall (tall, real), the ground (low, protected)
+    and a ghost return at (10,0,1.5) (a passed-through car's residual). 6 sweeps
+    all observe the wall + ground; only sweep 0 still sees the car. ERASOR should
+    drop the ghost (transient in 5/6 sweeps) and keep everything else.
+    Returns (map_4tuple, scans, ghost_index).
+    """
+    # MAP voxels (m_xy, m_z): wall (9) + ground (5) + ghost (1) = 15.
+    wall_xy, wall_z = [], []
+    for y in (-1.0, 0.0, 1.0):
+        for z in (0.5, 1.5, 2.5):
+            wall_xy.append([20.0, y]); wall_z.append(z)
+    ground_xy = [[5.0, 0.0], [10.0, 0.0], [15.0, 0.0], [20.0, 0.0], [25.0, 0.0]]
+    ground_z = [0.0] * 5
+    ghost_xy = [[10.0, 0.0]]
+    ghost_z = [1.5]
+    m_xy = np.array(wall_xy + ground_xy + ghost_xy, dtype="float64")
+    m_z = np.array(wall_z + ground_z + ghost_z, dtype="float64")
+    ghost_index = len(m_z) - 1
+    rgb = np.zeros((len(m_z), 3), dtype="uint8")
+    first_seen = np.full(len(m_z), 1000, dtype="int64")
+
+    # Per-sweep STATIC scans: wall + ground every sweep; the car only in sweep 0.
+    wall_scan = np.array([[20.0, y] for y in (-1.0, 0.0, 1.0)
+                          for _ in (0.5, 1.5, 2.5)], dtype="float64")
+    wall_scan_z = np.array([z for _ in (-1.0, 0.0, 1.0) for z in (0.5, 1.5, 2.5)])
+    ground_scan = np.array(ground_xy, dtype="float64")
+    ground_scan_z = np.array(ground_z)
+    ego = np.array([0.0, 0.0])
+    scans = []
+    for k in range(6):
+        sx = np.vstack([wall_scan, ground_scan])
+        sz = np.concatenate([wall_scan_z, ground_scan_z])
+        if k == 0:  # the car is still here in sweep 0
+            sx = np.vstack([sx, np.array([[10.0, 0.0]])])
+            sz = np.concatenate([sz, np.array([1.5])])
+        scans.append((sx, sz, ego))
+    return (m_xy, m_z, rgb, first_seen), scans, ghost_index
+
+
+def test_erasor_scrub_drops_ghost_keeps_structure():
+    final, scans, ghost = _erasor_fixture()
+    drop = avc.erasor_scrub(final, scans)
+    assert drop[ghost], "ghost trail should be scrubbed"
+    # Everything else (wall + ground) is kept.
+    keep = drop.copy(); keep[ghost] = False
+    assert not keep.any(), f"only the ghost should drop, got {np.flatnonzero(drop)}"
+    print(f"PASS test_erasor_scrub_drops_ghost_keeps_structure "
+          f"(dropped {int(drop.sum())}/{len(drop)} = ghost #{ghost})")
+
+
+def test_erasor_scrub_is_order_independent():
+    final, scans, _ = _erasor_fixture()
+    a = avc.erasor_scrub(final, scans)
+    b = avc.erasor_scrub(final, list(reversed(scans)))
+    assert np.array_equal(a, b), "ERASOR must be order-independent (deterministic)"
+    # Empty inputs are safe.
+    assert avc.erasor_scrub(final, []).tolist() == [False] * len(final[1])
+    print("PASS test_erasor_scrub_is_order_independent")
+
+
+def test_adaptive_stage_select_coarsens_flats_keeps_complex():
+    """Curvature-adaptive: a flat plane collapses hard, a complex blob is preserved."""
+    rng = np.random.default_rng(1)
+    # Flat plane: dense 0.1 m grid over 4×4 m at z≈0 (near-zero surface variation).
+    g = np.arange(0.0, 4.0, 0.1)
+    fx, fy = np.meshgrid(g, g)
+    flat = np.column_stack([fx.ravel(), fy.ravel(), rng.normal(0, 0.002, fx.size)])
+    n_flat = len(flat)
+    # Complex blob: a dense volumetric cube 2 m away (high surface variation).
+    blob = np.column_stack([6.0 + rng.uniform(0, 1, 800),
+                            rng.uniform(0, 1, 800),
+                            rng.uniform(0, 1, 800)])
+    n_blob = len(blob)
+    pts = np.vstack([flat, blob])
+    sel = avc.adaptive_stage_select(pts, base_voxel=0.1, max_voxel=0.5, levels=6)
+    kept = np.zeros(len(pts), bool)
+    kept[sel] = True
+    flat_frac = kept[:n_flat].sum() / n_flat
+    blob_frac = kept[n_flat:].sum() / n_blob
+    assert len(sel) < len(pts), "nothing compacted"
+    assert flat_frac < 0.25, f"flats not compacted enough: {flat_frac:.2f}"
+    assert blob_frac > 2 * flat_frac, \
+        f"complex not preserved vs flat: blob {blob_frac:.2f} vs flat {flat_frac:.2f}"
+    # base_voxel >= max_voxel (or tiny cloud) → no-op passthrough.
+    allsel = avc.adaptive_stage_select(pts, base_voxel=0.5, max_voxel=0.5)
+    assert len(allsel) == len(pts)
+    print(f"PASS test_adaptive_stage_select_coarsens_flats_keeps_complex "
+          f"(flat {flat_frac:.2f} kept, blob {blob_frac:.2f} kept)")
+
+
+def test_grade_rgb_white_balance_and_saturation():
+    """grade_rgb: gray-world WB neutralizes a cast; saturation widens; default no-op."""
+    # Blue-cast gray (B>R) → gray-world WB pulls the channel means together.
+    cast = np.tile([100, 105, 130], (64, 1))
+    wb = avc.grade_rgb(cast, white_balance=True).astype("float64").mean(0)
+    assert (wb.max() - wb.min()) < (130 - 100) * 0.5, wb
+    # saturation > 1 widens the channel spread on a colored patch.
+    col = np.tile([150, 100, 80], (64, 1))
+    s0 = float((col.max(1) - col.min(1)).mean())
+    s1 = avc.grade_rgb(col, saturation=2.0).astype("float64")
+    s1 = float((s1.max(1) - s1.min(1)).mean())
+    assert s1 > s0, (s0, s1)
+    # exposure > 1 brightens.
+    assert avc.grade_rgb(col, exposure=1.5).astype("float64").mean() > col.mean()
+    # all-default grade is ~identity (sRGB→linear→sRGB round-trip within rounding).
+    same = avc.grade_rgb(col)
+    assert int(np.abs(same.astype("int64") - col).max()) <= 2
+    print("PASS test_grade_rgb_white_balance_and_saturation")
+
+
+def test_accumulator_linear_weighted_recovers_brightness():
+    """linear_weighted fusion is brighter than the sRGB mean + favors high weight."""
+    xy = np.array([[0.1, 0.1]])
+    z = np.array([0.1])
+    bright = np.array([[200, 200, 200]], dtype="float64")
+    dark = np.array([[40, 40, 40]], dtype="float64")
+    am = avc.WorldVoxelAccumulator(0.5, color_mode="mean")
+    al = avc.WorldVoxelAccumulator(0.5, color_mode="linear_weighted")
+    am.add(xy, z, 1000, rgb=bright, rgb_hit=np.array([True]))
+    am.add(xy, z, 1000, rgb=dark, rgb_hit=np.array([True]))
+    al.add(xy, z, 1000, rgb=bright, rgb_hit=np.array([True]), rgb_weight=np.array([4.0]))
+    al.add(xy, z, 1000, rgb=dark, rgb_hit=np.array([True]), rgb_weight=np.array([1.0]))
+    rm = int(am.finalize()[2][0, 0])   # sRGB mean = (200+40)/2 = 120
+    rl = int(al.finalize()[2][0, 0])   # linear + weighted toward bright → higher
+    assert rm == 120, rm
+    assert rl > rm, (rl, rm)
+    print(f"PASS test_accumulator_linear_weighted_recovers_brightness "
+          f"(sRGB mean {rm} < linear-weighted {rl})")
+
+
+def test_denoise_actors_removes_scatter_keeps_cluster():
+    """SOR denoise: a dense moving-object cluster survives, isolated rain scatter drops."""
+    rng = np.random.default_rng(2)
+    car = rng.normal([5.0, 0.0, 1.0], 0.15, (300, 3))     # tight dense cluster
+    rain = rng.uniform([-10, -10, 0.0], [10, 10, 3.0], (150, 3))  # isolated scatter
+    pts = np.vstack([car, rain])
+    t = np.full(len(pts), 1000, dtype="int64")
+    keep = avc.denoise_actors(pts[:, :2], pts[:, 2], t, sor_k=8, sor_std=1.0)
+    car_kept = keep[:300].mean()
+    rain_kept = keep[300:].mean()
+    assert car_kept > 0.9, f"car cluster over-pruned: {car_kept:.2f}"
+    assert rain_kept < 0.6 and rain_kept < car_kept, (rain_kept, car_kept)
+    assert keep.sum() < len(pts)
+    # Too-few-points sweep is kept wholesale (can't judge outliers).
+    tiny = avc.denoise_actors(np.zeros((3, 2)), np.zeros(3),
+                              np.full(3, 1, dtype="int64"))
+    assert tiny.all()
+    # Voxel-only (sor=False): caps redundant density on a dense cluster, no SOR.
+    dense = rng.uniform([0, 0, 0], [1, 1, 1], (500, 3))
+    vk = avc.denoise_actors(dense[:, :2], dense[:, 2],
+                            np.full(500, 1, dtype="int64"), sor=False, voxel=0.25)
+    assert 0 < vk.sum() < 500, vk.sum()         # deduped, but kept representatives
+    # sor=False, voxel=0 → no-op (keep everything).
+    assert avc.denoise_actors(dense[:, :2], dense[:, 2],
+                              np.full(500, 1, dtype="int64"), sor=False).all()
+    print(f"PASS test_denoise_actors_removes_scatter_keeps_cluster "
+          f"(car {car_kept:.2f} kept, rain {rain_kept:.2f} kept, voxel-only {vk.sum()}/500)")
 
 
 def _run_all():

@@ -366,6 +366,23 @@ LIDARSEG_COLORS: dict[str, list[int]] = {
     "other": [120, 125, 140, 255],  # dim grey — noise / unknown
 }
 
+# height_band → RGBA, keyed by the canonical HEIGHT_BANDS labels. The COLOUR is
+# now baked per-point into `point_rgba` at build (write_lidar_points) so the
+# client binds it zero-copy — no per-point categorical colour expansion on the
+# render thread. DUAL-COPY: these MUST match `datasets.ts AV_HEIGHT_BAND_COLORS`
+# (the legend / any non-baked fallback) exactly, like OBJECT_COLORS /
+# LIDARSEG_COLORS. Indexed by the HEIGHT_BANDS order.
+HEIGHT_BAND_COLORS: dict[str, list[int]] = {
+    HEIGHT_BANDS[0]: [46, 30, 96, 255],   # <-2 below grade — deep indigo
+    HEIGHT_BANDS[1]: [52, 60, 158, 255],  # -2-0 ground — blue
+    HEIGHT_BANDS[2]: [40, 120, 190, 255], # 0-2 curb / low — cyan-blue
+    HEIGHT_BANDS[3]: [38, 168, 168, 255], # 2-4 car-roof height — teal
+    HEIGHT_BANDS[4]: [72, 196, 120, 255], # 4-6 green
+    HEIGHT_BANDS[5]: [170, 214, 74, 255], # 6-8 lime
+    HEIGHT_BANDS[6]: [248, 198, 60, 255], # 8-10 building edge — amber
+    HEIGHT_BANDS[7]: [250, 140, 48, 255], # >10 rooftops / canopy — orange
+}
+
 
 def lidarseg_class(name: str) -> str:
     """Collapse a fine nuScenes-lidarseg class NAME onto the coarse taxonomy.
@@ -447,6 +464,7 @@ def write_lidar_points(
     lat,
     timestamp,
     z,
+    end_timestamp=None,
     intensity=None,
     seg_class=None,
     rgb=None,
@@ -524,6 +542,20 @@ def write_lidar_points(
         "height_band": pa.array([str(b) for b in bands], type=pa.string()),
         "z": pa.array(z, type=pa.float64()),
     }
+    if end_timestamp is not None:
+        # Full-range validity (scene-split STATIC stage): each point is valid over
+        # [timestamp, end_timestamp]. Paired with run_stt_build(static_full_range=
+        # True) + a whole-scene bucket, the stage lands in ONE bucket that overlaps
+        # the playhead for the entire replay, so it loads once and persists — the
+        # HD-map idiom applied to a POINT archive. Scalar → broadcast to all rows.
+        et = (np.full(len(lon), int(end_timestamp), dtype="int64")
+              if np.ndim(end_timestamp) == 0
+              else np.asarray(end_timestamp, dtype="int64"))
+        if len(et) != len(lon):
+            raise ValueError(
+                f"lidar: end_timestamp length {len(et)} != point count {len(lon)}"
+            )
+        cols["end_timestamp"] = pa.array(et, type=pa.int64())
     if seg_class is not None:
         seg = np.asarray(seg_class, dtype=object)
         if len(seg) != len(lon):
@@ -531,6 +563,25 @@ def write_lidar_points(
                 f"lidar: seg_class length {len(seg)} != point count {len(lon)}"
             )
         cols["seg_class"] = pa.array([str(s) for s in seg], type=pa.string())
+    # Bake a per-point colour for any cloud that doesn't carry camera RGB, so
+    # EVERY point bundle ships an interleaved `point_rgba` the client binds
+    # zero-copy — no per-point categorical colour expansion on the render thread.
+    # Semantic class when present (nuScenes-lidarseg), else the height-band ramp
+    # (digitize matches `height_band` exactly). Camera-coloured clouds keep `rgb`.
+    if rgb is None:
+        if seg_class is not None:
+            seg = np.asarray(seg_class, dtype=object)
+            rgb = np.array(
+                [LIDARSEG_COLORS.get(str(s), LIDARSEG_COLORS["other"])[:3] for s in seg],
+                dtype="int64",
+            )
+        else:
+            edges = np.asarray(HEIGHT_BAND_EDGES, dtype="float64")
+            lut = np.array(
+                [HEIGHT_BAND_COLORS[b][:3] for b in HEIGHT_BANDS], dtype="int64"
+            )
+            idx = np.clip(np.digitize(z, edges), 0, len(HEIGHT_BANDS) - 1)
+            rgb = lut[idx]
     if rgb is not None:
         rgb = np.asarray(rgb)
         if rgb.shape != (len(lon), 3):
@@ -547,6 +598,18 @@ def write_lidar_points(
         cols["r"] = pa.array(rgb[:, 0], type=pa.int64())
         cols["g"] = pa.array(rgb[:, 1], type=pa.int64())
         cols["b"] = pa.array(rgb[:, 2], type=pa.int64())
+        # Alpha channel (0–255) so the build can fuse r,g,b,a into ONE interleaved
+        # `FixedSizeList<UInt8,4>` colour column (`stt-build --vector-group
+        # surfel_rgba=r,g,b,a:u8`) the client binds zero-copy — no per-point RGBA
+        # re-pack on the render thread. For a SURFEL cloud alpha carries the baked
+        # per-surfel confidence (surfels[:,6] = surfel_opacity, 0–1 → 0–255); a
+        # plain coloured point cloud is opaque (255).
+        if surfels is not None:
+            conf = np.clip(np.asarray(surfels, dtype="float64")[:, 6], 0.0, 1.0)
+            alpha = np.clip(np.round(conf * 255.0), 0, 255).astype("int64")
+        else:
+            alpha = np.full(len(lon), 255, dtype="int64")
+        cols["a"] = pa.array(alpha, type=pa.int64())
     if surfels is not None:
         surfels = np.asarray(surfels, dtype="float64")
         if surfels.shape != (len(lon), 7):
@@ -557,26 +620,19 @@ def write_lidar_points(
         # extractor reads scalar Float64/Int64 columns, like ``z`` / ``intensity``,
         # and hands them to the client as ``numericProps``. The quaternion is unit
         # length and the extents are small metre values, all f32-exact downstream.
+        # `surfel_opacity` is folded into the colour alpha above; `s_major` /
+        # `s_minor` are fused into the `surfel_scale` vector column at build time
+        # (`stt-build --vector-group surfel_scale=s_major,s_minor`).
         for j, name in enumerate(("s_major", "s_minor", "surfel_opacity"), start=4):
             cols[name] = pa.array(surfels[:, j], type=pa.float64())
-        if pack_quat:
-            # Smallest-three quaternion packing: a unit quat has only 3 DOF, so
-            # store the three non-largest components + a 2-bit index of the
-            # largest (reconstructed in the shader as +sqrt(1-Σ²)). Drops one
-            # near-incompressible orientation column (the quat is ~46% of a
-            # quantized surfel tile and high-entropy → zstd can't touch it) for a
-            # measured ~12% whole-tile win; the client's SplatLayer auto-detects
-            # the `q_imax` column and unpacks. Provably lossless to ~0.16° (see
-            # lidar_summarize_eval sibling proof). Largest stays POSITIVE by the
-            # q≡−q sign convention so its sqrt is unambiguous.
-            q_a, q_b, q_c, q_imax = pack_surfel_quaternions(surfels[:, 0:4])
-            cols["q_a"] = pa.array(q_a, type=pa.float64())
-            cols["q_b"] = pa.array(q_b, type=pa.float64())
-            cols["q_c"] = pa.array(q_c, type=pa.float64())
-            cols["q_imax"] = pa.array(q_imax.astype("float64"), type=pa.float64())
-        else:
-            for j, name in enumerate(("qx", "qy", "qz", "qw")):
-                cols[name] = pa.array(surfels[:, j], type=pa.float64())
+        # ALWAYS write the FULL quaternion qx,qy,qz,qw. The build fuses them into
+        # one `FixedSizeList<Float32,4>` (`--vector-group surfel_quat=qx,qy,qz,qw`)
+        # the client binds zero-copy; smallest-three packing is obsolete (it saved
+        # one scalar column, but the interleaved vector is width-4 either way and
+        # the client no longer unpacks). `pack_quat` is retained for signature
+        # compatibility but no longer changes the emitted columns.
+        for j, name in enumerate(("qx", "qy", "qz", "qw")):
+            cols[name] = pa.array(surfels[:, j], type=pa.float64())
     if world_class is not None:
         # Feature 1 (Worldbuild): a CATEGORICAL static/dynamic label. String
         # values ("static"/"dynamic"), never bare 0/1 — an all-numeric-string
@@ -1118,6 +1174,142 @@ def contour_kwargs(args) -> dict:
     )
 
 
+# ── scene-split ("stage + actors") shared CLI (AV2 + Waymo, no drift) ─────────
+SCENE_SPLIT_VOXEL_M = 0.2     # default static-stage BASE voxel edge (m)
+SCENE_STATIC_SPEED = 0.5      # m/s — a track at/above this is a moving "actor"
+ERASOR_SCAN_STRIDE = 6        # decimate per-sweep scans kept for the ERASOR pass
+# The STATIC stage is full-range (one bucket), so a low zoom packs the WHOLE scene
+# into ONE tile (a 60 MB+ megatile on a compact corridor). Floor the stage zoom so
+# those whole-scene low-zoom tiles aren't built; the cockpit views street-level
+# (~z18), so z17+ is ample (one level of zoom-out from the default) and splits a
+# compact corridor into ~2 tiles. The DYNAMIC actors stay at z14 (time-bucketed →
+# small tiles). Bump to 18 for the densest scenes if a single tile is still heavy.
+STAGE_MIN_ZOOM = 17
+
+
+def add_scene_split_args(p) -> None:
+    """Register the shared ``--scene-split`` + ``--stage-*`` + ``--erasor-*`` CLI
+    flags so the AV2 and Waymo extractors expose IDENTICAL knobs (the dual-copy
+    hazard this repo keeps hitting). Pair with ``scene_split_config(args)``."""
+    import argparse
+
+    p.add_argument("--scene-split", action="store_true", dest="scene_split",
+                   help="SCENE-SPLIT view ('stage + actors'): decompose the log into "
+                        "TWO surfel archives — a STATIC 'stage' (the fixed environment: "
+                        "every sweep accumulated + the moving returns removed via in-box "
+                        "+ ERASOR scrub, curvature-adaptively compacted + photo-graded, "
+                        "baked once as a timeless backdrop) and DYNAMIC 'actors' (the "
+                        "moving returns, animated per-sweep). Implies camera colour; "
+                        "mutually exclusive with --surfel / --worldbuild / --contours.")
+    p.add_argument("--stage-voxel", type=float, default=SCENE_SPLIT_VOXEL_M,
+                   dest="stage_voxel",
+                   help=f"static-stage BASE voxel (m) = detail kept in COMPLEX regions "
+                        f"(default {SCENE_SPLIT_VOXEL_M}).")
+    p.add_argument("--stage-min-zoom", type=int, default=STAGE_MIN_ZOOM,
+                   dest="stage_min_zoom",
+                   help="min zoom for the STATIC stage archive (full-range, so a low "
+                        "zoom packs the WHOLE scene into one giant tile). Higher = no "
+                        "whole-scene megatile + smaller bytes, but the stage stops "
+                        f"rendering when zoomed out past it (default {STAGE_MIN_ZOOM}; "
+                        "the cockpit is street-level ~z18).")
+    p.add_argument("--scene-static-speed", type=float, default=SCENE_STATIC_SPEED,
+                   dest="scene_static_speed",
+                   help=f"a track ≥ this speed (m/s) is a moving 'actor' "
+                        f"(default {SCENE_STATIC_SPEED}).")
+    # ERASOR residual scrub
+    p.add_argument("--erasor", action=argparse.BooleanOptionalAction, default=True,
+                   help="ERASOR-style residual scrub of ghost trails off the stage "
+                        "(--no-erasor to disable; default on).")
+    p.add_argument("--erasor-rings", type=int, default=ERASOR_RINGS, dest="erasor_rings")
+    p.add_argument("--erasor-sectors", type=int, default=ERASOR_SECTORS, dest="erasor_sectors")
+    p.add_argument("--erasor-max-r", type=float, default=ERASOR_MAX_R, dest="erasor_max_r")
+    p.add_argument("--erasor-height-diff", type=float, default=ERASOR_HEIGHT_DIFF,
+                   dest="erasor_height_diff")
+    p.add_argument("--erasor-occ-ratio", type=float, default=ERASOR_OCC_RATIO,
+                   dest="erasor_occ_ratio")
+    p.add_argument("--erasor-ground-margin", type=float, default=ERASOR_GROUND_MARGIN,
+                   dest="erasor_ground_margin")
+    p.add_argument("--erasor-min-scans", type=int, default=ERASOR_MIN_SCANS,
+                   dest="erasor_min_scans")
+    # curvature-adaptive stage compaction
+    p.add_argument("--adaptive-stage", action=argparse.BooleanOptionalAction,
+                   default=True, dest="adaptive_stage",
+                   help="curvature-adaptive stage compaction (flats→big surfels, "
+                        "complex→fine); --no-adaptive-stage for a uniform grid.")
+    p.add_argument("--stage-max-voxel", type=float, default=STAGE_MAX_VOXEL,
+                   dest="stage_max_voxel",
+                   help=f"voxel (m) for the FLATTEST adaptive tier (default {STAGE_MAX_VOXEL}).")
+    p.add_argument("--stage-adapt-levels", type=int, default=STAGE_ADAPT_LEVELS,
+                   dest="stage_adapt_levels")
+    p.add_argument("--stage-flat-pct", type=float, default=50.0, dest="stage_flat_pct",
+                   help="σ pct treated as fully flat → max voxel (higher = more compact; "
+                        "default 50).")
+    p.add_argument("--stage-complex-pct", type=float, default=95.0,
+                   dest="stage_complex_pct")
+    # photographic colour grade
+    p.add_argument("--stage-saturation", type=float, default=1.6, dest="stage_saturation",
+                   help="saturation multiplier for the colour grade (default 1.6).")
+    p.add_argument("--stage-exposure", type=float, default=1.25, dest="stage_exposure",
+                   help="exposure (linear gain) for the colour grade (default 1.25).")
+    p.add_argument("--stage-gamma", type=float, default=1.0, dest="stage_gamma")
+    p.add_argument("--stage-white-balance", action=argparse.BooleanOptionalAction,
+                   default=True, dest="stage_white_balance",
+                   help="gray-world white balance (neutralise blue cast; default on).")
+    # actor noise reduction (rain/sensor scatter) — OPT-IN: most scenes keep every
+    # moving return (clear agents); only noisy scenes (e.g. the rain highway) need it.
+    p.add_argument("--actor-denoise", action=argparse.BooleanOptionalAction,
+                   default=False, dest="actor_denoise",
+                   help="per-sweep statistical outlier removal on the actors: drop "
+                        "isolated rain/sensor scatter, keep the dense moving agents. "
+                        "OFF by default (only enable on noisy scenes — most scenes "
+                        "want every moving return).")
+    p.add_argument("--actor-denoise-k", type=int, default=ACTOR_SOR_K,
+                   dest="actor_denoise_k",
+                   help=f"k-NN for the outlier test (default {ACTOR_SOR_K}).")
+    p.add_argument("--actor-denoise-std", type=float, default=ACTOR_SOR_STD,
+                   dest="actor_denoise_std",
+                   help="drop returns with mean-kNN dist > mean + this·std (LOWER = "
+                        f"more aggressive; default {ACTOR_SOR_STD}).")
+    p.add_argument("--actor-voxel", type=float, default=0.0, dest="actor_voxel",
+                   help="optional per-sweep voxel cap (m) on the surviving actor "
+                        "density (0 = off; e.g. 0.1 to trim redundant close hits).")
+    # actor colour grade — punchier than the stage so the moving agents POP
+    p.add_argument("--actor-saturation", type=float, default=2.2, dest="actor_saturation",
+                   help="saturation for the ACTOR grade — higher than the stage so "
+                        "moving agents pop (default 2.2).")
+    p.add_argument("--actor-exposure", type=float, default=1.45, dest="actor_exposure",
+                   help="exposure (linear gain) for the ACTOR grade (default 1.45).")
+
+
+def scene_split_config(args) -> dict:
+    """Build the scene-split config dict (voxel / erasor / adaptive / grade) from
+    parsed args — consumed by both extractors' scene-split path."""
+    return dict(
+        voxel_m=args.stage_voxel,
+        static_speed=args.scene_static_speed,
+        erasor=args.erasor,
+        erasor_params=dict(
+            rings=args.erasor_rings, sectors=args.erasor_sectors,
+            max_r=args.erasor_max_r, height_diff=args.erasor_height_diff,
+            occ_ratio=args.erasor_occ_ratio, ground_margin=args.erasor_ground_margin,
+            min_scans=args.erasor_min_scans),
+        adaptive=(dict(base_voxel=args.stage_voxel, max_voxel=args.stage_max_voxel,
+                       levels=args.stage_adapt_levels, flat_pct=args.stage_flat_pct,
+                       complex_pct=args.stage_complex_pct)
+                  if args.adaptive_stage else None),
+        grade=dict(saturation=args.stage_saturation, exposure=args.stage_exposure,
+                   gamma=args.stage_gamma, white_balance=args.stage_white_balance),
+        # Principled actor reduction — SOR (noise) and voxel (overplot) are
+        # INDEPENDENT: build the config if EITHER is requested.
+        denoise=(dict(sor=args.actor_denoise, sor_k=args.actor_denoise_k,
+                      sor_std=args.actor_denoise_std, voxel=args.actor_voxel)
+                 if (args.actor_denoise or args.actor_voxel > 0) else None),
+        # Punchier grade for the actors than the stage so the moving agents POP.
+        actor_grade=dict(saturation=args.actor_saturation, exposure=args.actor_exposure,
+                         gamma=args.stage_gamma, white_balance=args.stage_white_balance),
+    )
+
+
 # ── Sidecar JSON writers ─────────────────────────────────────────────────────
 def write_telemetry_json(
     out_path: Path,
@@ -1280,6 +1472,40 @@ def lidar_quantize_attrs(z_prec: float) -> dict[str, float]:
     }
 
 
+def lidar_vector_groups(
+    *, surfel: bool, colored: bool = True
+) -> list[tuple[str, list[str], str]]:
+    """Canonical ``--vector-group`` list for LiDAR archives (see ``run_stt_build``).
+
+    Fuses the per-point scalar columns the extractor writes into ONE interleaved
+    ``FixedSizeList`` column each, so the client binds the contiguous buffer
+    straight to a deck.gl instanced attribute with ZERO per-point re-pack on the
+    render thread (the stutter fix). The encoder skips a group whose source
+    columns are absent, but we still gate here so a coloured-points archive gets
+    ``point_rgba`` while a surfel archive gets ``surfel_rgba`` (same r,g,b,a
+    sources, different consumer column name) — passing both would let the first
+    consume the columns and starve the second.
+
+    * surfel → ``surfel_quat`` (qx,qy,qz,qw, f32) + ``surfel_scale``
+      (s_major,s_minor, f32), read by ``SplatLayer``.
+    * coloured → ``surfel_rgba`` (surfel) or ``point_rgba`` (plain points), the
+      ``[r,g,b,a]`` u8 colour (alpha = baked confidence for surfels, else 255),
+      read by ``SplatLayer`` / ``AnimatedPointLayer`` respectively.
+
+    These columns are written as raw f32/u8 vectors (NOT quantized) — the
+    ``lidar_quantize_attrs`` entries for the grouped scalars become inert because
+    the encoder fuses them before the quantize pass.
+    """
+    groups: list[tuple[str, list[str], str]] = []
+    if surfel:
+        groups.append(("surfel_quat", ["qx", "qy", "qz", "qw"], "f32"))
+        groups.append(("surfel_scale", ["s_major", "s_minor"], "f32"))
+    if colored:
+        color_name = "surfel_rgba" if surfel else "point_rgba"
+        groups.append((color_name, ["r", "g", "b", "a"], "u8"))
+    return groups
+
+
 def pack_surfel_quaternions(quat):
     """Smallest-three encode unit quaternions ``(N,4) [x,y,z,w]`` →
     ``(q_a, q_b, q_c, q_imax)``: the three non-largest components (in ascending
@@ -1392,6 +1618,119 @@ def adaptive_lidar_select(pts, decimate: int, k: int = ADAPTIVE_K,
         rep_local = _voxel_real_indices(pts[flat_pos], v)
         keep = np.concatenate([edge_idx, flat_pos[rep_local]])
     return np.unique(keep)          # sorted + dedups any voxel-centroid ties
+
+
+# ── curvature-adaptive stage compaction (variable cell size) ─────────────────
+# The static "stage" is the fixed environment accumulated over every sweep; a flat
+# road/wall is the BULK of the returns yet the LEAST information (a neighbour
+# predicts it). A uniform voxel grid spends the same budget on a flat road cell as
+# on a foliage/pole/curb cell. adaptive_stage_select instead gives each region a
+# voxel size that tracks its surface complexity: flats collapse into a FEW big
+# cells (→ big surfels, since _surfel_frame sizes each disk from the local spacing,
+# so a sparse flat region auto-grows its disks to fill the gap), while complex
+# regions keep the fine base voxel (→ many small crisp surfels). Same idea as
+# octree / curvature-adaptive downsampling (PCL, AVS-Net) — a much more COMPACT
+# stage at equal-or-better perceived coverage. Tiers are by σ PERCENTILE so there
+# are no scene-specific magic thresholds.
+STAGE_MAX_VOXEL = 0.5    # m — voxel edge for the FLATTEST tier (the big-disk cells)
+STAGE_ADAPT_LEVELS = 6   # complexity tiers between base_voxel and max_voxel
+
+
+def adaptive_stage_select(pts, *, base_voxel, max_voxel=STAGE_MAX_VOXEL,
+                          levels=STAGE_ADAPT_LEVELS, flat_pct=50.0,
+                          complex_pct=95.0, k=ADAPTIVE_K):
+    """Curvature-adaptive multi-resolution voxel dedup for the static stage.
+
+    ``pts`` (M×3, metric) is the accumulated stage cloud (already deduped at
+    ``base_voxel``). Each point's local surface variation σ = λ0/Σλ is mapped to a
+    voxel edge by VALUE (not equal-population — so a uniformly-flat road all lands
+    in ONE coarse tier rather than being split across fine tiers): σ ≤ the
+    ``flat_pct``-th percentile → ``max_voxel`` (flats → a few big cells), σ ≥ the
+    ``complex_pct``-th percentile → ``base_voxel`` (poles/foliage/edges keep full
+    detail), graded geometrically between over ``levels`` tiers. Percentile anchors
+    keep it scene-adaptive + outlier-robust. Returns a SORTED int index array into
+    ``pts``. Downstream ``_fit_merged_surfels`` sizes each disk from the resulting
+    local spacing, so flat cells get big gap-filling disks and complex cells stay
+    crisp — no explicit per-point radius needed.
+    """
+    import numpy as np
+
+    m = len(pts)
+    if m <= levels or max_voxel <= base_voxel:
+        return np.arange(m)
+    sv = _surface_variation(pts, k)
+    lo, hi = np.percentile(sv, [flat_pct, complex_pct])
+    if hi <= lo:
+        norm = (sv > lo).astype("float64")
+    else:
+        norm = np.clip((sv - lo) / (hi - lo), 0.0, 1.0)
+    # tier 0 = flattest (σ ≤ lo) → max_voxel … tier levels-1 = complex → base_voxel.
+    tier = np.minimum((norm * levels).astype(np.int64), levels - 1)
+    # Geometric voxel edge per tier: tier 0 (flat) → max_voxel, last → base_voxel.
+    sizes = max_voxel * (base_voxel / max_voxel) ** (np.arange(levels) / (levels - 1))
+    keep = []
+    for t in range(levels):
+        idx = np.flatnonzero(tier == t)
+        if idx.size == 0:
+            continue
+        v = float(sizes[t])
+        if v <= base_voxel * 1.001:
+            keep.append(idx)                       # finest tier: already at base
+        else:
+            keep.append(idx[_voxel_real_indices(pts[idx], v)])
+    return np.unique(np.concatenate(keep))
+
+
+# ── actor denoise (rain / sensor scatter removal) ────────────────────────────
+# The DYNAMIC actors are kept per-sweep (un-deduped) so motion animates, but in a
+# rainy/dusty scene that cloud is full of NOISE: rain returns + spurious hits that
+# fall inside the moving boxes. A crude stride would thin the real agents as much
+# as the haze. denoise_actors is a PRINCIPLED reduction targeting the noise: within
+# each sweep a moving object's returns form a DENSE cluster while scatter is
+# ISOLATED, so Statistical Outlier Removal (mean distance to the k nearest
+# neighbours) drops the isolated returns and the agents stay crisp.
+ACTOR_SOR_K = 8           # k-NN for the statistical-outlier test
+ACTOR_SOR_STD = 1.0       # drop returns whose mean-kNN dist > mean + this·std
+
+
+def denoise_actors(xy, z, t, *, sor=True, sor_k=ACTOR_SOR_K, sor_std=ACTOR_SOR_STD,
+                   voxel=0.0):
+    """Per-sweep actor reduction — two INDEPENDENT, principled passes.
+
+    ``xy`` (N,2), ``z`` (N), ``t`` (N per-sweep ms). Grouped by sweep:
+    * ``sor`` (Statistical Outlier Removal): drop returns whose mean distance to
+      their ``sor_k`` nearest neighbours exceeds ``mean + sor_std·std`` — the
+      ISOLATED rain/sensor scatter — keeping the dense moving-object clusters.
+    * ``voxel`` (>0): cap the surviving density to one representative per voxel —
+      removes only REDUNDANT returns hitting the same cell in one sweep (overplot),
+      not the agent (use this on dense-traffic scenes that aren't noisy).
+    Either may run alone (e.g. SF traffic: ``sor=False, voxel=0.1``; rain: both).
+    Returns a boolean keep-mask over the concatenated cloud.
+    """
+    from scipy.spatial import cKDTree
+
+    n = len(z)
+    keep = np.zeros(n, dtype=bool)
+    if n == 0:
+        return keep
+    t = np.asarray(t).reshape(-1)
+    xy = np.asarray(xy, dtype="float64").reshape(-1, 2)
+    z = np.asarray(z, dtype="float64").reshape(-1)
+    for ti in np.unique(t):
+        idx = np.flatnonzero(t == ti)
+        pts = np.column_stack([xy[idx, 0], xy[idx, 1], z[idx]])
+        if sor and len(idx) >= sor_k + 2:
+            d, _ = cKDTree(pts).query(pts, k=sor_k + 1)
+            md = d[:, 1:].mean(axis=1)        # mean dist to k NN (excl self)
+            ok = md <= (md.mean() + sor_std * md.std())
+        else:
+            ok = np.ones(len(idx), dtype=bool)  # SOR off (or too few) → keep all
+        if voxel > 0 and ok.any():
+            sel = np.flatnonzero(ok)[_voxel_real_indices(pts[ok], voxel)]
+            keep[idx[sel]] = True
+        else:
+            keep[idx[ok]] = True
+    return keep
 
 
 # ── shared surfel frame (eigen → quaternion core) ────────────────────────────
@@ -1525,6 +1864,53 @@ def _surfel_frame(pts: np.ndarray, sel: np.ndarray, view_dir, R_post=None):
 FALLBACK_RGB = (70, 78, 96)  # slate for returns no camera saw (== the colorizers)
 
 
+# ── photographic colour: linear-light fusion + grade ─────────────────────────
+# Camera-projected LiDAR colour washes out two ways: (1) averaging many sweeps'
+# samples in sRGB (gamma) space darkens + desaturates (the mean of gamma-encoded
+# values is below the perceptual mean), and (2) the raw urban samples are genuinely
+# low-saturation/flat (measured ~9% saturation, slight blue cast). Fix (1) by
+# fusing in LINEAR light weighted toward the closest/sharpest view; fix (2) with a
+# grade (gray-world white balance → exposure → saturation → gamma) at bake time.
+def srgb_to_linear(u8):
+    """sRGB 0-255 (uint8-ish) → linear-light float in [0,1] (vectorised)."""
+    c = np.asarray(u8, dtype="float64") / 255.0
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+
+def linear_to_srgb(lin):
+    """Linear-light float [0,1] → sRGB 0-255 float (vectorised; clip+cast by caller)."""
+    lin = np.clip(np.asarray(lin, dtype="float64"), 0.0, 1.0)
+    s = np.where(lin <= 0.0031308, lin * 12.92, 1.055 * lin ** (1.0 / 2.4) - 0.055)
+    return s * 255.0
+
+
+def grade_rgb(rgb, *, saturation=1.0, exposure=1.0, gamma=1.0, white_balance=False):
+    """Photographic grade of baked per-point RGB (``(N,3)`` 0-255) → graded uint8.
+
+    Order (all in linear light, the physically-correct space for these ops):
+    optional GRAY-WORLD white balance (scale each channel so the cloud's mean is
+    neutral — removes the overcast/shadow blue cast), EXPOSURE gain, SATURATION push
+    about per-pixel luma, then a GAMMA tweak. Defaults are a no-op (1.0 / off) so an
+    ungraded caller is unchanged. Returns uint8 ``(N,3)``.
+    """
+    rgb = np.asarray(rgb, dtype="float64").reshape(-1, 3)
+    if len(rgb) == 0:
+        return rgb.astype("uint8")
+    lin = srgb_to_linear(rgb)
+    if white_balance:
+        mean = lin.mean(axis=0)                      # per-channel scene mean
+        gray = float(mean.mean())
+        lin = lin * (gray / np.maximum(mean, 1e-6))  # gray-world: neutralise cast
+    lin = lin * float(exposure)
+    if saturation != 1.0:
+        luma = (lin * np.array([0.2126, 0.7152, 0.0722])).sum(axis=1, keepdims=True)
+        lin = luma + (lin - luma) * float(saturation)
+    lin = np.clip(lin, 0.0, 1.0)
+    if gamma != 1.0:
+        lin = lin ** (1.0 / float(gamma))
+    return np.clip(linear_to_srgb(lin), 0, 255).astype("uint8")
+
+
 class WorldVoxelAccumulator:
     """Incremental per-voxel accumulator for the Worldbuild STATIC cloud.
 
@@ -1541,20 +1927,28 @@ class WorldVoxelAccumulator:
     and needs no second pass.
     """
 
-    def __init__(self, voxel_m: float):
+    def __init__(self, voxel_m: float, color_mode: str = "mean"):
         self.v = float(voxel_m)
+        # color_mode: "mean" = running sRGB mean (legacy worldbuild/waymo); or
+        # "linear_weighted" = weighted mean in LINEAR light (weight = per-return
+        # view quality, e.g. 1/depth) → recovers brightness + saturation a sRGB
+        # mean across many sweeps washes out. The slots are identical either way:
+        # cur[6] = colour accumulator (3-vec), cur[7] = weight accumulator (scalar).
+        self.color_mode = color_mode
         # key(tuple3 int) → list[best_d2, x, y, z, t_rep, first_seen,
-        #                        rgb_sum(3 float), rgb_cnt]
+        #                        colour_accum(3 float), weight_accum]
         self._vox: dict[tuple, list] = {}
 
-    def add(self, pts_world, z, t_ms, rgb=None, rgb_hit=None):
+    def add(self, pts_world, z, t_ms, rgb=None, rgb_hit=None, rgb_weight=None):
         """Fold one sweep's static returns into the grid.
 
         ``pts_world`` is (N,2) render world x,y (metres in the local frame *before*
         the lon/lat transform — any consistent metric frame works), ``z`` (N,) the
         vehicle-frame height, ``t_ms`` a scalar or (N,) per-return time. ``rgb``
         (N,3 uint8-ish) + ``rgb_hit`` (N bool) are the camera color + whether a
-        camera saw the return (only hits contribute to the running mean).
+        camera saw the return (only hits contribute). ``rgb_weight`` (N, optional)
+        is the per-return view quality used in ``color_mode="linear_weighted"``
+        (higher = closer/sharper); ignored in "mean" mode.
         """
         pts_world = np.asarray(pts_world, dtype="float64").reshape(-1, 2)
         z = np.asarray(z, dtype="float64").reshape(-1)
@@ -1574,6 +1968,15 @@ class WorldVoxelAccumulator:
             rgb = np.asarray(rgb, dtype="float64").reshape(-1, 3)
             rgb_hit = (np.zeros(n, dtype=bool) if rgb_hit is None
                        else np.asarray(rgb_hit, dtype=bool))
+        # Per-return colour contribution + weight, by mode (gated to camera hits).
+        if self.color_mode == "linear_weighted":
+            w = (np.ones(n) if rgb_weight is None
+                 else np.asarray(rgb_weight, dtype="float64").reshape(-1))
+            w = np.where(rgb_hit, np.maximum(w, 1e-6), 0.0)
+            cval = srgb_to_linear(rgb) * w[:, None]
+        else:
+            w = rgb_hit.astype("float64")
+            cval = rgb * w[:, None]
         vox = self._vox
         for i in range(n):
             key = (int(keys[i, 0]), int(keys[i, 1]), int(keys[i, 2]))
@@ -1582,16 +1985,13 @@ class WorldVoxelAccumulator:
             if cur is None:
                 vox[key] = [
                     float(d2[i]), float(xyz[i, 0]), float(xyz[i, 1]), float(z[i]),
-                    ti, ti,
-                    rgb[i].copy() if rgb_hit[i] else np.zeros(3),
-                    1 if rgb_hit[i] else 0,
+                    ti, ti, cval[i].copy(), float(w[i]),
                 ]
                 continue
             if ti < cur[5]:        # earliest sweep time = first_seen
                 cur[5] = ti
-            if rgb_hit[i]:         # running camera-RGB mean over hits
-                cur[6] = cur[6] + rgb[i]
-                cur[7] += 1
+            cur[6] = cur[6] + cval[i]   # colour accumulator (0 for non-hits)
+            cur[7] += float(w[i])       # weight accumulator
             if d2[i] < cur[0]:     # representative = real return nearest cell centre
                 cur[0] = float(d2[i])
                 cur[1] = float(xyz[i, 0])
@@ -1607,12 +2007,17 @@ class WorldVoxelAccumulator:
         rgb = np.zeros((n, 3), dtype="float64")
         first_seen = np.zeros(n, dtype="int64")
         fb = np.asarray(FALLBACK_RGB, dtype="float64")
+        linear = self.color_mode == "linear_weighted"
         for i, cur in enumerate(self._vox.values()):
             xy[i, 0] = cur[1]
             xy[i, 1] = cur[2]
             z[i] = cur[3]
             first_seen[i] = cur[5]
-            rgb[i] = (cur[6] / cur[7]) if cur[7] > 0 else fb
+            if cur[7] > 0:
+                mean = cur[6] / cur[7]
+                rgb[i] = linear_to_srgb(mean) if linear else mean
+            else:
+                rgb[i] = fb
         rgb = np.clip(np.round(rgb), 0, 255).astype("uint8")
         return xy, z, rgb, first_seen
 
@@ -1663,6 +2068,29 @@ def point_in_moving_boxes(pts_world, z, t_ms, boxes):
     return dyn
 
 
+def _fit_merged_surfels(pts_xyz):
+    """Fit oriented surfels on a consolidated cross-sweep cloud.
+
+    ``pts_xyz`` is (M,3) in render-world x,y + vehicle-frame z. Shared by
+    ``worldbuild_merge`` / ``finalize_stage`` / ``finalize_actors``: there is no
+    single ego pose for a many-sweep cloud, so each normal is oriented toward the
+    cloud centroid (a stable view dir) with NO ego-yaw ``R_post``. Empty- and
+    small-cloud-safe: fewer than ``SURFEL_K + 2`` points fall back to flat
+    up-facing low-confidence disks. Returns (M,7)
+    ``[qx,qy,qz,qw,s_major,s_minor,opacity]``.
+    """
+    pts = np.asarray(pts_xyz, dtype="float64").reshape(-1, 3)
+    m = len(pts)
+    if m >= SURFEL_K + 2:
+        centroid = pts.mean(axis=0)
+        view_dir = centroid[None, :] - pts          # per-point, toward centroid
+        quat, scale2, op = _surfel_frame(pts, np.arange(m), view_dir)
+        return np.concatenate([quat, scale2, op[:, None]], axis=1)
+    return np.tile(
+        np.array([0.0, 0.0, 0.0, 1.0, SURFEL_S_MIN, SURFEL_S_MIN, 0.30]),
+        (max(m, 0), 1))
+
+
 def worldbuild_merge(static_acc, dynamic):
     """Combine the streamed STATIC voxel grid + the full-rate DYNAMIC returns,
     fit surfels on the merged deduped cloud, and assemble the per-column arrays
@@ -1709,23 +2137,209 @@ def worldbuild_merge(static_acc, dynamic):
         np.zeros(n_static, dtype="int64"), np.ones(n_dyn, dtype="int64")])
     world_class = np.array(["static"] * n_static + ["dynamic"] * n_dyn, dtype=object)
 
-    # Surfels on the merged cloud (x,y world + vehicle-frame z). No ego pose to
-    # rotate by; orient normals toward the scene centroid (a stable view dir).
-    m = len(z)
-    pts = np.column_stack([xy[:, 0], xy[:, 1], z])
-    if m >= SURFEL_K + 2:
-        centroid = pts.mean(axis=0)
-        view_dir = centroid[None, :] - pts          # per-point, toward centroid
-        quat, scale2, op = _surfel_frame(pts, np.arange(m), view_dir)
-        surfels = np.concatenate([quat, scale2, op[:, None]], axis=1)
-    else:  # too few points to fit — flat up-facing low-confidence disks
-        surfels = np.tile(
-            np.array([0.0, 0.0, 0.0, 1.0, SURFEL_S_MIN, SURFEL_S_MIN, 0.30]), (max(m, 0), 1))
+    # Surfels on the merged cloud (x,y world + vehicle-frame z), oriented toward
+    # the scene centroid (no single ego pose) — see _fit_merged_surfels.
+    surfels = _fit_merged_surfels(np.column_stack([xy[:, 0], xy[:, 1], z]))
 
     return dict(
         xy=xy, z=z, rgb=rgb, timestamp=timestamp,
         is_dynamic=is_dynamic, world_class=world_class, surfels=surfels,
     )
+
+
+# ── Scene-split ("stage + actors"): decompose into TWO separate archives ──────
+# Unlike Worldbuild (one merged archive + an is_dynamic flag the shader branches
+# on), the scene-split mode emits the STATIC stage and the DYNAMIC actors as two
+# independent STT archives with different temporal structure: the stage is one
+# timeless cloud (the fixed infrastructure, summarised by accumulating every
+# sweep) and the actors are time-bucketed per-sweep returns. Surfels are fit per
+# archive (the stage is voxel-uniform → correct disk extents; the actors are dense
+# per-sweep) instead of once on the union, which would distort both.
+def finalize_stage(static_acc, *, drop_mask=None, adaptive=None, grade=None):
+    """Static "stage" columns for the scene-split mode (the fixed environment).
+
+    ``static_acc`` is a finalized ``WorldVoxelAccumulator`` (or its ``finalize()``
+    4-tuple ``(xy, z, rgb, first_seen)``). ``drop_mask`` (optional bool over the
+    finalized voxels, ``True`` = ERASOR-scrubbed residual dynamic — see
+    ``erasor_scrub``) is removed BEFORE the surfel fit. ``adaptive`` (optional dict
+    of ``adaptive_stage_select`` kwargs, e.g. ``{base_voxel, max_voxel, levels}``)
+    curvature-adaptively coarsens flat regions into big surfels for a more COMPACT
+    stage; ``None`` keeps the uniform cloud. Surfels are fit on the resulting static
+    cloud alone. ``timestamp`` carries each voxel's ``first_seen`` (free; lets a
+    future reveal-fade ramp in by first-observed time) — for the build the stage is
+    given a whole-scene ``end_timestamp`` so it loads once and persists.
+
+    Returns the ``write_lidar_points`` column dict: ``xy`` (M,2), ``z`` (M),
+    ``rgb`` (M,3 uint8), ``timestamp`` (M int64), ``surfels`` (M,7),
+    ``is_dynamic`` (M == 0), ``world_class`` (M == "static").
+    """
+    if isinstance(static_acc, WorldVoxelAccumulator):
+        xy, z, rgb, first_seen = static_acc.finalize()
+    else:
+        xy, z, rgb, first_seen = static_acc
+    xy = np.asarray(xy, dtype="float64").reshape(-1, 2)
+    z = np.asarray(z, dtype="float64").reshape(-1)
+    rgb = np.asarray(rgb).reshape(-1, 3)
+    first_seen = np.asarray(first_seen, dtype="int64").reshape(-1)
+    if drop_mask is not None:
+        keep = ~np.asarray(drop_mask, dtype=bool).reshape(-1)
+        xy, z, rgb, first_seen = xy[keep], z[keep], rgb[keep], first_seen[keep]
+    if adaptive is not None and len(z) > 0:
+        sel = adaptive_stage_select(
+            np.column_stack([xy[:, 0], xy[:, 1], z]), **adaptive)
+        xy, z, rgb, first_seen = xy[sel], z[sel], rgb[sel], first_seen[sel]
+    m = len(z)
+    surfels = _fit_merged_surfels(np.column_stack([xy[:, 0], xy[:, 1], z]))
+    rgb = np.clip(np.round(np.asarray(rgb, dtype="float64")), 0, 255).astype("uint8")
+    # Photographic grade (gray-world white balance + exposure + saturation) — the
+    # urban camera samples are genuinely flat/blue-cast, so a grade is what makes
+    # the stage read photoreal rather than washed out. No-op when grade is None.
+    if grade is not None and m > 0:
+        rgb = grade_rgb(rgb, **grade)
+    return dict(
+        xy=xy, z=z, rgb=rgb, timestamp=first_seen, surfels=surfels,
+        is_dynamic=np.zeros(m, dtype="int64"),
+        world_class=np.array(["static"] * m, dtype=object),
+    )
+
+
+def finalize_actors(dynamic, *, grade=None, denoise=None):
+    """Dynamic "actors" columns for the scene-split mode (the moving agents).
+
+    ``dynamic`` is the un-merged dynamic-returns dict (keys ``xy`` (N,2), ``z``
+    (N), ``rgb`` (N,3), ``t`` (N int64 per-sweep ms)) — the returns inside MOVING
+    actor boxes, each keeping its own sweep time so a car doesn't smear into a
+    streak. Surfels are fit on the dynamic cloud alone. Returns the same column
+    dict shape as ``finalize_stage`` with ``timestamp`` == per-sweep t,
+    ``is_dynamic`` == 1, ``world_class`` == "dynamic".
+    """
+    xy = np.asarray(dynamic.get("xy", np.empty((0, 2))), dtype="float64").reshape(-1, 2)
+    z = np.asarray(dynamic.get("z", np.empty(0)), dtype="float64").reshape(-1)
+    rgb = np.asarray(dynamic.get("rgb", np.empty((0, 3)))).reshape(-1, 3)
+    t = np.asarray(dynamic.get("t", np.empty(0)), dtype="int64").reshape(-1)
+    # Principled noise reduction (rain / sensor scatter): per-sweep statistical
+    # outlier removal keeps the dense moving agents, drops the isolated haze.
+    if denoise is not None and len(z) > 0:
+        keep = denoise_actors(xy, z, t, **denoise)
+        xy, z, rgb, t = xy[keep], z[keep], rgb[keep], t[keep]
+    m = len(z)
+    surfels = _fit_merged_surfels(np.column_stack([xy[:, 0], xy[:, 1], z]))
+    rgb = np.clip(np.round(np.asarray(rgb, dtype="float64")), 0, 255).astype("uint8")
+    # Same photographic grade as the stage so the actors share its colour space.
+    if grade is not None and m > 0:
+        rgb = grade_rgb(rgb, **grade)
+    return dict(
+        xy=xy, z=z, rgb=rgb, timestamp=t, surfels=surfels,
+        is_dynamic=np.ones(m, dtype="int64"),
+        world_class=np.array(["dynamic"] * m, dtype=object),
+    )
+
+
+# ── ERASOR-style residual scrub (cleans ghost trails off the static stage) ────
+# The in-box test (point_in_moving_boxes) removes returns inside ANNOTATED moving
+# boxes, but box-fit slack + unlabeled movers leave faint ghost trails baked into
+# the accumulated stage. erasor_scrub is a deterministic second pass after the
+# in-box removal: it bins each sweep's view into egocentric rings × sectors
+# (ERASOR's R-POD), and where the accumulated MAP holds tall structure a live scan
+# does NOT see (height-diff above what that sweep observed in the same bin) it
+# votes the map points "transient". A map point seen by enough sweeps and judged
+# transient by most of them is dropped. Ground (the lowest live returns per bin)
+# is never scrubbed. Per-sweep EGOCENTRIC bins (not one global polar grid) because
+# the ego translates across the ~15 s log. Reductions are commutative (min/max/sum
+# over integer bin ids) + percentile-free ground, so the result is order-independent.
+ERASOR_RINGS = 20            # radial bins out to ERASOR_MAX_R (~4 m each)
+ERASOR_SECTORS = 60          # angular bins (6° each)
+ERASOR_MAX_R = 80.0          # m — outer ring edge (AV2 lidar useful range)
+ERASOR_HEIGHT_DIFF = 0.5     # m — map-vs-scan max-height gap that flags a bin transient
+ERASOR_OCC_RATIO = 0.3       # keep if a bin reads as real structure in ≥ this share of sweeps
+ERASOR_GROUND_MARGIN = 0.3   # m above the per-bin ground = protected (never scrubbed)
+ERASOR_MIN_SCANS = 3         # a map point needs ≥ this many observing sweeps to be testable
+
+
+def _erasor_polar_bins(dx, dy, rings, sectors, max_r):
+    """(dx,dy) relative to ego → flat bin id ``ring*sectors + sector``."""
+    r = np.hypot(dx, dy)
+    ring = np.clip((r / max_r * rings).astype(np.int64), 0, rings - 1)
+    theta = np.arctan2(dy, dx)
+    sector = ((theta + np.pi) / (2.0 * np.pi) * sectors).astype(np.int64) % sectors
+    return ring * sectors + sector
+
+
+def erasor_scrub(static_acc, scans, *, rings=ERASOR_RINGS, sectors=ERASOR_SECTORS,
+                 max_r=ERASOR_MAX_R, height_diff=ERASOR_HEIGHT_DIFF,
+                 occ_ratio=ERASOR_OCC_RATIO, ground_margin=ERASOR_GROUND_MARGIN,
+                 min_scans=ERASOR_MIN_SCANS):
+    """Boolean drop-mask over the finalized stage voxels (``True`` = residual dynamic).
+
+    ``static_acc`` is the accumulated MAP (a ``WorldVoxelAccumulator`` or its
+    ``finalize()`` 4-tuple). ``scans`` is a list of ``(xy (N,2), z (N), ego_xy (2,))``
+    — each sweep's STATIC returns (post in-box removal) + that sweep's ego position,
+    in the SAME render-world metric frame as the map. The returned mask is aligned
+    to ``finalize()`` order, so pass the SAME finalized arrays to ``finalize_stage``
+    (call ``finalize()`` once) to keep the indices in lock-step.
+
+    Per sweep: pull the map points within ``max_r`` of the ego, bin both the map
+    and the scan into egocentric rings×sectors. A bin's ground = the lowest scan
+    return in it; scan structure height = the highest. An above-ground map point is
+    "transient this sweep" when ``map_z − scan_maxz > height_diff`` (the map holds
+    structure the live scan does not). Only bins the scan actually populated count
+    as "seen" (avoids penalising FOV gaps). A map point with
+    ``seen ≥ min_scans`` and ``transient/seen ≥ 1 − occ_ratio`` is dropped.
+    """
+    from scipy.spatial import cKDTree
+
+    if isinstance(static_acc, WorldVoxelAccumulator):
+        m_xy, m_z, _rgb, _first = static_acc.finalize()
+    else:
+        m_xy, m_z, _rgb, _first = static_acc
+    m_xy = np.asarray(m_xy, dtype="float64").reshape(-1, 2)
+    m_z = np.asarray(m_z, dtype="float64").reshape(-1)
+    big = len(m_z)
+    drop = np.zeros(big, dtype=bool)
+    if big == 0 or not scans:
+        return drop
+
+    nbins = rings * sectors
+    tree = cKDTree(m_xy)
+    seen = np.zeros(big, dtype="int64")
+    transient = np.zeros(big, dtype="int64")
+
+    for s_xy, s_z, ego in scans:
+        ego = np.asarray(ego, dtype="float64").reshape(2)
+        mi = np.asarray(tree.query_ball_point(ego, max_r), dtype=np.int64)
+        if mi.size == 0:
+            continue
+        s_xy = np.asarray(s_xy, dtype="float64").reshape(-1, 2)
+        s_z = np.asarray(s_z, dtype="float64").reshape(-1)
+        if s_xy.shape[0]:
+            srel = s_xy - ego
+            in_rng = np.hypot(srel[:, 0], srel[:, 1]) < max_r
+            srel, sz = srel[in_rng], s_z[in_rng]
+        else:
+            srel, sz = np.empty((0, 2)), np.empty(0)
+        if srel.shape[0] == 0:
+            continue
+        s_bin = _erasor_polar_bins(srel[:, 0], srel[:, 1], rings, sectors, max_r)
+        # Per-bin live ground (lowest return) + structure top (highest return).
+        bin_ground = np.full(nbins, np.inf)
+        bin_top = np.full(nbins, -np.inf)
+        np.minimum.at(bin_ground, s_bin, sz)
+        np.maximum.at(bin_top, s_bin, sz)
+        bin_has_scan = np.zeros(nbins, dtype=bool)
+        bin_has_scan[s_bin] = True
+
+        m_bin = _erasor_polar_bins(m_xy[mi, 0] - ego[0], m_xy[mi, 1] - ego[1],
+                                   rings, sectors, max_r)
+        observed = bin_has_scan[m_bin]
+        above_ground = m_z[mi] > (bin_ground[m_bin] + ground_margin)
+        is_trans = observed & above_ground & \
+            ((m_z[mi] - bin_top[m_bin]) > height_diff)
+        seen[mi[observed]] += 1
+        transient[mi[is_trans]] += 1
+
+    testable = seen >= min_scans
+    drop[testable] = transient[testable] >= (1.0 - occ_ratio) * seen[testable]
+    return drop
 
 
 # ── Feature 2: object tracks (always emitted, the tracks/ archive) ───────────
@@ -1861,6 +2475,9 @@ def run_stt_build(
     map_temporal_bucket: str = "1d",
     quantize_coords: float | None = None,
     quantize_attrs: dict[str, float] | None = None,
+    vector_groups: list[tuple[str, list[str], str]] | None = None,
+    point_elevation_column: str | None = None,
+    static_full_range: bool = False,
     publish: bool = True,
 ) -> None:
     """Run ``stt-build`` on one archive's GeoParquet → a packed STT directory.
@@ -1906,10 +2523,11 @@ def run_stt_build(
         raise ValueError(f"run_stt_build: unknown kind {kind!r} (use one of {valid})")
 
     is_map = kind in ("map_poly", "map_line")
-    # Static map archives must collapse into ONE temporal bucket so they load
-    # once + persist; a bucket >= the scene duration guarantees that regardless
-    # of the per-point bucket the caller passed.
-    bucket = map_temporal_bucket if is_map else temporal_bucket
+    # Full-range archives (HD-map, or the scene-split STATIC stage) collapse into
+    # ONE temporal bucket so they load once + persist; a bucket >= the scene
+    # duration guarantees that regardless of the per-point bucket the caller passed.
+    full_range = is_map or (static_full_range and kind == "point")
+    bucket = map_temporal_bucket if full_range else temporal_bucket
 
     cmd = [
         stt_build,
@@ -1935,6 +2553,23 @@ def run_stt_build(
         for name, prec in quantize_attrs.items():
             if prec and prec > 0:
                 cmd += ["--quantize-attr", f"{name}={float(prec)!r}"]
+    # Fuse scalar surfel / colour columns into GPU-ready interleaved
+    # FixedSizeList columns (`--vector-group name=cols[:f32|u8]`) so the client
+    # binds them zero-copy — no per-point re-pack on the render thread. A group
+    # whose source columns are absent from a tile is silently skipped by the
+    # encoder, so it's safe to pass surfel groups for a non-surfel archive.
+    if vector_groups:
+        for name, components, elem in vector_groups:
+            spec = f"{name}={','.join(components)}"
+            if elem and elem != "f32":
+                spec += f":{elem}"
+            cmd += ["--vector-group", spec]
+    # 3D POINT geometry: fold a numeric column (LiDAR `z`) into the geometry's
+    # 3rd coordinate so the renderer binds 3D positions zero-copy (no pad-to-3D
+    # on the main thread). POINT clouds only (ScatterplotLayer/AnimatedPointLayer);
+    # surfel bundles keep 2D + a separate elevation attribute.
+    if point_elevation_column:
+        cmd += ["--point-elevation-column", point_elevation_column]
     if kind == "trips":
         cmd += ["--end-time-field", "end_timestamp", "--simplify"]
     elif kind == "line":
@@ -1956,6 +2591,14 @@ def run_stt_build(
             # Keep short lane/road dividers whole (don't clip at tile edges) —
             # mirrors the linestring handling in storms.rs's track build.
             cmd.append("--no-clip")
+    elif static_full_range and kind == "point":
+        # Scene-split STATIC "stage": a full-range POINT cloud. Same idiom as the
+        # HD-map (one whole-scene bucket via `full_range` above + per-point validity
+        # [timestamp, end_timestamp]) so the fixed environment loads once and stays
+        # up for the entire replay. Requires an `end_timestamp` column (emit it via
+        # write_lidar_points(end_timestamp=...)). Points never span tile edges, so
+        # the default clip is correct — no --no-clip.
+        cmd += ["--end-time-field", "end_timestamp"]
     if publish:
         cmd.append("--publish")
 

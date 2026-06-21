@@ -363,6 +363,25 @@ struct Args {
     #[arg(long = "quantize-attrs-auto", default_value_t = false)]
     quantize_attrs_auto: bool,
 
+    /// Fuse several scalar numeric properties into ONE interleaved GPU-ready
+    /// column (`FixedSizeList<f32|u8, width>`) so the renderer binds it zero-copy
+    /// with no per-point re-interleave on the main thread. Format:
+    /// `NAME=col1,col2,...[:f32|:u8]` (default leaf `f32`; use `u8` for 0–255
+    /// RGBA). The component order is the vector's component order. Repeatable:
+    /// `--vector-group surfel_quat=qx,qy,qz,qw --vector-group surfel_rgba=r,g,b,a:u8`.
+    /// The source scalar columns are removed from the tile. Default: none.
+    #[arg(long = "vector-group", value_name = "NAME=COLS[:f32|u8]")]
+    vector_group: Vec<String>,
+
+    /// Fold a numeric property into POINT geometry as the 3rd (altitude)
+    /// coordinate, so the tile ships true 3D points (`FixedSizeList<_,3>`) the
+    /// renderer binds zero-copy — no per-point pad-to-3D on the main thread. The
+    /// column is removed from the property set (it lives in the geometry). Only
+    /// affects POINT layers. Pairs with `--quantize-coords` (the z axis is
+    /// quantized to the same ground precision). Default: none (plain 2D points).
+    #[arg(long = "point-elevation-column", value_name = "NAME")]
+    point_elevation_column: Option<String>,
+
     // --- Per-tile budgets (OPT-IN; default OFF) ----------------------------
     // The project follows a documented "no thinning / comprehensive data by
     // default" principle. These caps are inert unless explicitly set, and when
@@ -519,6 +538,51 @@ fn main() -> Result<()> {
     if args.quantize_attrs_auto {
         info!("Automatic range-adaptive numeric-attribute quantization ENABLED (every Float64 prop → u16)");
         stt_core::arrow_tile::set_quantize_attrs_auto(true);
+    }
+
+    // Vector grouping (e.g. surfel quat/scale/colour) — fuse scalar columns into
+    // a GPU-ready interleaved FixedSizeList. Parse `NAME=col1,col2[:f32|u8]`.
+    if !args.vector_group.is_empty() {
+        use stt_core::arrow_tile::{VectorElem, VectorGroup};
+        let mut groups: Vec<VectorGroup> = Vec::new();
+        for spec in &args.vector_group {
+            let (name, rest) = spec.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("--vector-group expects NAME=COLS[:f32|u8], got {spec:?}")
+            })?;
+            // Optional trailing `:f32` / `:u8` selects the leaf upload type.
+            let (cols_str, elem) = match rest.rsplit_once(':') {
+                Some((cols, "u8")) => (cols, VectorElem::U8),
+                Some((cols, "f32")) => (cols, VectorElem::F32),
+                Some((_, other)) => {
+                    anyhow::bail!("--vector-group {spec:?}: leaf type {other:?} must be f32 or u8")
+                }
+                None => (rest, VectorElem::F32),
+            };
+            let components: Vec<String> = cols_str
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            if components.is_empty() {
+                anyhow::bail!("--vector-group {spec:?}: no component columns");
+            }
+            groups.push(VectorGroup {
+                name: name.trim().to_string(),
+                components,
+                elem,
+            });
+        }
+        info!(
+            "Vector grouping ENABLED: {} group(s) → interleaved FixedSizeList columns",
+            groups.len()
+        );
+        stt_core::arrow_tile::set_vector_groups(groups);
+    }
+    if let Some(col) = args.point_elevation_column.as_deref() {
+        if !col.is_empty() {
+            info!("3D POINT geometry ENABLED: folding '{col}' into the geometry's z coordinate");
+            stt_core::arrow_tile::set_point_elevation_column(col);
+        }
     }
 
     // Parse compression

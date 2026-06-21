@@ -855,6 +855,7 @@ def read_scene_meta(stats_path: Path):
 # ~180M raw returns. See av_common.worldbuild_merge for the column contract.
 WORLDBUILD_VOXEL_M = 0.15        # default static-merge voxel edge (m)
 WORLDBUILD_STATIC_SPEED = 0.5    # m/s — a track at/above this is "moving"
+ERASOR_SCAN_STRIDE = avc.ERASOR_SCAN_STRIDE  # decimate per-sweep ERASOR scans
 
 
 def extract_moving_boxes_world(path: Path, pose_by_ts, origin, static_speed: float):
@@ -894,7 +895,10 @@ def extract_moving_boxes_world(path: Path, pose_by_ts, origin, static_speed: flo
 
 def extract_worldbuild(path: Path, cal: dict, pose_by_ts, origin,
                        colorizer: "CameraColorizer", moving_boxes,
-                       voxel_m: float = WORLDBUILD_VOXEL_M):
+                       voxel_m: float = WORLDBUILD_VOXEL_M,
+                       collect_scans: bool = False,
+                       scan_stride: int = ERASOR_SCAN_STRIDE,
+                       color_mode: str = "mean"):
     """Stream-accumulate the worldbuild cloud → (WorldVoxelAccumulator, dynamic).
 
     Decodes each sweep's five lasers at FULL density (in the vehicle frame), lifts
@@ -904,11 +908,19 @@ def extract_worldbuild(path: Path, cal: dict, pose_by_ts, origin,
     collects the DYNAMIC returns un-merged. Peak memory ∝ occupied voxels + the
     (small) dynamic-return set. ``dynamic`` is the ``{xy,z,rgb,t}`` dict for
     ``av_common.worldbuild_merge``.
+
+    Shared by Worldbuild and the scene-split "stage + actors" mode: ``color_mode``
+    (default "mean") → "linear_weighted" fuses cross-sweep colour in LINEAR light
+    (no washout); ``collect_scans`` also returns each sweep's STATIC returns
+    (decimated by ``scan_stride``) + ego xy as ``(xy,z,ego_xy)`` for
+    ``av_common.erasor_scrub``. Returns ``(acc, dynamic)`` — or
+    ``(acc, dynamic, scans)`` when ``collect_scans``.
     """
     VAL = "[LiDARComponent].range_image_return1.values"
     SH = "[LiDARComponent].range_image_return1.shape"
-    acc = avc.WorldVoxelAccumulator(voxel_m)
+    acc = avc.WorldVoxelAccumulator(voxel_m, color_mode=color_mode)
     d_xy, d_z, d_rgb, d_t = [], [], [], []
+    scans: list = []
     fallback = np.asarray(FALLBACK_RGB, dtype=np.uint8)
 
     def flush(ts: int, parts: list):
@@ -936,6 +948,10 @@ def extract_worldbuild(path: Path, cal: dict, pose_by_ts, origin,
         stat = ~dyn
         if stat.any():
             acc.add(xy[stat], z[stat], t_ms, rgb=rgb[stat], rgb_hit=hit[stat])
+            if collect_scans:
+                ego_xy = np.array([T[0, 3] - origin[0], T[1, 3] - origin[1]],
+                                  dtype="float64")
+                scans.append((xy[stat][::scan_stride], z[stat][::scan_stride], ego_xy))
         if dyn.any():
             d_xy.append(xy[dyn])
             d_z.append(z[dyn])
@@ -975,6 +991,8 @@ def extract_worldbuild(path: Path, cal: dict, pose_by_ts, origin,
         rgb=np.concatenate(d_rgb) if d_rgb else np.empty((0, 3)),
         t=np.concatenate(d_t) if d_t else np.empty(0, dtype="int64"),
     )
+    if collect_scans:
+        return acc, dynamic, scans
     return acc, dynamic
 
 
@@ -1028,17 +1046,21 @@ def generate(args):
 
     cal = load_calibration(cpath("lidar_calibration"))
 
-    # --worldbuild is mutually exclusive with --surfel / --contours and (like
-    # --surfel) forces camera colour on.
-    if args.worldbuild and (args.surfel or args.contours):
-        raise SystemExit("--worldbuild is mutually exclusive with --surfel / --contours")
+    # --worldbuild / --scene-split are mutually exclusive with --surfel / --contours
+    # (and each other) and (like --surfel) force camera colour on.
+    scene_split_mode = bool(getattr(args, "scene_split", False))
+    if sum((bool(args.worldbuild), scene_split_mode, bool(args.surfel),
+            bool(args.contours))) > 1:
+        raise SystemExit("--worldbuild / --scene-split / --surfel / --contours "
+                         "are mutually exclusive")
 
     # Optional camera-projection colorize (and its correctness overlay): load the
     # 5 cameras' calibrations + images and build the projector. Both need the
     # camera_calibration component (download it alongside camera_image).
-    # --worldbuild implies camera colour (like --surfel).
+    # --worldbuild / --scene-split imply camera colour (like --surfel).
     colorizer = None
-    if args.colorize or args.surfel or args.worldbuild or args.debug_overlay is not None:
+    if (args.colorize or args.surfel or args.worldbuild or scene_split_mode
+            or args.debug_overlay is not None):
         print("  loading camera calibrations + images (5 cams) for projection…")
         cam_cal = load_camera_calibrations(cpath("camera_calibration"))
         cam_store = load_camera_images(cpath("camera_image"))
@@ -1113,6 +1135,71 @@ def generate(args):
             print("  (--contours) NO contours produced — try a smaller --contour-cell "
                   "/ --contour-min-len or a larger --contour-width.")
         n_lidar = int(n_iso)  # contour-line count (iso has no point-density tiers)
+    elif scene_split_mode:
+        # SCENE-SPLIT ("stage + actors"): TWO archives. STATIC stage (every sweep
+        # accumulated, moving returns removed via in-box + ERASOR, curvature-adaptive
+        # compaction + photo grade, baked as one timeless full-range cloud) + DYNAMIC
+        # actors (moving returns, kept per-sweep + animated). Cross-sweep colour is
+        # fused in LINEAR light (no washout). Shared av_common pipeline w/ AV2.
+        ss = avc.scene_split_config(args)
+        print(f"  scene-split: stage voxel {ss['voxel_m']} m, static-speed "
+              f"{ss['static_speed']} m/s, erasor={'on' if ss['erasor'] else 'off'}…")
+        moving_boxes = extract_moving_boxes_world(
+            cpath("lidar_box"), pose_by_ts, origin, ss["static_speed"])
+        acc, dynamic, scans = extract_worldbuild(
+            cpath("lidar"), cal, pose_by_ts, origin, colorizer, moving_boxes,
+            voxel_m=ss["voxel_m"], collect_scans=True, color_mode="linear_weighted")
+        static_final = acc.finalize()
+        drop = (avc.erasor_scrub(static_final, scans, **ss["erasor_params"])
+                if ss["erasor"] else None)
+        if drop is not None:
+            print(f"  scene-split: ERASOR scrubbed {int(drop.sum())} / {len(drop)} "
+                  f"stage voxel(s) as residual dynamic")
+        stage = avc.finalize_stage(static_final, drop_mask=drop,
+                                   adaptive=ss.get("adaptive"), grade=ss.get("grade"))
+        actors = avc.finalize_actors(dynamic, grade=ss.get("actor_grade"),
+                                     denoise=ss.get("denoise"))
+        for d in (stage, actors):
+            s_lon, s_lat = to_lonlat(d["xy"][:, 0], d["xy"][:, 1])
+            d["lon"], d["lat"] = np.atleast_1d(s_lon), np.atleast_1d(s_lat)
+        n_stage, n_actors = len(stage["z"]), len(actors["z"])
+        fl_rgb = stage["rgb"]  # mark the bundle camera-colored in scene.json
+        print(f"  scene-split: {n_stage} stage + {n_actors} actor point(s)")
+        stage_pq = out / "static.parquet"
+        avc.write_lidar_points(
+            stage_pq, lon=stage["lon"], lat=stage["lat"], timestamp=stage["timestamp"],
+            end_timestamp=t_end, z=stage["z"], rgb=stage["rgb"], surfels=stage["surfels"],
+            world_class=stage["world_class"], is_dynamic=stage["is_dynamic"],
+            pack_quat=args.pack_quat)
+        actors_pq = out / "dynamic.parquet"
+        avc.write_lidar_points(
+            actors_pq, lon=actors["lon"], lat=actors["lat"], timestamp=actors["timestamp"],
+            z=actors["z"], rgb=actors["rgb"], surfels=actors["surfels"],
+            world_class=actors["world_class"], is_dynamic=actors["is_dynamic"],
+            pack_quat=args.pack_quat)
+        if not args.skip_build and n_stage > 0:
+            shutil.rmtree(out / "static", ignore_errors=True)  # prune orphan packs
+            avc.run_stt_build(
+                stage_pq, out / "static", "point", stt_build=args.stt_build,
+                min_zoom=args.stage_min_zoom, quantize_coords=LIDAR_QUANTIZE_M,
+                quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M),
+                vector_groups=avc.lidar_vector_groups(surfel=True, colored=True),
+                static_full_range=True)
+        if not args.skip_build and n_actors > 0:
+            shutil.rmtree(out / "dynamic", ignore_errors=True)  # prune orphan packs
+            avc.run_stt_build(
+                actors_pq, out / "dynamic", "point", stt_build=args.stt_build,
+                temporal_bucket=args.temporal_bucket,
+                min_zoom=LIDAR_MIN_ZOOM, quantize_coords=LIDAR_QUANTIZE_M,
+                quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M),
+                vector_groups=avc.lidar_vector_groups(surfel=True, colored=True))
+        elif n_actors == 0:
+            print("  scene-split: NO dynamic (moving-actor) returns this scene.")
+        lidar_densities.append({"id": "stage", "label": "Stage", "points": n_stage,
+                                "url": "static/manifest.json"})
+        lidar_densities.append({"id": "actors", "label": "Actors", "points": n_actors,
+                                "url": "dynamic/manifest.json"})
+        n_lidar = n_actors
     elif worldbuild_mode:
         # WORLDBUILD: one consolidated cross-sweep-merged cloud. STATIC returns
         # voxel-deduped over the whole drive; DYNAMIC (moving-actor) returns pass
@@ -1145,7 +1232,8 @@ def generate(args):
             avc.run_stt_build(tier_pq, tier_out, "point",
                               stt_build=args.stt_build, temporal_bucket=args.temporal_bucket,
                               min_zoom=LIDAR_MIN_ZOOM, quantize_coords=LIDAR_QUANTIZE_M,
-                              quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M))
+                              quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M),
+                              vector_groups=avc.lidar_vector_groups(surfel=True, colored=True))
         lidar_densities.append({"id": "world", "label": "Worldbuild", "points": int(n),
                                 "url": "lidar/manifest.json"})
         n_lidar = int(n)
@@ -1170,7 +1258,9 @@ def generate(args):
             avc.run_stt_build(tier_pq, tier_out, "point",
                               stt_build=args.stt_build, temporal_bucket=args.temporal_bucket,
                               min_zoom=LIDAR_MIN_ZOOM, quantize_coords=LIDAR_QUANTIZE_M,
-                              quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M))
+                              quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M),
+                              vector_groups=avc.lidar_vector_groups(
+                                  surfel=True, colored=True))
         lidar_densities.append({"id": "surfel", "label": "Surfel", "points": int(n),
                                 "url": "lidar/manifest.json"})
         n_lidar = int(n)
@@ -1202,7 +1292,10 @@ def generate(args):
                 avc.run_stt_build(tier_pq, tier_out, "point",
                                   stt_build=args.stt_build, temporal_bucket=args.temporal_bucket,
                                   min_zoom=LIDAR_MIN_ZOOM, quantize_coords=LIDAR_QUANTIZE_M,
-                                  quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M))
+                                  quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M),
+                                  vector_groups=avc.lidar_vector_groups(
+                                      surfel=False, colored=True),
+                                  point_elevation_column="z")
             lidar_densities.append({"id": tier_id, "label": label, "points": int(n),
                                     "url": f"{dname}/manifest.json",
                                     "radius": radius_px, "radiusMinPixels": radius_min_px})
@@ -1252,6 +1345,16 @@ def generate(args):
     }
     if cam_frames:
         streams["camera"] = {"url": "cameras.json"}
+    if scene_split_mode:
+        # Scene-split overrides the single `lidar` stream with two surfel archives:
+        # `lidar` aliases the animated DYNAMIC actors (single-stream code resolves),
+        # plus a `stage` stream for the timeless STATIC backdrop.
+        streams["lidar"] = {"url": "dynamic/manifest.json", "points": int(n_actors),
+                            "colored": True, "splat": "surfel", "style": "actors",
+                            "densities": lidar_densities}
+        streams["stage"] = {"url": "static/manifest.json", "points": int(n_stage),
+                            "colored": True, "splat": "surfel", "style": "stage",
+                            "static": True}
 
     if not args.skip_build:
         # (lidar tiers were built above, per density.) Clear stale packs first —
@@ -1346,6 +1449,8 @@ def main():
                    help="a track at/above this speed (m/s) is MOVING → its returns are "
                         f"tagged dynamic + passed through un-merged (default "
                         f"{WORLDBUILD_STATIC_SPEED}).")
+    # Scene-split ("stage + actors") flags, shared with argoverse_extract.py.
+    avc.add_scene_split_args(p)
     p.add_argument("--surfel-decimate", type=int, default=SURFEL_DECIMATE,
                    help=f"render decimation for the surfel tier (default {SURFEL_DECIMATE}; "
                         "neighbourhoods are always full-density).")

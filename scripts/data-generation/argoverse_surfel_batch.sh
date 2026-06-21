@@ -27,7 +27,10 @@ RING=(ring_front_center ring_front_left ring_front_right \
 aws_cp() { aws s3 cp --no-sign-request --only-show-errors "$@"; }
 
 # log UUID : 3-letter city (recovered via `aws s3 ls .../val/`).
+# Miami (02a00399) is included so a full re-roll (FORCE=1) rebuilds every city
+# with the current pipeline; without FORCE an already-built city is skipped.
 SCENES=(
+  "02a00399-3857-444e-8db3-a8f58489c394:MIA"
   "02678d04-cc9f-3148-9f95-1ba66347dff9:PIT"
   "0b5142c1-420b-3fea-9e98-b87327ae22c6:WDC"
   "0bae3b5e-417d-3b03-abaa-806b433233b8:DTW"

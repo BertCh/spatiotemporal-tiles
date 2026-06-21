@@ -161,15 +161,23 @@ fn is_list_like(dt: &DataType) -> bool {
 }
 
 /// A property column is one of the shapes `encode_layer` emits: a plain
-/// `Float64` (numeric), a `Dictionary<UInt16, Utf8>` (categorical), or — when
-/// the build opts a numeric column into quantization (`--quantize-attr`) — a
-/// fixed-point `UInt16`/`Int32` leaf carrying the `stt:qa` reconstruction affine
-/// in its field metadata (the reader rebuilds Float64 from `{o,s}`).
+/// `Float64` (numeric), a `Dictionary<UInt16, Utf8>` (categorical), an
+/// interleaved `FixedSizeList<Float32|UInt8, N>` vector (`--vector-group`), or —
+/// when the build opts a numeric column into quantization (`--quantize-attr`) —
+/// a fixed-point `UInt16`/`Int32` leaf carrying the `stt:qa` reconstruction
+/// affine in its field metadata (the reader rebuilds Float64 from `{o,s}`).
 fn is_valid_property_field(field: &Field) -> bool {
     match field.data_type() {
         DataType::Float64 => true,
         DataType::Dictionary(k, v) => {
             matches!(k.as_ref(), DataType::UInt16) && matches!(v.as_ref(), DataType::Utf8)
+        }
+        // Interleaved GPU-ready vector column: a FixedSizeList of Float32 (quat /
+        // scale) or UInt8 (RGBA colour). The renderer binds the child buffer
+        // zero-copy, so only those two leaf types are encodable.
+        DataType::FixedSizeList(item, n) => {
+            *n > 0
+                && matches!(item.data_type(), DataType::Float32 | DataType::UInt8)
         }
         // Quantized numeric: only valid WITH the affine metadata — a bare
         // UInt16/Int32 property with no `stt:qa` is producer drift.

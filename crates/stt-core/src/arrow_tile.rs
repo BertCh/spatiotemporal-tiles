@@ -38,15 +38,15 @@
 use crate::error::{Error, Result};
 use crate::types::GeometryType;
 use arrow::array::{
-    Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Builder,
+    Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Float32Builder,
     Float64Array, Int32Array, Int32Builder, Int64Array, Int64Builder, ListArray, ListBuilder,
-    RecordBatch, StringArray, UInt16Array, UInt16Builder, UInt32Builder, UInt64Array,
+    RecordBatch, StringArray, UInt16Array, UInt16Builder, UInt32Builder, UInt64Array, UInt8Array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, UInt16Type};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -124,6 +124,16 @@ impl GeometryColumn {
     }
 }
 
+/// Leaf element type of a [`PropertyColumn::Vector`] — the GPU upload type the
+/// renderer binds the decoded child buffer as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorElem {
+    /// `Float32` leaf — quaternion / scale / generic vec attributes.
+    F32,
+    /// `UInt8` leaf — packed RGBA colour (0–255 per channel).
+    U8,
+}
+
 /// A property column. Values are per-feature and may be missing.
 #[derive(Debug, Clone)]
 pub enum PropertyColumn {
@@ -131,6 +141,23 @@ pub enum PropertyColumn {
     Numeric(Vec<Option<f64>>),
     /// Categorical / string values.
     Categorical(Vec<Option<String>>),
+    /// A fixed-width interleaved vector per feature — a GPU-ready instance
+    /// attribute baked at build time (e.g. a `[qx,qy,qz,qw]` surfel quaternion,
+    /// a `[s_major,s_minor]` scale, an `[r,g,b,a]` colour). Encoded as
+    /// `FixedSizeList<Float32|UInt8, width>` so the TS decoder hands the
+    /// contiguous child buffer straight to deck.gl with **zero per-point work**
+    /// (no main-thread re-interleave). `values` is row-major and flattened:
+    /// feature `i` occupies `[i*width, (i+1)*width)`. No per-element nulls (a
+    /// missing feature is encoded as a zero/identity vector by the producer).
+    Vector {
+        /// Components per feature (the FixedSizeList list size).
+        width: usize,
+        /// Leaf upload type (`F32` or `U8`).
+        elem: VectorElem,
+        /// Flattened row-major values; length must be `width * feature_count`.
+        /// `U8` values are rounded+clamped to `[0,255]` at encode.
+        values: Vec<f32>,
+    },
 }
 
 /// One decoded/encodable tile layer.
@@ -213,11 +240,29 @@ impl ColumnarLayer {
             check("triangles", tri.len())?;
         }
         for (name, col) in &self.properties {
-            let len = match col {
-                PropertyColumn::Numeric(v) => v.len(),
-                PropertyColumn::Categorical(v) => v.len(),
-            };
-            check(&format!("property '{}'", name), len)?;
+            match col {
+                PropertyColumn::Numeric(v) => check(&format!("property '{}'", name), v.len())?,
+                PropertyColumn::Categorical(v) => check(&format!("property '{}'", name), v.len())?,
+                PropertyColumn::Vector { width, values, .. } => {
+                    if *width == 0 {
+                        return Err(Error::Other(format!(
+                            "tile layer '{}': vector property '{}' has width 0",
+                            self.name, name
+                        )));
+                    }
+                    if values.len() != width * n {
+                        return Err(Error::Other(format!(
+                            "tile layer '{}': vector property '{}' has {} values, expected {} ({} × {})",
+                            self.name,
+                            name,
+                            values.len(),
+                            width * n,
+                            width,
+                            n
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -297,15 +342,27 @@ pub struct QuantAffine {
     pub y0: f64,
     pub sx: f64,
     pub sy: f64,
+    /// Z-axis origin/step (metres), present ONLY for 3D point geometry
+    /// (`FixedSizeList<i32,3>`). `None` ⇒ plain 2D coords, byte-identical to the
+    /// historical affine (the `z0`/`sz` keys are simply omitted from the JSON).
+    pub z0: Option<f64>,
+    pub sz: Option<f64>,
 }
 
 impl QuantAffine {
     fn to_json(&self) -> String {
-        // Full f64 round-trip precision (17 sig digits) so decode is exact.
-        format!(
-            r#"{{"x0":{:.17e},"y0":{:.17e},"sx":{:.17e},"sy":{:.17e}}}"#,
-            self.x0, self.y0, self.sx, self.sy
-        )
+        // Full f64 round-trip precision (17 sig digits) so decode is exact. The
+        // z keys are emitted only for 3D affines, so a 2D affine is byte-identical.
+        match (self.z0, self.sz) {
+            (Some(z0), Some(sz)) => format!(
+                r#"{{"x0":{:.17e},"y0":{:.17e},"sx":{:.17e},"sy":{:.17e},"z0":{:.17e},"sz":{:.17e}}}"#,
+                self.x0, self.y0, self.sx, self.sy, z0, sz
+            ),
+            _ => format!(
+                r#"{{"x0":{:.17e},"y0":{:.17e},"sx":{:.17e},"sy":{:.17e}}}"#,
+                self.x0, self.y0, self.sx, self.sy
+            ),
+        }
     }
 
     /// Parse the affine from its [`STT_QUANT_META_KEY`] JSON value. The TS
@@ -318,6 +375,8 @@ impl QuantAffine {
             y0: f("y0")?,
             sx: f("sx")?,
             sy: f("sy")?,
+            z0: f("z0"),
+            sz: f("sz"),
         })
     }
 
@@ -339,6 +398,13 @@ impl QuantAffine {
     #[inline]
     fn qy(&self, lat: f64) -> i32 {
         (((lat - self.y0) / self.sy).round() as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }
+    /// Quantize a metre altitude to a grid index (3D affines only; `z0`/`sz` set).
+    #[inline]
+    fn qz(&self, z: f64) -> i32 {
+        let z0 = self.z0.unwrap_or(0.0);
+        let sz = self.sz.unwrap_or(1.0);
+        (((z - z0) / sz).round() as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32
     }
 }
 
@@ -365,19 +431,67 @@ fn world_grid_affine(meters: f64) -> Option<QuantAffine> {
         y0: -90.0,
         sx: step,
         sy: step,
+        z0: None,
+        sz: None,
     })
 }
 
-/// Construct the GeoArrow geometry array for a [`GeometryColumn`] (Float64).
-fn build_geometry_array(geom: &GeometryColumn) -> ArrayRef {
-    build_geometry_array_q(geom, None)
+/// The 3D variant of [`world_grid_affine`]: same world-grid xy plus a Z axis
+/// quantized to the SAME ground precision in metres, origin pinned to a fixed
+/// global datum (`z0 = 0`) so identical surfels stay byte-identical across tiles
+/// (dedup-preserving, like the xy world grid). For point clouds whose altitude
+/// rides the geometry's 3rd coordinate (`--point-elevation-column`).
+fn world_grid_affine_3d(meters: f64) -> Option<QuantAffine> {
+    let a = world_grid_affine(meters)?;
+    Some(QuantAffine {
+        z0: Some(0.0),
+        sz: Some(meters),
+        ..a
+    })
 }
 
-/// [`build_geometry_array`], optionally quantizing coordinates to an `i32` grid
+/// Optionally quantizing coordinates to an `i32` grid
 /// (when `quant` is `Some`). The List/FixedSizeList nesting and offset buffers
 /// are identical either way — only the leaf changes from `Float64` to `Int32`,
 /// so `quant = None` is byte-identical to the historical encoder.
-fn build_geometry_array_q(geom: &GeometryColumn, quant: Option<&QuantAffine>) -> ArrayRef {
+///
+/// When `point_elev` is `Some` (POINT geometry only), each point's altitude is
+/// folded in as a 3rd coordinate: the leaf becomes `FixedSizeList<_,3>`
+/// (`[x,y,z]`), quantized with the affine's `z0`/`sz` when quantizing. The
+/// renderer then binds 3D positions zero-copy (no pad). `None` ⇒ 2D, unchanged.
+fn build_geometry_array_q(
+    geom: &GeometryColumn,
+    quant: Option<&QuantAffine>,
+    point_elev: Option<&[f64]>,
+) -> ArrayRef {
+    // 3D POINT path: interleave [x,y,z] into a FixedSizeList<_,3> leaf.
+    if let (GeometryColumn::Point(points), Some(elev)) = (geom, point_elev) {
+        let list_size = 3;
+        let dt = if quant.is_some() { DataType::Int32 } else { DataType::Float64 };
+        let field = Arc::new(Field::new("xyz", dt, false));
+        let child: ArrayRef = match quant {
+            Some(q) => {
+                let mut iv = Vec::with_capacity(points.len() * 3);
+                for (i, [x, y]) in points.iter().enumerate() {
+                    iv.push(q.qx(*x));
+                    iv.push(q.qy(*y));
+                    iv.push(q.qz(elev.get(i).copied().unwrap_or(0.0)));
+                }
+                Arc::new(Int32Array::from(iv))
+            }
+            None => {
+                let mut flat = Vec::with_capacity(points.len() * 3);
+                for (i, [x, y]) in points.iter().enumerate() {
+                    flat.push(*x);
+                    flat.push(*y);
+                    flat.push(elev.get(i).copied().unwrap_or(0.0));
+                }
+                Arc::new(Float64Array::from(flat))
+            }
+        };
+        return Arc::new(FixedSizeListArray::new(field, list_size, child, None));
+    }
+
     let coord_field = || {
         let dt = if quant.is_some() {
             DataType::Int32
@@ -622,6 +736,127 @@ pub fn set_quantize_attrs_auto(on: bool) {
 /// Whether automatic numeric-property quantization is enabled.
 pub fn quantize_attrs_auto() -> bool {
     QUANTIZE_ATTRS_AUTO.load(Ordering::Relaxed)
+}
+
+/// A build-time directive to fuse several scalar numeric properties into one
+/// GPU-ready interleaved [`PropertyColumn::Vector`]. The component order is the
+/// vector's component order (e.g. `["qx","qy","qz","qw"]` → `instanceQuaternions`).
+/// Applied at encode time (like the quantization maps), so the producer keeps
+/// emitting plain scalar columns and the renderer still binds the result
+/// zero-copy. See [`set_vector_groups`].
+#[derive(Debug, Clone)]
+pub struct VectorGroup {
+    /// Output column name (the FixedSizeList field name the decoder keys on).
+    pub name: String,
+    /// Source scalar-property names, in component order.
+    pub components: Vec<String>,
+    /// Leaf upload type (`F32` for quat/scale, `U8` for 0–255 RGBA).
+    pub elem: VectorElem,
+}
+
+/// Build-global list of vector groups (see [`VectorGroup`]). Set once per build
+/// from `stt-build --vector-group`. Empty (the default) ⇒ every property stays a
+/// scalar column, byte-identical to the historical encoder.
+fn vector_groups_cell() -> &'static RwLock<Vec<VectorGroup>> {
+    static A: OnceLock<RwLock<Vec<VectorGroup>>> = OnceLock::new();
+    A.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Replace the build-global vector-group list.
+pub fn set_vector_groups(groups: Vec<VectorGroup>) {
+    *vector_groups_cell().write().unwrap() = groups;
+}
+
+/// The current vector-group list (a clone).
+pub fn vector_groups() -> Vec<VectorGroup> {
+    vector_groups_cell().read().unwrap().clone()
+}
+
+/// Build-global name of the numeric property to fold into POINT geometry as the
+/// 3rd (altitude) coordinate, so the tile ships true 3D points
+/// (`FixedSizeList<_,3>`) the renderer binds zero-copy — no per-point pad to 3D
+/// on the main thread. The named column is REMOVED from the property set (it
+/// lives in the geometry instead). Empty (default) ⇒ plain 2D points.
+fn point_elevation_column_cell() -> &'static RwLock<String> {
+    static A: OnceLock<RwLock<String>> = OnceLock::new();
+    A.get_or_init(|| RwLock::new(String::new()))
+}
+
+/// Set the build-global point-elevation column name (see above). Empty disables.
+pub fn set_point_elevation_column(name: &str) {
+    *point_elevation_column_cell().write().unwrap() = name.to_string();
+}
+
+/// The current point-elevation column name (empty ⇒ disabled).
+pub fn point_elevation_column() -> String {
+    point_elevation_column_cell().read().unwrap().clone()
+}
+
+/// Fuse the scalar columns named by each configured [`VectorGroup`] into a single
+/// [`PropertyColumn::Vector`], leaving every other column untouched and in order.
+///
+/// A group whose components are not ALL present as `Numeric` columns is skipped
+/// (its scalars stay as-is) — so a tile that happens not to carry one of the
+/// inputs degrades to scalars rather than dropping data. Missing per-feature
+/// values (`None`) encode as `0.0`. Returns `None` when no group applied, letting
+/// the caller iterate `layer.properties` directly with no clone.
+fn group_vector_properties(
+    props: &[(String, PropertyColumn)],
+    n: usize,
+) -> Option<Vec<(String, PropertyColumn)>> {
+    let groups = vector_groups();
+    if groups.is_empty() {
+        return None;
+    }
+    // name → numeric values slice, for component lookup.
+    let numeric: HashMap<&str, &[Option<f64>]> = props
+        .iter()
+        .filter_map(|(k, c)| match c {
+            PropertyColumn::Numeric(v) => Some((k.as_str(), v.as_slice())),
+            _ => None,
+        })
+        .collect();
+
+    let mut out: Vec<(String, PropertyColumn)> = Vec::new();
+    let mut consumed: HashSet<String> = HashSet::new();
+    let mut any = false;
+    for g in &groups {
+        if g.components.is_empty()
+            || !g.components.iter().all(|c| numeric.contains_key(c.as_str()))
+        {
+            continue;
+        }
+        let width = g.components.len();
+        let mut values = vec![0f32; width * n];
+        for (ci, cname) in g.components.iter().enumerate() {
+            let col = numeric[cname.as_str()];
+            for i in 0..n {
+                values[i * width + ci] = col[i].map(|x| x as f32).unwrap_or(0.0);
+            }
+        }
+        for c in &g.components {
+            consumed.insert(c.clone());
+        }
+        out.push((
+            g.name.clone(),
+            PropertyColumn::Vector {
+                width,
+                elem: g.elem,
+                values,
+            },
+        ));
+        any = true;
+    }
+    if !any {
+        return None;
+    }
+    // Keep every column not pulled into a group, in original order.
+    for (k, c) in props {
+        if !consumed.contains(k) {
+            out.push((k.clone(), c.clone()));
+        }
+    }
+    Some(out)
 }
 
 /// Range-adaptive auto quantization: size the step from the column's own span so
@@ -966,9 +1201,41 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
     fields.push(Arc::new(Field::new("end_time", DataType::Int64, false)));
     columns.push(Arc::new(Int64Array::from(layer.end_times.clone())));
 
+    // 3D POINT geometry: fold the configured numeric column into the geometry's
+    // 3rd coordinate, so the tile ships true 3D points the renderer binds
+    // zero-copy (no per-point pad). The column is then dropped from properties.
+    let elev_col = point_elevation_column();
+    let point_elev: Option<Vec<f64>> = if !elev_col.is_empty()
+        && matches!(layer.geometry, GeometryColumn::Point(_))
+    {
+        layer.properties.iter().find_map(|(name, col)| match col {
+            PropertyColumn::Numeric(v) if name == &elev_col => {
+                let n = layer.feature_count();
+                let mut out = vec![0.0f64; n];
+                for (i, x) in v.iter().enumerate() {
+                    if let Some(val) = x {
+                        out[i] = *val;
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        })
+    } else {
+        None
+    };
+    let elev_consumed = point_elev.is_some();
+
     // Geometry column carries the GeoArrow extension name in field metadata.
-    let quant = quantize_m.and_then(world_grid_affine);
-    let geom_array = build_geometry_array_q(&layer.geometry, quant.as_ref());
+    let quant = quantize_m.and_then(|m| {
+        if point_elev.is_some() {
+            world_grid_affine_3d(m)
+        } else {
+            world_grid_affine(m)
+        }
+    });
+    let geom_array =
+        build_geometry_array_q(&layer.geometry, quant.as_ref(), point_elev.as_deref());
     let mut geom_meta = HashMap::new();
     geom_meta.insert(
         GEOARROW_EXT_KEY.to_string(),
@@ -1074,7 +1341,19 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
         columns.push(array);
     }
 
-    for (name, col) in &layer.properties {
+    // Fuse configured scalar columns into GPU-ready interleaved Vector columns
+    // (e.g. qx/qy/qz/qw → one FixedSizeList<f32,4>). Runs BEFORE the quantize
+    // loop so grouped components are written as the raw vector, not individually
+    // quantized. No groups configured ⇒ iterate `layer.properties` with no clone.
+    let grouped = group_vector_properties(&layer.properties, layer.feature_count());
+    let props_iter: &[(String, PropertyColumn)] =
+        grouped.as_deref().unwrap_or(&layer.properties);
+    for (name, col) in props_iter {
+        // The point-elevation column now lives in the geometry's 3rd coordinate;
+        // don't also emit it as a scalar property.
+        if elev_consumed && name == &elev_col {
+            continue;
+        }
         match col {
             PropertyColumn::Numeric(values) => {
                 // Opt-in: a numeric property named in the build-global
@@ -1124,6 +1403,34 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
                 let dict = DictionaryArray::<UInt16Type>::try_new(key_array, value_array)
                     .map_err(|e| Error::Other(format!("dictionary build failed: {e}")))?;
                 columns.push(Arc::new(dict));
+            }
+            PropertyColumn::Vector { width, elem, values } => {
+                // Interleaved GPU-ready vector → FixedSizeList<leaf, width>. The
+                // child buffer is the flattened row-major run, so the TS decoder
+                // hands `child.values.subarray(...)` straight to deck.gl with no
+                // per-point re-interleave. Non-null leaf (producer encodes a
+                // missing feature as a zero/identity vector).
+                let (child, child_dt): (ArrayRef, DataType) = match elem {
+                    VectorElem::F32 => (
+                        Arc::new(Float32Array::from(values.clone())),
+                        DataType::Float32,
+                    ),
+                    VectorElem::U8 => {
+                        let bytes: Vec<u8> = values
+                            .iter()
+                            .map(|v| v.round().clamp(0.0, 255.0) as u8)
+                            .collect();
+                        (Arc::new(UInt8Array::from(bytes)), DataType::UInt8)
+                    }
+                };
+                let item_field = Arc::new(Field::new("item", child_dt, false));
+                let fsl = FixedSizeListArray::new(item_field, *width as i32, child, None);
+                fields.push(Arc::new(Field::new(
+                    name,
+                    fsl.data_type().clone(),
+                    true,
+                )));
+                columns.push(Arc::new(fsl));
             }
         }
     }
@@ -1520,6 +1827,202 @@ mod tests {
             .unwrap();
         assert!(speed.is_null(1));
         assert_eq!(speed.value(0), 10.0);
+    }
+
+    #[test]
+    fn vector_property_roundtrips_as_fixed_size_list() {
+        // A Vector property encodes as FixedSizeList<leaf, width>: the f32 quat
+        // as <Float32,4>, the u8 colour as <UInt8,4>, with the child buffer the
+        // flattened row-major run the TS decoder hands to the GPU zero-copy.
+        use arrow::array::{Float32Array, UInt8Array};
+        let layer = ColumnarLayer {
+            name: "surfels".to_string(),
+            feature_ids: vec![1, 2],
+            start_times: vec![0, 10],
+            end_times: vec![0, 10],
+            geometry: GeometryColumn::Point(vec![[-122.4, 37.7], [-122.5, 37.8]]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![
+                (
+                    "surfel_quat".to_string(),
+                    PropertyColumn::Vector {
+                        width: 4,
+                        elem: VectorElem::F32,
+                        values: vec![0.0, 0.0, 0.0, 1.0, 0.5, 0.5, 0.5, 0.5],
+                    },
+                ),
+                (
+                    "surfel_rgba".to_string(),
+                    PropertyColumn::Vector {
+                        width: 4,
+                        elem: VectorElem::U8,
+                        values: vec![255.0, 0.0, 0.0, 128.0, 0.0, 255.0, 0.0, 255.0],
+                    },
+                ),
+            ],
+        };
+        let ipc = encode_layer(&layer).unwrap();
+        let batch = decode_layer(&ipc).unwrap();
+
+        let quat = batch
+            .column_by_name("surfel_quat")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(quat.len(), 2);
+        assert_eq!(quat.value_length(), 4);
+        let qchild = quat
+            .values()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(
+            qchild.values(),
+            &[0.0, 0.0, 0.0, 1.0, 0.5, 0.5, 0.5, 0.5]
+        );
+
+        let rgba = batch
+            .column_by_name("surfel_rgba")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(rgba.value_length(), 4);
+        let cchild = rgba
+            .values()
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap();
+        assert_eq!(cchild.values(), &[255, 0, 0, 128, 0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn vector_groups_fuse_scalar_columns_at_encode() {
+        // `--vector-group` fuses named scalar columns into one interleaved
+        // FixedSizeList and drops the scalars; ungrouped columns are untouched.
+        use arrow::array::Float32Array;
+        set_vector_groups(vec![VectorGroup {
+            name: "surfel_quat".to_string(),
+            components: vec!["qx".into(), "qy".into(), "qz".into(), "qw".into()],
+            elem: VectorElem::F32,
+        }]);
+        let layer = ColumnarLayer {
+            name: "surfels".to_string(),
+            feature_ids: vec![1, 2],
+            start_times: vec![0, 10],
+            end_times: vec![0, 10],
+            geometry: GeometryColumn::Point(vec![[-122.4, 37.7], [-122.5, 37.8]]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![
+                ("qx".into(), PropertyColumn::Numeric(vec![Some(0.0), Some(0.5)])),
+                ("qy".into(), PropertyColumn::Numeric(vec![Some(0.0), Some(0.5)])),
+                ("qz".into(), PropertyColumn::Numeric(vec![Some(0.0), Some(0.5)])),
+                ("qw".into(), PropertyColumn::Numeric(vec![Some(1.0), Some(0.5)])),
+                ("z".into(), PropertyColumn::Numeric(vec![Some(3.0), Some(4.0)])),
+            ],
+        };
+        let ipc = encode_layer(&layer).unwrap();
+        set_vector_groups(Vec::new()); // reset the build-global before asserting
+        let batch = decode_layer(&ipc).unwrap();
+
+        // Scalars fused away; the grouped vector + the ungrouped `z` remain.
+        assert!(batch.column_by_name("qx").is_none());
+        assert!(batch.column_by_name("z").is_some());
+        let quat = batch
+            .column_by_name("surfel_quat")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(quat.value_length(), 4);
+        let qchild = quat
+            .values()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(qchild.values(), &[0.0, 0.0, 0.0, 1.0, 0.5, 0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn point_elevation_folds_into_3d_geometry_unquantized() {
+        use arrow::array::Float64Array;
+        let layer = ColumnarLayer {
+            name: "cloud".into(),
+            feature_ids: vec![1, 2],
+            start_times: vec![0, 0],
+            end_times: vec![0, 0],
+            geometry: GeometryColumn::Point(vec![[-122.4, 37.7], [-122.5, 37.8]]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![
+                ("z".into(), PropertyColumn::Numeric(vec![Some(3.5), Some(9.0)])),
+                ("speed".into(), PropertyColumn::Numeric(vec![Some(1.0), Some(2.0)])),
+            ],
+        };
+        set_point_elevation_column("z");
+        let ipc = encode_layer(&layer).unwrap();
+        set_point_elevation_column("");
+        let batch = decode_layer(&ipc).unwrap();
+
+        // Geometry is now a 3-wide list with z folded in; `z` is gone as a property.
+        let geom = batch
+            .column_by_name("geometry")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(geom.value_length(), 3);
+        let coords = geom.values().as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(coords.value(2), 3.5); // feature 0 z
+        assert_eq!(coords.value(5), 9.0); // feature 1 z
+        assert!(batch.column_by_name("z").is_none(), "z folded into geometry");
+        assert!(batch.column_by_name("speed").is_some(), "other props untouched");
+    }
+
+    #[test]
+    fn point_elevation_3d_geometry_quantizes_with_z_affine() {
+        use arrow::array::Int32Array;
+        let layer = ColumnarLayer {
+            name: "cloud".into(),
+            feature_ids: vec![1],
+            start_times: vec![0],
+            end_times: vec![0],
+            geometry: GeometryColumn::Point(vec![[-122.4, 37.7]]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![("z".into(), PropertyColumn::Numeric(vec![Some(5.0)]))],
+        };
+        set_point_elevation_column("z");
+        let ipc = encode_layer_quantized(&layer, Some(0.05)).unwrap();
+        set_point_elevation_column("");
+        let batch = decode_layer(&ipc).unwrap();
+
+        let field = batch.schema().field_with_name("geometry").unwrap().clone();
+        let affine = QuantAffine::from_json(field.metadata().get(STT_QUANT_META_KEY).unwrap()).unwrap();
+        assert_eq!(affine.z0, Some(0.0));
+        assert_eq!(affine.sz, Some(0.05));
+        let geom = batch
+            .column_by_name("geometry")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(geom.value_length(), 3);
+        let coords = geom.values().as_any().downcast_ref::<Int32Array>().unwrap();
+        // z = 5.0 / 0.05 = 100; reconstructs to z0 + 100*sz = 5.0.
+        assert_eq!(coords.value(2), 100);
+        assert_eq!(affine.z0.unwrap() + coords.value(2) as f64 * affine.sz.unwrap(), 5.0);
     }
 
     #[test]
