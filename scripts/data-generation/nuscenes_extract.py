@@ -636,6 +636,17 @@ def extract_map(dataroot: Path, location: str, ego_x, ego_y, origin_lat, origin_
 def generate(args):
     from nuscenes.nuscenes import NuScenes
 
+    # Feature 1 (Worldbuild) is NOT implemented for nuScenes: the 32-beam sweep is
+    # far too sparse to cross-sweep-merge into a coherent consolidated cloud
+    # (Waymo's 5×64-beam and AV2's 2×64-beam are dense enough; nuScenes is not).
+    # Tracks (Feature 2) are still emitted normally. The Sweep mode (Feature 5) is
+    # AV2-only (needs the per-return offset_ns column nuScenes lacks).
+    if getattr(args, "worldbuild", False):
+        raise SystemExit(
+            "--worldbuild is NOT supported for nuScenes (the 32-beam sweep is too "
+            "sparse to cross-sweep-merge). Use waymo_extract.py / argoverse_extract.py "
+            "--worldbuild instead; nuScenes still emits the tracks/ archive normally.")
+
     dataroot = args.dataroot
     nusc = NuScenes(version=args.version, dataroot=str(dataroot), verbose=False)
     scene = _resolve_scene(nusc, args.scene)
@@ -698,6 +709,20 @@ def generate(args):
     n_objects = avc.write_objects_points(obj_pq, **objects)
     obj_categories = sorted(set(objects["category"]))
 
+    # --- tracks (Feature 2): one LineString per tracked object, ego folded in
+    # as category "ego". kind="line" (NOT trips/point — no --simplify /
+    # --quantize-coords, which would desync vertex_timestamps from coords). ---
+    tracks = avc.build_tracks(
+        lon=objects["lon"], lat=objects["lat"], timestamp=objects["timestamp"],
+        category=objects["category"], track_id=objects["track_id"],
+        speed=objects["speed"])
+    tracks.append(dict(lon=ego_lon, lat=ego_lat,
+                       vts=[int(t) for t in ego_t],
+                       vvals=[float(v) for v in ego_speed], category="ego"))
+    track_pq = out / "tracks.parquet"
+    n_tracks = avc.write_track_lines(track_pq, tracks=tracks)
+    track_categories = sorted({str(tr["category"]) for tr in tracks})
+
     # --- lidar (points) ---
     l_lon, l_lat, l_t, l_z, l_i, l_seg, l_rgb = lidar
     if l_rgb is not None:
@@ -738,6 +763,9 @@ def generate(args):
                   **({"colored": True} if l_rgb is not None else {})},
         "ego": {"url": "ego/manifest.json", "path": ego_path},
         "objects": {"url": "objects/manifest.json", "categories": obj_categories},
+        # Feature 2: per-object motion-trail LineStrings (ego folded in as "ego").
+        "tracks": {"url": "tracks/manifest.json", "count": int(n_tracks),
+                   "categories": track_categories},
         "map": {
             "polyUrl": "map_poly/manifest.json",
             "lineUrl": "map_line/manifest.json",
@@ -772,6 +800,10 @@ def generate(args):
                           stt_build=args.stt_build, temporal_bucket=args.temporal_bucket)
         avc.run_stt_build(ego_pq, out / "ego", "trips",
                           stt_build=args.stt_build, temporal_bucket=args.temporal_bucket)
+        # Feature 2 tracks — kind="line" (NO --simplify / quantize-coords so
+        # vertex_timestamps stay aligned to the coords).
+        avc.run_stt_build(track_pq, out / "tracks", "line",
+                          stt_build=args.stt_build, temporal_bucket=args.temporal_bucket)
         # Static HD-map archives — one bucket spanning the whole replay (the
         # map_temporal_bucket default >> the ~20s scene), so they load once.
         avc.run_stt_build(map_poly_pq, out / "map_poly", "map_poly",
@@ -802,7 +834,7 @@ def generate(args):
     )
     print(f"Done: {scene['name']} → {out} "
           f"({len(ego_t)} ego vertices, {len(ego_path)} ego.path pts, "
-          f"{n_objects} objects, {n_lidar} lidar, "
+          f"{n_objects} objects, {n_tracks} tracks, {n_lidar} lidar, "
           f"{n_map_poly} map polygon(s) + {n_map_line} line(s) "
           f"[{', '.join(map_layers)}])")
     if args.skip_build:
@@ -823,6 +855,10 @@ def main():
     p.add_argument("--camera-decimate", type=int, default=CAMERA_DECIMATE,
                    help="keep every Nth CAM_FRONT keyframe (40 keyframes /2 ≈ 20 frames)")
     p.add_argument("--stt-build", default="stt-build", help="stt-build binary path")
+    p.add_argument("--worldbuild", action="store_true",
+                   help="(NOT SUPPORTED for nuScenes — the 32-beam sweep is too "
+                        "sparse to cross-sweep-merge; errors out with guidance. Use "
+                        "waymo_extract.py / argoverse_extract.py --worldbuild.)")
     p.add_argument("--no-lidarseg", action="store_true",
                    help="ignore nuScenes-lidarseg labels; color LIDAR by height band")
     p.add_argument("--colorize", action="store_true",

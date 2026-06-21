@@ -527,66 +527,17 @@ def compute_surfels(pts: np.ndarray, sel: np.ndarray, yaw: float):
     sparser rendered cloud still tiles the surface. Confidence (alpha) tracks
     local planarity. Degenerate neighbourhoods fall back to a flat, up-facing,
     low-confidence disk.
+
+    Delegates the eigen→quaternion + extents + opacity CORE to the shared
+    ``av_common._surfel_frame`` (so the per-sweep and the merged Worldbuild paths
+    fit surfels identically — the dual-copy hazard this repo keeps hitting). The
+    view direction is toward the sensor at the ego origin (``-sel_pts``) and the
+    ego-YAW matrix is passed as ``R_post``, so the output is bit-for-bit what this
+    function produced before the refactor.
     """
-    from scipy.spatial import cKDTree
-
-    m = len(sel)
-    sel_pts = pts[sel]
-    # Full-density neighbourhood → covariance → eigenframe (clean normals).
-    tree = cKDTree(pts)
-    k = min(SURFEL_K, len(pts) - 1)
-    _d, idx = tree.query(sel_pts, k=k + 1)  # includes self at column 0
-    neigh = pts[idx]                         # (m, k+1, 3)
-    centred = neigh - neigh.mean(axis=1, keepdims=True)
-    cov = np.einsum("mki,mkj->mij", centred, centred) / (k + 1)
-    evals, evecs = np.linalg.eigh(cov)       # ascending eigenvalues; cols = vecs
-    l0, l1, l2 = evals[:, 0], evals[:, 1], evals[:, 2]
-    normal = evecs[:, :, 0].copy()           # smallest eigenvalue → surface normal
-    tmaj = evecs[:, :, 2].copy()             # largest → in-plane major axis
-
-    # Orient the normal consistently toward the sensor (near the vehicle origin),
-    # then build a right-handed orthonormal frame [tmaj | tmin | normal].
-    view = -sel_pts
-    flip = np.sum(normal * view, axis=1) < 0.0
-    normal[flip] *= -1.0
-    normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-12)
-    tmaj -= np.sum(tmaj * normal, axis=1, keepdims=True) * normal  # orthogonalise
-    tmaj /= np.maximum(np.linalg.norm(tmaj, axis=1, keepdims=True), 1e-12)
-    tmin = np.cross(normal, tmaj)
-
-    # Surfel frame columns in the ego frame, then yawed into the render frame
-    # (yaw only — see the docstring; the render keeps vehicle-frame z).
     cy, sy = math.cos(yaw), math.sin(yaw)
     R_yaw = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
-    R_surfel = np.stack([tmaj, tmin, normal], axis=2)   # (m,3,3), columns
-    R_world = np.einsum("ij,mjk->mik", R_yaw, R_surfel)
-    quat = mat3_to_quat(R_world)
-
-    # Disk extents: base size from the DECIMATED spacing (fills the rendered
-    # gaps), in-plane anisotropy from the full-density eigenvalues.
-    tree_sel = cKDTree(sel_pts)
-    dsel, _ = tree_sel.query(sel_pts, k=min(2, m))
-    spacing = dsel[:, 1] if dsel.ndim == 2 and dsel.shape[1] > 1 else np.full(m, 0.1)
-    s_base = np.clip(SURFEL_FILL * spacing, SURFEL_S_MIN, SURFEL_S_MAX)
-    aspect = np.clip(np.sqrt(np.maximum(l1, 1e-9) / np.maximum(l2, 1e-9)),
-                     SURFEL_ASPECT_FLOOR, 1.0)
-    s_major = s_base
-    s_minor = np.clip(s_base * aspect, SURFEL_S_MIN, SURFEL_S_MAX)
-
-    # Confidence from planarity ((λ1−λ0)/λ2): flat well-sampled patches read
-    # opaque, noisy/edge ones translucent.
-    planarity = np.clip((l1 - l0) / np.maximum(l2, 1e-9), 0.0, 1.0)
-    opacity = np.clip(0.45 + 0.55 * planarity, 0.30, 1.0)
-
-    # Degenerate neighbourhoods (no surface to fit) → flat up-facing fallback.
-    bad = (l2 <= 1e-9) | ~np.isfinite(quat).all(axis=1)
-    if bad.any():
-        quat[bad] = np.array([0.0, 0.0, 0.0, 1.0])
-        s_minor[bad] = s_major[bad]
-        opacity[bad] = 0.30
-
-    scale2 = np.stack([s_major, s_minor], axis=1)
-    return quat, scale2, opacity
+    return avc._surfel_frame(pts, sel, -pts[sel], R_post=R_yaw)
 
 
 def extract_lidar_surfels(sweep_dir: Path, ego_pose_at, to_lonlat, colorizer,
@@ -643,8 +594,181 @@ def extract_lidar_surfels(sweep_dir: Path, ego_pose_at, to_lonlat, colorizer,
             np.concatenate(out_rgb), np.concatenate(out_sf))
 
 
+# ── Worldbuild (--worldbuild): cross-sweep-merged consolidated cloud ─────────
+# Build ONE consolidated render-world (CITY-metric) cloud over the whole log:
+# STATIC returns are voxel-deduped across all sweeps (a wall sampled 100× → one
+# crisp surface, keyed by first_seen) while DYNAMIC returns (inside a MOVING
+# actor box at their sweep time) pass through UN-merged so a moving car doesn't
+# smear into a streak. Streamed into av_common.WorldVoxelAccumulator so peak
+# memory ∝ occupied voxels. See av_common.worldbuild_merge for the columns.
+WORLDBUILD_VOXEL_M = 0.15        # default static-merge voxel edge (m)
+WORLDBUILD_STATIC_SPEED = 0.5    # m/s — a track at/above this is "moving"
+
+
+def _av2_moving_boxes(log_dir: Path, ego_pose_at, static_speed: float):
+    """annotations.feather → CITY-metric moving-box dicts (the dynamic test set).
+
+    AV2 annotations carry no velocity, so (like ``extract``'s objects pass-2) we
+    lift each cuboid ego→city, group by ``track_uuid``, finite-difference the
+    city-frame centre → per-observation speed, and keep ONLY observations at/above
+    ``static_speed``. Each dict is ``{cx, cy, heading, length, width, t}`` (ms) in
+    the SAME city-metric frame the worldbuild cloud accumulates in.
+    """
+    ann = _read_feather(log_dir / "annotations.feather")
+    rows = []
+    for _, r in ann.iterrows():
+        t_ms = int(r["timestamp_ns"]) // 1_000_000
+        ecx, ecy, eyaw = ego_pose_at(t_ms)
+        c, s = math.cos(eyaw), math.sin(eyaw)
+        cx = ecx + r["tx_m"] * c - r["ty_m"] * s
+        cy = ecy + r["tx_m"] * s + r["ty_m"] * c
+        obj_yaw = _yaw_of(r["qw"], r["qx"], r["qy"], r["qz"]) + eyaw
+        rows.append(dict(cx=float(cx), cy=float(cy), heading=float(obj_yaw),
+                         length=float(r["length_m"]), width=float(r["width_m"]),
+                         t=t_ms, track=str(r["track_uuid"])))
+    # per-track finite-difference speed (== the objects pass-2 idiom).
+    by_track: dict[str, list[int]] = {}
+    for i, b in enumerate(rows):
+        by_track.setdefault(b["track"], []).append(i)
+    moving: list[dict] = []
+    for idx in by_track.values():
+        idx.sort(key=lambda i: rows[i]["t"])
+        if len(idx) < 2:
+            continue
+        cx_t = np.asarray([rows[i]["cx"] for i in idx])
+        cy_t = np.asarray([rows[i]["cy"] for i in idx])
+        t_s = np.asarray([rows[i]["t"] for i in idx], dtype="float64") / 1000.0
+        dt = np.gradient(t_s)
+        spd = np.hypot(np.gradient(cx_t) / np.maximum(dt, 1e-3),
+                       np.gradient(cy_t) / np.maximum(dt, 1e-3))
+        for k, i in enumerate(idx):
+            if spd[k] >= static_speed:
+                b = rows[i]
+                moving.append(dict(cx=b["cx"], cy=b["cy"], heading=b["heading"],
+                                   length=b["length"], width=b["width"], t=b["t"]))
+    print(f"  worldbuild: {len(moving)} moving-box observation(s) "
+          f"(speed ≥ {static_speed} m/s)")
+    return moving
+
+
+def extract_worldbuild_av2(sweep_dir: Path, ego_pose_at, colorizer, moving_boxes,
+                           voxel_m: float = WORLDBUILD_VOXEL_M):
+    """Stream-accumulate the AV2 worldbuild cloud → (WorldVoxelAccumulator, dynamic).
+
+    Each AV2 lidar sweep is one ``<ts_ns>.feather`` in the EGO frame; per sweep we
+    read all returns at FULL density, camera-colour them (7 ring cameras), lift
+    x,y ego→city (yaw rotate + translate; z stays vehicle-frame), tag each return
+    dynamic iff it falls inside a moving box at its sweep time, fold STATIC returns
+    into the streaming voxel accumulator and collect the DYNAMIC returns un-merged.
+    Returns ``(acc, {xy,z,rgb,t})`` for ``av_common.worldbuild_merge``.
+    """
+    acc = avc.WorldVoxelAccumulator(voxel_m)
+    d_xy, d_z, d_rgb, d_t = [], [], [], []
+    fallback = np.asarray(FALLBACK_RGB, dtype=np.uint8)
+    for sweep in sorted(sweep_dir.glob("*.feather")):
+        t_ns = int(sweep.stem)
+        t_ms = t_ns // 1_000_000
+        ecx, ecy, eyaw = ego_pose_at(t_ms)
+        df = _read_feather(sweep)
+        full = np.stack([df["x"].to_numpy(), df["y"].to_numpy(),
+                         df["z"].to_numpy()], axis=1).astype(np.float64)
+        if len(full) == 0:
+            continue
+        if colorizer is not None:
+            rgb, hit = colorizer.colorize(full, t_ns)
+            rgb = rgb.astype("float64")
+            rgb[~hit] = fallback
+        else:
+            rgb = np.tile(fallback.astype("float64"), (len(full), 1))
+            hit = np.zeros(len(full), dtype=bool)
+        c, s = math.cos(eyaw), math.sin(eyaw)
+        cx = ecx + full[:, 0] * c - full[:, 1] * s
+        cy = ecy + full[:, 0] * s + full[:, 1] * c
+        z = full[:, 2]
+        xy = np.column_stack([cx, cy])
+        dyn = avc.point_in_moving_boxes(xy, z, t_ms, moving_boxes)
+        stat = ~dyn
+        if stat.any():
+            acc.add(xy[stat], z[stat], t_ms, rgb=rgb[stat], rgb_hit=hit[stat])
+        if dyn.any():
+            d_xy.append(xy[dyn])
+            d_z.append(z[dyn])
+            d_rgb.append(rgb[dyn])
+            d_t.append(np.full(int(dyn.sum()), t_ms, dtype="int64"))
+    dynamic = dict(
+        xy=np.concatenate(d_xy) if d_xy else np.empty((0, 2)),
+        z=np.concatenate(d_z) if d_z else np.empty(0),
+        rgb=np.concatenate(d_rgb) if d_rgb else np.empty((0, 3)),
+        t=np.concatenate(d_t) if d_t else np.empty(0, dtype="int64"),
+    )
+    return acc, dynamic
+
+
+# ── Sweep (--scan, AV2 only): per-return scan-time + phase→hue beam ──────────
+# A SEPARATE `<id>-scan` bundle whose lidar carries each return's TRUE per-return
+# scan time (sweep_ts + offset_ns→ms) so the playhead reveals the beam sweeping
+# the scene, plus a scan_phase (offset normalized [0,1] within the sweep) coloured
+# as a rotating rainbow (av_common.phase_to_rgb → the existing r/g/b path). AV2's
+# lidar feathers ship `offset_ns` next to x/y/z; Waymo has no such column → no
+# --scan there. Guard: if offset_ns is absent, fall back to the sweep time + warn.
+SCAN_DECIMATE = 4  # single mid-density tier (no pyramid; protects the base archive)
+
+
+def extract_scan_av2(sweep_dir: Path, ego_pose_at, to_lonlat, decimate: int = SCAN_DECIMATE):
+    """Per-return scan-time + phase cloud → dict(lon, lat, timestamp, z, scan_phase, rgb).
+
+    Each AV2 sweep is one ``<ts_ns>.feather`` (ego frame). Per return we read the
+    (currently-dropped) ``offset_ns`` column, compute the TRUE per-return time
+    ``sweep_ts_ms + round(offset_ns / 1e6)`` and ``scan_phase`` = offset normalized
+    to ``[0,1]`` within the sweep, colour by ``av_common.phase_to_rgb``, and lift
+    x,y ego→city→lon/lat (z stays vehicle-frame). Single mid-density tier (stride
+    ``decimate``). If ``offset_ns`` is absent, falls back to the broadcast sweep
+    time (phase 0) + a one-time warning.
+    """
+    out_lon, out_lat, out_t, out_z, out_phase = [], [], [], [], []
+    warned = [False]
+    for sweep in sorted(sweep_dir.glob("*.feather")):
+        t_ns = int(sweep.stem)
+        sweep_t_ms = t_ns // 1_000_000
+        ecx, ecy, eyaw = ego_pose_at(sweep_t_ms)
+        df = _read_feather(sweep)
+        s = slice(None, None, decimate)
+        x = df["x"].to_numpy()[s]
+        y = df["y"].to_numpy()[s]
+        z = df["z"].to_numpy()[s]
+        if "offset_ns" in df:
+            off = df["offset_ns"].to_numpy()[s].astype("float64")
+            span = float(off.max() - off.min()) if len(off) else 0.0
+            phase = (off - off.min()) / span if span > 0 else np.zeros(len(off))
+            t_ms = sweep_t_ms + np.round(off / 1e6).astype("int64")
+        else:
+            if not warned[0]:
+                print("  (--scan) WARNING: no offset_ns column — falling back to "
+                      "the broadcast sweep time (no per-return scan reveal).")
+                warned[0] = True
+            phase = np.zeros(len(x))
+            t_ms = np.full(len(x), sweep_t_ms, dtype="int64")
+        c, s2 = math.cos(eyaw), math.sin(eyaw)
+        cx = ecx + x * c - y * s2
+        cy = ecy + x * s2 + y * c
+        lon, lat = to_lonlat(cx, cy)
+        out_lon.append(np.atleast_1d(lon))
+        out_lat.append(np.atleast_1d(lat))
+        out_t.append(np.asarray(t_ms, dtype="int64"))
+        out_z.append(z)
+        out_phase.append(phase)
+    if not out_lon:
+        raise SystemExit("scan extraction produced no points")
+    phase = np.concatenate(out_phase)
+    return dict(
+        lon=np.concatenate(out_lon), lat=np.concatenate(out_lat),
+        timestamp=np.concatenate(out_t), z=np.concatenate(out_z),
+        scan_phase=phase, rgb=avc.phase_to_rgb(phase),
+    )
+
+
 def extract(log_dir: Path, city: str, drop_empty_boxes: bool = True,
-            colorizer=None, surfel_decimate=None):
+            colorizer=None, surfel_decimate=None, worldbuild=None, scan=None):
     """Pull ego / objects / lidar / telemetry / HD-map arrays out of one AV2 log.
 
     ``drop_empty_boxes`` (default ``True``) drops annotation cuboids with
@@ -663,8 +787,20 @@ def extract(log_dir: Path, city: str, drop_empty_boxes: bool = True,
     ``(N,7)`` surfel block and a ``colorizer`` is required (surfels are
     camera-coloured). Otherwise the 7th element is ``None``.
 
+    When ``worldbuild`` (a ``{voxel_m, static_speed}`` dict) is set, the LIDAR is
+    the consolidated CROSS-SWEEP-MERGED Worldbuild cloud (Feature 1): the ``lidar``
+    slot is then a ``("worldbuild", merged)`` tuple where ``merged`` is the
+    ``av_common.worldbuild_merge`` result dict (xy / z / rgb / timestamp /
+    is_dynamic / world_class / surfels). A ``colorizer`` is required.
+
+    When ``scan`` (a ``{decimate}`` dict) is set, the LIDAR is the per-return
+    scan-time + phase→hue Sweep cloud (Feature 5, AV2 only): the ``lidar`` slot is
+    a ``("scan", sc)`` tuple where ``sc`` is the ``extract_scan_av2`` dict
+    (lon / lat / timestamp / z / scan_phase / rgb). NO colorizer needed.
+
     Returns ``(ego, objects, lidar, telemetry_fields, map_polys, map_lines)``
-    where ``lidar = (lon, lat, t_ms, z, intensity, rgb, surfels)``.
+    where ``lidar = (lon, lat, t_ms, z, intensity, rgb, surfels)`` (or the
+    worldbuild / scan 2-tuple above).
     """
     to_lonlat, frame_note = _make_city_to_lonlat(city)
     print(f"  city-frame → lon/lat via {frame_note}")
@@ -772,7 +908,28 @@ def extract(log_dir: Path, city: str, drop_empty_boxes: bool = True,
 
     # --- lidar sweeps (ego frame → city → lon/lat) ---
     sweep_dir = log_dir / "sensors" / "lidar"
-    if surfel_decimate is not None:
+    if scan is not None:
+        # SWEEP: per-return scan-time + phase→hue beam (a separate `<id>-scan`
+        # bundle). NOT camera-coloured — the rainbow comes from scan_phase.
+        print(f"  scan: per-return scan time + phase→hue (1/{scan['decimate']})…")
+        sc = extract_scan_av2(sweep_dir, ego_pose_at, to_lonlat,
+                              decimate=scan["decimate"])
+        lidar = ("scan", sc)
+    elif worldbuild is not None:
+        # WORLDBUILD: one consolidated cross-sweep-merged cloud (city-metric),
+        # static voxel-deduped + dynamic un-merged, surfels on the merged cloud.
+        print(f"  worldbuild: merging all sweeps (voxel {worldbuild['voxel_m']} m, "
+              f"static-speed {worldbuild['static_speed']} m/s)…")
+        moving_boxes = _av2_moving_boxes(log_dir, ego_pose_at, worldbuild["static_speed"])
+        acc, dynamic = extract_worldbuild_av2(
+            sweep_dir, ego_pose_at, colorizer, moving_boxes,
+            voxel_m=worldbuild["voxel_m"])
+        merged = avc.worldbuild_merge(acc, dynamic)
+        wb_lon, wb_lat = to_lonlat(merged["xy"][:, 0], merged["xy"][:, 1])
+        merged["lon"] = np.atleast_1d(wb_lon)
+        merged["lat"] = np.atleast_1d(wb_lat)
+        lidar = ("worldbuild", merged)
+    elif surfel_decimate is not None:
         # ORIENTED-SURFEL tier: per-sweep k-NN covariance → quaternion + extents +
         # confidence for the client's SplatLayer (camera-coloured; a colorizer is
         # required — generate() forces one on in surfel mode).
@@ -901,12 +1058,21 @@ def generate(args):
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
 
-    # Optional camera-projection colorize (+ its correctness overlay). The SURFEL
-    # path (--surfel) implies camera colour (the disks are painted from the ring
-    # cameras), so it forces a colorizer on regardless of --colorize.
+    # --surfel / --worldbuild / --scan / --contours are mutually exclusive LIDAR modes.
     surfel_mode = bool(args.surfel)
+    worldbuild_mode = bool(args.worldbuild)
+    scan_mode = bool(args.scan)
+    contour_mode = bool(args.contours)
+    if sum((surfel_mode, worldbuild_mode, scan_mode, contour_mode)) > 1:
+        raise SystemExit(
+            "--surfel / --worldbuild / --scan / --contours are mutually exclusive")
+
+    # Optional camera-projection colorize (+ its correctness overlay). The SURFEL
+    # and WORLDBUILD paths imply camera colour (the disks are painted from the ring
+    # cameras), so they force a colorizer on regardless of --colorize. --scan does
+    # NOT need a colorizer (its rainbow comes from scan_phase, not cameras).
     colorizer = None
-    if args.colorize or surfel_mode or args.debug_overlay is not None:
+    if args.colorize or surfel_mode or worldbuild_mode or args.debug_overlay is not None:
         colorizer = Av2Colorizer(args.log_dir)
     if args.debug_overlay is not None:
         debug_overlay_av2(args.log_dir, out, colorizer, args.debug_overlay)
@@ -919,7 +1085,11 @@ def generate(args):
     ego, objects, lidar, telemetry_fields, map_polys, map_lines = extract(
         args.log_dir, args.city, drop_empty_boxes=not args.keep_empty_boxes,
         colorizer=colorizer,
-        surfel_decimate=(args.surfel_decimate if surfel_mode else None))
+        surfel_decimate=(args.surfel_decimate if surfel_mode else None),
+        worldbuild=(dict(voxel_m=args.worldbuild_voxel,
+                         static_speed=args.worldbuild_static_speed)
+                    if worldbuild_mode else None),
+        scan=(dict(decimate=args.scan_decimate) if scan_mode else None))
     ego_t, ego_lon, ego_lat, ego_speed = ego
     t_start, t_end = int(ego_t[0]), int(ego_t[-1])
 
@@ -934,17 +1104,112 @@ def generate(args):
     n_objects = avc.write_objects_points(obj_pq, **objects)
     obj_categories = sorted(set(objects["category"]))
 
+    # --- tracks (Feature 2): one LineString per tracked object, ego folded in
+    # as category "ego". kind="line" (NOT trips/point — no --simplify /
+    # --quantize-coords, which would desync vertex_timestamps from coords). ---
+    tracks = avc.build_tracks(
+        lon=objects["lon"], lat=objects["lat"], timestamp=objects["timestamp"],
+        category=objects["category"], track_id=objects["track_id"],
+        speed=objects["speed"])
+    tracks.append(dict(lon=ego_lon, lat=ego_lat,
+                       vts=[int(t) for t in ego_t],
+                       vvals=[float(v) for v in ego_speed], category="ego"))
+    track_pq = out / "tracks.parquet"
+    n_tracks = avc.write_track_lines(track_pq, tracks=tracks)
+    track_categories = sorted({str(tr["category"]) for tr in tracks})
+
     # --- lidar ---
     # SURFEL mode bakes a SINGLE oriented-Gaussian-surfel tier (per-sweep k-NN
     # covariance → quaternion + extents + confidence) for the client's SplatLayer.
+    # WORLDBUILD bakes the consolidated cross-sweep-merged cloud (one 2-tuple).
     # The default path builds the round-dot density tiers (stride the finest cloud).
-    fl_lon, fl_lat, fl_t, fl_z, fl_i, fl_rgb, fl_surf = lidar
-    if fl_rgb is not None:
-        n_seen = int((fl_rgb != np.asarray(FALLBACK_RGB, np.uint8)).any(axis=1).sum())
-        print(f"  camera colorize: {n_seen}/{len(fl_rgb)} returns "
-              f"({100 * n_seen / max(len(fl_rgb), 1):.0f}%) got a camera color")
     lidar_densities = []
-    if surfel_mode:
+    if contour_mode:
+        # DENSITY ISO-LINES: contour where the cloud clusters, per playhead window.
+        # With --contour-z-step it goes TRUE-3D (density contoured per height layer,
+        # each contour tagged with its real `z_layer` altitude). Builds ONE
+        # windowed-LineString `lidar/` archive (rendered by AnimatedPathLayer); the
+        # returns come from the default (round-dot) extract path, then strided.
+        fl_rgb = None  # iso-lines are density-colored, not camera-colored
+        cl_lon, cl_lat, cl_t, cl_z, _ci, _rgb, _sf = lidar
+        dec = max(1, args.contour_decimate)
+        cl_lon, cl_lat = np.asarray(cl_lon)[::dec], np.asarray(cl_lat)[::dec]
+        cl_t, cl_z = np.asarray(cl_t)[::dec], np.asarray(cl_z)[::dec]
+        mode3d = "3D z-layered" if args.contour_z_step > 0 else "2D flat"
+        print(f"  density iso-lines ({mode3d}) from {len(cl_lon)} returns (1/{dec})…")
+        contours = avc.build_density_contours(
+            cl_lon, cl_lat, cl_z, cl_t,
+            anchor_lat=float(np.median(cl_lat)), **avc.contour_kwargs(args))
+        iso_pq = out / "lidar.parquet"
+        n = avc.write_contour_lines(iso_pq, contours)
+        if not args.skip_build and n > 0:
+            tier_out = out / "lidar"
+            shutil.rmtree(tier_out, ignore_errors=True)  # prune orphan packs on rebuild
+            # kind="line": windowed LineStrings, NO --simplify / NO quantize-coords
+            # (the line-quantize GL bug). Bucket = the window step.
+            avc.run_stt_build(iso_pq, tier_out, "line", stt_build=args.stt_build,
+                              temporal_bucket=f"{int(args.contour_step)}ms",
+                              min_zoom=LIDAR_MIN_ZOOM)
+            iso_pq.unlink(missing_ok=True)
+        elif n == 0:
+            print("  (--contours) NO contours produced — tune --contour-cell / "
+                  "--contour-min-len / --contour-width.")
+        lidar_densities.append({"id": "iso", "label": "Iso-lines", "points": int(n),
+                                "url": "lidar/manifest.json"})
+        n_lidar = int(n)
+    elif scan_mode:
+        _tag, sc = lidar
+        fl_rgb = sc["rgb"]  # phase→hue rainbow (NOT camera) — mark colored
+        print(f"  scan: {len(sc['z'])} returns over "
+              f"[{int(sc['timestamp'].min())}, {int(sc['timestamp'].max())}] ms "
+              f"(per-return scan time + phase→hue)")
+        tier_pq = out / "lidar.parquet"
+        n = avc.write_lidar_points(
+            tier_pq, lon=sc["lon"], lat=sc["lat"], timestamp=sc["timestamp"],
+            z=sc["z"], rgb=sc["rgb"], scan_phase=sc["scan_phase"])
+        if not args.skip_build:
+            tier_out = out / "lidar"
+            shutil.rmtree(tier_out, ignore_errors=True)  # prune orphan packs on rebuild
+            # single mid-density tier (no pyramid beyond the zoom-floor clamp);
+            # scan_phase quantization rides in the canonical attr map.
+            avc.run_stt_build(tier_pq, tier_out, "point",
+                              stt_build=args.stt_build, temporal_bucket=args.temporal_bucket,
+                              min_zoom=LIDAR_MIN_ZOOM, quantize_coords=LIDAR_QUANTIZE_M,
+                              quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M))
+            tier_pq.unlink(missing_ok=True)
+        lidar_densities.append({"id": "scan", "label": "Sweep", "points": int(n),
+                                "url": "lidar/manifest.json"})
+        n_lidar = int(n)
+    elif worldbuild_mode:
+        _tag, wb = lidar
+        n_dyn = int(wb["is_dynamic"].sum())
+        fl_rgb = wb["rgb"]  # marks the bundle as camera-colored in scene.json
+        n_seen = int((wb["rgb"] != np.asarray(FALLBACK_RGB, np.uint8)).any(axis=1).sum())
+        print(f"  worldbuild: {len(wb['z'])} merged points "
+              f"({len(wb['z']) - n_dyn} static + {n_dyn} dynamic); camera color "
+              f"{n_seen}/{len(wb['rgb'])} ({100 * n_seen / max(len(wb['rgb']), 1):.0f}%)")
+        tier_pq = out / "lidar.parquet"
+        n = avc.write_lidar_points(
+            tier_pq, lon=wb["lon"], lat=wb["lat"], timestamp=wb["timestamp"],
+            z=wb["z"], rgb=wb["rgb"], surfels=wb["surfels"],
+            world_class=wb["world_class"], is_dynamic=wb["is_dynamic"])
+        if not args.skip_build:
+            tier_out = out / "lidar"
+            shutil.rmtree(tier_out, ignore_errors=True)  # prune orphan packs on rebuild
+            avc.run_stt_build(tier_pq, tier_out, "point",
+                              stt_build=args.stt_build, temporal_bucket=args.temporal_bucket,
+                              min_zoom=LIDAR_MIN_ZOOM, quantize_coords=LIDAR_QUANTIZE_M,
+                              quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M))
+            tier_pq.unlink(missing_ok=True)
+        lidar_densities.append({"id": "world", "label": "Worldbuild", "points": int(n),
+                                "url": "lidar/manifest.json"})
+        n_lidar = int(n)
+    elif surfel_mode:
+        fl_lon, fl_lat, fl_t, fl_z, fl_i, fl_rgb, fl_surf = lidar
+        if fl_rgb is not None:
+            n_seen = int((fl_rgb != np.asarray(FALLBACK_RGB, np.uint8)).any(axis=1).sum())
+            print(f"  camera colorize: {n_seen}/{len(fl_rgb)} returns "
+                  f"({100 * n_seen / max(len(fl_rgb), 1):.0f}%) got a camera color")
         print(f"  surfels: {len(fl_surf)} oriented disks → single 'surfel' tier")
         tier_pq = out / "lidar.parquet"
         n = avc.write_lidar_points(tier_pq, lon=fl_lon, lat=fl_lat, timestamp=fl_t,
@@ -961,6 +1226,11 @@ def generate(args):
                                 "url": "lidar/manifest.json"})
         n_lidar = int(n)
     else:
+        fl_lon, fl_lat, fl_t, fl_z, fl_i, fl_rgb, fl_surf = lidar
+        if fl_rgb is not None:
+            n_seen = int((fl_rgb != np.asarray(FALLBACK_RGB, np.uint8)).any(axis=1).sum())
+            print(f"  camera colorize: {n_seen}/{len(fl_rgb)} returns "
+                  f"({100 * n_seen / max(len(fl_rgb), 1):.0f}%) got a camera color")
         skip_tiers = {t.strip() for t in args.skip_tiers.split(",") if t.strip()}
         for tier_id, label, dec, dname, radius_px, radius_min_px in LIDAR_DENSITY_TIERS:
             if tier_id in skip_tiers:
@@ -1018,12 +1288,27 @@ def generate(args):
                   # Per-point RGB sampled from the 7 ring cameras → the frontend
                   # paints each return (see AnimatedPointLayer.rgbColorColumns).
                   **({"colored": True} if fl_rgb is not None else {}),
-                  # Surfel mode bakes oriented-Gaussian columns (quaternion +
-                  # extents + confidence); the cockpit renders this tier with
-                  # SplatLayer instead of AnimatedPointLayer.
-                  **({"splat": "surfel"} if surfel_mode else {})},
+                  # Surfel / worldbuild modes bake oriented-Gaussian columns
+                  # (quaternion + extents + confidence); the cockpit renders the
+                  # tier with SplatLayer instead of AnimatedPointLayer.
+                  **({"splat": "surfel"} if (surfel_mode or worldbuild_mode) else {}),
+                  # Worldbuild mode: the consolidated cross-sweep-merged cloud
+                  # (world_class static/dynamic + is_dynamic columns); the frontend
+                  # keys the static-vs-dynamic styling on it.
+                  **({"style": "world"} if worldbuild_mode else {}),
+                  # Scan mode: the per-return scan-time + phase→hue Sweep cloud
+                  # (scan_phase column + a rotating-rainbow r/g/b). A separate
+                  # `<id>-scan` bundle; the frontend reveals the beam over time.
+                  **({"scan": True, "style": "scan"} if scan_mode else {}),
+                  # Contour mode: the `lidar/` archive is windowed density iso-line
+                  # LineStrings (density_band + z_layer columns); the frontend
+                  # renders it with AnimatedPathLayer, lifting by z_layer in 3D.
+                  **({"style": "iso"} if contour_mode else {})},
         "ego": {"url": "ego/manifest.json", "path": ego_path},
         "objects": {"url": "objects/manifest.json", "categories": obj_categories},
+        # Feature 2: per-object motion-trail LineStrings (ego folded in as "ego").
+        "tracks": {"url": "tracks/manifest.json", "count": int(n_tracks),
+                   "categories": track_categories},
         "map": {
             "polyUrl": "map_poly/manifest.json",
             "lineUrl": "map_line/manifest.json",
@@ -1040,6 +1325,11 @@ def generate(args):
         avc.run_stt_build(obj_pq, out / "objects", "point",
                           stt_build=args.stt_build, temporal_bucket=args.temporal_bucket)
         avc.run_stt_build(ego_pq, out / "ego", "trips",
+                          stt_build=args.stt_build, temporal_bucket=args.temporal_bucket)
+        # Feature 2 tracks — kind="line" (windowed LineStrings, NO --simplify /
+        # quantize-coords so vertex_timestamps stay aligned to the coords).
+        shutil.rmtree(out / "tracks", ignore_errors=True)
+        avc.run_stt_build(track_pq, out / "tracks", "line",
                           stt_build=args.stt_build, temporal_bucket=args.temporal_bucket)
         # Static HD-map archives — one bucket spanning the whole replay (the
         # map_temporal_bucket default >> the ~16s scene), so they load once.
@@ -1071,7 +1361,7 @@ def generate(args):
         streams=streams,
     )
     print(f"Done: {out} ({len(ego_t)} ego [{len(ego_path)} path pts], "
-          f"{n_objects} objects, {n_lidar} lidar, "
+          f"{n_objects} objects, {n_tracks} tracks, {n_lidar} lidar, "
           f"{n_map_poly} map poly + {n_map_line} map line "
           f"[{', '.join(map_layers)}])")
     if args.skip_build:
@@ -1103,6 +1393,8 @@ def main():
                         "7 ring cameras (adds r/g/b columns; needs the calibration/ + "
                         "all ring-camera JPGs). Returns no camera sees get a slate "
                         "fallback. Pairs with the cockpit's camera-colored splat.")
+    # --contours + all --contour-* knobs (shared with waymo_extract.py).
+    avc.add_contour_args(p)
     p.add_argument("--surfel", action="store_true",
                    help="bake ORIENTED GAUSSIAN SURFELS instead of the round-dot "
                         "density tiers: per-sweep k-NN covariance → orientation "
@@ -1114,6 +1406,34 @@ def main():
     p.add_argument("--surfel-decimate", type=int, default=SURFEL_DECIMATE,
                    help=f"render decimation for the surfel tier (default {SURFEL_DECIMATE}; "
                         "orientation still uses the FULL-density neighbourhood)")
+    p.add_argument("--worldbuild", action="store_true",
+                   help="WORLDBUILD view: ONE consolidated cross-sweep-merged cloud. "
+                        "STATIC returns voxel-deduped over the whole log (a wall seen "
+                        "100× → one crisp surface, keyed first_seen); DYNAMIC "
+                        "(moving-actor) returns pass through UN-merged, each keeping "
+                        "its own per-sweep time. Adds world_class (static/dynamic "
+                        "categorical) + is_dynamic (0/1 numeric); surfels fit on the "
+                        "merged cloud → SplatLayer. Implies camera colour; mutually "
+                        "exclusive with --surfel / --scan. Output a sibling "
+                        "'<id>-world' bundle.")
+    p.add_argument("--worldbuild-voxel", type=float, default=WORLDBUILD_VOXEL_M,
+                   dest="worldbuild_voxel",
+                   help=f"static-merge voxel edge in metres (default {WORLDBUILD_VOXEL_M}).")
+    p.add_argument("--worldbuild-static-speed", type=float,
+                   default=WORLDBUILD_STATIC_SPEED, dest="worldbuild_static_speed",
+                   help="a track at/above this speed (m/s) is MOVING → its returns are "
+                        "tagged dynamic + passed through un-merged (default "
+                        f"{WORLDBUILD_STATIC_SPEED}).")
+    p.add_argument("--scan", action="store_true",
+                   help="SWEEP view (AV2 only): a separate '<id>-scan' bundle whose "
+                        "lidar carries each return's TRUE per-return scan time "
+                        "(sweep_ts + offset_ns→ms) so the playhead reveals the beam "
+                        "sweeping the scene, coloured by scan_phase (offset normalized "
+                        "[0,1]) as a rotating rainbow. Single mid-density tier, NOT a "
+                        "base-archive change. Does NOT need the camera colorizer.")
+    p.add_argument("--scan-decimate", type=int, default=SCAN_DECIMATE,
+                   dest="scan_decimate",
+                   help=f"render decimation for the scan tier (default {SCAN_DECIMATE}).")
     p.add_argument("--debug-overlay", type=int, default=None, metavar="SWEEP",
                    help="project sweep SWEEP into every ring camera, dots colored by "
                         "depth, save _debug_overlay_<CAM>.png, and STOP "

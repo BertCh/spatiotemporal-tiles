@@ -397,6 +397,32 @@ def lidarseg_class(name: str) -> str:
     return "other"  # noise / animal / static.other / unmapped
 
 
+# ── LIDAR density iso-lines ───────────────────────────────────────────────────
+# An alternate LIDAR "view" (waymo_extract.py --contours): instead of drawing the
+# returns as points/surfels, bin them into a 2D ground-plane density grid and draw
+# the iso-density CONTOURS — a topographic map of where returns CLUSTER (walls,
+# parked cars, vegetation, poles). This is height-INDEPENDENT, so it reads richly
+# even on a flat scene with no vertical relief (the failure mode of the earlier
+# height-contour attempt). Computed per playhead time-window so the contours morph
+# live as the car drives.
+#
+# Bands are ORDINAL (sparsest contour ring → densest core), deliberately decoupled
+# from the numeric contour level VALUES so the levels can be retuned without
+# touching the colors. Like OBJECT_COLORS / LIDARSEG_COLORS, the palette lives in
+# TWO copies that MUST stay in lockstep: these labels and ``datasets.ts
+# AV_ISO_DENSITY_COLORS`` (the ACTUAL rendered line colors, via the iso variant's
+# ``lidarColorMapping``). Keys are non-numeric strings (the categorical-column
+# rule above), so stt-build keeps ``density_band`` categorical.
+ISO_DENSITY_BANDS: tuple[str, ...] = ("d1", "d2", "d3", "d4", "d5")
+
+
+def iso_density_band(level_index: int) -> str:
+    """Ordinal ISO_DENSITY_BANDS label for a contour at sorted level ``level_index``
+    (0 = the sparsest / outermost ring). Clamped to the band count, so passing more
+    contour levels than bands collapses the densest extras onto the hottest band."""
+    return ISO_DENSITY_BANDS[min(int(level_index), len(ISO_DENSITY_BANDS) - 1)]
+
+
 # ── GeoParquet writers ───────────────────────────────────────────────────────
 def _wkb_points(lon: Sequence[float], lat: Sequence[float]):
     """WKB-encode parallel lon/lat arrays as POINT geometries (vectorised).
@@ -425,6 +451,10 @@ def write_lidar_points(
     seg_class=None,
     rgb=None,
     surfels=None,
+    pack_quat=False,
+    world_class=None,
+    is_dynamic=None,
+    scan_phase=None,
 ) -> int:
     """Write the ``lidar/`` POINT GeoParquet (av-cockpit.md §2a).
 
@@ -459,6 +489,23 @@ def write_lidar_points(
     (``[0,1]``). The client's ``SplatLayer`` reads these as ``numericProps`` to
     render each return as an oriented anisotropic Gaussian disk instead of a flat
     dot. Returns the row count written.
+
+    Three optional columns for the new AV render modes (each independent):
+
+    * ``world_class`` (Feature 1 — Worldbuild): a per-point ``"static"`` /
+      ``"dynamic"`` Utf8 CATEGORICAL label. Deliberately string-valued (NOT
+      ``0``/``1``) so stt-build keeps it categorical — an all-numeric-string
+      column is silently promoted to Numeric, no-opping a categorical color map.
+    * ``is_dynamic`` (Feature 1): a NUMERIC Int64 ``0``/``1`` per point (``1`` =
+      a return inside a MOVING actor box). Flows through stt-build as a
+      ``numericProp`` (like ``z`` / ``r``); the worldbuild renderer keys
+      static-vs-dynamic on it. Quantize via ``lidar_quantize_attrs``.
+    * ``scan_phase`` (Feature 5 — Sweep, AV2 only): a NUMERIC Float64 in
+      ``[0,1]`` per point, the return's normalized offset within its sweep (so
+      the renderer can drive a rotating-beam reveal). Quantize via
+      ``lidar_quantize_attrs``. The phase→hue ramp is precomputed into
+      ``r``/``g``/``b`` by the caller, so the existing rgb path renders the beam
+      as a rotating rainbow.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -510,10 +557,54 @@ def write_lidar_points(
         # extractor reads scalar Float64/Int64 columns, like ``z`` / ``intensity``,
         # and hands them to the client as ``numericProps``. The quaternion is unit
         # length and the extents are small metre values, all f32-exact downstream.
-        for j, name in enumerate(
-            ("qx", "qy", "qz", "qw", "s_major", "s_minor", "surfel_opacity")
-        ):
+        for j, name in enumerate(("s_major", "s_minor", "surfel_opacity"), start=4):
             cols[name] = pa.array(surfels[:, j], type=pa.float64())
+        if pack_quat:
+            # Smallest-three quaternion packing: a unit quat has only 3 DOF, so
+            # store the three non-largest components + a 2-bit index of the
+            # largest (reconstructed in the shader as +sqrt(1-Σ²)). Drops one
+            # near-incompressible orientation column (the quat is ~46% of a
+            # quantized surfel tile and high-entropy → zstd can't touch it) for a
+            # measured ~12% whole-tile win; the client's SplatLayer auto-detects
+            # the `q_imax` column and unpacks. Provably lossless to ~0.16° (see
+            # lidar_summarize_eval sibling proof). Largest stays POSITIVE by the
+            # q≡−q sign convention so its sqrt is unambiguous.
+            q_a, q_b, q_c, q_imax = pack_surfel_quaternions(surfels[:, 0:4])
+            cols["q_a"] = pa.array(q_a, type=pa.float64())
+            cols["q_b"] = pa.array(q_b, type=pa.float64())
+            cols["q_c"] = pa.array(q_c, type=pa.float64())
+            cols["q_imax"] = pa.array(q_imax.astype("float64"), type=pa.float64())
+        else:
+            for j, name in enumerate(("qx", "qy", "qz", "qw")):
+                cols[name] = pa.array(surfels[:, j], type=pa.float64())
+    if world_class is not None:
+        # Feature 1 (Worldbuild): a CATEGORICAL static/dynamic label. String
+        # values ("static"/"dynamic"), never bare 0/1 — an all-numeric-string
+        # column is promoted to Numeric by stt-build (the categorical no-op bug).
+        wc = np.asarray(world_class, dtype=object)
+        if len(wc) != len(lon):
+            raise ValueError(
+                f"lidar: world_class length {len(wc)} != point count {len(lon)}"
+            )
+        cols["world_class"] = pa.array([str(w) for w in wc], type=pa.string())
+    if is_dynamic is not None:
+        # Feature 1 (Worldbuild): a NUMERIC 0/1 flag (== num_interior_pts path,
+        # Int64 so stt-build's property extractor reads it → numericProps).
+        idn = np.asarray(is_dynamic, dtype="int64")
+        if len(idn) != len(lon):
+            raise ValueError(
+                f"lidar: is_dynamic length {len(idn)} != point count {len(lon)}"
+            )
+        cols["is_dynamic"] = pa.array(idn, type=pa.int64())
+    if scan_phase is not None:
+        # Feature 5 (Sweep, AV2 only): a NUMERIC Float64 in [0,1], the per-return
+        # normalized offset within its sweep (drives the rotating-beam reveal).
+        sp = np.asarray(scan_phase, dtype="float64")
+        if len(sp) != len(lon):
+            raise ValueError(
+                f"lidar: scan_phase length {len(sp)} != point count {len(lon)}"
+            )
+        cols["scan_phase"] = pa.array(sp, type=pa.float64())
 
     table = pa.table(cols)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -525,6 +616,12 @@ def write_lidar_points(
         extras.append("rgb")
     if surfels is not None:
         extras.append("surfels")
+    if world_class is not None:
+        extras.append("world_class")
+    if is_dynamic is not None:
+        extras.append("is_dynamic")
+    if scan_phase is not None:
+        extras.append("scan_phase")
     suffix = f" (+{', '.join(extras)})" if extras else ""
     print(f"  wrote {table.num_rows} LIDAR points{suffix} → {out_path}")
     return table.num_rows
@@ -710,6 +807,317 @@ def write_map_lines(out_parquet: Path, lines, t_start: int, t_end: int) -> int:
     return n
 
 
+def write_contour_lines(out_parquet: Path, lines) -> int:
+    """Write the LIDAR density-contour iso-line GeoParquet (waymo_extract.py --contours).
+
+    ``lines`` is an iterable of ``(linestring, density_band, z_layer, t_start, t_end)``
+    where ``linestring`` is a shapely ``LineString`` in **lon/lat** degrees,
+    ``density_band`` is an ordinal ``ISO_DENSITY_BANDS`` label, ``z_layer`` is the
+    contour's real altitude in METRES (0 for the flat 2D mode; the height-slab centre
+    for the z-layered 3D mode), and ``[t_start, t_end]`` is the playhead window
+    (unix-ms) the contour is shown for. Columns: ``geometry`` (WKB LineString),
+    ``density_band`` (Utf8 categorical), ``z_layer`` (Float64 — a NUMERIC per-feature
+    property the client lifts the line to; line geometry stays 2D because the Rust
+    tiler drops line-vertex Z, so the height rides as this column instead),
+    ``timestamp`` + ``end_timestamp`` (Int64 unix-ms). Built with
+    ``run_stt_build(kind="line")`` so each contour shows for its own window (the
+    contour map morphs as the playhead moves). Returns the row count written.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from shapely import wkb
+
+    geoms: list[bytes] = []
+    bands: list[str] = []
+    zls: list[float] = []
+    t0s: list[int] = []
+    t1s: list[int] = []
+    for line, band, z_layer, t_start, t_end in lines:
+        geoms.append(wkb.dumps(line))
+        bands.append(str(band))
+        zls.append(float(z_layer))
+        t0s.append(int(t_start))
+        t1s.append(int(t_end))
+    n = len(geoms)
+    table = pa.table(
+        {
+            "geometry": pa.array(geoms, type=pa.binary()),
+            "density_band": pa.array(bands, type=pa.string()),
+            "z_layer": pa.array(zls, type=pa.float64()),
+            "timestamp": pa.array(t0s, type=pa.int64()),
+            "end_timestamp": pa.array(t1s, type=pa.int64()),
+        }
+    )
+    out_parquet.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, out_parquet, compression="snappy")
+    print(f"  wrote {n} contour line(s) → {out_parquet}")
+    return n
+
+
+# ── density iso-lines (build-time) ────────────────────────────────────────────
+# An alternate LIDAR "view" for the cockpit (`--contours`): instead of points /
+# surfels, draw the iso-density CONTOURS of the returns — a live topographic map
+# of where the cloud CLUSTERS (walls, parked cars, vegetation, poles), morphing as
+# the car drives. SHARED by waymo_extract.py and argoverse_extract.py (both call
+# avc.build_density_contours / avc.add_contour_args). See ISO_DENSITY_BANDS for the
+# color contract.
+#
+# Two modes, chosen by `--contour-z-step`:
+#   • FLAT (z-step 0): contour the 2D ground-plane density (one grid per window).
+#     Height-INDEPENDENT, so it reads even on a flat scene. z_layer = 0.
+#   • TRUE-3D (z-step > 0): slice the returns into HEIGHT layers (slab centres
+#     spaced z_step m, each accumulating returns within z_thickness m) and contour
+#     each slab's XY density INDEPENDENTLY, tagging every contour with its slab's
+#     real altitude `z_layer` (metres). The vertical axis then carries real
+#     structure — a wall contours up its whole height, a parked car only near the
+#     ground — and the client lifts each ring to that altitude. The contour LEVELS
+#     are pooled across slabs so a band means the same density at every height.
+def build_density_contours(lon, lat, z, t_ms, *, anchor_lat,
+                           cell_m=0.5, sigma_cells=1.6, n_levels=5,
+                           win_step_ms=200, win_width_ms=900,
+                           min_len=12, min_pts=2000, simplify_cells=0.0,
+                           z_step=0.0, z_thickness=None,
+                           z_min=None, z_max=None, min_pts_layer=120):
+    """Per-playhead-window density contours of the returns → iso-line records.
+
+    Bins the returns into a FIXED lon/lat grid (cell ≈ ``cell_m`` m), then for each
+    window steps the playhead by ``win_step_ms`` and accumulates the returns within
+    a ``win_width_ms`` window centred on the step (a wider accumulation than the
+    step → denser, smoother contours that still morph live). Each grid is
+    gaussian-smoothed (``sigma_cells``) and contoured at ``n_levels`` FIXED density
+    levels derived once from a subsample (so the bands — and thus the colors — are
+    stable across the whole drive, not per-window-relative and flickery). Tiny
+    loops (< ``min_len`` vertices) are dropped.
+
+    When ``z_step > 0`` the per-window grid is replaced by a STACK of grids, one
+    per height slab (centres spaced ``z_step`` m over [``z_min``, ``z_max``] —
+    defaulting to the 1st/99th z percentiles — each accumulating returns within
+    ``z_thickness`` m, default 1.5×``z_step``). Each contour is tagged with its
+    slab centre as ``z_layer`` (metres). Slabs with < ``min_pts_layer`` returns are
+    skipped. ``z`` is the per-return height in metres (ego/vehicle frame, same
+    column the point cloud renders as elevation).
+
+    Yields ``(LineString, density_band, z_layer, t_start, t_end)`` tuples for
+    ``write_contour_lines``; coords are lon/lat degrees, the window is
+    ``[w, w + win_step_ms)`` (so consecutive windows tile the timeline cleanly).
+    """
+    from scipy import ndimage as ndi
+    from skimage import measure
+    from shapely.geometry import LineString
+
+    lon = np.asarray(lon, dtype="float64")
+    lat = np.asarray(lat, dtype="float64")
+    z = np.asarray(z, dtype="float64")
+    t_ms = np.asarray(t_ms, dtype="int64")
+    if len(lon) == 0:
+        return []
+
+    layered = bool(z_step and z_step > 0)
+
+    # Fixed grid over the full scene extent (a little padding so edge structure
+    # isn't clipped). Cell size is set in metres → degrees at the scene latitude.
+    pad = cell_m * 2
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lon = 111_320.0 * math.cos(math.radians(anchor_lat))
+    dlon = cell_m / m_per_deg_lon
+    dlat = cell_m / m_per_deg_lat
+    lon0 = float(lon.min()) - pad / m_per_deg_lon
+    lat0 = float(lat.min()) - pad / m_per_deg_lat
+    nx = max(8, int((float(lon.max()) + pad / m_per_deg_lon - lon0) / dlon) + 1)
+    ny = max(8, int((float(lat.max()) + pad / m_per_deg_lat - lat0) / dlat) + 1)
+    lon_edges = lon0 + np.arange(nx + 1) * dlon
+    lat_edges = lat0 + np.arange(ny + 1) * dlat
+
+    # Pre-sort by time so each window is a contiguous slice (searchsorted).
+    order = np.argsort(t_ms, kind="stable")
+    lon, lat, z, t_ms = lon[order], lat[order], z[order], t_ms[order]
+    t0, t1 = int(t_ms[0]), int(t_ms[-1])
+
+    def smoothed_grid(lo, la):
+        H, _, _ = np.histogram2d(lo, la, bins=[lon_edges, lat_edges])
+        return ndi.gaussian_filter(H, sigma=sigma_cells, mode="constant")
+
+    # Window starts. Each shows for [w, w+step); returns accumulated over the
+    # wider [centre-width/2, centre+width/2).
+    starts = list(range(t0, t1 + 1, int(win_step_ms)))
+    half = win_width_ms / 2.0
+
+    def window_slice(w):
+        centre = w + win_step_ms / 2.0
+        a = np.searchsorted(t_ms, centre - half, side="left")
+        b = np.searchsorted(t_ms, centre + half, side="right")
+        return a, b
+
+    # Height slabs (3D) or a single flat layer (2D). Each slab is (centre, half-thick).
+    if layered:
+        zlo = float(np.percentile(z, 1)) if z_min is None else float(z_min)
+        zhi = float(np.percentile(z, 99)) if z_max is None else float(z_max)
+        if zhi - zlo < z_step:
+            zhi = zlo + z_step
+        zhalf = (z_thickness if z_thickness else z_step * 1.5) / 2.0
+        slabs = [(float(zc), zhalf) for zc in np.arange(zlo, zhi + 1e-6, z_step)]
+        floor = int(min_pts_layer)
+    else:
+        slabs = [(0.0, None)]      # one layer, all heights, z_layer=0
+        floor = int(min_pts)
+
+    def slab_grid(lo_w, la_w, z_w, zc, zhalf):
+        """Smoothed XY density grid for one slab of a window (None zhalf → all z)."""
+        if zhalf is None:
+            return smoothed_grid(lo_w, la_w), len(lo_w)
+        m = np.abs(z_w - zc) <= zhalf
+        c = int(m.sum())
+        if c < floor:
+            return None, c
+        return smoothed_grid(lo_w[m], la_w[m]), c
+
+    # ── pass 1: derive FIXED contour levels, pooled across sample windows × slabs ──
+    sample_idx = np.unique(
+        np.linspace(0, len(starts) - 1, num=min(12, len(starts))).astype(int))
+    pooled = []
+    for si in sample_idx:
+        a, b = window_slice(starts[si])
+        if b - a < floor:
+            continue
+        lo_w, la_w, z_w = lon[a:b], lat[a:b], z[a:b]
+        for zc, zhalf in slabs:
+            g, _c = slab_grid(lo_w, la_w, z_w, zc, zhalf)
+            if g is None:
+                continue
+            nz = g[g > 0.5]
+            if nz.size:
+                pooled.append(nz)
+    if not pooled:
+        print("  (--contours) every window/slab below the point floor — no contours")
+        return []
+    pooled = np.concatenate(pooled)
+    # Percentile ladder across the n_levels bands (sparse outer → dense core).
+    pcts = np.linspace(55, 96, num=n_levels)
+    levels = np.unique(np.round(np.percentile(pooled, pcts), 2))
+    levels = levels[levels > 0]
+    if layered:
+        print(f"  (--contours) 3D: {nx}×{ny} grid (cell {cell_m} m), {len(starts)} "
+              f"windows × {len(slabs)} z-slabs (step {z_step} m, "
+              f"{slabs[0][0]:.1f}…{slabs[-1][0]:.1f} m), levels={levels.tolist()}")
+    else:
+        print(f"  (--contours) 2D: {nx}×{ny} grid (cell {cell_m} m), "
+              f"{len(starts)} windows, levels={levels.tolist()}")
+
+    # ── pass 2: contour every window (× slab) at the fixed levels ──
+    out = []
+    n_win = 0
+    for w in starts:
+        a, b = window_slice(w)
+        if b - a < floor:
+            continue
+        lo_w, la_w, z_w = lon[a:b], lat[a:b], z[a:b]
+        w_end = w + int(win_step_ms)
+        active = False
+        for zc, zhalf in slabs:
+            g, _c = slab_grid(lo_w, la_w, z_w, zc, zhalf)
+            if g is None or g.max() < levels[0]:
+                continue
+            active = True
+            for li, lvl in enumerate(levels):
+                band = iso_density_band(li)
+                for seg in measure.find_contours(g, float(lvl)):
+                    if len(seg) < min_len:
+                        continue
+                    # find_contours emits a vertex at EVERY cell crossing — a
+                    # dense staircase. Douglas-Peucker in CELL units (tolerance
+                    # < 1 cell) collapses that to clean lines, cutting vertices
+                    # ~3-5× with NO visible change to the contour shape — the
+                    # cheap lever that makes a FINE grid (high XY resolution)
+                    # affordable. Done in cell space so the tolerance is uniform.
+                    if simplify_cells > 0:
+                        s = LineString(seg).simplify(simplify_cells,
+                                                     preserve_topology=False)
+                        seg = np.asarray(s.coords)
+                        if len(seg) < 2:
+                            continue
+                    # (row, col) array-index space; row ↔ lon (axis-0) bin, col ↔
+                    # lat (axis-1) bin. Map each index to its cell CENTRE in lon/lat.
+                    pl = lon0 + (seg[:, 0] + 0.5) * dlon
+                    pa = lat0 + (seg[:, 1] + 0.5) * dlat
+                    coords = np.column_stack([pl, pa])
+                    out.append((LineString(coords), band, zc, w, w_end))
+        if active:
+            n_win += 1
+    print(f"  (--contours) {len(out)} contour lines over {n_win} active windows")
+    return out
+
+
+def add_contour_args(p) -> None:
+    """Register the shared ``--contours`` / ``--contour-*`` CLI flags on an
+    argparse parser. Used identically by waymo_extract.py and argoverse_extract.py
+    so the density iso-line knobs stay in lockstep across extractors."""
+    p.add_argument("--contours", action="store_true",
+                   help="DENSITY ISO-LINES view: instead of point/surfel tiers, draw "
+                        "the iso-density contours of the returns (a live topographic "
+                        "map of where the cloud clusters — walls / cars / vegetation), "
+                        "morphing per playhead window. With --contour-z-step it goes "
+                        "TRUE-3D (contour density per height layer, stack at real "
+                        "altitude). Builds ONE windowed-LineString `lidar/` archive "
+                        "(rendered by AnimatedPathLayer). Tune with the knobs below.")
+    p.add_argument("--contour-decimate", type=int, default=1,
+                   help="LIDAR decode/stride decimation for the contour pass "
+                        "(default 1 = full density — the fine default grid needs it "
+                        "so each small cell still sees enough returns).")
+    p.add_argument("--contour-cell", type=float, default=0.25,
+                   help="density grid cell size in metres (default 0.25 — the XY "
+                        "resolution lever; smaller = finer horizontal detail).")
+    p.add_argument("--contour-sigma", type=float, default=1.2,
+                   help="gaussian smoothing sigma in CELLS before contouring "
+                        "(default 1.2 — sharper than a wide blur so fine XY structure "
+                        "survives).")
+    p.add_argument("--contour-levels", type=int, default=5,
+                   help="number of density contour levels / bands (default 5; max "
+                        "useful is len(ISO_DENSITY_BANDS)).")
+    p.add_argument("--contour-step", type=int, default=200,
+                   help="playhead window step in ms — how often the contour set is "
+                        "re-cut (default 200; also the tile bucket).")
+    p.add_argument("--contour-width", type=int, default=900,
+                   help="accumulation window in ms centred on each step (default 900).")
+    p.add_argument("--contour-min-len", type=int, default=16,
+                   help="drop contour loops shorter than this many vertices (default 16 "
+                        "— culls fine-grid speckle).")
+    p.add_argument("--contour-simplify", type=float, default=0.5,
+                   help="Douglas-Peucker tolerance in CELLS applied to each contour "
+                        "(default 0.5; 0 disables). Collapses marching-squares' "
+                        "per-cell-crossing staircase to clean lines — ~3-5× fewer "
+                        "vertices with no visible change, so a fine grid stays cheap.")
+    p.add_argument("--contour-z-step", type=float, default=0.0,
+                   help="TRUE-3D iso-lines: height-slab spacing in METRES. 0 (default) "
+                        "= the flat 2D ground-density map. >0 slices returns into "
+                        "height layers and tags each contour with its real altitude "
+                        "so the client lifts it. Try 1.0.")
+    p.add_argument("--contour-z-thickness", type=float, default=None,
+                   help="3D: per-slab accumulation thickness in metres (default "
+                        "1.5×z-step — overlapping slabs → smoother vertical continuity).")
+    p.add_argument("--contour-z-min", type=float, default=None,
+                   help="3D: lowest slab centre (metres; default = 1st z percentile).")
+    p.add_argument("--contour-z-max", type=float, default=None,
+                   help="3D: highest slab centre (metres; default = 99th z percentile).")
+    p.add_argument("--contour-min-pts-layer", type=int, default=120,
+                   help="3D: drop a window's height slab with fewer than this many "
+                        "returns (default 120).")
+
+
+def contour_kwargs(args) -> dict:
+    """Collect the ``--contour-*`` knobs from parsed args into the keyword dict
+    ``build_density_contours`` expects (the ``--contour-decimate`` stride is applied
+    by the caller before contouring, so it's NOT included here)."""
+    return dict(
+        cell_m=args.contour_cell, sigma_cells=args.contour_sigma,
+        n_levels=args.contour_levels, win_step_ms=args.contour_step,
+        win_width_ms=args.contour_width, min_len=args.contour_min_len,
+        simplify_cells=args.contour_simplify,
+        z_step=args.contour_z_step, z_thickness=args.contour_z_thickness,
+        z_min=args.contour_z_min, z_max=args.contour_z_max,
+        min_pts_layer=args.contour_min_pts_layer,
+    )
+
+
 # ── Sidecar JSON writers ─────────────────────────────────────────────────────
 def write_telemetry_json(
     out_path: Path,
@@ -834,9 +1242,12 @@ def lidar_quantize_attrs(z_prec: float) -> dict[str, float]:
     * ``r``/``g``/``b`` — camera-projected per-point colour, integers 0–255 stored
       as Float64 (see ``write_lidar_points``); ``step=1`` is lossless → ``u16``
       (256 distinct values compress trivially), 8 B/pt → 2 B/pt each.
-    * ``qx``/``qy``/``qz``/``qw`` — unit surfel quaternion ∈ [-1,1]; ``1e-4`` is
-      ~0.01° of orientation error (imperceptible) and fits ``u16`` (range 2 / 1e-4
-      = 20 000 < 65 535). 8 B/pt → 2 B/pt each.
+    * ``qx``/``qy``/``qz``/``qw`` — unit surfel quaternion ∈ [-1,1]; ``1e-3`` is
+      ~0.1° of orientation error (still imperceptible on a disk) and the quat is
+      ~46 % of a quantized surfel tile + near-incompressible (high-entropy
+      orientations), so the coarser grid is a measured ~7.5 % whole-tile win with
+      no visible change (point_column_stats: 16.1 → 14.9 B/pt). Fits ``u16``
+      (range 2 / 1e-3 = 2 000). 8 B/pt → 2 B/pt each.
     * ``s_major``/``s_minor`` — in-plane extents (m) at cm precision.
     * ``surfel_opacity`` — confidence ∈ [0,1] at ~1/250 precision.
     """
@@ -845,14 +1256,597 @@ def lidar_quantize_attrs(z_prec: float) -> dict[str, float]:
         "r": 1.0,
         "g": 1.0,
         "b": 1.0,
-        "qx": 1e-4,
-        "qy": 1e-4,
-        "qz": 1e-4,
-        "qw": 1e-4,
+        "qx": 1e-3,
+        "qy": 1e-3,
+        "qz": 1e-3,
+        "qw": 1e-3,
+        # Smallest-three packed quaternion (write_lidar_points pack_quat=True):
+        # three components ∈ [-0.71, 0.71] at the same ~0.1° grid; q_imax is the
+        # 0–3 index of the dropped (largest) component, step 1 → stored EXACTLY.
+        "q_a": 1e-3,
+        "q_b": 1e-3,
+        "q_c": 1e-3,
+        "q_imax": 1.0,
         "s_major": 0.01,
         "s_minor": 0.01,
         "surfel_opacity": 0.004,
+        # Feature 1 (Worldbuild): the static/dynamic numeric flag is exactly 0/1,
+        # so step 1 is lossless → a single-distinct-value (or two) u16 that
+        # compresses to nothing.
+        "is_dynamic": 1.0,
+        # Feature 5 (Sweep): scan phase ∈ [0,1]; ~1/1000 precision is finer than
+        # the beam reveal needs, fits u16 (range 1 / 1e-3 = 1000), 8 B/pt → 2 B/pt.
+        "scan_phase": 1e-3,
     }
+
+
+def pack_surfel_quaternions(quat):
+    """Smallest-three encode unit quaternions ``(N,4) [x,y,z,w]`` →
+    ``(q_a, q_b, q_c, q_imax)``: the three non-largest components (in ascending
+    component order) + the index ``0..3`` of the largest. The whole quaternion is
+    sign-flipped so the largest component is POSITIVE (``q ≡ −q`` as a rotation),
+    so the shader reconstructs it unambiguously as ``+sqrt(1 − a² − b² − c²)``.
+    Vectorised; mirrored by ``unpackQuat`` in ``splat-primitive-layer.ts``.
+    """
+    q = np.asarray(quat, dtype="float64")
+    q = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-12)
+    n = len(q)
+    imax = np.argmax(np.abs(q), axis=1)
+    sign = np.sign(q[np.arange(n), imax])
+    sign[sign == 0] = 1.0
+    q = q * sign[:, None]
+    keep = np.ones((n, 4), dtype=bool)
+    keep[np.arange(n), imax] = False
+    abc = q[keep].reshape(n, 3)  # boolean-index preserves ascending column order
+    return abc[:, 0], abc[:, 1], abc[:, 2], imax.astype("int64")
+
+
+# ── geometry-aware decimation ────────────────────────────────────────────────
+# The crude lever is a uniform stride (``pts[::decimate]``): it spends its point
+# budget EQUALLY on flat road/walls (where a neighbour predicts the point — it's
+# redundant) and on curbs/poles/foliage/vehicle outlines (where it's the detail
+# that makes the scene read). A measured bake-off (``lidar_summarize_eval.py``,
+# point-to-plane RMS on real Waymo sweeps) showed the same point budget keeps
+# ~2-4× MORE edge detail when you instead keep every high-curvature return and
+# voxel-summarise the flat majority — at equal-or-better surface error and no
+# catastrophic holes. So at a given fidelity this sends far fewer points.
+ADAPTIVE_K = 12          # k-NN for the local surface-variation estimate (== SURFEL_K)
+ADAPTIVE_BETA = 0.5      # share of the budget reserved for guaranteed-detail returns
+
+
+def _surface_variation(pts, k: int = ADAPTIVE_K):
+    """σ = λ0/(λ0+λ1+λ2) per point — local planarity from the k-NN covariance.
+    ~0 on flats, large on edges/corners/foliage. Same eigenframe ``compute_surfels``
+    fits; kept standalone so the plain (non-surfel) path can reuse it."""
+    import numpy as np
+    from scipy.spatial import cKDTree
+
+    k = min(k, len(pts) - 1)
+    _d, idx = cKDTree(pts).query(pts, k=k + 1)
+    neigh = pts[idx]
+    c = neigh - neigh.mean(axis=1, keepdims=True)
+    cov = np.einsum("nki,nkj->nij", c, c) / (k + 1)
+    evals = np.linalg.eigvalsh(cov)            # ascending
+    return evals[:, 0] / (evals.sum(axis=1) + 1e-12)
+
+
+def _voxel_real_indices(pts, v: float):
+    """Index of the REAL point nearest each occupied ``v``-metre voxel's centroid."""
+    import numpy as np
+
+    keys = np.floor(pts / v).astype(np.int64)
+    uniq, inv, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+    sums = np.zeros((len(uniq), 3))
+    np.add.at(sums, inv, pts)
+    cent = sums / counts[:, None]
+    d2 = np.einsum("ni,ni->n", pts - cent[inv], pts - cent[inv])
+    best = np.full(len(uniq), np.inf)
+    np.minimum.at(best, inv, d2)
+    return np.flatnonzero(d2 == best[inv])
+
+
+def _voxel_size_for_count(pts, target: int) -> float:
+    """Bisect the voxel edge so the occupied-voxel count ≈ ``target``."""
+    import numpy as np
+
+    lo, hi = 0.02, 8.0
+    for _ in range(26):
+        v = (lo * hi) ** 0.5
+        n = len(np.unique(np.floor(pts / v).astype(np.int64), axis=0))
+        if n > target:
+            lo = v
+        else:
+            hi = v
+    return (lo * hi) ** 0.5
+
+
+def adaptive_lidar_select(pts, decimate: int, k: int = ADAPTIVE_K,
+                          beta: float = ADAPTIVE_BETA):
+    """Geometry-aware replacement for ``np.arange(0, len(pts), decimate)``.
+
+    ``pts`` is the FULL-density vehicle/ego-frame sweep (N×3). Returns a SORTED
+    int index array of ≈ N/``decimate`` REAL returns — keep ``beta`` of the budget
+    as the highest-curvature points (poles/edges/objects, preserved exactly) and
+    the rest as one representative real point per voxel over the flat remainder
+    (even coverage, no synthetic points → all attributes ride along). Drop-in for
+    the surfel and plain lidar paths; downstream colorize/quantize/tiling unchanged.
+    """
+    import numpy as np
+
+    n = len(pts)
+    target = max(1, n // max(1, decimate))
+    if target >= n:
+        return np.arange(n)
+    sv = _surface_variation(pts, k)
+    order = np.argsort(sv)[::-1]
+    ne = min(int(beta * target), n)
+    edge_idx = order[:ne]
+    flat_mask = np.ones(n, bool)
+    flat_mask[edge_idx] = False
+    flat_pos = np.flatnonzero(flat_mask)
+    want_flat = max(1, target - ne)
+    if want_flat >= len(flat_pos):
+        keep = np.arange(n)
+    else:
+        v = _voxel_size_for_count(pts[flat_pos], want_flat)
+        rep_local = _voxel_real_indices(pts[flat_pos], v)
+        keep = np.concatenate([edge_idx, flat_pos[rep_local]])
+    return np.unique(keep)          # sorted + dedups any voxel-centroid ties
+
+
+# ── shared surfel frame (eigen → quaternion core) ────────────────────────────
+# The eigen→quaternion core of the per-sweep ``compute_surfels`` (in
+# waymo_extract / argoverse_extract) factored out so the per-sweep paths AND the
+# new merged Worldbuild path fit surfels the SAME way (the dual-copy hazard this
+# repo keeps hitting). Tuning constants mirror the extractors' SURFEL_* values.
+SURFEL_K = 12               # k-NN for the covariance estimate (== ADAPTIVE_K)
+SURFEL_FILL = 0.70          # disk radius as a fraction of the local point spacing
+SURFEL_S_MIN = 0.03         # m — floor (avoid sub-cm slivers)
+SURFEL_S_MAX = 0.45         # m — ceil (sparse returns don't become giant blobs)
+SURFEL_ASPECT_FLOOR = 0.45  # keep disks from collapsing to needles on edges
+
+
+def mat3_to_quat(R: np.ndarray) -> np.ndarray:
+    """Batched rotation matrices ``(M,3,3)`` → unit quaternions ``(M,4)`` [x,y,z,w].
+
+    Shepperd's method (the numerically-stable four-case branch on which diagonal
+    term is largest), vectorised. Same implementation the per-sweep extractors
+    carry; kept here so the merged Worldbuild path shares it.
+    """
+    m00, m01, m02 = R[:, 0, 0], R[:, 0, 1], R[:, 0, 2]
+    m10, m11, m12 = R[:, 1, 0], R[:, 1, 1], R[:, 1, 2]
+    m20, m21, m22 = R[:, 2, 0], R[:, 2, 1], R[:, 2, 2]
+    trace = m00 + m11 + m22
+
+    def _sqrt(v):
+        return np.sqrt(np.maximum(v, 1e-12))
+
+    s0 = _sqrt(trace + 1.0) * 2.0  # = 4w
+    q0 = np.stack([(m21 - m12) / s0, (m02 - m20) / s0, (m10 - m01) / s0, 0.25 * s0], 1)
+    s1 = _sqrt(1.0 + m00 - m11 - m22) * 2.0  # = 4x
+    q1 = np.stack([0.25 * s1, (m01 + m10) / s1, (m02 + m20) / s1, (m21 - m12) / s1], 1)
+    s2 = _sqrt(1.0 + m11 - m00 - m22) * 2.0  # = 4y
+    q2 = np.stack([(m01 + m10) / s2, 0.25 * s2, (m12 + m21) / s2, (m02 - m20) / s2], 1)
+    s3 = _sqrt(1.0 + m22 - m00 - m11) * 2.0  # = 4z
+    q3 = np.stack([(m02 + m20) / s3, (m12 + m21) / s3, 0.25 * s3, (m10 - m01) / s3], 1)
+
+    use0 = trace > 0.0
+    use1 = (~use0) & (m00 >= m11) & (m00 >= m22)
+    use2 = (~use0) & (~use1) & (m11 >= m22)
+    q = np.where(use0[:, None], q0,
+        np.where(use1[:, None], q1,
+        np.where(use2[:, None], q2, q3)))
+    q /= np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-12)
+    return q
+
+
+def _surfel_frame(pts: np.ndarray, sel: np.ndarray, view_dir, R_post=None):
+    """Eigen → quaternion + extents + opacity core, shared by per-sweep + merged.
+
+    ``pts`` is the full-density cloud (N×3), ``sel`` indexes the rendered subset.
+    For each selected point: estimate the local surface frame from its k-NN
+    covariance (smallest eigenvector = normal, largest = in-plane major axis),
+    orient the normal toward ``view_dir`` (a single (3,) sensor→origin direction,
+    or a per-point (M,3) array — e.g. the merged path uses centroid−point), build a
+    right-handed ``[tmaj | tmin | normal]`` rotation, and convert to a quaternion.
+    Disk extents scale to the DECIMATED spacing (fills the rendered gaps),
+    anisotropy from the eigenvalues; confidence tracks planarity.
+
+    ``R_post`` (optional 3×3): a left-multiplied rotation applied to every surfel
+    frame BEFORE the quaternion conversion — the per-sweep extractors pass the
+    ego-YAW matrix here (the render keeps vehicle-frame z, so only yaw is applied)
+    so the shared core reproduces their existing output exactly. The merged
+    Worldbuild path passes ``None`` (no single ego pose).
+
+    Returns ``(quat M×4 [x,y,z,w], scale2 M×2 [s_major,s_minor], opacity M)``.
+    """
+    from scipy.spatial import cKDTree
+
+    pts = np.asarray(pts, dtype="float64")
+    sel = np.asarray(sel)
+    m = len(sel)
+    sel_pts = pts[sel]
+    tree = cKDTree(pts)
+    k = min(SURFEL_K, len(pts) - 1)
+    _d, idx = tree.query(sel_pts, k=k + 1)   # includes self at column 0
+    neigh = pts[idx]                          # (m, k+1, 3)
+    centred = neigh - neigh.mean(axis=1, keepdims=True)
+    cov = np.einsum("mki,mkj->mij", centred, centred) / (k + 1)
+    evals, evecs = np.linalg.eigh(cov)        # ascending eigenvalues; cols = vecs
+    l0, l1, l2 = evals[:, 0], evals[:, 1], evals[:, 2]
+    normal = evecs[:, :, 0].copy()            # smallest eigenvalue → surface normal
+    tmaj = evecs[:, :, 2].copy()              # largest → in-plane major axis
+
+    view = np.asarray(view_dir, dtype="float64")
+    if view.ndim == 1:
+        view = np.broadcast_to(view, (m, 3))
+    flip = np.sum(normal * view, axis=1) < 0.0
+    normal[flip] *= -1.0
+    normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-12)
+    tmaj -= np.sum(tmaj * normal, axis=1, keepdims=True) * normal  # orthogonalise
+    tmaj /= np.maximum(np.linalg.norm(tmaj, axis=1, keepdims=True), 1e-12)
+    tmin = np.cross(normal, tmaj)
+
+    R_surfel = np.stack([tmaj, tmin, normal], axis=2)   # (m,3,3), columns
+    if R_post is not None:
+        R_surfel = np.einsum("ij,mjk->mik", np.asarray(R_post, dtype="float64"), R_surfel)
+    quat = mat3_to_quat(R_surfel)
+
+    tree_sel = cKDTree(sel_pts)
+    dsel, _ = tree_sel.query(sel_pts, k=min(2, m))
+    spacing = dsel[:, 1] if dsel.ndim == 2 and dsel.shape[1] > 1 else np.full(m, 0.1)
+    s_base = np.clip(SURFEL_FILL * spacing, SURFEL_S_MIN, SURFEL_S_MAX)
+    aspect = np.clip(np.sqrt(np.maximum(l1, 1e-9) / np.maximum(l2, 1e-9)),
+                     SURFEL_ASPECT_FLOOR, 1.0)
+    s_major = s_base
+    s_minor = np.clip(s_base * aspect, SURFEL_S_MIN, SURFEL_S_MAX)
+
+    planarity = np.clip((l1 - l0) / np.maximum(l2, 1e-9), 0.0, 1.0)
+    opacity = np.clip(0.45 + 0.55 * planarity, 0.30, 1.0)
+
+    bad = (l2 <= 1e-9) | ~np.isfinite(quat).all(axis=1)
+    if bad.any():
+        quat[bad] = np.array([0.0, 0.0, 0.0, 1.0])
+        s_minor[bad] = s_major[bad]
+        opacity[bad] = 0.30
+
+    scale2 = np.stack([s_major, s_minor], axis=1)
+    return quat, scale2, opacity
+
+
+# ── Feature 1: Worldbuild cross-sweep merge ──────────────────────────────────
+# Accumulate ALL sweeps' returns into a single consolidated render-world cloud:
+# STATIC returns are voxel-deduped across the whole drive (so a wall sampled 100×
+# becomes one crisp surface) while DYNAMIC returns (inside MOVING actor boxes)
+# pass through UN-merged, each keeping its own per-sweep time (so a moving car
+# doesn't smear into a solid streak). The static voxel grid is built by a
+# STREAMING accumulator (``WorldVoxelAccumulator``) so peak memory is ∝ the
+# occupied-voxel count, NOT the ~180M raw returns.
+FALLBACK_RGB = (70, 78, 96)  # slate for returns no camera saw (== the colorizers)
+
+
+class WorldVoxelAccumulator:
+    """Incremental per-voxel accumulator for the Worldbuild STATIC cloud.
+
+    Call ``add(...)`` once per sweep with that sweep's STATIC returns (already in
+    render world x,y + vehicle-frame z). Per occupied voxel it keeps the single
+    REAL return nearest the voxel-cell centre (so attributes ride along — NO
+    synthetic points), the earliest sweep time it was seen (``first_seen``), and a
+    running RGB sum/count over the returns a camera actually saw. ``finalize()``
+    emits the deduped representative cloud. Peak memory ∝ occupied voxels.
+
+    Voxel key is ``floor(x/v), floor(y/v), floor(z/v)`` (the same idiom as
+    ``_voxel_real_indices``); "nearest the cell centre" uses the cell centre
+    ``(key+0.5)*v`` rather than a running centroid so the choice is order-stable
+    and needs no second pass.
+    """
+
+    def __init__(self, voxel_m: float):
+        self.v = float(voxel_m)
+        # key(tuple3 int) → list[best_d2, x, y, z, t_rep, first_seen,
+        #                        rgb_sum(3 float), rgb_cnt]
+        self._vox: dict[tuple, list] = {}
+
+    def add(self, pts_world, z, t_ms, rgb=None, rgb_hit=None):
+        """Fold one sweep's static returns into the grid.
+
+        ``pts_world`` is (N,2) render world x,y (metres in the local frame *before*
+        the lon/lat transform — any consistent metric frame works), ``z`` (N,) the
+        vehicle-frame height, ``t_ms`` a scalar or (N,) per-return time. ``rgb``
+        (N,3 uint8-ish) + ``rgb_hit`` (N bool) are the camera color + whether a
+        camera saw the return (only hits contribute to the running mean).
+        """
+        pts_world = np.asarray(pts_world, dtype="float64").reshape(-1, 2)
+        z = np.asarray(z, dtype="float64").reshape(-1)
+        n = len(z)
+        if n == 0:
+            return
+        t = (np.full(n, int(t_ms), dtype="int64") if np.ndim(t_ms) == 0
+             else np.asarray(t_ms, dtype="int64"))
+        xyz = np.column_stack([pts_world[:, 0], pts_world[:, 1], z])
+        keys = np.floor(xyz / self.v).astype(np.int64)
+        cell_centre = (keys + 0.5) * self.v
+        d2 = np.einsum("ni,ni->n", xyz - cell_centre, xyz - cell_centre)
+        if rgb is None:
+            rgb = np.zeros((n, 3), dtype="float64")
+            rgb_hit = np.zeros(n, dtype=bool)
+        else:
+            rgb = np.asarray(rgb, dtype="float64").reshape(-1, 3)
+            rgb_hit = (np.zeros(n, dtype=bool) if rgb_hit is None
+                       else np.asarray(rgb_hit, dtype=bool))
+        vox = self._vox
+        for i in range(n):
+            key = (int(keys[i, 0]), int(keys[i, 1]), int(keys[i, 2]))
+            ti = int(t[i])
+            cur = vox.get(key)
+            if cur is None:
+                vox[key] = [
+                    float(d2[i]), float(xyz[i, 0]), float(xyz[i, 1]), float(z[i]),
+                    ti, ti,
+                    rgb[i].copy() if rgb_hit[i] else np.zeros(3),
+                    1 if rgb_hit[i] else 0,
+                ]
+                continue
+            if ti < cur[5]:        # earliest sweep time = first_seen
+                cur[5] = ti
+            if rgb_hit[i]:         # running camera-RGB mean over hits
+                cur[6] = cur[6] + rgb[i]
+                cur[7] += 1
+            if d2[i] < cur[0]:     # representative = real return nearest cell centre
+                cur[0] = float(d2[i])
+                cur[1] = float(xyz[i, 0])
+                cur[2] = float(xyz[i, 1])
+                cur[3] = float(z[i])
+                cur[4] = ti
+
+    def finalize(self):
+        """→ (xy N×2, z N, rgb N×3 uint8, first_seen N int64). One row / voxel."""
+        n = len(self._vox)
+        xy = np.zeros((n, 2), dtype="float64")
+        z = np.zeros(n, dtype="float64")
+        rgb = np.zeros((n, 3), dtype="float64")
+        first_seen = np.zeros(n, dtype="int64")
+        fb = np.asarray(FALLBACK_RGB, dtype="float64")
+        for i, cur in enumerate(self._vox.values()):
+            xy[i, 0] = cur[1]
+            xy[i, 1] = cur[2]
+            z[i] = cur[3]
+            first_seen[i] = cur[5]
+            rgb[i] = (cur[6] / cur[7]) if cur[7] > 0 else fb
+        rgb = np.clip(np.round(rgb), 0, 255).astype("uint8")
+        return xy, z, rgb, first_seen
+
+
+def point_in_moving_boxes(pts_world, z, t_ms, boxes):
+    """Boolean mask: which (x,y) returns fall inside ANY moving actor box.
+
+    ``boxes`` is an iterable of dicts ``{cx, cy, heading, length, width, t}`` in
+    the SAME render-world metric frame as ``pts_world`` (one per moving-object
+    observation at its sweep time ``t`` ms; height is ignored — the test is a 2D
+    oriented-rectangle membership in the box-local frame, ample for tagging
+    dynamic returns). A return is dynamic if at ITS sweep time it lies inside a
+    box observed at the same ms.
+
+    Box-local test: rotate the return by ``-heading`` about the box centre, then
+    ``|x'| <= length/2`` and ``|y'| <= width/2`` (a small ε pad absorbs box-fit
+    slack). ``z`` is accepted for signature symmetry / future 3D use but unused.
+    """
+    pts_world = np.asarray(pts_world, dtype="float64").reshape(-1, 2)
+    n = len(pts_world)
+    t_ms = (np.full(n, int(t_ms), dtype="int64") if np.ndim(t_ms) == 0
+            else np.asarray(t_ms, dtype="int64"))
+    dyn = np.zeros(n, dtype=bool)
+    if n == 0:
+        return dyn
+    by_t: dict[int, list] = {}
+    for b in boxes:
+        by_t.setdefault(int(b["t"]), []).append(b)
+    eps = 0.25  # m — pad for box-fit slack
+    for ti in np.unique(t_ms):
+        sel = np.flatnonzero(t_ms == ti)
+        blist = by_t.get(int(ti))
+        if not blist:
+            continue
+        px = pts_world[sel, 0]
+        py = pts_world[sel, 1]
+        for b in blist:
+            dx = px - b["cx"]
+            dy = py - b["cy"]
+            c = math.cos(-b["heading"])
+            s = math.sin(-b["heading"])
+            xl = dx * c - dy * s
+            yl = dx * s + dy * c
+            hit = (np.abs(xl) <= b["length"] / 2.0 + eps) & \
+                  (np.abs(yl) <= b["width"] / 2.0 + eps)
+            if hit.any():
+                dyn[sel[hit]] = True
+    return dyn
+
+
+def worldbuild_merge(static_acc, dynamic):
+    """Combine the streamed STATIC voxel grid + the full-rate DYNAMIC returns,
+    fit surfels on the merged deduped cloud, and assemble the per-column arrays
+    for ``write_lidar_points`` (Feature 1 — Worldbuild).
+
+    ``static_acc`` is a finalized ``WorldVoxelAccumulator`` (or its ``finalize()``
+    4-tuple). ``dynamic`` is a dict of the un-merged dynamic returns with keys
+    ``xy`` (N×2 render world), ``z`` (N), ``rgb`` (N×3 uint8), ``t`` (N int64
+    per-sweep ms). Either side may be empty.
+
+    The merged STATIC points keep their voxel ``first_seen`` as their timestamp;
+    DYNAMIC points keep their own per-sweep time. Surfels are fit on the WHOLE
+    merged cloud (static + dynamic) so even the dynamic returns render as oriented
+    disks; the merged path uses NO ego-yaw rotation (there is no single ego pose —
+    the normal is oriented toward the scene centroid).
+
+    Returns a dict with keys:
+      ``xy`` (M×2), ``z`` (M), ``rgb`` (M×3 uint8), ``timestamp`` (M int64),
+      ``is_dynamic`` (M int64 0/1), ``world_class`` (M object "static"/"dynamic"),
+      ``surfels`` (M×7 [qx,qy,qz,qw,s_major,s_minor,opacity]).
+    """
+    if isinstance(static_acc, WorldVoxelAccumulator):
+        s_xy, s_z, s_rgb, s_first = static_acc.finalize()
+    else:
+        s_xy, s_z, s_rgb, s_first = static_acc
+    s_xy = np.asarray(s_xy, dtype="float64").reshape(-1, 2)
+    s_z = np.asarray(s_z, dtype="float64").reshape(-1)
+    s_rgb = np.asarray(s_rgb).reshape(-1, 3)
+    s_first = np.asarray(s_first, dtype="int64").reshape(-1)
+    n_static = len(s_z)
+
+    d_xy = np.asarray(dynamic.get("xy", np.empty((0, 2))), dtype="float64").reshape(-1, 2)
+    d_z = np.asarray(dynamic.get("z", np.empty(0)), dtype="float64").reshape(-1)
+    d_rgb = np.asarray(dynamic.get("rgb", np.empty((0, 3))), dtype="float64").reshape(-1, 3)
+    d_t = np.asarray(dynamic.get("t", np.empty(0)), dtype="int64").reshape(-1)
+    n_dyn = len(d_z)
+
+    xy = np.concatenate([s_xy, d_xy], axis=0) if n_dyn else s_xy
+    z = np.concatenate([s_z, d_z]) if n_dyn else s_z
+    rgb = (np.concatenate([s_rgb, d_rgb], axis=0) if n_dyn else s_rgb)
+    rgb = np.clip(np.round(np.asarray(rgb, dtype="float64")), 0, 255).astype("uint8")
+    timestamp = np.concatenate([s_first, d_t]) if n_dyn else s_first
+    is_dynamic = np.concatenate([
+        np.zeros(n_static, dtype="int64"), np.ones(n_dyn, dtype="int64")])
+    world_class = np.array(["static"] * n_static + ["dynamic"] * n_dyn, dtype=object)
+
+    # Surfels on the merged cloud (x,y world + vehicle-frame z). No ego pose to
+    # rotate by; orient normals toward the scene centroid (a stable view dir).
+    m = len(z)
+    pts = np.column_stack([xy[:, 0], xy[:, 1], z])
+    if m >= SURFEL_K + 2:
+        centroid = pts.mean(axis=0)
+        view_dir = centroid[None, :] - pts          # per-point, toward centroid
+        quat, scale2, op = _surfel_frame(pts, np.arange(m), view_dir)
+        surfels = np.concatenate([quat, scale2, op[:, None]], axis=1)
+    else:  # too few points to fit — flat up-facing low-confidence disks
+        surfels = np.tile(
+            np.array([0.0, 0.0, 0.0, 1.0, SURFEL_S_MIN, SURFEL_S_MIN, 0.30]), (max(m, 0), 1))
+
+    return dict(
+        xy=xy, z=z, rgb=rgb, timestamp=timestamp,
+        is_dynamic=is_dynamic, world_class=world_class, surfels=surfels,
+    )
+
+
+# ── Feature 2: object tracks (always emitted, the tracks/ archive) ───────────
+def build_tracks(*, lon, lat, timestamp, category, track_id, speed):
+    """Group per-observation object points into per-track polylines (Feature 2).
+
+    Parallel arrays of object OBSERVATIONS (one row per object per sample — the
+    same arrays that feed ``write_objects_points``): ``lon`` / ``lat`` (deg),
+    ``timestamp`` (ms), ``category`` (canonical class str), ``track_id`` (str),
+    ``speed`` (m/s). Groups by ``track_id`` (the AV2 velocity grouping idiom),
+    sorts each by time, and emits one track per id. Tracks with < 2 vertices are
+    dropped (a LineString needs ≥ 2 points). The track's ``category`` is its
+    first-seen class (constant per track).
+
+    Returns a list of dicts ``{lon, lat, vts (vertex times int64), vvals (speed
+    float32), category}`` ready for ``write_track_lines``. INCLUDE the ego as one
+    more track (category ``"ego"``) — the caller folds it in (see the extractors).
+    """
+    lon = np.asarray(lon, dtype="float64")
+    lat = np.asarray(lat, dtype="float64")
+    timestamp = np.asarray(timestamp, dtype="int64")
+    speed = np.asarray(speed, dtype="float64")
+    category = list(category)
+    track_id = list(track_id)
+
+    by_track: dict[str, list[int]] = {}
+    for i, tid in enumerate(track_id):
+        by_track.setdefault(str(tid), []).append(i)
+
+    tracks: list[dict] = []
+    for tid, idx in by_track.items():
+        idx.sort(key=lambda i: int(timestamp[i]))
+        if len(idx) < 2:
+            continue  # a LineString needs ≥ 2 vertices
+        ii = np.asarray(idx)
+        tracks.append(dict(
+            lon=lon[ii],
+            lat=lat[ii],
+            vts=[int(t) for t in timestamp[ii]],
+            vvals=[float(v) for v in speed[ii]],
+            category=str(category[idx[0]]),  # first-seen class (constant)
+        ))
+    return tracks
+
+
+# ── Feature 5: scan-phase → hue ramp ─────────────────────────────────────────
+def phase_to_rgb(phase) -> np.ndarray:
+    """Map a per-point scan phase ∈ [0,1] → an (N,3) uint8 RGB rainbow (HSV sweep).
+
+    Feature 5 (Sweep): the AV2 scan bundle colours each return by its normalized
+    offset within the sweep so the LiDAR beam renders as a ROTATING RAINBOW via
+    the existing r/g/b path. A simple full-saturation full-value HSV sweep
+    (hue = phase·360°) — vectorised, no colorsys/matplotlib. Values clamp to
+    ``[0,1]`` so the endpoints (phase 0 and 1) both land on red, closing the loop.
+    """
+    h = (np.clip(np.asarray(phase, dtype="float64"), 0.0, 1.0)) * 6.0  # sector 0..6
+    i = np.floor(h).astype(int) % 6
+    f = h - np.floor(h)
+    # S=V=1 → the standard HSV-to-RGB six-sector form with p=0, q=1−f, t=f.
+    q = 1.0 - f
+    t = f
+    r = np.choose(i, [1.0, q, 0.0, 0.0, t, 1.0])
+    g = np.choose(i, [t, 1.0, 1.0, q, 0.0, 0.0])
+    b = np.choose(i, [0.0, 0.0, t, 1.0, 1.0, q])
+    return np.clip(np.round(np.stack([r, g, b], axis=1) * 255.0), 0, 255).astype("uint8")
+
+
+def write_track_lines(out_path: Path, *, tracks) -> int:
+    """Write the ``tracks/`` LineString GeoParquet (Feature 2).
+
+    One WKB LineString per tracked object (the ego folded in as category
+    ``"ego"``). Columns: ``geometry`` (WKB LineString), ``timestamp`` /
+    ``end_timestamp`` (Int64 first/last vertex ms = the feature window),
+    ``vertex_timestamps`` (List<Int64> per-vertex ms — load-bearing for the
+    PathLayer time animation), ``vertex_values`` (List<Float32> per-vertex speed
+    m/s), ``category`` (Utf8 categorical = canonical class / ``"ego"``). Mirrors
+    ``write_ego_trips`` but multi-row and adds ``category``. Built with
+    ``run_stt_build(kind="line")`` (NOT trips/point) so it skips ``--simplify`` /
+    ``--quantize-coords`` — both would desync ``vertex_timestamps`` from the
+    coords and trip the PathLayer vertex-buffer GL bug. Returns the row count.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from shapely import wkb
+    from shapely.geometry import LineString
+
+    geoms: list[bytes] = []
+    t0s: list[int] = []
+    t1s: list[int] = []
+    vts_col: list[list[int]] = []
+    vvals_col: list[list[float]] = []
+    cats: list[str] = []
+    for tr in tracks:
+        lon = np.asarray(tr["lon"], dtype="float64")
+        lat = np.asarray(tr["lat"], dtype="float64")
+        vts = [int(t) for t in tr["vts"]]
+        vvals = [np.float32(v) for v in tr["vvals"]]
+        if not (len(lon) == len(lat) == len(vts) == len(vvals)):
+            raise ValueError("track: lon/lat/vts/vvals length mismatch")
+        if len(lon) < 2:
+            continue  # guard (build_tracks already drops these)
+        coords = list(zip(lon.tolist(), lat.tolist()))
+        geoms.append(wkb.dumps(LineString(coords)))
+        t0s.append(vts[0])
+        t1s.append(vts[-1])
+        vts_col.append(vts)
+        vvals_col.append(vvals)
+        cats.append(str(tr["category"]))
+    n = len(geoms)
+    table = pa.table({
+        "geometry": pa.array(geoms, type=pa.binary()),
+        "timestamp": pa.array(t0s, type=pa.int64()),
+        "end_timestamp": pa.array(t1s, type=pa.int64()),
+        "vertex_timestamps": pa.array(vts_col, type=pa.list_(pa.int64())),
+        "vertex_values": pa.array(vvals_col, type=pa.list_(pa.float32())),
+        "category": pa.array(cats, type=pa.string()),
+    })
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, out_path, compression="snappy")
+    print(f"  wrote {n} track LineString(s) → {out_path}")
+    return n
 
 
 def run_stt_build(
@@ -907,7 +1901,7 @@ def run_stt_build(
       in *degrees*, so at mid latitudes ``1.0`` snaps longitude to ~0.75 m
       (visible jitter on a ~4.5 m car) — use ``<= 0.1`` (~7.5 cm) for AV.
     """
-    valid = ("point", "trips", "map_poly", "map_line")
+    valid = ("point", "trips", "map_poly", "map_line", "line")
     if kind not in valid:
         raise ValueError(f"run_stt_build: unknown kind {kind!r} (use one of {valid})")
 
@@ -943,6 +1937,17 @@ def run_stt_build(
                 cmd += ["--quantize-attr", f"{name}={float(prec)!r}"]
     if kind == "trips":
         cmd += ["--end-time-field", "end_timestamp", "--simplify"]
+    elif kind == "line":
+        # Windowed LineStrings (live density-contour iso-lines): each feature is
+        # shown for its own [timestamp, end_timestamp] playhead window — like trips
+        # / map_line — but at the caller's SMALL per-window temporal bucket (NOT the
+        # static whole-scene map bucket) so the contour map morphs as the playhead
+        # moves. Crucially NO --simplify: it would distort the contour polylines.
+        # Keep contours whole (--no-clip) so a loop isn't dropped at a tile edge.
+        # The caller must NOT pass quantize_coords here — quantizing multi-vertex
+        # LineStrings mis-sizes PathLayer's instanced draw ("vertex buffer is not
+        # big enough"); lines are cheap, so store plain Float64 coords.
+        cmd += ["--end-time-field", "end_timestamp", "--no-clip"]
     elif is_map:
         # Full-range static features: valid_from = timestamp, valid_to =
         # end_timestamp (= timeRange.end), so they're present for the whole replay.
