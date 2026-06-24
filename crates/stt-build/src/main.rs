@@ -16,9 +16,51 @@ use tracing::{info, warn};
 #[command(about = "Build spatiotemporal tile archives from GeoParquet data", long_about = None)]
 #[command(version)]
 struct Args {
-    /// Input GeoParquet file path (.parquet or .geoparquet)
+    /// Input GeoParquet file path (.parquet or .geoparquet).
+    ///
+    /// Optional: omit it to read from a database instead via
+    /// `--postgres`/`--table`/`--sql` (requires `--features postgres`) or
+    /// `--duckdb`/`--table`/`--sql` (requires `--features duckdb`).
     #[arg(short, long)]
-    input: PathBuf,
+    input: Option<PathBuf>,
+
+    /// PostgreSQL/PostGIS connection string (libpq URI or key=value). When set,
+    /// stt-build reads features from a live PostGIS query INSTEAD of `--input`.
+    /// Requires a build with `--features postgres`. Env fallback:
+    /// `STT_POSTGRES_URL`, then `DATABASE_URL`.
+    #[arg(long)]
+    postgres: Option<String>,
+
+    /// DuckDB database file to read (or `:memory:` to scan files via `--sql`,
+    /// e.g. `read_parquet(...)`). When set, stt-build reads features from a
+    /// DuckDB query INSTEAD of `--input`. Requires a `--features duckdb` build.
+    /// The source geometry column must be a DuckDB spatial `GEOMETRY`.
+    #[arg(long)]
+    duckdb: Option<String>,
+
+    /// Source table to read (with `--postgres`/`--duckdb`; optionally
+    /// schema-qualified, e.g. `public.trips`). Mutually exclusive with `--sql`.
+    #[arg(long)]
+    table: Option<String>,
+
+    /// Arbitrary SQL `SELECT` to read (with `--postgres`/`--duckdb`). Mutually
+    /// exclusive with `--table`. Must expose the geometry column named by
+    /// `--geom-column`.
+    #[arg(long)]
+    sql: Option<String>,
+
+    /// Geometry column name in the PostGIS / DuckDB source.
+    #[arg(long, default_value = "geom")]
+    geom_column: String,
+
+    /// Optional SQL `WHERE` filter applied to the PostGIS / DuckDB source.
+    #[arg(long = "where")]
+    where_clause: Option<String>,
+
+    /// Reproject source geometry from this SRID to EPSG:4326 (`ST_Transform`).
+    /// Omit when the geometry is already lon/lat (4326).
+    #[arg(long)]
+    source_srid: Option<i32>,
 
     /// Output packed-dataset DIRECTORY (manifest.json + index/ + packs/).
     ///
@@ -439,6 +481,289 @@ enum SummaryTierScheme {
     Quadbin,
 }
 
+/// Where features come from: a GeoParquet file, a live PostGIS query, or a
+/// DuckDB query. Every arm yields the same [`input::ParsedFeature`] stream, so
+/// the rest of the build pipeline is source-agnostic.
+#[derive(Clone)]
+enum InputSource {
+    File(PathBuf),
+    #[cfg(feature = "postgres")]
+    Postgres {
+        conn: String,
+        spec: stt_build::postgres_input::QuerySpec,
+    },
+    #[cfg(feature = "duckdb")]
+    DuckDb {
+        db_path: String,
+        spec: stt_build::duckdb_input::QuerySpec,
+    },
+}
+
+impl InputSource {
+    /// Human-readable source description for logs.
+    fn describe(&self) -> String {
+        match self {
+            InputSource::File(p) => p.display().to_string(),
+            #[cfg(feature = "postgres")]
+            InputSource::Postgres { spec, .. } => match &spec.source {
+                stt_build::postgres_input::QuerySource::Table(t) => format!("PostGIS table {t}"),
+                stt_build::postgres_input::QuerySource::Sql(_) => "PostGIS query".to_string(),
+            },
+            #[cfg(feature = "duckdb")]
+            InputSource::DuckDb { spec, .. } => match &spec.source {
+                stt_build::duckdb_input::QuerySource::Table(t) => format!("DuckDB table {t}"),
+                stt_build::duckdb_input::QuerySource::Sql(_) => "DuckDB query".to_string(),
+            },
+        }
+    }
+
+    /// Default archive name when `--name` is not given.
+    fn default_name(&self) -> String {
+        match self {
+            InputSource::File(p) => p
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "dataset".to_string()),
+            #[cfg(feature = "postgres")]
+            InputSource::Postgres { spec, .. } => match &spec.source {
+                stt_build::postgres_input::QuerySource::Table(t) => {
+                    t.rsplit('.').next().unwrap_or(t).to_string()
+                }
+                stt_build::postgres_input::QuerySource::Sql(_) => "postgis".to_string(),
+            },
+            #[cfg(feature = "duckdb")]
+            InputSource::DuckDb { spec, .. } => match &spec.source {
+                stt_build::duckdb_input::QuerySource::Table(t) => {
+                    t.rsplit('.').next().unwrap_or(t).to_string()
+                }
+                stt_build::duckdb_input::QuerySource::Sql(_) => "duckdb".to_string(),
+            },
+        }
+    }
+
+    /// Eager load — collect every feature into memory.
+    fn load(
+        &self,
+        time_field: &str,
+        end_time_field: Option<&str>,
+        time_format: input::TimeFormat,
+        time_strictness: input::InputStrictness,
+        geometry_strictness: input::InputStrictness,
+    ) -> Result<Vec<input::ParsedFeature>> {
+        match self {
+            InputSource::File(path) => input::load_features(
+                path,
+                time_field,
+                end_time_field,
+                time_format,
+                time_strictness,
+                geometry_strictness,
+            ),
+            #[cfg(feature = "postgres")]
+            InputSource::Postgres { conn, spec } => {
+                stt_build::postgres_input::load_features_postgres(
+                    conn,
+                    spec,
+                    time_field,
+                    end_time_field,
+                    time_format,
+                    time_strictness,
+                    geometry_strictness,
+                )
+            }
+            #[cfg(feature = "duckdb")]
+            InputSource::DuckDb { db_path, spec } => {
+                stt_build::duckdb_input::load_features_duckdb(
+                    db_path,
+                    spec,
+                    time_field,
+                    end_time_field,
+                    time_format,
+                    time_strictness,
+                    geometry_strictness,
+                )
+            }
+        }
+    }
+
+    /// Streaming load — invoke `on_batch` per bounded batch (bounded RAM).
+    fn stream<F>(
+        &self,
+        time_field: &str,
+        end_time_field: Option<&str>,
+        time_format: input::TimeFormat,
+        time_strictness: input::InputStrictness,
+        geometry_strictness: input::InputStrictness,
+        on_batch: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Vec<input::ParsedFeature>) -> Result<()>,
+    {
+        match self {
+            InputSource::File(path) => input::stream_features(
+                path,
+                time_field,
+                end_time_field,
+                time_format,
+                time_strictness,
+                geometry_strictness,
+                on_batch,
+            ),
+            #[cfg(feature = "postgres")]
+            InputSource::Postgres { conn, spec } => {
+                stt_build::postgres_input::stream_features_postgres(
+                    conn,
+                    spec,
+                    time_field,
+                    end_time_field,
+                    time_format,
+                    time_strictness,
+                    geometry_strictness,
+                    stt_build::postgres_input::DEFAULT_BATCH_SIZE,
+                    on_batch,
+                )
+            }
+            #[cfg(feature = "duckdb")]
+            InputSource::DuckDb { db_path, spec } => {
+                stt_build::duckdb_input::stream_features_duckdb(
+                    db_path,
+                    spec,
+                    time_field,
+                    end_time_field,
+                    time_format,
+                    time_strictness,
+                    geometry_strictness,
+                    stt_build::duckdb_input::DEFAULT_BATCH_SIZE,
+                    on_batch,
+                )
+            }
+        }
+    }
+}
+
+/// Resolve the `Args` into a concrete [`InputSource`], validating that exactly
+/// one of the file / PostGIS / DuckDB sources is requested.
+fn resolve_source(args: &Args) -> Result<InputSource> {
+    let wants_postgres = args.postgres.is_some();
+    let wants_duckdb = args.duckdb.is_some();
+    if wants_postgres && wants_duckdb {
+        anyhow::bail!("--postgres and --duckdb are mutually exclusive");
+    }
+    // `--table`/`--sql` with no explicit backend default to PostGIS (which can
+    // take its connection from STT_POSTGRES_URL / DATABASE_URL), preserving the
+    // prior behaviour; DuckDB always needs an explicit `--duckdb <PATH|:memory:>`.
+    let wants_db =
+        wants_postgres || wants_duckdb || args.table.is_some() || args.sql.is_some();
+    if wants_db {
+        if args.input.is_some() {
+            anyhow::bail!(
+                "Provide either --input or a database source (--postgres/--duckdb with \
+                 --table/--sql), not both"
+            );
+        }
+        if wants_duckdb {
+            #[cfg(feature = "duckdb")]
+            {
+                return resolve_duckdb_source(args);
+            }
+            #[cfg(not(feature = "duckdb"))]
+            {
+                let _ = (&args.geom_column, &args.where_clause, &args.source_srid);
+                anyhow::bail!(
+                    "stt-build was built without DuckDB support; rebuild with `--features duckdb`"
+                );
+            }
+        }
+        // Explicit `--postgres`, or bare `--table`/`--sql` (env-var connection).
+        #[cfg(feature = "postgres")]
+        {
+            return resolve_postgres_source(args);
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            // Keep the DB-only flags "read" in this build so they don't warn,
+            // then explain why they can't be honoured.
+            let _ = (&args.geom_column, &args.where_clause, &args.source_srid);
+            anyhow::bail!(
+                "stt-build was built without PostGIS support; rebuild with `--features postgres` \
+                 (or pass --duckdb for the DuckDB source)"
+            );
+        }
+    }
+
+    let path = args.input.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no input: pass --input <GeoParquet>, --postgres <CONN> with --table/--sql, or \
+             --duckdb <PATH> with --table/--sql"
+        )
+    })?;
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    if !matches!(ext.to_lowercase().as_str(), "parquet" | "geoparquet") {
+        anyhow::bail!(
+            "Input must be a GeoParquet file (.parquet or .geoparquet), got: .{ext}"
+        );
+    }
+    Ok(InputSource::File(path))
+}
+
+/// Build a DuckDB [`InputSource`] from the relevant `Args`. Only compiled with
+/// the `duckdb` feature.
+#[cfg(feature = "duckdb")]
+fn resolve_duckdb_source(args: &Args) -> Result<InputSource> {
+    use stt_build::duckdb_input::{QuerySource, QuerySpec};
+    // `wants_duckdb` gates this call, so `--duckdb` is Some; empty / ":memory:"
+    // both mean an in-memory database (for scanning files via `--sql`).
+    let db_path = args.duckdb.clone().unwrap_or_else(|| ":memory:".to_string());
+    let source = match (&args.table, &args.sql) {
+        (Some(_), Some(_)) => anyhow::bail!("--table and --sql are mutually exclusive"),
+        (Some(t), None) => QuerySource::Table(t.clone()),
+        (None, Some(s)) => QuerySource::Sql(s.clone()),
+        (None, None) => anyhow::bail!("--duckdb requires --table <NAME> or --sql <SELECT>"),
+    };
+    Ok(InputSource::DuckDb {
+        db_path,
+        spec: QuerySpec {
+            source,
+            geom_column: args.geom_column.clone(),
+            where_clause: args.where_clause.clone(),
+            reproject_from_srid: args.source_srid,
+        },
+    })
+}
+
+/// Build a PostGIS [`InputSource`] from the relevant `Args`. Only compiled with
+/// the `postgres` feature.
+#[cfg(feature = "postgres")]
+fn resolve_postgres_source(args: &Args) -> Result<InputSource> {
+    use stt_build::postgres_input::{QuerySource, QuerySpec};
+    let conn = args
+        .postgres
+        .clone()
+        .or_else(|| std::env::var("STT_POSTGRES_URL").ok())
+        .or_else(|| std::env::var("DATABASE_URL").ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--table/--sql require a connection: pass --postgres <CONN> or set \
+                 STT_POSTGRES_URL / DATABASE_URL"
+            )
+        })?;
+    let source = match (&args.table, &args.sql) {
+        (Some(_), Some(_)) => anyhow::bail!("--table and --sql are mutually exclusive"),
+        (Some(t), None) => QuerySource::Table(t.clone()),
+        (None, Some(s)) => QuerySource::Sql(s.clone()),
+        (None, None) => anyhow::bail!("--postgres requires --table <NAME> or --sql <SELECT>"),
+    };
+    Ok(InputSource::Postgres {
+        conn,
+        spec: QuerySpec {
+            source,
+            geom_column: args.geom_column.clone(),
+            where_clause: args.where_clause.clone(),
+            reproject_from_srid: args.source_srid,
+        },
+    })
+}
+
 fn main() -> Result<()> {
     let matches = Args::command().get_matches();
     let mut args = Args::from_arg_matches(&matches)
@@ -461,17 +786,10 @@ fn main() -> Result<()> {
     let out_dir = packed_output_dir(&args.output);
 
     info!("Starting stt-build");
-    info!("Input: {}", args.input.display());
+    // Resolve + validate the input source (GeoParquet file or PostGIS query).
+    let source = resolve_source(&args)?;
+    info!("Input: {}", source.describe());
     info!("Output (packed dataset dir): {}", out_dir.display());
-
-    // Validate input file is GeoParquet
-    let extension = args.input.extension().and_then(|s| s.to_str()).unwrap_or("");
-    if !matches!(extension.to_lowercase().as_str(), "parquet" | "geoparquet") {
-        anyhow::bail!(
-            "Input must be a GeoParquet file (.parquet or .geoparquet), got: .{}",
-            extension
-        );
-    }
 
     // Validate attribute-filter flags up front — before loading input — so a
     // misuse like `--exclude X --include Y` (or excluding a column that
@@ -734,15 +1052,14 @@ fn main() -> Result<()> {
         let mut feature_count: u64 = 0;
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<input::ParsedFeature>>>(2);
-        // Producer: stream parquet -> channel.
-        let input_path = args.input.clone();
+        // Producer: stream the source (GeoParquet file or PostGIS) -> channel.
+        let producer_source = source.clone();
         let time_field = args.time_field.clone();
         let end_time_field = args.end_time_field.clone();
         let time_format = args.time_format;
         let handle = std::thread::spawn(move || {
             let tx_clone = tx.clone();
-            let res = input::stream_features(
-                &input_path,
+            let res = producer_source.stream(
                 &time_field,
                 end_time_field.as_deref(),
                 time_format,
@@ -814,13 +1131,9 @@ fn main() -> Result<()> {
                 false,
             )
         };
-        let metadata = stt_core::metadata::Metadata::new(args.name.unwrap_or_else(|| {
-            args.input
-                .file_stem()
-                .unwrap()
-                .to_string_lossy()
-                .to_string()
-        }))
+        let metadata = stt_core::metadata::Metadata::new(
+            args.name.clone().unwrap_or_else(|| source.default_name()),
+        )
         .with_description(args.description.unwrap_or_default())
         .with_attribution(args.attribution.unwrap_or_default())
         .with_bounds(bounds)
@@ -863,8 +1176,7 @@ fn main() -> Result<()> {
     );
     pb.set_message("Reading input file...");
 
-    let features = input::load_features(
-        &args.input,
+    let features = source.load(
         &args.time_field,
         args.end_time_field.as_deref(),
         args.time_format,
@@ -1159,13 +1471,9 @@ fn main() -> Result<()> {
     };
 
     // Step 5: Build metadata (combine summary-tier + temporal-LOD builders).
-    let mut metadata = stt_core::metadata::Metadata::new(args.name.unwrap_or_else(|| {
-        args.input
-            .file_stem()
-            .unwrap()
-            .to_string_lossy()
-            .to_string()
-    }))
+    let mut metadata = stt_core::metadata::Metadata::new(
+        args.name.clone().unwrap_or_else(|| source.default_name()),
+    )
     .with_description(args.description.unwrap_or_default())
     .with_attribution(args.attribution.unwrap_or_default())
     .with_bounds(bounds)
@@ -1377,8 +1685,11 @@ fn compute_heatmap_domain(
 /// for any flag the user did NOT pass explicitly.
 fn apply_auto_recommendations(matches: &ArgMatches, args: &mut Args) -> Result<()> {
     info!("--auto: analyzing input for build recommendations...");
+    let path = args.input.clone().ok_or_else(|| {
+        anyhow::anyhow!("--auto is not supported with --postgres/--duckdb (the analyzer reads a GeoParquet file)")
+    })?;
     let source = stt_optimize::DataSource::GeoParquet {
-        path: args.input.clone(),
+        path,
         time_field: args.time_field.clone(),
         time_format: args.time_format.as_str().to_string(),
     };
@@ -1731,5 +2042,49 @@ mod tests {
         ]);
         let err = build_attribute_filter(&args).unwrap_err().to_string();
         assert!(err.contains("depth"), "got: {err}");
+    }
+
+    /// Build `Args` from a flag list WITHOUT an implicit `--input` (only the
+    /// required `-o` is supplied), for exercising `resolve_source`'s backend
+    /// selection. These assertions hold regardless of the postgres/duckdb
+    /// cargo features (the mutual-exclusion + file/no-source paths run before
+    /// any feature gate).
+    fn args_src(extra: &[&str]) -> Args {
+        let mut argv: Vec<&str> = vec!["stt-build", "-o", "out"];
+        argv.extend_from_slice(extra);
+        Args::parse_from(argv)
+    }
+
+    #[test]
+    fn resolve_source_rejects_input_plus_database() {
+        let err = resolve_source(&args_src(&["--input", "x.parquet", "--duckdb", "d", "--table", "t"]))
+            .err()
+            .expect("input + duckdb should conflict")
+            .to_string();
+        assert!(err.contains("not both"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_source_rejects_postgres_plus_duckdb() {
+        let err = resolve_source(&args_src(&["--postgres", "postgresql://x", "--duckdb", "d", "--table", "t"]))
+            .err()
+            .expect("postgres + duckdb should conflict")
+            .to_string();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_source_file_input_ok() {
+        let src = resolve_source(&args_src(&["--input", "x.parquet"])).expect("file input resolves");
+        assert!(matches!(src, InputSource::File(_)));
+    }
+
+    #[test]
+    fn resolve_source_requires_a_source() {
+        let err = resolve_source(&args_src(&[]))
+            .err()
+            .expect("no source should error")
+            .to_string();
+        assert!(err.contains("no input"), "got: {err}");
     }
 }

@@ -51,12 +51,31 @@ arrow = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
 arrow-array = { workspace = true, optional = true }
 
+# PostGIS input source (feature `postgres`). Sync driver — keeps stt-build
+# tokio-free. `with-chrono-0_4` decodes timestamp columns; `with-serde_json-1`
+# decodes json/jsonb property columns.
+postgres = { version = "0.19", features = ["with-chrono-0_4", "with-serde_json-1"], optional = true }
+
+# DuckDB input source (feature `duckdb`). `bundled` statically links libduckdb
+# so there's no system-lib requirement (mirrors the self-contained `postgres`
+# crate); `chrono` decodes DATE/TIMESTAMP/TIMESTAMPTZ columns. The DuckDB
+# *spatial* extension (ST_AsWKB/ST_Transform) is a separate downloadable
+# extension loaded at runtime via `INSTALL spatial; LOAD spatial;` — it is NOT
+# part of the bundle. The crate vendors its own (newer) Arrow internally; we use
+# only the row/`ValueRef` API, so no Arrow types cross the boundary and there's
+# no clash with stt-build's own Arrow version.
+duckdb = { version = "1", features = ["bundled", "chrono"], optional = true }
+
 [features]
 default = ["geoparquet"]
 # Enable advanced projection support (requires system libproj)
 projection = ["stt-core/projection", "proj"]
-# Enable GeoParquet/GeoArrow support for high-performance I/O  
+# Enable GeoParquet/GeoArrow support for high-performance I/O
 geoparquet = ["geoarrow", "parquet", "arrow", "arrow-schema", "arrow-array"]
+# Enable the PostGIS input source (`--postgres`/`--table`/`--sql`).
+postgres = ["dep:postgres"]
+# Enable the DuckDB input source (`--duckdb`/`--table`/`--sql`).
+duckdb = ["dep:duckdb"]
 
 [dev-dependencies]
 criterion.workspace = true

@@ -389,6 +389,93 @@ pub fn generate_tiles(
     Ok(all)
 }
 
+/// Encode exactly one tile `(z, x, y, t)` from a candidate feature set, without
+/// running the whole-dataset build (no rayon pool, no pack/directory writer, no
+/// cross-tile state). The returned bytes are a ready-to-serve STT tile blob
+/// (Arrow IPC + GeoArrow, per-blob zstd) — identical to what the build would
+/// emit for that tile. `Ok(None)` means the tile is empty.
+///
+/// This is the reusable core a dynamic per-request tile server (`stt-serve`)
+/// calls. `features` is the caller's candidate set — typically already narrowed
+/// by a PostGIS bbox + time-window query; this function performs the
+/// authoritative per-tile placement, clipping, temporal bucketing and encoding,
+/// so it stays byte-identical to the offline `process_zoom_level` path.
+///
+/// `t` selects the temporal bucket: the tile covers
+/// `[floor(t/bucket)*bucket, …)`, matching [`chunk_by_temporal_bucket`].
+pub fn encode_single_tile(
+    features: &[ParsedFeature],
+    z: u8,
+    x: u32,
+    y: u32,
+    t: i64,
+    config: &TileConfig,
+) -> Result<Option<Vec<u8>>> {
+    let clip_config = clip_config_from(config);
+    let bucket_ms = config.temporal_bucket_ms.max(1);
+    let bucket_start = (t.max(0) as u64 / bucket_ms) * bucket_ms;
+
+    // Place each feature for this zoom, keeping only what lands in (x, y) — the
+    // same clip-or-centroid placement `process_zoom_level` performs.
+    let mut chunk: Vec<TileFeature> = Vec::new();
+    for feature in features {
+        if feature_out_of_band(feature, z, config) {
+            continue;
+        }
+        let should_clip = config.clip_trajectories
+            && is_clippable_trajectory(&feature.geojson, feature.end_timestamp);
+        if should_clip {
+            let segments = clip_trajectory(
+                &feature.geojson,
+                feature.shared_properties.clone(),
+                feature.timestamp,
+                feature.end_timestamp.unwrap_or(feature.timestamp),
+                z,
+                &clip_config,
+                feature.vertex_timestamps.as_deref(),
+                feature.vertex_values.as_deref(),
+                feature.vertex_value_matrix.as_deref(),
+            );
+            if segments.is_empty() {
+                let (fx, fy) =
+                    projection::lonlat_to_tile(feature.lon, feature.lat, z).unwrap_or((0, 0));
+                if fx == x && fy == y {
+                    chunk.push(TileFeature::Original(feature));
+                }
+            } else {
+                for s in segments {
+                    if s.tile_x == x && s.tile_y == y {
+                        chunk.push(TileFeature::Clipped(s));
+                    }
+                }
+            }
+        } else {
+            let (fx, fy) =
+                projection::lonlat_to_tile(feature.lon, feature.lat, z).unwrap_or((0, 0));
+            if fx == x && fy == y {
+                chunk.push(TileFeature::Original(feature));
+            }
+        }
+    }
+
+    // Keep only the requested temporal bucket (matches chunk_by_temporal_bucket).
+    chunk.retain(|f| (f.timestamp() / bucket_ms) * bucket_ms == bucket_start);
+    if chunk.is_empty() {
+        return Ok(None);
+    }
+
+    let time_end = chunk
+        .iter()
+        .map(|f| f.end_timestamp())
+        .max()
+        .unwrap_or(bucket_start + bucket_ms);
+    let id = TileId::new(z, x, y, bucket_start);
+    match build_tile(id, &chunk, config, bucket_start as i64, time_end as i64)? {
+        Some(tile) => Ok(Some(encode_tile(&tile.layers)?)),
+        None => Ok(None),
+    }
+}
+
 /// Generate tiles and stream them straight into a [`TileWriter`], bounding
 /// memory to a single zoom level at a time.
 pub fn generate_tiles_streaming<W: TileWriter + Send>(
@@ -1264,6 +1351,65 @@ mod tests {
             lon,
             lat,
         }
+    }
+
+    /// `encode_single_tile` must produce a decodable STT blob containing exactly
+    /// the features that fall in the requested `(z, x, y, bucket)` — the same
+    /// selection the full build's `process_zoom_level` makes — and `None` for an
+    /// empty tile. This is the core a dynamic per-request server (stt-serve)
+    /// relies on, verified here with no database.
+    #[test]
+    fn encode_single_tile_selects_tile_and_bucket() {
+        use stt_core::arrow_tile::decode_tile;
+        let z = 12u8;
+        let bucket_ms = 3_600_000u64; // 1h
+        let lon = -122.42;
+        let lat = 37.77;
+        let (x, y) = projection::lonlat_to_tile(lon, lat, z).unwrap();
+        let base = 1_700_000_000_000u64;
+        let bucket_start = (base / bucket_ms) * bucket_ms;
+
+        let feats = vec![
+            point(lon, lat, bucket_start + 10),
+            point(lon + 0.0003, lat + 0.0003, bucket_start + 20),
+            // A third point one bucket later (same tile, different time bucket).
+            point(lon, lat, bucket_start + bucket_ms + 5),
+        ];
+        let config = TileConfig {
+            min_zoom: z,
+            max_zoom: z,
+            layer_name: "obs".to_string(),
+            temporal_bucket_ms: bucket_ms,
+            clip_trajectories: false,
+            ..TileConfig::default()
+        };
+
+        // The requested tile + bucket has exactly the two in-bucket points.
+        let bytes = encode_single_tile(&feats, z, x, y, bucket_start as i64, &config)
+            .unwrap()
+            .expect("tile should be non-empty");
+        let rows: usize = decode_tile(&bytes)
+            .unwrap()
+            .iter()
+            .map(|l| l.batch.num_rows())
+            .sum();
+        assert_eq!(rows, 2, "only the two points in this (tile, bucket)");
+
+        // A different spatial cell is empty.
+        assert!(encode_single_tile(&feats, z, x + 9, y, bucket_start as i64, &config)
+            .unwrap()
+            .is_none());
+
+        // The next bucket carries the single later point.
+        let next = encode_single_tile(&feats, z, x, y, (bucket_start + bucket_ms) as i64, &config)
+            .unwrap()
+            .expect("next bucket tile");
+        let n: usize = decode_tile(&next)
+            .unwrap()
+            .iter()
+            .map(|l| l.batch.num_rows())
+            .sum();
+        assert_eq!(n, 1);
     }
 
     fn trajectory(start: u64, end: u64) -> ParsedFeature {

@@ -1161,10 +1161,11 @@ def generate(args):
     scan_mode = bool(args.scan)
     contour_mode = bool(args.contours)
     scene_split_mode = bool(args.scene_split)
+    lod_mode = bool(args.lod)
     if sum((surfel_mode, worldbuild_mode, scan_mode, contour_mode,
-            scene_split_mode)) > 1:
+            scene_split_mode, lod_mode)) > 1:
         raise SystemExit(
-            "--surfel / --worldbuild / --scan / --contours / --scene-split "
+            "--surfel / --worldbuild / --scan / --contours / --scene-split / --lod "
             "are mutually exclusive")
 
     # Optional camera-projection colorize (+ its correctness overlay). The SURFEL,
@@ -1387,6 +1388,54 @@ def generate(args):
             tier_pq.unlink(missing_ok=True)
         lidar_densities.append({"id": "surfel", "label": "Surfel", "points": int(n),
                                 "url": "lidar/manifest.json"})
+        n_lidar = int(n)
+    elif lod_mode:
+        # ADDITIVE-OCTREE LOD: ONE 'lidar-lod/' archive replacing the 5 fixed
+        # density tiers. Each return is materialized at a single per-sweep home
+        # zoom (avc.lod_home_zoom) and stt-build places it in exactly that zoom's
+        # tiles via --min-zoom-field=--max-zoom-field=home_zoom — so each zoom
+        # level holds only its residual and the client loads the union. Same
+        # source as the default (round-dot) path: camera RGB when --colorize, else
+        # the height-band ramp (write_lidar_points auto-fills it).
+        fl_lon, fl_lat, fl_t, fl_z, fl_i, fl_rgb, _fl_surf = lidar
+        if fl_rgb is not None:
+            n_seen = int((fl_rgb != np.asarray(FALLBACK_RGB, np.uint8)).any(axis=1).sum())
+            print(f"  camera colorize: {n_seen}/{len(fl_rgb)} returns "
+                  f"({100 * n_seen / max(len(fl_rgb), 1):.0f}%) got a camera color")
+        home = avc.lod_home_zoom(
+            fl_lon, fl_lat, fl_z, fl_t,
+            min_zoom=args.lod_min_zoom, max_zoom=args.lod_max_zoom,
+            px_per_point=args.lod_px_per_point, curvature=not args.lod_uniform)
+        levels, counts = np.unique(home, return_counts=True)
+        pyramid = " ".join(f"z{int(zl)}:{int(c) // 1000}k" for zl, c in zip(levels, counts))
+        print(f"  LOD octree: {len(home)} returns over home-zooms "
+              f"[{args.lod_min_zoom},{args.lod_max_zoom}] → {pyramid}")
+        # Self-contained bundle: the single LOD archive lands in the standard
+        # `lidar/` dir (same idiom as --surfel / --scan), so a `<id>-lod` scene
+        # bundle's avLidarUrl resolves to lidar/manifest.json. The home_zoom
+        # column + --min/max-zoom-field make each zoom level hold only its
+        # residual; the client loads the union (lodMode:'additive').
+        tier_pq = out / "lidar.parquet"
+        n = avc.write_lidar_points(
+            tier_pq, lon=fl_lon, lat=fl_lat, timestamp=fl_t, z=fl_z, intensity=fl_i,
+            rgb=(fl_rgb if fl_rgb is not None else None), home_zoom=home)
+        if not args.skip_build:
+            tier_out = out / "lidar"
+            shutil.rmtree(tier_out, ignore_errors=True)  # prune orphan packs on rebuild
+            avc.run_stt_build(
+                tier_pq, tier_out, "point",
+                stt_build=args.stt_build, temporal_bucket=args.temporal_bucket,
+                min_zoom=args.lod_min_zoom, max_zoom=args.lod_max_zoom,
+                quantize_coords=LIDAR_QUANTIZE_M,
+                quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M),
+                vector_groups=avc.lidar_vector_groups(surfel=False, colored=True),
+                point_elevation_column="z",
+                min_zoom_field="home_zoom", max_zoom_field="home_zoom")
+            tier_pq.unlink(missing_ok=True)
+        lidar_densities.append({
+            "id": "lod", "label": "Zoom LOD", "points": int(n),
+            "url": "lidar/manifest.json", "lod": True,
+            "minZoom": args.lod_min_zoom, "maxZoom": args.lod_max_zoom})
         n_lidar = int(n)
     else:
         fl_lon, fl_lat, fl_t, fl_z, fl_i, fl_rgb, fl_surf = lidar
@@ -1613,6 +1662,32 @@ def main():
     p.add_argument("--scan-decimate", type=int, default=SCAN_DECIMATE,
                    dest="scan_decimate",
                    help=f"render decimation for the scan tier (default {SCAN_DECIMATE}).")
+    p.add_argument("--lod", action="store_true",
+                   help="ADDITIVE-OCTREE LOD: bake ONE 'lidar-lod/' archive where "
+                        "each return is materialized at a single per-sweep 'home "
+                        "zoom' (hierarchical voxel subsample). Coarse zooms are "
+                        "sparse overviews; finer zooms add ONLY the residual "
+                        "detail, so the client loads the union minZoom..cameraZoom "
+                        "and zooming in streams detail without re-fetching the "
+                        "coarse cloud. Lossless (union = full cloud) and ~½ the "
+                        "bytes of the 5 fixed density tiers it replaces. Mutually "
+                        "exclusive with --surfel/--worldbuild/--scan/--contours/"
+                        "--scene-split.")
+    p.add_argument("--lod-min-zoom", type=int, default=avc.LOD_MIN_ZOOM,
+                   dest="lod_min_zoom",
+                   help=f"coarsest LOD level (default {avc.LOD_MIN_ZOOM}).")
+    p.add_argument("--lod-max-zoom", type=int, default=avc.LOD_MAX_ZOOM,
+                   dest="lod_max_zoom",
+                   help=f"finest LOD level — the full-density residual lands here "
+                        f"(default {avc.LOD_MAX_ZOOM}).")
+    p.add_argument("--lod-px-per-point", type=float, default=avc.LOD_PX_PER_POINT,
+                   dest="lod_px_per_point",
+                   help=f"target return spacing (screen px) at a point's home zoom "
+                        f"(default {avc.LOD_PX_PER_POINT}; smaller = denser per level).")
+    p.add_argument("--lod-uniform", action="store_true", dest="lod_uniform",
+                   help="use a PLAIN uniform voxel grid for the LOD home-zoom "
+                        "(default is geometry-aware: keep high-curvature edges/poles "
+                        "at coarse zoom, defer flat surfaces). For A/B comparison.")
     p.add_argument("--debug-overlay", type=int, default=None, metavar="SWEEP",
                    help="project sweep SWEEP into every ring camera, dots colored by "
                         "depth, save _debug_overlay_<CAM>.png, and STOP "

@@ -5,6 +5,7 @@ members = [
     "crates/stt-generate",
     "crates/stt-optimize",
     "crates/stt-validate",
+    "crates/stt-serve",
 ]
 resolver = "2"
 

@@ -1050,8 +1050,8 @@ def generate(args):
     # (and each other) and (like --surfel) force camera colour on.
     scene_split_mode = bool(getattr(args, "scene_split", False))
     if sum((bool(args.worldbuild), scene_split_mode, bool(args.surfel),
-            bool(args.contours))) > 1:
-        raise SystemExit("--worldbuild / --scene-split / --surfel / --contours "
+            bool(args.contours), bool(args.lod))) > 1:
+        raise SystemExit("--worldbuild / --scene-split / --surfel / --contours / --lod "
                          "are mutually exclusive")
 
     # Optional camera-projection colorize (and its correctness overlay): load the
@@ -1105,6 +1105,7 @@ def generate(args):
     surfel_mode = bool(args.surfel)
     contour_mode = bool(args.contours)
     worldbuild_mode = bool(args.worldbuild)
+    lod_mode = bool(args.lod)
     fl_rgb = None
     if contour_mode:
         # DENSITY ISO-LINES: contour where the cloud clusters (height-independent),
@@ -1263,6 +1264,50 @@ def generate(args):
                                   surfel=True, colored=True))
         lidar_densities.append({"id": "surfel", "label": "Surfel", "points": int(n),
                                 "url": "lidar/manifest.json"})
+        n_lidar = int(n)
+    elif lod_mode:
+        # ADDITIVE-OCTREE LOD: ONE 'lidar/' archive replacing the 5 density tiers.
+        # Each return is materialized at a single per-sweep, geometry-aware home
+        # zoom (avc.lod_home_zoom); stt-build places it in exactly that zoom's tiles
+        # via --min/max-zoom-field=home_zoom, so the client loads the union.
+        print("  decoding LIDAR range images (all 5 lasers) at full density for LOD…"
+              + ("  (+camera colorize)" if colorizer is not None else ""))
+        fl_lon, fl_lat, fl_t, fl_z, fl_i, fl_rgb = extract_lidar(
+            cpath("lidar"), cal, pose_by_ts, origin, to_lonlat, decimate=1,
+            colorizer=colorizer)
+        if fl_rgb is not None:
+            n_seen = int((fl_rgb != np.asarray(FALLBACK_RGB, np.uint8)).any(axis=1).sum())
+            print(f"  camera colorize: {n_seen}/{len(fl_rgb)} returns "
+                  f"({100 * n_seen / max(len(fl_rgb), 1):.0f}%) got a camera color")
+        home = avc.lod_home_zoom(
+            fl_lon, fl_lat, fl_z, fl_t,
+            min_zoom=args.lod_min_zoom, max_zoom=args.lod_max_zoom,
+            px_per_point=args.lod_px_per_point, curvature=not args.lod_uniform)
+        levels, counts = np.unique(home, return_counts=True)
+        pyramid = " ".join(f"z{int(zl)}:{int(c) // 1000}k" for zl, c in zip(levels, counts))
+        print(f"  LOD octree: {len(home)} returns over home-zooms "
+              f"[{args.lod_min_zoom},{args.lod_max_zoom}] → {pyramid}")
+        tier_pq = out / "lidar.parquet"
+        n = avc.write_lidar_points(
+            tier_pq, lon=fl_lon, lat=fl_lat, timestamp=fl_t, z=fl_z, intensity=fl_i,
+            rgb=(fl_rgb if fl_rgb is not None else None), home_zoom=home)
+        if not args.skip_build:
+            tier_out = out / "lidar"
+            shutil.rmtree(tier_out, ignore_errors=True)  # prune orphan packs on rebuild
+            avc.run_stt_build(
+                tier_pq, tier_out, "point",
+                stt_build=args.stt_build, temporal_bucket=args.temporal_bucket,
+                min_zoom=args.lod_min_zoom, max_zoom=args.lod_max_zoom,
+                quantize_coords=LIDAR_QUANTIZE_M,
+                quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M),
+                vector_groups=avc.lidar_vector_groups(surfel=False, colored=True),
+                point_elevation_column="z",
+                min_zoom_field="home_zoom", max_zoom_field="home_zoom")
+            tier_pq.unlink(missing_ok=True)  # drop the big full-density intermediate
+        lidar_densities.append({
+            "id": "lod", "label": "Zoom LOD", "points": int(n),
+            "url": "lidar/manifest.json", "lod": True,
+            "minZoom": args.lod_min_zoom, "maxZoom": args.lod_max_zoom})
         n_lidar = int(n)
     else:
         tiers = list(LIDAR_DENSITY_TIERS)
@@ -1473,6 +1518,27 @@ def main():
                         "(projection-correctness check; implies camera load).")
     p.add_argument("--keep-empty-boxes", action="store_true",
                    help="keep boxes with num_lidar_points_in_box==0 (default drops them)")
+    p.add_argument("--lod", action="store_true",
+                   help="ADDITIVE-OCTREE LOD: bake ONE 'lidar/' archive where each "
+                        "return is materialized at a single per-sweep 'home zoom' "
+                        "(geometry-aware: keep high-curvature edges/poles at coarse "
+                        "zoom, defer flat surfaces). The client loads the union "
+                        "minZoom..cameraZoom, so zooming in streams detail without "
+                        "re-fetching the coarse cloud. Replaces the 5 density tiers. "
+                        "Mutually exclusive with --surfel/--worldbuild/--contours/"
+                        "--scene-split.")
+    p.add_argument("--lod-min-zoom", type=int, default=avc.LOD_MIN_ZOOM,
+                   dest="lod_min_zoom", help=f"coarsest LOD level (default {avc.LOD_MIN_ZOOM}).")
+    p.add_argument("--lod-max-zoom", type=int, default=avc.LOD_MAX_ZOOM,
+                   dest="lod_max_zoom",
+                   help=f"finest LOD level — full-density residual (default {avc.LOD_MAX_ZOOM}).")
+    p.add_argument("--lod-px-per-point", type=float, default=avc.LOD_PX_PER_POINT,
+                   dest="lod_px_per_point",
+                   help=f"return spacing (px) at a point's home zoom (default "
+                        f"{avc.LOD_PX_PER_POINT}; smaller = denser per level).")
+    p.add_argument("--lod-uniform", action="store_true", dest="lod_uniform",
+                   help="plain uniform voxel grid for the LOD home-zoom (default is "
+                        "geometry-aware). For A/B comparison.")
     p.add_argument("--temporal-bucket", default="100ms",
                    help="stt-build temporal bucket (Waymo lidar 10 Hz → 100ms)")
     p.add_argument("--stt-build", default="stt-build", help="stt-build binary path")

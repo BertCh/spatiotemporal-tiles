@@ -1054,7 +1054,7 @@ fn extract_property_value(
 /// Parse ISO 8601 timestamp to Unix milliseconds. Returns the signed value
 /// so the caller can reject pre-1970 (negative) instants explicitly rather
 /// than letting them wrap through `as u64`.
-fn parse_iso8601(s: &str) -> Result<i64> {
+pub(crate) fn parse_iso8601(s: &str) -> Result<i64> {
     use chrono::{DateTime, NaiveDateTime};
 
     // Try parsing as DateTime with timezone
@@ -1085,7 +1085,7 @@ fn parse_iso8601(s: &str) -> Result<i64> {
 /// Delegates to `geozero`, which correctly handles 2D, 3D (WKB Z/M), and EWKB
 /// (SRID-prefixed) inputs. The previous hand-rolled parser assumed a fixed 2D
 /// 16-byte coordinate stride and silently misread any geometry carrying Z/M.
-fn parse_wkb_geometry(wkb: &[u8]) -> Option<(Geometry, f64, f64)> {
+pub(crate) fn parse_wkb_geometry(wkb: &[u8]) -> Option<(Geometry, f64, f64)> {
     use geo::algorithm::centroid::Centroid;
     use geozero::ToGeo;
 

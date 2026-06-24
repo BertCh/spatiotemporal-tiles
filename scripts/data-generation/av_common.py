@@ -473,6 +473,7 @@ def write_lidar_points(
     world_class=None,
     is_dynamic=None,
     scan_phase=None,
+    home_zoom=None,
 ) -> int:
     """Write the ``lidar/`` POINT GeoParquet (av-cockpit.md §2a).
 
@@ -661,6 +662,19 @@ def write_lidar_points(
                 f"lidar: scan_phase length {len(sp)} != point count {len(lon)}"
             )
         cols["scan_phase"] = pa.array(sp, type=pa.float64())
+    if home_zoom is not None:
+        # Additive-octree LOD (see lod_home_zoom): the single zoom level each
+        # return is materialized at. NUMERIC Int64 so stt-build's property
+        # extractor reads it → used as BOTH --min-zoom-field and --max-zoom-field
+        # (the feature lands in exactly that zoom's tiles) and shipped to the
+        # client (quantized u16 via lidar_quantize_attrs) for optional
+        # fractional-zoom shader smoothing.
+        hz = np.asarray(home_zoom, dtype="int64")
+        if len(hz) != len(lon):
+            raise ValueError(
+                f"lidar: home_zoom length {len(hz)} != point count {len(lon)}"
+            )
+        cols["home_zoom"] = pa.array(hz, type=pa.int64())
 
     table = pa.table(cols)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -678,6 +692,8 @@ def write_lidar_points(
         extras.append("is_dynamic")
     if scan_phase is not None:
         extras.append("scan_phase")
+    if home_zoom is not None:
+        extras.append("home_zoom")
     suffix = f" (+{', '.join(extras)})" if extras else ""
     print(f"  wrote {table.num_rows} LIDAR points{suffix} → {out_path}")
     return table.num_rows
@@ -1469,6 +1485,10 @@ def lidar_quantize_attrs(z_prec: float) -> dict[str, float]:
         # Feature 5 (Sweep): scan phase ∈ [0,1]; ~1/1000 precision is finer than
         # the beam reveal needs, fits u16 (range 1 / 1e-3 = 1000), 8 B/pt → 2 B/pt.
         "scan_phase": 1e-3,
+        # Additive-octree LOD (lod_home_zoom): the integer home zoom (~14-19),
+        # step 1 lossless → a handful of distinct u16 values that compress to
+        # nothing. Read on the client only for optional fractional-zoom smoothing.
+        "home_zoom": 1.0,
     }
 
 
@@ -1679,6 +1699,165 @@ def adaptive_stage_select(pts, *, base_voxel, max_voxel=STAGE_MAX_VOXEL,
         else:
             keep.append(idx[_voxel_real_indices(pts[idx], v)])
     return np.unique(np.concatenate(keep))
+
+
+# ── additive-octree LOD home-zoom assignment ─────────────────────────────────
+# The 5 fixed density tiers (LIDAR_DENSITY_TIERS) each ship a COMPLETE strided
+# copy of the cloud (small ⊂ … ⊂ full), so the scene stores ~2× its points and
+# the cockpit picks one tier at runtime — there is no true zoom-LOD. This is the
+# additive-octree (COPC / Entwine / Potree-style) alternative: assign every
+# return a SINGLE "home zoom" via a per-sweep hierarchical voxel subsample, emit
+# each point ONCE (stt-build --min-zoom-field=--max-zoom-field=home_zoom places
+# it in exactly that zoom's tiles), and let the client load the UNION of zoom
+# levels minZoom..cameraZoom. Coarse levels are spatially-uniform sparse
+# overviews (few big-area tiles, already resident from when the camera was
+# zoomed out); zooming in fetches ONLY the deeper residual. Lossless: the union
+# at maxZoom is the complete cloud, so it honours the no-thinning principle —
+# full fidelity at depth, progressively revealed — while storing each point once
+# (~½ the bytes of the 5-tier pyramid).
+LOD_MIN_ZOOM = 14        # coarsest LOD level (== LIDAR_MIN_ZOOM floor; below = waste)
+# Finest level: the un-claimed residual (FULL density) lands here. Deep enough
+# that the voxel ladder steps down to ~cm spacing before the residual (so the
+# dense returns spread across levels rather than dumping into one), but no deeper:
+# past z21 the per-level gain is negligible at this px_per_point, so z21 IS the
+# full quantized cloud (its voxel ≈ cm-scale < the 5 cm coord quantize).
+LOD_MAX_ZOOM = 21
+# Target return spacing (screen px) at a point's home zoom. SMALLER = denser at
+# every zoom (richer zoomed-out overview + "good detail" arrives at a shallower
+# zoom). Tuned from a measured cumulative-points-vs-zoom sweep on real Miami:
+# 0.4 puts ~1.7M points in the z16 overview (≈ the old "medium" manual tier) and
+# ~full detail by ~z19-20, while keeping a smooth multi-level reveal to z21.
+LOD_PX_PER_POINT = 0.4
+# ── geometry-aware (curvature) home-zoom knobs ───────────────────────────────
+# A UNIFORM voxel grid spends the same one-point-per-cell budget on a flat road
+# cell (which a single sample conveys) as on a pole / curb / car-edge / foliage
+# cell (which needs MANY points to read as a shape) — so the sparse overview is a
+# featureless blur. The geometry-aware path instead grades each level's voxel by
+# local surface variation σ = λ0/Σλ (the same k-NN-covariance planarity the surfel
+# fit + adaptive_stage_select use): FLAT regions get a coarser voxel (few points,
+# deferred to finer zooms), HIGH-CURVATURE regions keep the base voxel (kept dense
+# at coarse zoom). The flat penalty is strongest at the coarsest zoom and fades to
+# 1.0 by the finest pre-residual level, so flats still fill in before the residual
+# (no lopsided dump). Same idea the repo measured at ~2-4× more edge detail per
+# point (lidar_summarize_eval.py); here it makes the zoomed-out overview read as
+# real structure — "preserve the geometry with the fewest points."
+LOD_CURV = True          # default ON; pass curvature=False (--lod-uniform) to compare
+LOD_CURV_K = 12          # k-NN for the σ estimate (== SURFEL_K / ADAPTIVE_K)
+LOD_CURV_LEVELS = 5      # σ tiers between flat and complex
+LOD_FLAT_RATIO = 3.0     # flat-region voxel is up to this× coarser than complex (at coarse zoom)
+LOD_FLAT_PCT = 50.0      # σ ≤ this percentile → flattest tier (max penalty)
+LOD_COMPLEX_PCT = 92.0   # σ ≥ this percentile → complex tier (no penalty)
+
+
+def _lod_curv_reps(p, tier, base_v, levels, flat_ratio, lvl_frac):
+    """Curvature-graded voxel reps for ONE octree level over remaining points.
+
+    ``tier`` (0=flattest … levels-1=most complex) grades each point's voxel: the
+    flat tier is voxelized at ``base_v · penalty`` (penalty up to ``flat_ratio`` at
+    coarse zoom, → 1 at the finest level via ``lvl_frac`` ∈ [1,0]), the complex tier
+    always at ``base_v``. Returns local indices (into ``p``) of the claimed reps.
+    """
+    keep = []
+    span = max(levels - 1, 1)
+    for tval in range(levels):
+        idx = np.flatnonzero(tier == tval)
+        if idx.size == 0:
+            continue
+        # tval 0 (flat) → full penalty; tval levels-1 (complex) → none. lvl_frac
+        # fades the whole penalty to 0 at the finest pre-residual level.
+        penalty = 1.0 + (flat_ratio - 1.0) * (1.0 - tval / span) * lvl_frac
+        reps = _voxel_real_indices(p[idx], base_v * penalty)
+        keep.append(idx[reps])
+    return np.concatenate(keep) if keep else np.zeros(0, dtype=np.int64)
+
+
+def lod_home_zoom(lon, lat, z, timestamp, *, min_zoom=LOD_MIN_ZOOM,
+                  max_zoom=LOD_MAX_ZOOM, px_per_point=LOD_PX_PER_POINT,
+                  curvature=LOD_CURV, curvature_levels=LOD_CURV_LEVELS,
+                  flat_ratio=LOD_FLAT_RATIO, flat_pct=LOD_FLAT_PCT,
+                  complex_pct=LOD_COMPLEX_PCT, k=LOD_CURV_K, anchor_lat=None):
+    """Assign each LiDAR return a single additive-octree "home zoom".
+
+    ``lon`` / ``lat`` (deg) / ``z`` (m) / ``timestamp`` (per-sweep ms) are the
+    FULL-density cloud. Returns an ``Int64`` array (one home zoom per return) for
+    the ``home_zoom`` column ``write_lidar_points`` writes and stt-build consumes
+    as ``--min-zoom-field=--max-zoom-field=home_zoom``.
+
+    Per SWEEP (grouped by ``timestamp`` — the cockpit time-windows ~one sweep, so
+    the LOD must densify the LIVE sweep, not the accumulated cloud), points are
+    claimed coarse→fine: at each zoom ``zz`` the still-unclaimed points are
+    voxelized at the Web-Mercator ground resolution for ``zz`` (≈ one return per
+    ``px_per_point`` screen pixels) and one real representative per occupied voxel
+    is claimed for that level. Everything still unclaimed at ``max_zoom`` lands
+    there (the full-density residual). Each point is materialized at EXACTLY one
+    zoom; the union over min..max reconstructs the whole sweep.
+
+    Voxel sizing is tied to the tile pyramid: ``voxel(zz) = px_per_point ·
+    156543.03·cos(lat) / 2^zz`` metres, so a point's home-zoom spacing matches its
+    on-screen pixel spacing at that zoom (the EPT/octree screen-space-error idea).
+
+    ``curvature`` (default on) makes the per-level voxel GEOMETRY-AWARE: σ surface
+    variation is computed once per sweep and grades each cell's voxel so flat
+    regions are deferred while edges/poles/curbs are kept at coarse zoom (see the
+    LOD_CURV_* knobs / ``_lod_curv_reps``). ``curvature=False`` is the plain
+    uniform-voxel grid (for A/B comparison). Deterministic either way (no RNG).
+    """
+    lon = np.asarray(lon, dtype="float64")
+    lat = np.asarray(lat, dtype="float64")
+    z = np.asarray(z, dtype="float64")
+    t = np.asarray(timestamp)
+    n = len(lon)
+    home = np.full(n, int(max_zoom), dtype="int64")
+    if n == 0:
+        return home
+    lat0 = float(np.median(lat)) if anchor_lat is None else float(anchor_lat)
+    # Local metric frame for voxelisation — only RELATIVE spacing matters, so an
+    # absolute deg→m scaling (exact enough over a city-block scene) is fine.
+    m_per_deg_lon = 111320.0 * np.cos(np.radians(lat0))
+    x_m = lon * m_per_deg_lon
+    y_m = lat * 110540.0
+    pts = np.column_stack([x_m, y_m, z])
+    levels = int(curvature_levels)
+    span_zoom = max(int(max_zoom) - 1 - int(min_zoom), 1)
+
+    def _vox(zz):
+        # Web-Mercator ground resolution (m/px) at this zoom & latitude × spacing.
+        return px_per_point * 156543.03392 * np.cos(np.radians(lat0)) / (2.0 ** zz)
+
+    for ti in np.unique(t):
+        sweep = np.flatnonzero(t == ti)
+        p = pts[sweep]
+        # Per-sweep σ tier (computed ONCE, reused across all levels).
+        tier = None
+        if curvature and len(sweep) > k + 2:
+            sv = _surface_variation(p, k)
+            lo, hi = np.percentile(sv, [flat_pct, complex_pct])
+            if hi <= lo:
+                norm = (sv > lo).astype("float64")
+            else:
+                norm = np.clip((sv - lo) / (hi - lo), 0.0, 1.0)
+            # 0 = flattest (σ ≤ lo) … levels-1 = most complex (σ ≥ hi).
+            tier = np.minimum((norm * levels).astype(np.int64), levels - 1)
+        remaining = np.arange(len(sweep))  # local indices into p / sweep
+        for zz in range(int(min_zoom), int(max_zoom)):
+            if remaining.size == 0:
+                break
+            base_v = _vox(zz)
+            if tier is None:
+                reps = _voxel_real_indices(p[remaining], base_v)
+            else:
+                # 1 at the coarsest zoom → 0 at the finest pre-residual level, so
+                # the flat penalty fades out and flats fill in before the residual.
+                lvl_frac = (int(max_zoom) - 1 - zz) / span_zoom
+                reps = _lod_curv_reps(p[remaining], tier[remaining], base_v,
+                                      levels, flat_ratio, lvl_frac)
+            claimed = sweep[remaining[reps]]
+            home[claimed] = zz
+            mask = np.ones(remaining.size, dtype=bool)
+            mask[reps] = False
+            remaining = remaining[mask]
+        # whatever is left for this sweep keeps the max_zoom residual default
+    return home
 
 
 # ── actor denoise (rain / sensor scatter removal) ────────────────────────────
@@ -2477,6 +2656,8 @@ def run_stt_build(
     quantize_attrs: dict[str, float] | None = None,
     vector_groups: list[tuple[str, list[str], str]] | None = None,
     point_elevation_column: str | None = None,
+    min_zoom_field: str | None = None,
+    max_zoom_field: str | None = None,
     static_full_range: bool = False,
     publish: bool = True,
 ) -> None:
@@ -2570,6 +2751,17 @@ def run_stt_build(
     # surfel bundles keep 2D + a separate elevation attribute.
     if point_elevation_column:
         cmd += ["--point-elevation-column", point_elevation_column]
+    # Additive-octree LOD: confine each feature to a single zoom level read from a
+    # per-feature numeric column (lod_home_zoom writes `home_zoom`). With min ==
+    # max field the point lands in EXACTLY that zoom's tiles, so the per-zoom
+    # archive is the additive pyramid (no replication across zooms). The column
+    # must survive to the encoder (it does — no --exclude-all here), and is read
+    # at tiling time BEFORE quantization, so quantizing it (lidar_quantize_attrs)
+    # doesn't affect placement.
+    if min_zoom_field:
+        cmd += ["--min-zoom-field", min_zoom_field]
+    if max_zoom_field:
+        cmd += ["--max-zoom-field", max_zoom_field]
     if kind == "trips":
         cmd += ["--end-time-field", "end_timestamp", "--simplify"]
     elif kind == "line":
