@@ -19,6 +19,8 @@ hosting = "github"
 install-updater = false
 # Cheap `dist plan` check on PRs (no artifact builds)
 pr-run-mode = "plan"
+# Allow manually dispatching a release for an existing tag (Actions -> Release -> Run workflow)
+dispatch-releases = true
 
 # Build linux-arm natively — cross-compiling bundled DuckDB's C++ toolchain
 # is the failure mode to avoid.

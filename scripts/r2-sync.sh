@@ -97,11 +97,17 @@ COMMON_FLAGS=(
 
 # License gate: Waymo Open Dataset terms forbid redistribution, so waymo-*
 # dataset bundles must never reach the public bucket. The all-datasets walk
-# excludes them (exclude precedes the includes: rclone filters are ordered,
-# first match wins), single-stem sync refuses outright, and the prune pass
-# treats any remote waymo-* object as unreferenced so an accidental prior
-# upload self-heals (gets deleted once past the retention window).
-LICENSE_EXCLUDE_FLAGS=(--exclude "waymo-*/**")
+# excludes them via ordered `--filter` rules (NOT --exclude: rclone documents
+# the relative order of mixed --include/--exclude flags as INDETERMINATE, and
+# v1.74 actually places includes first — which silently defeated this gate).
+# Only `--filter` rules are guaranteed first-match-wins in flag order, so every
+# copy pass below builds its whole filter list from `--filter` alone, leading
+# with these excludes and ending with an explicit "- **". Single-stem sync
+# refuses waymo outright, and the prune pass treats any remote waymo-* object
+# as unreferenced so an accidental prior upload self-heals (gets deleted once
+# past the retention window). Hidden dot-dirs (e.g. `.foo-bundle.bak` backup
+# trees) are local-only scratch and never ship.
+LICENSE_EXCLUDE_FLAGS=(--filter "- waymo-*/**" --filter "- .*/**")
 
 # Cache-Control headers, one per regime.
 #   immutable: content-addressed packs/index never change under a stable name →
@@ -150,15 +156,17 @@ sync_tree() {
   rclone copy "${COMMON_FLAGS[@]}" ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
     "${LICENSE_EXCLUDE_FLAGS[@]}" \
     --header-upload "${IMMUTABLE_HEADER}" \
-    --include "packs/**" --include "index/**" \
-    --include "**/packs/**" --include "**/index/**" \
+    --filter "+ packs/**" --filter "+ index/**" \
+    --filter "+ **/packs/**" --filter "+ **/index/**" \
+    --filter "- **" \
     "${src}" "${dst}"
 
   echo ">> [manifest]  ${src} (manifest.json) -> ${dst}"
   rclone copy "${COMMON_FLAGS[@]}" ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
     "${LICENSE_EXCLUDE_FLAGS[@]}" \
     --header-upload "${MANIFEST_HEADER}" \
-    --include "manifest.json" --include "**/manifest.json" \
+    --filter "+ manifest.json" --filter "+ **/manifest.json" \
+    --filter "- **" \
     "${src}" "${dst}"
 
   # AV "scene bundle" sidecars (type:'av' datasets): scene.json / telemetry.json /
@@ -171,10 +179,11 @@ sync_tree() {
   rclone copy "${COMMON_FLAGS[@]}" ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
     "${LICENSE_EXCLUDE_FLAGS[@]}" \
     --header-upload "${MANIFEST_HEADER}" \
-    --include "scene.json" --include "**/scene.json" \
-    --include "telemetry.json" --include "**/telemetry.json" \
-    --include "cameras.json" --include "**/cameras.json" \
-    --include "cam/**" --include "**/cam/**" \
+    --filter "+ scene.json" --filter "+ **/scene.json" \
+    --filter "+ telemetry.json" --filter "+ **/telemetry.json" \
+    --filter "+ cameras.json" --filter "+ **/cameras.json" \
+    --filter "+ cam/**" --filter "+ **/cam/**" \
+    --filter "- **" \
     "${src}" "${dst}"
 
   if [[ "${PRUNE}" -eq 1 ]]; then
@@ -204,8 +213,10 @@ prune_tree() {
     [[ -n "${rel}" ]] && rel="${rel}/"
     # License gate: don't let a local waymo-* manifest protect remote objects —
     # nothing waymo should exist on R2, so leaving them unreferenced lets the
-    # prune below clean up any accidental upload.
-    case "${rel}" in waymo-*) continue ;; esac
+    # prune below clean up any accidental upload. Hidden dot-dir manifests
+    # (local `.foo.bak` backup trees) likewise never ship, and a stale backup
+    # manifest must not protect superseded packs from GC.
+    case "${rel}" in waymo-*|.*) continue ;; esac
     python3 - "$manifest" "$rel" <<'PY' >> "${filter_file}"
 import json, sys
 manifest_path, rel = sys.argv[1], sys.argv[2]
