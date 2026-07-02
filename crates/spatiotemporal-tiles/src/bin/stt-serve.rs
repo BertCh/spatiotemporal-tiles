@@ -26,15 +26,20 @@
 //! domain (`--heatmap-weight`/`--heatmap-class`) is computed once at startup via
 //! a SQL aggregate and advertised in `/metadata.json`.
 //!
-//! The backend is chosen by `--postgres <CONN>` or `--duckdb <PATH>`. PostGIS
-//! uses an async client + pool; DuckDB is embedded and blocking, so its pool
-//! checkout / query / decode / encode all run on `spawn_blocking`.
+//! The backend is chosen by `--postgres <CONN>` or `--duckdb <PATH>`; each is
+//! compiled in by its cargo feature (`serve-postgres` / `serve-duckdb`), and at
+//! least one must be enabled. PostGIS uses an async client + pool; DuckDB is
+//! embedded and blocking, so its pool checkout / query / decode / encode all
+//! run on `spawn_blocking`.
 //!
 //! Tiles are regenerated per request (no app cache), so unlike the pre-baked
 //! packed format this is NOT edge-cacheable — that is the live-source trade-off.
 //! The source geometry must be EPSG:4326 lon/lat (index the table in 4326;
 //! reproject at ingest with `stt-build --source-srid` if needed — reprojecting
 //! in a per-tile filter would defeat the spatial index).
+
+#[cfg(not(any(feature = "serve-postgres", feature = "serve-duckdb")))]
+compile_error!("stt-serve needs at least one backend: enable `serve-postgres` and/or `serve-duckdb`");
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -58,14 +63,20 @@ use stt_build::input::{InputStrictness, ParsedFeature, TimeFormat};
 use stt_build::tiler::{encode_single_tile_counted, TileConfig};
 use stt_core::metadata::{HeatmapClassDomain, HeatmapDomain};
 
-// Postgres backend.
+// Postgres backend (feature `serve-postgres`).
+#[cfg(feature = "serve-postgres")]
 use deadpool_postgres::{Manager, ManagerConfig, Pool as PgPool, RecyclingMethod};
+#[cfg(feature = "serve-postgres")]
 use stt_build::postgres_input;
+#[cfg(feature = "serve-postgres")]
 use tokio_postgres::NoTls;
 
-// DuckDB backend.
+// DuckDB backend (feature `serve-duckdb`).
+#[cfg(feature = "serve-duckdb")]
 use duckdb::{AccessMode, Config as DuckConfig, DuckdbConnectionManager};
+#[cfg(feature = "serve-duckdb")]
 use r2d2::Pool as R2d2Pool;
+#[cfg(feature = "serve-duckdb")]
 use stt_build::duckdb_input;
 
 /// CLI args AND the per-dataset schema of a `--config` JSON file: every field is
@@ -98,12 +109,14 @@ struct Args {
     /// PostgreSQL/PostGIS connection string (libpq URI or key=value). Env
     /// fallback: STT_POSTGRES_URL, then DATABASE_URL. Mutually exclusive with
     /// --duckdb.
+    #[cfg(feature = "serve-postgres")]
     #[arg(long)]
     postgres: Option<String>,
 
     /// DuckDB database file path (or `:memory:` with a `--sql` that scans
     /// external files, e.g. `read_parquet(...)`). Env fallback: STT_DUCKDB_PATH.
     /// Mutually exclusive with --postgres.
+    #[cfg(feature = "serve-duckdb")]
     #[arg(long)]
     duckdb: Option<String>,
 
@@ -304,10 +317,12 @@ struct ServeConfig {
 /// r2d2 manager that loads the DuckDB `spatial` extension and pins UTC on every
 /// *new physical connection* (once, not per checkout), so `ST_AsWKB` /
 /// `ST_Intersects` / `epoch_ms` are available and epoch math is tz-independent.
+#[cfg(feature = "serve-duckdb")]
 struct SpatialDuckManager {
     inner: DuckdbConnectionManager,
 }
 
+#[cfg(feature = "serve-duckdb")]
 impl r2d2::ManageConnection for SpatialDuckManager {
     type Connection = duckdb::Connection;
     type Error = duckdb::Error;
@@ -325,11 +340,14 @@ impl r2d2::ManageConnection for SpatialDuckManager {
     }
 }
 
+#[cfg(feature = "serve-duckdb")]
 type DuckPool = R2d2Pool<SpatialDuckManager>;
 
-/// The selected data source.
+/// The selected data source (only compiled-in backends have a variant).
 enum Backend {
+    #[cfg(feature = "serve-postgres")]
     Postgres(PgPool),
+    #[cfg(feature = "serve-duckdb")]
     DuckDb(DuckPool),
 }
 
@@ -441,6 +459,7 @@ async fn build_tile(
     let t_end = (bucket_start + effective_bucket) as i64;
 
     let bytes: Option<Vec<u8>> = match &st.backend {
+        #[cfg(feature = "serve-postgres")]
         Backend::Postgres(pool) => {
             let sql = postgres_input::build_tile_query(
                 &st.source,
@@ -473,6 +492,7 @@ async fn build_tile(
             .await
             .context("encode task join")??
         }
+        #[cfg(feature = "serve-duckdb")]
         Backend::DuckDb(pool) => {
             let sql = duckdb_input::build_tile_query(
                 &st.source,
@@ -627,6 +647,7 @@ fn quote_ident(name: &str) -> String {
 
 /// PostGIS startup metadata aggregate (extent + time range + count) + optional
 /// heatmap domain.
+#[cfg(feature = "serve-postgres")]
 async fn load_metadata_pg(
     pool: &PgPool,
     args: &Args,
@@ -694,6 +715,7 @@ async fn load_metadata_pg(
 /// column (per class when `--heatmap-class` is set, capped at 8). Computed via
 /// the DB's continuous `percentile_cont`, which may differ marginally from the
 /// offline floor-index percentile (this is a style hint, not tile bytes).
+#[cfg(feature = "serve-postgres")]
 async fn load_heatmap_pg(
     pool: &PgPool,
     source: &str,
@@ -772,6 +794,7 @@ async fn load_heatmap_pg(
 
 /// DuckDB startup metadata aggregate (extent + time range + count) + optional
 /// heatmap domain.
+#[cfg(feature = "serve-duckdb")]
 fn load_metadata_duckdb(
     pool: &DuckPool,
     args: &Args,
@@ -817,8 +840,9 @@ fn load_metadata_duckdb(
     )
 }
 
-/// DuckDB heatmap-domain aggregate (mirrors [`load_heatmap_pg`] via
+/// DuckDB heatmap-domain aggregate (mirrors the PostGIS `load_heatmap_pg` via
 /// `quantile_cont`).
+#[cfg(feature = "serve-duckdb")]
 fn load_heatmap_duckdb(
     conn: &duckdb::Connection,
     source: &str,
@@ -903,6 +927,7 @@ fn load_heatmap_duckdb(
 }
 
 /// Build the DuckDB r2d2 pool (read-only for a real file; in-memory otherwise).
+#[cfg(feature = "serve-duckdb")]
 fn build_duckdb_pool(path: &str, pool_size: usize) -> Result<DuckPool> {
     let inner = if path.is_empty() || path == ":memory:" {
         tracing::warn!(
@@ -1121,6 +1146,7 @@ fn build_config(
 /// pool, and load the startup metadata. Returns the resolved dataset name (the
 /// `--name` override or the table/query-derived name) alongside the state.
 async fn build_dataset_state(args: &Args) -> Result<(String, ServerState)> {
+    #[cfg(all(feature = "serve-postgres", feature = "serve-duckdb"))]
     if args.postgres.is_some() && args.duckdb.is_some() {
         anyhow::bail!("--postgres and --duckdb are mutually exclusive");
     }
@@ -1129,44 +1155,67 @@ async fn build_dataset_state(args: &Args) -> Result<(String, ServerState)> {
     let name = args.name.clone().unwrap_or(derived_name);
     let (config, encoder) = build_config(args, bucket_ms)?;
 
-    // Resolve the backend: explicit per-dataset flags first, then env fallbacks.
-    let duck_path = args
-        .duckdb
-        .clone()
-        .or_else(|| std::env::var("STT_DUCKDB_PATH").ok());
-    let pg_conn = args
-        .postgres
-        .clone()
-        .or_else(|| std::env::var("STT_POSTGRES_URL").ok())
-        .or_else(|| std::env::var("DATABASE_URL").ok());
+    // Resolve the backend: explicit per-dataset flags first, then env
+    // fallbacks. DuckDB is tried first (but an explicit --postgres outranks the
+    // STT_DUCKDB_PATH env fallback), matching the pre-gating precedence.
+    let mut resolved: Option<(Backend, serde_json::Value)> = None;
 
-    let (backend, mut metadata) = if let Some(path) = duck_path.filter(|_| args.postgres.is_none()) {
-        let pool = build_duckdb_pool(&path, args.pool_size)?;
-        let metadata = load_metadata_duckdb(&pool, args, &source, &name, bucket_ms)
-            .context("load DuckDB source metadata")?;
-        (Backend::DuckDb(pool), metadata)
-    } else if let Some(conn) = pg_conn {
-        let pg_config: tokio_postgres::Config = conn.parse().context("parse connection string")?;
-        let mgr = Manager::from_config(
-            pg_config,
-            NoTls,
-            ManagerConfig {
-                recycling_method: RecyclingMethod::Fast,
-            },
-        );
-        let pool = PgPool::builder(mgr)
-            .max_size(args.pool_size)
-            .build()
-            .context("build connection pool")?;
-        let metadata = load_metadata_pg(&pool, args, &source, &name, bucket_ms)
-            .await
-            .context("load PostGIS source metadata")?;
-        (Backend::Postgres(pool), metadata)
-    } else {
-        anyhow::bail!(
-            "no source: pass --postgres <CONN> or --duckdb <PATH> (or set STT_POSTGRES_URL / \
-             DATABASE_URL / STT_DUCKDB_PATH)"
-        );
+    #[cfg(feature = "serve-duckdb")]
+    if resolved.is_none() {
+        let duck_path = args
+            .duckdb
+            .clone()
+            .or_else(|| std::env::var("STT_DUCKDB_PATH").ok());
+        #[cfg(feature = "serve-postgres")]
+        let duck_path = duck_path.filter(|_| args.postgres.is_none());
+        if let Some(path) = duck_path {
+            let pool = build_duckdb_pool(&path, args.pool_size)?;
+            let metadata = load_metadata_duckdb(&pool, args, &source, &name, bucket_ms)
+                .context("load DuckDB source metadata")?;
+            resolved = Some((Backend::DuckDb(pool), metadata));
+        }
+    }
+
+    #[cfg(feature = "serve-postgres")]
+    if resolved.is_none() {
+        let pg_conn = args
+            .postgres
+            .clone()
+            .or_else(|| std::env::var("STT_POSTGRES_URL").ok())
+            .or_else(|| std::env::var("DATABASE_URL").ok());
+        if let Some(conn) = pg_conn {
+            let pg_config: tokio_postgres::Config = conn.parse().context("parse connection string")?;
+            let mgr = Manager::from_config(
+                pg_config,
+                NoTls,
+                ManagerConfig {
+                    recycling_method: RecyclingMethod::Fast,
+                },
+            );
+            let pool = PgPool::builder(mgr)
+                .max_size(args.pool_size)
+                .build()
+                .context("build connection pool")?;
+            let metadata = load_metadata_pg(&pool, args, &source, &name, bucket_ms)
+                .await
+                .context("load PostGIS source metadata")?;
+            resolved = Some((Backend::Postgres(pool), metadata));
+        }
+    }
+
+    // The "no source" hint only names the flags/envs of compiled-in backends.
+    #[cfg(all(feature = "serve-postgres", feature = "serve-duckdb"))]
+    const NO_SOURCE: &str = "no source: pass --postgres <CONN> or --duckdb <PATH> (or set \
+                             STT_POSTGRES_URL / DATABASE_URL / STT_DUCKDB_PATH)";
+    #[cfg(all(feature = "serve-postgres", not(feature = "serve-duckdb")))]
+    const NO_SOURCE: &str =
+        "no source: pass --postgres <CONN> (or set STT_POSTGRES_URL / DATABASE_URL)";
+    #[cfg(all(feature = "serve-duckdb", not(feature = "serve-postgres")))]
+    const NO_SOURCE: &str = "no source: pass --duckdb <PATH> (or set STT_DUCKDB_PATH)";
+
+    let (backend, mut metadata) = match resolved {
+        Some(v) => v,
+        None => anyhow::bail!(NO_SOURCE),
     };
 
     // Advertise the temporal-LOD pyramid so a client can discover the coarser
@@ -1317,6 +1366,9 @@ mod tests {
         assert!(build_config(&a, 3_600_000).is_err());
     }
 
+    // References both backends' `--config` keys/fields, so it needs both
+    // compiled in (a compiled-out backend's key is an unknown field).
+    #[cfg(all(feature = "serve-postgres", feature = "serve-duckdb"))]
     #[test]
     fn config_json_deserializes_datasets_with_kebab_keys_and_clap_defaults() {
         // Config-file keys mirror the CLI flag names (kebab-case); any omitted

@@ -5,6 +5,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
 description = "Spatiotemporal dataset analyzer and optimizer for STT file generation"
 readme = "README.md"
 keywords = ["tiles", "spatiotemporal", "geospatial", "optimization", "cli"]
@@ -13,10 +15,6 @@ categories = ["science::geo", "command-line-utilities"]
 [lib]
 name = "stt_optimize"
 path = "src/lib.rs"
-
-[[bin]]
-name = "stt-optimize"
-path = "src/main.rs"
 
 [dependencies]
 # Workspace crate
@@ -31,8 +29,7 @@ serde_json.workspace = true
 parquet.workspace = true
 arrow.workspace = true
 
-# CLI
-clap.workspace = true
+# Progress reporting (loader/spatial analysis)
 indicatif.workspace = true
 
 # Time
@@ -40,6 +37,5 @@ chrono.workspace = true
 
 # Logging
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 

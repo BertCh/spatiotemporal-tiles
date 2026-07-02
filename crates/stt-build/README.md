@@ -11,15 +11,17 @@ forever-cacheable). Simplification, temporal LOD pyramids, summary tiers
 (H3/Quadbin), coordinate/attribute quantization, and per-tile budgets are
 all flags away.
 
-> **Not yet published to crates.io** — build from the repo:
+> **Internal implementation crate** of
+> [`spatiotemporal-tiles`](https://crates.io/crates/spatiotemporal-tiles):
+> this is the tiler/encoder *library* (the facade's `build` module). The
+> `stt-build` CLI ships with the facade:
 >
 > ```bash
-> git clone https://github.com/BertCh/spatiotemporal-tiles
-> cd spatiotemporal-tiles
-> cargo install --path crates/stt-build
-> # database inputs are feature-gated:
-> cargo build --release -p stt-build --features postgres   # or duckdb
+> cargo install spatiotemporal-tiles --features cli
 > ```
+>
+> Database inputs stay feature-gated (`postgres` / `duckdb`) on both the
+> library and the facade.
 
 ## Example
 

@@ -9,14 +9,13 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+exclude = ["/examples", "/tests"]
 
 [lib]
 name = "stt_build"
 path = "src/lib.rs"
-
-[[bin]]
-name = "stt-build"
-path = "src/main.rs"
 
 [dependencies]
 stt-core = { path = "../stt-core", version = "0.1.0" }
@@ -29,9 +28,7 @@ geo.workspace = true
 geozero.workspace = true
 rayon.workspace = true
 clap.workspace = true
-indicatif.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 chrono.workspace = true
 
 # Temp single-file archive staging for the --streaming-arrow -> packed transcode.
@@ -43,12 +40,14 @@ h3o = "0.7"
 # Optional advanced projection support (requires system libproj)
 proj = { version = "0.27", optional = true }
 
-# GeoParquet/GeoArrow support
-geoarrow = { workspace = true, optional = true }
-parquet = { workspace = true, optional = true }
-arrow = { workspace = true, optional = true }
-arrow-schema = { workspace = true, optional = true }
-arrow-array = { workspace = true, optional = true }
+# GeoParquet/GeoArrow support. Mandatory: the tiler's Arrow IPC encode path
+# uses arrow/parquet unconditionally, so a geoparquet-less stt-build cannot
+# exist — the `geoparquet` feature below is a no-op kept for CLI compat.
+geoarrow = { workspace = true }
+parquet = { workspace = true }
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-array = { workspace = true }
 
 # PostGIS input source (feature `postgres`). Sync driver — keeps stt-build
 # tokio-free. `with-chrono-0_4` decodes timestamp columns; `with-serde_json-1`
@@ -69,8 +68,9 @@ duckdb = { version = "1", features = ["bundled", "chrono"], optional = true }
 default = ["geoparquet"]
 # Enable advanced projection support (requires system libproj)
 projection = ["stt-core/projection", "proj"]
-# Enable GeoParquet/GeoArrow support for high-performance I/O
-geoparquet = ["geoarrow", "parquet", "arrow", "arrow-schema", "arrow-array"]
+# No-op back-compat alias: GeoParquet/GeoArrow support is always compiled in
+# (the encode path needs arrow/parquet unconditionally).
+geoparquet = []
 # Enable the PostGIS input source (`--postgres`/`--table`/`--sql`).
 postgres = ["dep:postgres"]
 # Enable the DuckDB input source (`--duckdb`/`--table`/`--sql`).

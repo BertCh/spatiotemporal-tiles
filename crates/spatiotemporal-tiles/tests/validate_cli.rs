@@ -5,6 +5,10 @@
 //! with `--json` and asserts on the parsed report. This exercises the real
 //! decode path, the schema checks, and the `--sample` accounting end to end.
 
+// The stt-validate binary (and CARGO_BIN_EXE_stt-validate) only exists when
+// the `validate-cli` feature is on; compile the suite out otherwise.
+#![cfg(feature = "validate-cli")]
+
 use std::path::Path;
 use std::process::Command;
 

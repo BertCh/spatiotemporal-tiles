@@ -4165,6 +4165,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "spatiotemporal-tiles"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow 54.3.1",
+ "axum",
+ "clap",
+ "deadpool-postgres",
+ "duckdb",
+ "indicatif",
+ "r2d2",
+ "serde",
+ "serde_json",
+ "stt-build",
+ "stt-core",
+ "stt-optimize",
+ "tempfile",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4231,7 +4255,6 @@ dependencies = [
  "geojson",
  "geozero",
  "h3o",
- "indicatif",
  "libc",
  "parquet",
  "postgres",
@@ -4243,7 +4266,6 @@ dependencies = [
  "stt-optimize",
  "tempfile",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -4314,48 +4336,12 @@ dependencies = [
  "anyhow",
  "arrow 54.3.1",
  "chrono",
- "clap",
  "indicatif",
  "parquet",
  "serde",
  "serde_json",
  "stt-core",
  "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "stt-serve"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "deadpool-postgres",
- "duckdb",
- "r2d2",
- "serde",
- "serde_json",
- "stt-build",
- "stt-core",
- "tokio",
- "tokio-postgres",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "stt-validate"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow 54.3.1",
- "clap",
- "indicatif",
- "serde",
- "serde_json",
- "stt-core",
- "tempfile",
 ]
 
 [[package]]

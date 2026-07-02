@@ -7,12 +7,13 @@ don't hand-tune them per dataset. The same logic is what runs inside
 `stt-build --auto`; the CLI exists to run the analysis standalone, inspect
 the reasoning (`--verbose`), or emit machine-readable reports.
 
-> **Not yet published to crates.io** — build from the repo:
+> **Internal implementation crate** of
+> [`spatiotemporal-tiles`](https://crates.io/crates/spatiotemporal-tiles):
+> the analysis *library* (the facade's `optimize` module). The
+> `stt-optimize` CLI ships with the facade:
 >
 > ```bash
-> git clone https://github.com/BertCh/spatiotemporal-tiles
-> cd spatiotemporal-tiles
-> cargo install --path crates/stt-optimize
+> cargo install spatiotemporal-tiles --features cli
 > ```
 
 ## Example

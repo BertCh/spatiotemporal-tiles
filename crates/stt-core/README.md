@@ -10,13 +10,12 @@ and the `Manifest`, Arrow-IPC tile payloads with GeoArrow geometry
 (`arrow_tile`), the run-length + paged tile directory, Hilbert/temporal blob
 ordering (`curve`), zstd/gzip compression, and timestamp normalization.
 
-> **Not yet published to crates.io** — depend on it by path from the
-> workspace, or via a git dependency:
->
-> ```toml
-> [dependencies]
-> stt-core = { git = "https://github.com/BertCh/spatiotemporal-tiles" }
-> ```
+> **Internal implementation crate** of
+> [`spatiotemporal-tiles`](https://crates.io/crates/spatiotemporal-tiles) —
+> the same role `bevy_ecs` plays under `bevy`. Prefer
+> `cargo add spatiotemporal-tiles` (this crate is its `core` module);
+> depend on `stt-core` directly only if you need exactly the format layer.
+> Versions track the facade in lockstep.
 
 ## Example
 

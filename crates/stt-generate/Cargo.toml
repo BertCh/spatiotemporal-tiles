@@ -9,6 +9,13 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+# Internal demo-dataset generator (RC nexrad deps); never published.
+publish = false
+
+[package.metadata.dist]
+dist = false
 
 [[bin]]
 name = "stt-generate"

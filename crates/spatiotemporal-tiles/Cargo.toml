@@ -1,0 +1,122 @@
+[package]
+name = "spatiotemporal-tiles"
+description = "SpatioTemporal Tiles (STT): animated space-time tile archives — umbrella crate re-exporting the stt-* libraries and shipping the stt-build/stt-optimize/stt-validate/stt-serve CLIs"
+readme = "README.md"
+keywords = ["tiles", "spatiotemporal", "geospatial", "arrow", "gis"]
+categories = ["science::geo", "encoding", "command-line-utilities"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "spatiotemporal_tiles"
+path = "src/lib.rs"
+
+# The CLI binaries live here (feature-gated) so `cargo install
+# spatiotemporal-tiles --features cli` is the one install command; the
+# binary names stay `stt-*` to match the CLI reference docs.
+[[bin]]
+name = "stt-build"
+path = "src/bin/stt-build.rs"
+required-features = ["build-cli"]
+
+[[bin]]
+name = "stt-optimize"
+path = "src/bin/stt-optimize.rs"
+required-features = ["optimize-cli"]
+
+[[bin]]
+name = "stt-validate"
+path = "src/bin/stt-validate/main.rs"
+required-features = ["validate-cli"]
+
+[[bin]]
+name = "stt-serve"
+path = "src/bin/stt-serve.rs"
+required-features = ["serve"]
+
+[dependencies]
+# The reader/format core is always present (the facade is useless without it).
+stt-core = { path = "../stt-core", version = "0.1.0" }
+stt-build = { path = "../stt-build", version = "0.1.0", optional = true }
+stt-optimize = { path = "../stt-optimize", version = "0.1.0", optional = true }
+
+# CLI support (feature `cli-core`).
+anyhow = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+indicatif = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+# stt-build CLI (feature `build-cli`): temp staging for the
+# --streaming-arrow -> packed transcode path.
+tempfile = { version = "3.10", optional = true }
+
+# stt-validate (feature `validate-cli`): Arrow IPC decode checks.
+arrow = { workspace = true, optional = true }
+
+# stt-serve (feature `serve`): HTTP server + runtime.
+axum = { version = "0.7", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"], optional = true }
+
+# stt-serve Postgres backend (feature `serve-postgres`): async client +
+# pool. `tokio_postgres::Row` is exactly the `postgres::Row` stt-build's
+# postgres_input decodes, so `decode_rows` accepts these rows directly.
+tokio-postgres = { version = "0.7", optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
+
+# stt-serve DuckDB backend (feature `serve-duckdb`): embedded engine + r2d2
+# pool (DuckDB `Connection` is Send but !Sync — one connection per worker).
+duckdb = { version = "1", features = ["bundled", "r2d2"], optional = true }
+r2d2 = { version = "0.8", optional = true }
+
+[features]
+default = []
+# Library re-exports: `spatiotemporal_tiles::build` / `::optimize`.
+build = ["dep:stt-build"]
+optimize = ["dep:stt-optimize"]
+# Database input sources for the build library/CLI.
+postgres = ["build", "stt-build/postgres"]
+duckdb = ["build", "stt-build/duckdb"]
+# Advanced projection support (requires system libproj) — never a default,
+# never in prebuilt binaries, never on docs.rs.
+projection = ["stt-core/projection", "stt-build?/projection"]
+
+# --- CLI binaries -----------------------------------------------------------
+# Shared bin plumbing; not useful on its own.
+cli-core = [
+  "dep:anyhow",
+  "dep:serde",
+  "dep:serde_json",
+  "dep:clap",
+  "dep:indicatif",
+  "dep:tracing",
+  "dep:tracing-subscriber",
+]
+build-cli = ["build", "cli-core", "dep:tempfile"]
+optimize-cli = ["optimize", "cli-core"]
+validate-cli = ["cli-core", "dep:arrow"]
+# stt-serve needs at least one backend; enabling only `serve` is a compile
+# error (see the compile_error! guard in src/bin/stt-serve.rs).
+serve = ["build", "cli-core", "dep:axum", "dep:tokio"]
+serve-postgres = ["serve", "postgres", "dep:tokio-postgres", "dep:deadpool-postgres"]
+serve-duckdb = ["serve", "duckdb", "dep:duckdb", "dep:r2d2"]
+# Everything: all four binaries, both serve backends.
+cli = ["build-cli", "optimize-cli", "validate-cli", "serve-postgres", "serve-duckdb"]
+
+[dev-dependencies]
+tempfile = "3.10"
+
+# Prebuilt binaries (cargo-dist): all four CLIs, both stt-serve backends.
+# `projection` (system libproj) stays out of dist builds by design.
+[package.metadata.dist]
+features = ["cli"]
+
+[package.metadata.docs.rs]
+features = ["build", "optimize", "postgres", "duckdb"]
