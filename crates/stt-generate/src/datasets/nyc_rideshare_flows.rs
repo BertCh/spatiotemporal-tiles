@@ -34,7 +34,7 @@ use crate::datasets::osm_streets::{EdgeKey, OsmNetwork};
 
 /// Cap corridor features so a single way can't span a borough — very long
 /// features land in (and bloat) every tile they cross at every zoom.
-const MAX_CHAIN_SEGMENTS: usize = 64;
+pub(crate) const MAX_CHAIN_SEGMENTS: usize = 64;
 
 /// Undirected edge key (endpoints ascending) — matches `OsmNetwork`'s keying.
 fn edge_key(a: i64, b: i64) -> EdgeKey {
@@ -76,6 +76,32 @@ pub struct FlowAggregator {
     bin_ms: i64,
     network: OsmNetwork,
     counts: HashMap<EdgeKey, HashMap<i64, u32>>,
+    /// Directed per-edge counts `(from_node, to_node) → bin → count`, populated
+    /// only by [`Self::add_route_bins_directed`] (the `bixi --merged-paths`
+    /// stroke path). Empty for the undirected `--streets`/`--flows` modes. Kept
+    /// separate from `counts` so a corridor that is two-way keeps A→B and B→A
+    /// distinct (asymmetric ridership, one-way pairs) for the twin-ribbon render.
+    dir_counts: HashMap<(i64, i64), HashMap<i64, u32>>,
+    /// Directional mode for the undirected `--streets` path (opt-in via
+    /// [`Self::set_directional`]; used by `bixi --streets --directional`). When
+    /// on, also accumulate the *signed* net flow per undirected edge — positive
+    /// toward the edge's canonical `a<b` orientation, negative the other way — so
+    /// [`Self::write_parquet`] can PRE-ORIENT each corridor's geometry toward its
+    /// dominant travel direction (vertex winding == flow) for the chevron
+    /// renderer. Distinct from `dir_counts` (which keeps A→B and B→A separate for
+    /// the twin-ribbon stroke): this collapses to one signed net per undirected
+    /// edge. The undirected `counts` (the magnitude matrix) are untouched, so a
+    /// non-directional `--streets` build stays byte-identical.
+    directional: bool,
+    signed: HashMap<EdgeKey, HashMap<i64, i64>>,
+    /// When on (opt-in via [`Self::set_per_bucket_direction`], `bixi --streets
+    /// --per-bucket-direction`), [`Self::write_parquet`] encodes the SIGN of each
+    /// bucket's net flow (along the emitted winding) into the magnitude matrix:
+    /// `matrix[v][b] = |volume| * dir`, `dir ∈ {+1,-1}`. The renderer colours by
+    /// `abs` (volume) and flips the chevrons by the sign, so a corridor's arrows
+    /// change direction per time-step (morning inbound → evening outbound).
+    /// Requires `directional` (the signed map). Off → plain magnitude matrix.
+    per_bucket_direction: bool,
     min_bin: i64,
     max_bin: i64,
     trips_added: usize,
@@ -92,6 +118,10 @@ impl FlowAggregator {
             bin_ms,
             network,
             counts: HashMap::new(),
+            dir_counts: HashMap::new(),
+            directional: false,
+            signed: HashMap::new(),
+            per_bucket_direction: false,
             min_bin: i64::MAX,
             max_bin: i64::MIN,
             trips_added: 0,
@@ -99,6 +129,25 @@ impl FlowAggregator {
             matched_exact: 0,
             matched_fallback: 0,
             unmatched: 0,
+        }
+    }
+
+    /// Enable directional accumulation on the undirected `--streets` path: track
+    /// signed per-edge net flow so [`Self::write_parquet`] orients each corridor's
+    /// geometry toward its dominant travel direction (winding == flow) for the
+    /// chevron renderer. Off by default (geometry follows the OSM way's
+    /// digitization order; undirected magnitude only).
+    pub fn set_directional(&mut self, on: bool) {
+        self.directional = on;
+    }
+
+    /// Enable per-bucket direction encoding (implies [`Self::set_directional`],
+    /// since it needs the signed net map). See the `per_bucket_direction` field.
+    /// Must be called BEFORE ingestion so the signed map is populated.
+    pub fn set_per_bucket_direction(&mut self, on: bool) {
+        self.per_bucket_direction = on;
+        if on {
+            self.directional = true;
         }
     }
 
@@ -144,6 +193,10 @@ impl FlowAggregator {
             let mid = (times[i - 1] + times[i]) / 2;
             let bin = mid.div_euclid(self.bin_ms);
             *self.counts.entry(edge).or_default().entry(bin).or_insert(0) += 1;
+            if self.directional {
+                let sign = segment_orientation(&self.network, p0, p1, edge);
+                *self.signed.entry(edge).or_default().entry(bin).or_insert(0) += sign;
+            }
             self.min_bin = self.min_bin.min(bin);
             self.max_bin = self.max_bin.max(bin);
         }
@@ -182,7 +235,58 @@ impl FlowAggregator {
                     continue;
                 }
             };
+            // Signed orientation vs the edge's canonical a<b — computed before the
+            // mutable borrows below (needs an immutable borrow of `network`).
+            let sign = if self.directional {
+                segment_orientation(&self.network, p0, p1, edge)
+            } else {
+                0
+            };
             let edge_counts = self.counts.entry(edge).or_default();
+            for (&bin, &count) in bins {
+                *edge_counts.entry(bin).or_insert(0) += count;
+                self.min_bin = self.min_bin.min(bin);
+                self.max_bin = self.max_bin.max(bin);
+            }
+            if self.directional {
+                let sc = self.signed.entry(edge).or_default();
+                for (&bin, &count) in bins {
+                    *sc.entry(bin).or_insert(0) += sign * count as i64;
+                }
+            }
+        }
+        self.trips_added += 1;
+    }
+
+    /// Directed counterpart of [`Self::add_route_bins`] for `bixi --merged-paths`:
+    /// distribute an OD corridor's per-bin counts onto **directed** edge keys
+    /// `(from_node, to_node)` oriented in travel direction (via
+    /// [`OsmNetwork::match_segment_directed`]). A→B and B→A traffic therefore stay
+    /// on separate keys even on a two-way street, so the stroke synthesis can emit
+    /// two offset ribbons whose widths reflect each direction's ridership.
+    pub fn add_route_bins_directed(&mut self, coords: &[[f64; 2]], bins: &HashMap<i64, u32>) {
+        if coords.len() < 2 || bins.is_empty() {
+            self.trips_skipped += 1;
+            return;
+        }
+        for i in 1..coords.len() {
+            let p0 = coords[i - 1];
+            let p1 = coords[i];
+            let dedge = match self.network.match_segment_directed(p0, p1) {
+                Some(e) => {
+                    if self.network.is_exact_pair(p0, p1) {
+                        self.matched_exact += 1;
+                    } else {
+                        self.matched_fallback += 1;
+                    }
+                    e
+                }
+                None => {
+                    self.unmatched += 1;
+                    continue;
+                }
+            };
+            let edge_counts = self.dir_counts.entry(dedge).or_default();
             for (&bin, &count) in bins {
                 *edge_counts.entry(bin).or_insert(0) += count;
                 self.min_bin = self.min_bin.min(bin);
@@ -207,7 +311,9 @@ impl FlowAggregator {
     /// or `None` if nothing was aggregated. Matches the `timestamp`/`end_timestamp`
     /// written by [`Self::write_parquet`] — use it to set the showcase `timeRange`.
     pub fn bucket_span_ms(&self) -> Option<(i64, i64)> {
-        if self.counts.is_empty() {
+        // Directed mode (`--merged-paths`) fills `dir_counts`, not `counts`; both
+        // share the same min_bin/max_bin axis, so either being non-empty is enough.
+        if self.counts.is_empty() && self.dir_counts.is_empty() {
             return None;
         }
         let num_buckets = self.max_bin - self.min_bin + 1;
@@ -275,6 +381,122 @@ impl FlowAggregator {
         Ok((features, num_buckets))
     }
 
+    /// Emit **coherent directed corridors** for `bixi --merged-paths`: synthesize
+    /// long strokes from the directed per-edge flow (degree-2 contraction +
+    /// self-best-fit good-continuation at junctions, gated by flow similarity),
+    /// then write each stroke (chunked at `MAX_CHAIN_SEGMENTS`) as one LineString
+    /// in travel-direction vertex order, carrying its `[vertex][bucket]` directed
+    /// volume matrix + a volume-based `min_zoom` LOD. Returns (features, buckets).
+    pub fn write_parquet_strokes(
+        self,
+        output: &Path,
+        params: &StrokeParams,
+    ) -> Result<(usize, usize)> {
+        let property_columns = vec![
+            PropertyColumn::numeric("max_count"),
+            PropertyColumn::numeric("total_count"),
+            PropertyColumn::numeric("min_zoom"),
+        ];
+        let mut writer = StreamingLineStringParquetWriter::with_columns(output, property_columns)?;
+
+        if self.dir_counts.is_empty() {
+            writer.finish()?;
+            return Ok((0, 0));
+        }
+
+        let min_bin = self.min_bin;
+        let num_buckets = (self.max_bin - min_bin + 1) as usize;
+        let bucket0 = min_bin * self.bin_ms;
+        let range_end = bucket0 + num_buckets as i64 * self.bin_ms;
+
+        // Per-directed-edge total throughput (Σ over buckets) — reused for the
+        // continuation flow-similarity gate and the per-corridor volume LOD.
+        let mut edge_total: HashMap<(i64, i64), u32> = HashMap::new();
+        for (e, bins) in &self.dir_counts {
+            edge_total.insert(*e, bins.values().copied().sum());
+        }
+
+        let net = &self.network;
+        let strokes = synthesize_strokes(
+            &self.dir_counts,
+            &edge_total,
+            |id| net.node_xy(id).unwrap(),
+            net.lon_scale(),
+            params,
+        );
+
+        let mut features = 0usize;
+        for stroke in &strokes {
+            let mut start = 0usize;
+            while start + 1 < stroke.len() {
+                let end = (start + MAX_CHAIN_SEGMENTS + 1).min(stroke.len()); // ≤64 edges
+                let chunk = &stroke[start..end];
+                start = end - 1; // overlap one node so chunks connect
+
+                let dedges: Vec<(i64, i64)> = chunk.windows(2).map(|w| (w[0], w[1])).collect();
+                // Representative corridor volume = busiest segment's total
+                // throughput (length-independent), driving width + LOD.
+                let peak_seg_total = dedges
+                    .iter()
+                    .map(|e| edge_total.get(e).copied().unwrap_or(0))
+                    .max()
+                    .unwrap_or(0);
+                if peak_seg_total < params.min_stroke_trips {
+                    continue;
+                }
+
+                let coords: Vec<[f64; 2]> = chunk
+                    .iter()
+                    .map(|&id| {
+                        let (x, y) = self.network.node_xy(id).unwrap();
+                        [x, y]
+                    })
+                    .collect();
+                let n = coords.len();
+
+                let mut matrix = vec![0.0f32; n * num_buckets];
+                let mut overall_max = 0u32;
+                for b in 0..num_buckets {
+                    let bin = min_bin + b as i64;
+                    let seg_counts: Vec<u32> = dedges
+                        .iter()
+                        .map(|e| {
+                            let c =
+                                self.dir_counts.get(e).and_then(|m| m.get(&bin)).copied().unwrap_or(0);
+                            overall_max = overall_max.max(c);
+                            c
+                        })
+                        .collect();
+                    let vvals = vertex_values_from_segment_counts(&seg_counts);
+                    for (v, &val) in vvals.iter().enumerate() {
+                        matrix[v * num_buckets + b] = val;
+                    }
+                }
+                if overall_max == 0 {
+                    continue;
+                }
+
+                let mut properties = Map::new();
+                properties.insert("max_count".to_string(), json!(overall_max));
+                properties.insert("total_count".to_string(), json!(peak_seg_total));
+                properties.insert("min_zoom".to_string(), json!(stroke_min_zoom(peak_seg_total)));
+
+                writer.write_linestring(&LineStringRecord {
+                    coordinates: coords,
+                    timestamp_ms: bucket0,
+                    end_timestamp_ms: Some(range_end),
+                    vertex_timestamps_ms: None,
+                    vertex_values: None,
+                    vertex_value_matrix: Some(matrix),
+                    properties,
+                })?;
+                features += 1;
+            }
+        }
+        writer.finish()?;
+        Ok((features, num_buckets))
+    }
+
     /// Emit a contiguous run of coord-resolved node ids as one or more corridor
     /// features (chunked). Returns the number of features written. Chunks with
     /// no traffic in any bucket are skipped.
@@ -296,7 +518,7 @@ impl FlowAggregator {
             let chunk = &run[start..end];
             start = end - 1; // overlap one node so chunks connect
 
-            let coords: Vec<[f64; 2]> = chunk
+            let mut coords: Vec<[f64; 2]> = chunk
                 .iter()
                 .map(|&id| {
                     let (x, y) = self.network.node_xy(id).unwrap();
@@ -326,6 +548,60 @@ impl FlowAggregator {
             // Skip chunks the taxis never touched (don't bloat with empty geometry).
             if overall_max == 0 {
                 continue;
+            }
+
+            // Directional: pre-orient the corridor toward its overall-dominant
+            // travel direction so the renderer marches chevrons along the winding.
+            // A negative net means the chunk's vertex order runs against the
+            // dominant flow — reverse both the coords and the matrix rows.
+            let do_reverse =
+                self.directional && chunk_net_along_winding(&self.signed, chunk, &edges) < 0;
+            if do_reverse {
+                reverse_corridor(&mut coords, &mut matrix, n, num_buckets);
+            }
+
+            // Per-bucket direction: encode the sign of each bucket's net flow
+            // (along the FINAL, post-reversal winding) into the magnitude matrix,
+            // so the renderer flips the chevrons per time-step while |value| stays
+            // the volume for colour. Balanced/zero-net buckets keep the baseline
+            // (+, i.e. the overall-dominant winding). Computed after the reversal
+            // so signs are relative to the emitted vertex order.
+            if self.per_bucket_direction {
+                let final_chunk: Vec<i64> = if do_reverse {
+                    chunk.iter().rev().copied().collect()
+                } else {
+                    chunk.to_vec()
+                };
+                for b in 0..num_buckets {
+                    let bin = min_bin + b as i64;
+                    // Net along the final traversal order, per edge.
+                    let seg_signed: Vec<i64> = final_chunk
+                        .windows(2)
+                        .map(|w| {
+                            let e = edge_key(w[0], w[1]);
+                            let along = if w[0] <= w[1] { 1 } else { -1 };
+                            let net =
+                                self.signed.get(&e).and_then(|m| m.get(&bin)).copied().unwrap_or(0);
+                            along * net
+                        })
+                        .collect();
+                    for v in 0..n {
+                        // Per-vertex net = its adjacent segments' net (same
+                        // averaging shape as vertex_values_from_segment_counts).
+                        let vnet = if v == 0 {
+                            seg_signed[0]
+                        } else if v == n - 1 {
+                            seg_signed[n - 2]
+                        } else {
+                            seg_signed[v - 1] + seg_signed[v]
+                        };
+                        // Flip the sign only when this bucket's net runs against
+                        // the winding; |value| (volume) is preserved either way.
+                        if vnet < 0 {
+                            matrix[v * num_buckets + b] = -matrix[v * num_buckets + b];
+                        }
+                    }
+                }
             }
 
             let mut properties = Map::new();
@@ -370,9 +646,62 @@ fn interpolate_times_by_distance(coords: &[[f64; 2]], start_ms: i64, end_ms: i64
         .collect()
 }
 
+/// Sign of a routed segment `p0→p1` relative to an edge's canonical (`a<b`)
+/// orientation: `+1` when travel runs from the lower-id endpoint toward the
+/// higher (the [`edge_key`] order), `-1` otherwise. Geometric — the dot of the
+/// travel vector against the edge's `a→b` vector — so it works for exact and
+/// nearest-edge matches alike. Falls back to `+1` if an endpoint lacks a coord.
+fn segment_orientation(net: &OsmNetwork, p0: [f64; 2], p1: [f64; 2], e: EdgeKey) -> i64 {
+    match (net.node_xy(e.0), net.node_xy(e.1)) {
+        (Some((ax, ay)), Some((bx, by))) => {
+            let dot = (p1[0] - p0[0]) * (bx - ax) + (p1[1] - p0[1]) * (by - ay);
+            if dot >= 0.0 {
+                1
+            } else {
+                -1
+            }
+        }
+        _ => 1,
+    }
+}
+
+/// Signed net flow along a chunk's winding: for each edge `chunk[k]→chunk[k+1]`,
+/// take its stored net (kept along the canonical `a<b`) and flip it when the
+/// chunk traverses the edge high→low, then sum over every edge and bucket.
+/// Positive ⇒ the chunk's vertex order already matches the dominant travel
+/// direction; negative ⇒ reverse it so winding == flow.
+fn chunk_net_along_winding(
+    signed: &HashMap<EdgeKey, HashMap<i64, i64>>,
+    chunk: &[i64],
+    edges: &[EdgeKey],
+) -> i64 {
+    let mut net = 0i64;
+    for (k, e) in edges.iter().enumerate() {
+        let along = if chunk[k] <= chunk[k + 1] { 1 } else { -1 };
+        if let Some(m) = signed.get(e) {
+            let edge_net: i64 = m.values().sum();
+            net += along * edge_net;
+        }
+    }
+    net
+}
+
+/// Reverse a corridor in place: flip the vertex order of both the coordinate
+/// list and the vertex-major `[vertex][bucket]` matrix, so the polyline winds the
+/// other way while every vertex keeps its own value row.
+fn reverse_corridor(coords: &mut [[f64; 2]], matrix: &mut [f32], n: usize, nb: usize) {
+    coords.reverse();
+    for v in 0..(n / 2) {
+        let w = n - 1 - v;
+        for b in 0..nb {
+            matrix.swap(v * nb + b, w * nb + b);
+        }
+    }
+}
+
 /// Per-vertex values from per-segment counts: endpoints take their single
 /// adjacent segment's count, interior vertices the mean of both sides.
-fn vertex_values_from_segment_counts(counts: &[u32]) -> Vec<f32> {
+pub(crate) fn vertex_values_from_segment_counts(counts: &[u32]) -> Vec<f32> {
     let n = counts.len();
     let mut values = Vec::with_capacity(n + 1);
     values.push(counts[0] as f32);
@@ -381,6 +710,189 @@ fn vertex_values_from_segment_counts(counts: &[u32]) -> Vec<f32> {
     }
     values.push(counts[n - 1] as f32);
     values
+}
+
+/// Tuning for [`FlowAggregator::write_parquet_strokes`] directed stroke synthesis.
+#[derive(Clone, Copy, Debug)]
+pub struct StrokeParams {
+    /// Max deflection angle (degrees) allowed to continue a corridor across a
+    /// junction (0 = straight). Larger = longer, less-straight corridors. ~50°.
+    pub angle_threshold_deg: f64,
+    /// Flow-similarity gate: continue only when `min(w1,w2)/max(w1,w2) ≥ ratio`,
+    /// so a corridor SPLITS where a heavy tributary joins or leaves. ~0.35.
+    pub flow_similarity_ratio: f64,
+    /// Drop corridors whose busiest segment carries fewer than this many trips.
+    pub min_stroke_trips: u32,
+}
+
+impl Default for StrokeParams {
+    fn default() -> Self {
+        Self { angle_threshold_deg: 50.0, flow_similarity_ratio: 0.35, min_stroke_trips: 1 }
+    }
+}
+
+/// Deflection angle (degrees; 0 = straight, 180 = U-turn) of the turn a→b→c, with
+/// longitude scaled by `lon_scale` so the angle is geometric, not raw-degree.
+fn deflection_angle(a: (f64, f64), b: (f64, f64), c: (f64, f64), lon_scale: f64) -> f64 {
+    let v1 = ((b.0 - a.0) * lon_scale, b.1 - a.1);
+    let v2 = ((c.0 - b.0) * lon_scale, c.1 - b.1);
+    let n1 = (v1.0 * v1.0 + v1.1 * v1.1).sqrt();
+    let n2 = (v2.0 * v2.0 + v2.1 * v2.1).sqrt();
+    if n1 < 1e-12 || n2 < 1e-12 {
+        return 180.0;
+    }
+    let cos = ((v1.0 * v2.0 + v1.1 * v2.1) / (n1 * n2)).clamp(-1.0, 1.0);
+    cos.acos().to_degrees()
+}
+
+/// Whether two corridor volumes are within the similarity ratio (both > 0).
+fn flow_similar(w1: u32, w2: u32, ratio: f64) -> bool {
+    if w1 == 0 || w2 == 0 {
+        return false;
+    }
+    let (lo, hi) = if w1 <= w2 { (w1, w2) } else { (w2, w1) };
+    (lo as f64) / (hi as f64) >= ratio
+}
+
+/// Volume-based LOD: shallowest zoom a corridor of this peak throughput appears
+/// at. Heaviest trunks anchor the city overview; light corridors fill in deep.
+/// Thresholds tuned from the measured Aug-2024 Montréal corridor distribution
+/// (`total_count` = busiest-segment Σ-over-hours: p50≈200, p90≈1500, p95≈2500,
+/// p99≈5600), so the city overview (z10) shows only the ~top-5% trunk corridors.
+pub(crate) fn stroke_min_zoom(peak: u32) -> u8 {
+    match peak {
+        p if p >= 2500 => 10, // ~p95: sparse trunk overview
+        p if p >= 1000 => 11, // ~p87
+        p if p >= 350 => 12,  // ~p63
+        p if p >= 80 => 13,   // ~p33
+        _ => 14,
+    }
+}
+
+/// Synthesize long, coherent **directed** corridors ("strokes") from directed
+/// per-edge flow.
+///
+/// Greedy good-continuation: seed from each unused directed edge in sorted order,
+/// then extend downstream and upstream, at each junction continuing onto the
+/// unused edge of smallest deflection angle (self-best-fit) — subject to the
+/// angle cap, the flow-similarity gate (so corridors split where volume changes
+/// sharply), and U-turn avoidance. Degree-2 chains contract for free (their lone
+/// option always wins). Deterministic (sorted seeds + sorted candidates + a
+/// `used` set), so the content-addressed packs stay byte-reproducible.
+pub(crate) fn synthesize_strokes<F: Fn(i64) -> (f64, f64)>(
+    dir_counts: &HashMap<(i64, i64), HashMap<i64, u32>>,
+    edge_total: &HashMap<(i64, i64), u32>,
+    node: F,
+    lon_scale: f64,
+    params: &StrokeParams,
+) -> Vec<Vec<i64>> {
+    let angle_thresh = params.angle_threshold_deg;
+    let ratio = params.flow_similarity_ratio;
+
+    // out[u] = downstream neighbours; inc[v] = upstream neighbours (sorted).
+    let mut out: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut inc: HashMap<i64, Vec<i64>> = HashMap::new();
+    for &(u, v) in dir_counts.keys() {
+        out.entry(u).or_default().push(v);
+        inc.entry(v).or_default().push(u);
+    }
+    for vs in out.values_mut() {
+        vs.sort_unstable();
+        vs.dedup();
+    }
+    for us in inc.values_mut() {
+        us.sort_unstable();
+        us.dedup();
+    }
+
+    // Best downstream continuation of edge (u,v): unused (v,x), x≠u, within the
+    // angle + flow gates; min angle then min x for determinism.
+    let best_next = |u: i64, v: i64, used: &HashSet<(i64, i64)>| -> Option<i64> {
+        let wuv = *edge_total.get(&(u, v)).unwrap_or(&0);
+        let mut best: Option<(f64, i64)> = None;
+        for &x in inc_or_out(&out, v) {
+            if x == u || used.contains(&(v, x)) {
+                continue;
+            }
+            let ang = deflection_angle(node(u), node(v), node(x), lon_scale);
+            if ang > angle_thresh
+                || !flow_similar(wuv, *edge_total.get(&(v, x)).unwrap_or(&0), ratio)
+            {
+                continue;
+            }
+            if best.map_or(true, |(ba, bx)| ang < ba - 1e-9 || (ang <= ba + 1e-9 && x < bx)) {
+                best = Some((ang, x));
+            }
+        }
+        best.map(|(_, x)| x)
+    };
+
+    // Best upstream extension of edge (u,v): unused (z,u), z≠v, where the turn
+    // z→u→v is within the gates; min angle then min z.
+    let best_prev = |u: i64, v: i64, used: &HashSet<(i64, i64)>| -> Option<i64> {
+        let wuv = *edge_total.get(&(u, v)).unwrap_or(&0);
+        let mut best: Option<(f64, i64)> = None;
+        for &z in inc_or_out(&inc, u) {
+            if z == v || used.contains(&(z, u)) {
+                continue;
+            }
+            let ang = deflection_angle(node(z), node(u), node(v), lon_scale);
+            if ang > angle_thresh
+                || !flow_similar(wuv, *edge_total.get(&(z, u)).unwrap_or(&0), ratio)
+            {
+                continue;
+            }
+            if best.map_or(true, |(ba, bz)| ang < ba - 1e-9 || (ang <= ba + 1e-9 && z < bz)) {
+                best = Some((ang, z));
+            }
+        }
+        best.map(|(_, z)| z)
+    };
+
+    let mut edges: Vec<(i64, i64)> = dir_counts.keys().copied().collect();
+    edges.sort_unstable();
+
+    let mut used: HashSet<(i64, i64)> = HashSet::new();
+    let mut strokes: Vec<Vec<i64>> = Vec::new();
+    for &(a, b) in &edges {
+        if used.contains(&(a, b)) {
+            continue;
+        }
+        used.insert((a, b));
+
+        // Downstream from (a,b): [b, x, …].
+        let mut fwd: Vec<i64> = vec![b];
+        let (mut u, mut v) = (a, b);
+        while let Some(x) = best_next(u, v, &used) {
+            used.insert((v, x));
+            fwd.push(x);
+            u = v;
+            v = x;
+        }
+        // Upstream from (a,b): [z, …] collected reversed.
+        let mut back: Vec<i64> = Vec::new();
+        let (mut u, mut v) = (a, b);
+        while let Some(z) = best_prev(u, v, &used) {
+            used.insert((z, u));
+            back.push(z);
+            v = u;
+            u = z;
+        }
+        back.reverse();
+
+        // [upstream…, a, b, downstream…]
+        let mut stroke = back;
+        stroke.push(a);
+        stroke.extend(fwd);
+        strokes.push(stroke);
+    }
+    strokes
+}
+
+/// Neighbour slice for a node from an adjacency map, or an empty slice. (Helper
+/// so the stroke closures can iterate without `Option`/empty-slice typing noise.)
+fn inc_or_out(adj: &HashMap<i64, Vec<i64>>, k: i64) -> &[i64] {
+    adj.get(&k).map(Vec::as_slice).unwrap_or(&[])
 }
 
 /// Stream a `--paths` intermediate GeoParquet back through the aggregator,
@@ -575,6 +1087,121 @@ mod tests {
     }
 
     #[test]
+    fn segment_orientation_signs_by_travel() {
+        let n = net();
+        // Edge (1,2) canonical points node 1 (-74.000) → node 2 (-73.999) = +lon.
+        assert_eq!(segment_orientation(&n, [-74.000, 40.0], [-73.999, 40.0], (1, 2)), 1);
+        assert_eq!(segment_orientation(&n, [-73.999, 40.0], [-74.000, 40.0], (1, 2)), -1);
+    }
+
+    #[test]
+    fn directional_tracks_signed_net_and_is_opt_in() {
+        // Off by default: the signed map stays empty, output is the plain heatmap.
+        let mut plain = FlowAggregator::new(900_000, net());
+        let fwd = [[-74.000, 40.000], [-73.999, 40.000]];
+        plain.add_trip(&fwd, Some(&[0, 10_000]), 0, 10_000);
+        assert!(plain.signed.is_empty());
+
+        // On: two forward + one reverse over edge (1,2) → undirected count 3,
+        // signed net along canonical (1→2) = +1 +1 -1 = +1.
+        let mut agg = FlowAggregator::new(900_000, net());
+        agg.set_directional(true);
+        let rev = [[-73.999, 40.000], [-74.000, 40.000]];
+        agg.add_trip(&fwd, Some(&[0, 10_000]), 0, 10_000);
+        agg.add_trip(&fwd, Some(&[0, 10_000]), 0, 10_000);
+        agg.add_trip(&rev, Some(&[0, 10_000]), 0, 10_000);
+        assert_eq!(agg.counts.get(&(1, 2)).unwrap().values().sum::<u32>(), 3);
+        assert_eq!(agg.signed.get(&(1, 2)).unwrap().values().sum::<i64>(), 1);
+    }
+
+    #[test]
+    fn per_bucket_direction_implies_directional() {
+        let mut agg = FlowAggregator::new(900_000, net());
+        assert!(!agg.directional);
+        agg.set_per_bucket_direction(true);
+        assert!(agg.directional, "per-bucket direction needs the signed map");
+        assert!(agg.per_bucket_direction);
+    }
+
+    #[test]
+    fn per_bucket_direction_flips_matrix_sign_per_bucket() {
+        use arrow::array::{Array, Float32Array, ListArray};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        // Line 1→2→3→4. Ride it FORWARD in bin 0, REVERSE in bin 2 (bin 1 idle).
+        let mut agg = FlowAggregator::new(900_000, line_net());
+        agg.set_per_bucket_direction(true);
+        let fwd = [
+            [-73.600, 45.500],
+            [-73.590, 45.500],
+            [-73.580, 45.500],
+            [-73.570, 45.500],
+        ];
+        let rev = [
+            [-73.570, 45.500],
+            [-73.580, 45.500],
+            [-73.590, 45.500],
+            [-73.600, 45.500],
+        ];
+        agg.add_route_bins(&fwd, &HashMap::from([(0i64, 5u32)]));
+        agg.add_route_bins(&rev, &HashMap::from([(2i64, 5u32)]));
+
+        let tmp = std::env::temp_dir().join(format!("stt_pbd_{}.parquet", std::process::id()));
+        let (features, buckets) = agg.write_parquet(&tmp).unwrap();
+        assert_eq!((features, buckets), (1, 3)); // one corridor, bins 0..=2
+
+        let file = std::fs::File::open(&tmp).unwrap();
+        let batch = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let list = batch
+            .column_by_name("vertex_value_matrix")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let m = list
+            .value(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        // Vertex-major [v * nb + b], nb = 3. Vertex 0: bucket 0 (forward) vs
+        // bucket 2 (reverse) must carry OPPOSITE signs, same magnitude (volume).
+        assert!(m[0] > 0.0, "bucket 0 flows along winding → positive, got {}", m[0]);
+        assert!(m[2] < 0.0, "bucket 2 flows against winding → negative, got {}", m[2]);
+        assert_eq!(m[0].abs(), m[2].abs(), "|value| is the volume, sign is direction");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn chunk_net_flips_with_winding_order() {
+        // Edge (1,2) carries net +5 along its canonical 1→2 orientation.
+        let mut signed = HashMap::new();
+        signed.insert((1, 2), HashMap::from([(0i64, 5i64)]));
+        // Forward winding [1,2,3]: net reads +5.
+        assert_eq!(chunk_net_along_winding(&signed, &[1, 2, 3], &[(1, 2), (2, 3)]), 5);
+        // Reversed winding [3,2,1]: the same edge is traversed high→low → -5.
+        assert_eq!(chunk_net_along_winding(&signed, &[3, 2, 1], &[(2, 3), (1, 2)]), -5);
+    }
+
+    #[test]
+    fn reverse_corridor_flips_geometry_and_matrix_rows() {
+        let mut coords = vec![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]];
+        // 3 vertices × 2 buckets, vertex-major: v0=[10,11], v1=[20,21], v2=[30,31].
+        let mut matrix = vec![10.0, 11.0, 20.0, 21.0, 30.0, 31.0];
+        reverse_corridor(&mut coords, &mut matrix, 3, 2);
+        assert_eq!(coords, vec![[2.0, 0.0], [1.0, 0.0], [0.0, 0.0]]);
+        // The middle vertex row is unchanged; the ends swap, each carrying its row.
+        assert_eq!(matrix, vec![30.0, 31.0, 20.0, 21.0, 10.0, 11.0]);
+    }
+
+    #[test]
     fn vertex_values_average_interior() {
         assert_eq!(
             vertex_values_from_segment_counts(&[4, 2, 2]),
@@ -588,5 +1215,115 @@ mod tests {
         let coords = vec![[-73.98, 40.75], [-73.97, 40.76], [-73.96, 40.77]];
         let wkb = crate::common::encode_wkb_linestring(&coords);
         assert_eq!(decode_wkb_linestring(&wkb).unwrap(), coords);
+    }
+
+    // ---- directed flow + stroke synthesis (`--merged-paths`) ----
+
+    /// A 4-node eastward line 1-2-3-4 (Montréal latitude) plus a branch node 5
+    /// due north of 3 (a 90° turn). Geometry-only — stroke synthesis reads just
+    /// `node_xy` + `lon_scale`.
+    fn line_net() -> OsmNetwork {
+        let mut nc = HashMap::new();
+        nc.insert(1, (-73.600, 45.500));
+        nc.insert(2, (-73.590, 45.500));
+        nc.insert(3, (-73.580, 45.500));
+        nc.insert(4, (-73.570, 45.500));
+        nc.insert(5, (-73.580, 45.510));
+        let mut ways = HashMap::new();
+        ways.insert(10, WayRec { refs: vec![1, 2, 3, 4], class: RoadClass::Residential });
+        ways.insert(20, WayRec { refs: vec![3, 5], class: RoadClass::Residential });
+        OsmNetwork::build_indices(nc, ways)
+    }
+
+    /// Build a directed-count map with a single bin (bin 0) per directed edge.
+    fn dir(edges: &[((i64, i64), u32)]) -> HashMap<(i64, i64), HashMap<i64, u32>> {
+        edges
+            .iter()
+            .map(|&(e, w)| (e, HashMap::from([(0i64, w)])))
+            .collect()
+    }
+
+    fn totals(dc: &HashMap<(i64, i64), HashMap<i64, u32>>) -> HashMap<(i64, i64), u32> {
+        dc.iter().map(|(e, b)| (*e, b.values().copied().sum::<u32>())).collect()
+    }
+
+    #[test]
+    fn directed_keeps_both_directions_separate() {
+        let mut agg = FlowAggregator::new(3_600_000, net());
+        let fwd = [[-74.000, 40.000], [-73.999, 40.000], [-73.998, 40.000]];
+        let rev = [[-73.998, 40.000], [-73.999, 40.000], [-74.000, 40.000]];
+        let bins = HashMap::from([(0i64, 3u32)]);
+        agg.add_route_bins_directed(&fwd, &bins);
+        agg.add_route_bins_directed(&rev, &bins);
+        // Four distinct directed edges: (1,2),(2,3),(3,2),(2,1) — undirected
+        // aggregation would have collapsed these to two.
+        assert_eq!(agg.dir_counts.len(), 4);
+        assert_eq!(agg.dir_counts[&(1, 2)].get(&0).copied(), Some(3));
+        assert_eq!(agg.dir_counts[&(2, 1)].get(&0).copied(), Some(3));
+    }
+
+    #[test]
+    fn deflection_straight_vs_turn() {
+        let straight = deflection_angle((-73.60, 45.50), (-73.59, 45.50), (-73.58, 45.50), 0.70);
+        assert!(straight < 1.0, "collinear → ~0°, got {straight}");
+        let turn = deflection_angle((-73.60, 45.50), (-73.59, 45.50), (-73.59, 45.51), 0.70);
+        assert!((80.0..100.0).contains(&turn), "north turn → ~90°, got {turn}");
+    }
+
+    #[test]
+    fn stroke_contracts_degree2_chain() {
+        let net = line_net();
+        let dc = dir(&[((1, 2), 10), ((2, 3), 10), ((3, 4), 10)]);
+        let strokes = synthesize_strokes(&dc, &totals(&dc), |id| net.node_xy(id).unwrap(), net.lon_scale(), &StrokeParams::default());
+        assert_eq!(strokes, vec![vec![1, 2, 3, 4]]);
+    }
+
+    #[test]
+    fn stroke_splits_on_flow_dropoff() {
+        let net = line_net();
+        // 1→2→3 heavy (100), 3→4 light (5): ratio 0.05 < 0.35 → split at node 3.
+        let dc = dir(&[((1, 2), 100), ((2, 3), 100), ((3, 4), 5)]);
+        let strokes = synthesize_strokes(&dc, &totals(&dc), |id| net.node_xy(id).unwrap(), net.lon_scale(), &StrokeParams::default());
+        assert_eq!(strokes.len(), 2);
+        assert!(strokes.contains(&vec![1, 2, 3]));
+        assert!(strokes.contains(&vec![3, 4]));
+    }
+
+    #[test]
+    fn stroke_stops_at_sharp_turn() {
+        let net = line_net();
+        // Equal flow, but the 90° turn 3→5 exceeds the 50° default cap.
+        let dc = dir(&[((1, 2), 10), ((2, 3), 10), ((3, 5), 10)]);
+        let strokes = synthesize_strokes(&dc, &totals(&dc), |id| net.node_xy(id).unwrap(), net.lon_scale(), &StrokeParams::default());
+        assert!(strokes.contains(&vec![1, 2, 3]));
+        assert!(strokes.contains(&vec![3, 5]));
+    }
+
+    #[test]
+    fn strokes_are_deterministic() {
+        let net = line_net();
+        let dc = dir(&[((1, 2), 10), ((2, 3), 10), ((3, 4), 10), ((3, 5), 10)]);
+        let a = synthesize_strokes(&dc, &totals(&dc), |id| net.node_xy(id).unwrap(), net.lon_scale(), &StrokeParams::default());
+        let b = synthesize_strokes(&dc, &totals(&dc), |id| net.node_xy(id).unwrap(), net.lon_scale(), &StrokeParams::default());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn write_strokes_matrix_is_vertex_major() {
+        let mut agg = FlowAggregator::new(3_600_000, line_net());
+        // Route 1→2→3→4 in bin 0 (×8 trips).
+        let coords = [
+            [-73.600, 45.500],
+            [-73.590, 45.500],
+            [-73.580, 45.500],
+            [-73.570, 45.500],
+        ];
+        agg.add_route_bins_directed(&coords, &HashMap::from([(0i64, 8u32)]));
+        let tmp = std::env::temp_dir().join(format!("stt_strokes_{}.parquet", std::process::id()));
+        let (features, buckets) = agg
+            .write_parquet_strokes(&tmp, &StrokeParams { min_stroke_trips: 1, ..Default::default() })
+            .unwrap();
+        assert_eq!((features, buckets), (1, 1)); // one corridor, one bucket
+        let _ = std::fs::remove_file(&tmp);
     }
 }

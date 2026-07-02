@@ -1,7 +1,7 @@
 //! stt-optimize as a library.
 //!
-//! `stt-build --auto` calls into [`recommend_for`] to pick zoom levels,
-//! temporal bucket, and compression from an input file before building.
+//! `stt-build --auto` calls into [`recommend_for`] to pick zoom levels and
+//! a temporal bucket from an input file before building.
 //! The CLI in `main.rs` is a thin wrapper around the same functions.
 
 pub mod analysis;

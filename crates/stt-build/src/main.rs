@@ -2,8 +2,9 @@
 //!
 //! This tool converts GeoParquet files into optimized STT archives for web visualization.
 
-use stt_build::{input, summary, tiler};
+use stt_build::build_options::{self, parse_duration, parse_temporal_lod, EncoderSettings};
 use stt_build::tiler::TileWriter;
+use stt_build::{input, summary, tiler};
 
 use anyhow::{Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser};
@@ -264,7 +265,7 @@ struct Args {
     // --- Summary-tier options (server-aggregated low-zoom tier) ---
     /// Emit a pre-aggregated summary tier alongside the raw tier.
     /// Aggregation scheme: `h3` (Uber H3 hexes) or `quadbin` (CARTO quadbin).
-    /// Currently only `h3` is implemented.
+    /// Both `h3` and `quadbin` are implemented.
     ///
     /// Summary tiles live in the same archive directory as raw tiles but use
     /// a distinct layer name (`summary` by default). Readers dispatch
@@ -473,8 +474,9 @@ struct Args {
     exclude_all: bool,
 }
 
-/// Aggregation scheme for `--summary-tier`. `quadbin` is reserved (declared
-/// here so the CLI vocabulary is stable) but not implemented yet.
+/// Aggregation scheme for `--summary-tier`: Uber `h3` hexes or CARTO `quadbin`
+/// cells. Both are implemented (see the `summary` module and the `SummaryScheme`
+/// mapping below).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum SummaryTierScheme {
     H3,
@@ -815,92 +817,23 @@ fn main() -> Result<()> {
         info!("Publish build: zstd-{}", args.zstd_level);
     }
 
-    // Per-vertex time precision is a process-wide encoder setting (the
-    // encode sites sit behind generic tile-writer traits with no per-call
-    // options channel). Set once, before any tile is encoded.
-    stt_core::arrow_tile::set_vertex_time_max_step_ms(args.vertex_time_precision);
-
-    // Coordinate quantization is likewise a process-wide encoder setting, read
-    // by both the streaming and in-memory builders. Off (0) unless opted in.
-    stt_core::arrow_tile::set_quantize_coords_m(args.quantize_coords);
-    if args.quantize_coords > 0.0 {
-        info!(
-            "Coordinate quantization ENABLED: {} m fixed-point geometry (non-GeoArrow-Float64; \
-             reader reconstructs)",
-            args.quantize_coords
-        );
+    // Process-wide encoder settings (vertex-time precision, coordinate +
+    // numeric-attribute quantization, vector grouping, point-elevation fold) are
+    // globals on `stt_core::arrow_tile` read at encode time by both the
+    // in-memory and streaming builders. Parsed + installed via the shared
+    // `build_options` module so a live `stt-serve` configures the encoder
+    // byte-identically. Set once, before any tile is encoded.
+    let enabled = EncoderSettings {
+        vertex_time_precision: Some(args.vertex_time_precision),
+        quantize_coords_m: args.quantize_coords,
+        quantize_attr: args.quantize_attr.clone(),
+        quantize_attrs_auto: args.quantize_attrs_auto,
+        vector_group: args.vector_group.clone(),
+        point_elevation_column: args.point_elevation_column.clone(),
     }
-
-    // Numeric-attribute quantization (e.g. LiDAR `z`) — also a process-wide
-    // encoder setting. Parse `NAME=PREC` pairs once, before any tile is encoded.
-    if !args.quantize_attr.is_empty() {
-        let mut attrs: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-        for spec in &args.quantize_attr {
-            let (name, prec) = spec
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("--quantize-attr expects NAME=PREC, got {spec:?}"))?;
-            let prec: f64 = prec.trim().parse().map_err(|_| {
-                anyhow::anyhow!("--quantize-attr {spec:?}: PREC {prec:?} is not a number")
-            })?;
-            if prec <= 0.0 {
-                anyhow::bail!("--quantize-attr {spec:?}: PREC must be > 0");
-            }
-            attrs.insert(name.trim().to_string(), prec);
-        }
-        info!(
-            "Numeric-attribute quantization ENABLED: {:?} (fixed-point; reader reconstructs)",
-            attrs
-        );
-        stt_core::arrow_tile::set_quantize_attrs(attrs);
-    }
-    if args.quantize_attrs_auto {
-        info!("Automatic range-adaptive numeric-attribute quantization ENABLED (every Float64 prop → u16)");
-        stt_core::arrow_tile::set_quantize_attrs_auto(true);
-    }
-
-    // Vector grouping (e.g. surfel quat/scale/colour) — fuse scalar columns into
-    // a GPU-ready interleaved FixedSizeList. Parse `NAME=col1,col2[:f32|u8]`.
-    if !args.vector_group.is_empty() {
-        use stt_core::arrow_tile::{VectorElem, VectorGroup};
-        let mut groups: Vec<VectorGroup> = Vec::new();
-        for spec in &args.vector_group {
-            let (name, rest) = spec.split_once('=').ok_or_else(|| {
-                anyhow::anyhow!("--vector-group expects NAME=COLS[:f32|u8], got {spec:?}")
-            })?;
-            // Optional trailing `:f32` / `:u8` selects the leaf upload type.
-            let (cols_str, elem) = match rest.rsplit_once(':') {
-                Some((cols, "u8")) => (cols, VectorElem::U8),
-                Some((cols, "f32")) => (cols, VectorElem::F32),
-                Some((_, other)) => {
-                    anyhow::bail!("--vector-group {spec:?}: leaf type {other:?} must be f32 or u8")
-                }
-                None => (rest, VectorElem::F32),
-            };
-            let components: Vec<String> = cols_str
-                .split(',')
-                .map(|c| c.trim().to_string())
-                .filter(|c| !c.is_empty())
-                .collect();
-            if components.is_empty() {
-                anyhow::bail!("--vector-group {spec:?}: no component columns");
-            }
-            groups.push(VectorGroup {
-                name: name.trim().to_string(),
-                components,
-                elem,
-            });
-        }
-        info!(
-            "Vector grouping ENABLED: {} group(s) → interleaved FixedSizeList columns",
-            groups.len()
-        );
-        stt_core::arrow_tile::set_vector_groups(groups);
-    }
-    if let Some(col) = args.point_elevation_column.as_deref() {
-        if !col.is_empty() {
-            info!("3D POINT geometry ENABLED: folding '{col}' into the geometry's z coordinate");
-            stt_core::arrow_tile::set_point_elevation_column(col);
-        }
+    .apply()?;
+    if !enabled.is_empty() {
+        info!("Encoder settings ENABLED: {}", enabled.join(", "));
     }
 
     // Parse compression
@@ -1781,22 +1714,11 @@ fn parse_compression(s: &str) -> Result<stt_core::types::Compression> {
 /// budget still drops the LEAST-important features (a `Combined`
 /// geometry+property score) rather than randomly.
 fn build_tile_budget(args: &Args) -> Option<stt_core::budget::TileBudget> {
-    use stt_core::budget::{ImportanceScorer, TileBudget};
-    if args.maximum_tile_bytes.is_none() && args.maximum_tile_features.is_none() {
-        return None;
-    }
-    // Unset cap → effectively unbounded for that axis, so only the axis the
-    // user actually set constrains the tile.
-    let max_bytes = args.maximum_tile_bytes.unwrap_or(usize::MAX);
-    let max_features = args.maximum_tile_features.unwrap_or(usize::MAX);
-    let scorer = if args.drop_densest_as_needed {
-        ImportanceScorer::GeometrySize
-    } else {
-        ImportanceScorer::Combined
-    };
-    // `max_compressed_size` is unused by the build-time enforcement (we cap the
-    // pre-compression estimate); set it to the byte cap so the struct is sane.
-    Some(TileBudget::new(max_bytes, max_bytes, max_features).with_scorer(scorer))
+    build_options::build_tile_budget(
+        args.maximum_tile_bytes,
+        args.maximum_tile_features,
+        args.drop_densest_as_needed,
+    )
 }
 
 /// Resolve `--exclude` / `--include` / `--exclude-all` into an
@@ -1810,37 +1732,11 @@ fn build_tile_budget(args: &Args) -> Option<stt_core::budget::TileBudget> {
 ///   removed by the filter — refusing rather than silently breaking those
 ///   features.
 fn build_attribute_filter(args: &Args) -> Result<stt_build::columnar::AttributeFilter> {
-    use stt_build::columnar::AttributeFilter;
-    use std::collections::HashSet;
-
-    let has_exclude = !args.exclude.is_empty();
-    let has_include = !args.include.is_empty();
-
-    // Mutual exclusivity (exclude / include / exclude-all are three ways to say
-    // the same thing and must not be combined).
-    let modes = [has_exclude, has_include, args.exclude_all]
-        .iter()
-        .filter(|b| **b)
-        .count();
-    if modes > 1 {
-        anyhow::bail!(
-            "--exclude, --include and --exclude-all are mutually exclusive; pass at most one"
-        );
-    }
-
-    let filter = if args.exclude_all {
-        AttributeFilter::ExcludeAll
-    } else if has_include {
-        AttributeFilter::Include(args.include.iter().cloned().collect())
-    } else if has_exclude {
-        AttributeFilter::Exclude(args.exclude.iter().cloned().collect())
-    } else {
-        AttributeFilter::KeepAll
-    };
-
     // Guard columns other features depend on. A filter that would drop a
     // property the heatmap/summary/min-zoom passes read is almost certainly a
-    // mistake — error out rather than emit a quietly-broken archive.
+    // mistake — the shared builder errors rather than emit a quietly-broken
+    // archive. Summary aggregation source columns are resolved here (stt-build
+    // specific) and threaded into the shared filter builder as `required`.
     let mut required: Vec<String> = Vec::new();
     if let Some(w) = &args.heatmap_weight {
         required.push(w.clone());
@@ -1854,98 +1750,18 @@ fn build_attribute_filter(args: &Args) -> Result<stt_build::columnar::AttributeF
     if let Some(z) = &args.max_zoom_field {
         required.push(z.clone());
     }
-    // Summary aggregation source columns (the `name` of each `name:agg` entry).
     for col in summary::parse_summary_columns(&args.summary_columns)? {
         if !col.name.is_empty() && col.name != "_count" {
             required.push(col.name.clone());
         }
     }
 
-    let dropped_required: Vec<&String> =
-        required.iter().filter(|p| !filter.keeps(p)).collect();
-    if !dropped_required.is_empty() {
-        let uniq: HashSet<&String> = dropped_required.into_iter().collect();
-        let mut names: Vec<&str> = uniq.iter().map(|s| s.as_str()).collect();
-        names.sort_unstable();
-        anyhow::bail!(
-            "attribute filter would drop column(s) still needed by another build \
-             feature (--heatmap-weight/--heatmap-class/--summary-columns/\
-             --min-zoom-field/--max-zoom-field): {}. Add them to --include (or \
-             drop the conflicting flag).",
-            names.join(", ")
-        );
-    }
-
-    Ok(filter)
-}
-
-/// Parse a `--temporal-lod` spec like `"1d,30d"` or `"1d@8,30d@4"`. Each
-/// entry is `<duration>` (applies at every zoom) or `<duration>@<zoom>`
-/// (applies at zoom <= the given level). Entries are returned in input
-/// order so the build can re-validate sorting against the base bucket.
-fn parse_temporal_lod(
-    s: &str,
-    fallback_max_zoom: u8,
-) -> Result<Vec<stt_core::metadata::TemporalLodLevel>> {
-    let mut levels = Vec::new();
-    for piece in s.split(',') {
-        let piece = piece.trim();
-        if piece.is_empty() {
-            continue;
-        }
-        let (dur, zoom) = match piece.split_once('@') {
-            Some((d, z)) => {
-                let z: u8 = z
-                    .trim()
-                    .parse()
-                    .with_context(|| format!("invalid zoom in temporal-lod entry '{piece}'"))?;
-                (d.trim(), z)
-            }
-            None => (piece, fallback_max_zoom),
-        };
-        let bucket_ms = parse_duration(dur)
-            .with_context(|| format!("invalid duration in temporal-lod entry '{piece}'"))?;
-        levels.push(stt_core::metadata::TemporalLodLevel {
-            bucket_ms,
-            max_zoom_level: zoom,
-        });
-    }
-    Ok(levels)
-}
-
-/// Parse a duration string like "1h", "6h", "1d", "30m" into milliseconds
-fn parse_duration(s: &str) -> Result<u64> {
-    let s = s.trim().to_lowercase();
-
-    // Try to extract number and unit
-    let mut num_str = String::new();
-    let mut unit = String::new();
-
-    for c in s.chars() {
-        if c.is_ascii_digit() || c == '.' {
-            num_str.push(c);
-        } else {
-            unit.push(c);
-        }
-    }
-
-    let value: f64 = num_str
-        .parse()
-        .context(format!("Invalid duration value: {}", s))?;
-
-    let multiplier: u64 = match unit.as_str() {
-        "ms" | "" => 1,
-        "s" | "sec" => 1000,
-        "m" | "min" => 60 * 1000,
-        "h" | "hr" | "hour" => 60 * 60 * 1000,
-        "d" | "day" => 24 * 60 * 60 * 1000,
-        _ => anyhow::bail!(
-            "Invalid duration unit '{}'. Use ms, s, m, h, or d (e.g., '1h', '30m', '6h')",
-            unit
-        ),
-    };
-
-    Ok((value * multiplier as f64) as u64)
+    build_options::build_attribute_filter(
+        &args.exclude,
+        &args.include,
+        args.exclude_all,
+        &required,
+    )
 }
 
 #[cfg(test)]
@@ -2086,5 +1902,35 @@ mod tests {
             .expect("no source should error")
             .to_string();
         assert!(err.contains("no input"), "got: {err}");
+    }
+
+    /// Doc gate (naming-types-consistency F9): every visible long flag must
+    /// appear in THIS binary's section of `docs/api/cli-reference.md`, so a new
+    /// flag fails the build until it is documented. Scoped to the section so a
+    /// flag documented under another binary can't satisfy the gate.
+    #[test]
+    fn cli_flags_are_documented_in_cli_reference() {
+        let doc = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/api/cli-reference.md"
+        ))
+        .expect("read docs/api/cli-reference.md");
+        let start = doc.find("## `stt-build`").expect("stt-build section heading");
+        let body = &doc[start + 1..];
+        let end = body.find("\n## `").map(|i| start + 1 + i).unwrap_or(doc.len());
+        let section = &doc[start..end];
+        let missing: Vec<String> = Args::command()
+            .get_arguments()
+            .filter(|a| !a.is_hide_set())
+            .filter_map(|a| a.get_long())
+            .filter(|l| !matches!(*l, "help" | "version"))
+            .map(|l| format!("--{l}"))
+            .filter(|f| !section.contains(f.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "flags missing from the `stt-build` section of docs/api/cli-reference.md \
+             (document them before shipping): {missing:?}"
+        );
     }
 }

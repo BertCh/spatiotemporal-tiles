@@ -48,9 +48,6 @@ pub(crate) struct OsrmLeg {
 pub(crate) struct OsrmAnnotation {
     #[serde(default)]
     pub(crate) duration: Vec<f64>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub(crate) distance: Vec<f64>,
 }
 
 /// Probe the OSRM server with a trivial route and confirm it answers `Ok`.
@@ -151,4 +148,166 @@ pub(crate) fn get_osrm_route_pooled(
 
         Ok(body.routes.and_then(|mut r| r.pop()))
     })
+}
+
+/// Flatten an OSRM route into `[lon, lat]` vertices plus, when the response was
+/// annotated (`annotations=duration`), the per-edge durations in seconds.
+///
+/// The durations come back as `Some` only when they're self-consistent — one
+/// per edge (`coords.len() - 1`) and summing to a positive total — so callers
+/// can treat `Some` as "usable per-segment timing" without re-checking. The
+/// coords are returned even when the timing isn't, so a caller can still bake
+/// geometry and let stt-build fall back to uniform-by-distance interpolation.
+pub(crate) fn route_geometry(route: &OsrmRoute) -> (Vec<[f64; 2]>, Option<Vec<f64>>) {
+    let coords: Vec<[f64; 2]> = route
+        .geometry
+        .coordinates
+        .iter()
+        .map(|c| [c[0], c[1]])
+        .collect();
+    // For a single source→destination request there is one leg whose
+    // annotation.duration has `coords.len() - 1` entries; concatenate across
+    // legs defensively so a multi-leg response (unused today) still works.
+    let mut durations: Vec<f64> = Vec::with_capacity(coords.len().saturating_sub(1));
+    for leg in &route.legs {
+        if let Some(ann) = &leg.annotation {
+            durations.extend(ann.duration.iter().copied());
+        }
+    }
+    let edge = (coords.len() >= 2
+        && durations.len() == coords.len() - 1
+        && durations.iter().sum::<f64>() > 0.0)
+        .then_some(durations);
+    (coords, edge)
+}
+
+/// Turn per-edge OSRM durations into per-vertex absolute Unix-ms timestamps,
+/// rescaled to land exactly on `[start_ms, end_ms]`.
+///
+/// OSRM's predicted total usually differs from a trip's recorded duration by
+/// ±10-30%, but the *shape* of the per-edge distribution (which edges are fast,
+/// which slow) is what drives the per-segment-speed effect, so we keep the shape
+/// and stretch it onto the real window. The last vertex is pinned to `end_ms`
+/// so cumulative rounding never drifts the trip's end off its recorded value.
+///
+/// Returns `None` (caller falls back to uniform-by-distance interpolation)
+/// unless there is exactly one duration per edge, they sum positive, and the
+/// window is non-empty.
+pub(crate) fn vertex_timestamps_from_durations(
+    n_coords: usize,
+    edge_durations: &[f64],
+    start_ms: i64,
+    end_ms: i64,
+) -> Option<Vec<i64>> {
+    if n_coords < 2 || end_ms <= start_ms || edge_durations.len() != n_coords - 1 {
+        return None;
+    }
+    let total: f64 = edge_durations.iter().sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let window_ms = (end_ms - start_ms) as f64;
+    let mut acc = 0.0f64;
+    let mut out: Vec<i64> = Vec::with_capacity(n_coords);
+    out.push(start_ms);
+    for &d in edge_durations {
+        acc += d;
+        out.push(start_ms + (acc / total * window_ms) as i64);
+    }
+    if let Some(last) = out.last_mut() {
+        *last = end_ms;
+    }
+    Some(out)
+}
+
+/// Convenience: per-vertex absolute timestamps for a whole route across
+/// `[start_ms, end_ms]`. `None` when the route carries no usable per-edge
+/// annotations. Reads the vertex count and per-edge durations directly (no
+/// throwaway coord allocation) — this runs per trip under a rayon pool, and
+/// callers that also need the geometry build it once themselves. The
+/// consistency checks live in [`vertex_timestamps_from_durations`], so this
+/// stays identical to gating on [`route_geometry`]'s `Some` edge.
+pub(crate) fn vertex_timestamps_from_route(
+    route: &OsrmRoute,
+    start_ms: i64,
+    end_ms: i64,
+) -> Option<Vec<i64>> {
+    let n_coords = route.geometry.coordinates.len();
+    let mut durations: Vec<f64> = Vec::with_capacity(n_coords.saturating_sub(1));
+    for leg in &route.legs {
+        if let Some(ann) = &leg.annotation {
+            durations.extend(ann.duration.iter().copied());
+        }
+    }
+    vertex_timestamps_from_durations(n_coords, &durations, start_ms, end_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an `OsrmRoute` from `[lon,lat]` coords and optional per-edge
+    /// durations (one leg; `None` = no annotation, as OSRM returns without
+    /// `annotations=duration`).
+    fn mk_route(coords: &[[f64; 2]], durations: Option<Vec<f64>>) -> OsrmRoute {
+        OsrmRoute {
+            geometry: OsrmGeometry {
+                coordinates: coords.iter().map(|c| vec![c[0], c[1]]).collect(),
+            },
+            legs: vec![OsrmLeg {
+                annotation: durations.map(|duration| OsrmAnnotation { duration }),
+            }],
+        }
+    }
+
+    #[test]
+    fn route_geometry_gates_on_consistent_annotations() {
+        let coords = [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]];
+        // Consistent: one duration per edge, positive sum → Some.
+        let (c, edge) = route_geometry(&mk_route(&coords, Some(vec![10.0, 30.0])));
+        assert_eq!(c, coords.to_vec());
+        assert_eq!(edge, Some(vec![10.0, 30.0]));
+        // Coords still returned when timing is unusable, so callers can bake
+        // geometry and let stt-build interpolate.
+        assert!(route_geometry(&mk_route(&coords, None)).1.is_none()); // no annotations
+        assert!(route_geometry(&mk_route(&coords, Some(vec![10.0]))).1.is_none()); // wrong count
+        assert!(route_geometry(&mk_route(&coords, Some(vec![0.0, 0.0]))).1.is_none()); // zero total
+    }
+
+    #[test]
+    fn route_wrapper_rescales_end_to_end() {
+        let coords = [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]];
+        // Same rescale as the durations path: 0%, 75%, 100% of a 40s window.
+        let vt = vertex_timestamps_from_route(&mk_route(&coords, Some(vec![30.0, 10.0])), 1_000, 41_000);
+        assert_eq!(vt, Some(vec![1_000, 31_000, 41_000]));
+        // No annotations → None so the caller falls back to uniform-by-distance.
+        assert!(vertex_timestamps_from_route(&mk_route(&coords, None), 0, 1_000).is_none());
+    }
+
+    #[test]
+    fn rescales_durations_onto_window() {
+        // 3 vertices / 2 edges; leg0 is 3× leg1 (slow then fast). Rescaled onto
+        // a 40s window starting at t=1000: 0%, 75%, 100% → 1000, 31000, 41000.
+        let vt = vertex_timestamps_from_durations(3, &[30.0, 10.0], 1_000, 41_000).unwrap();
+        assert_eq!(vt, vec![1_000, 31_000, 41_000]);
+    }
+
+    #[test]
+    fn endpoints_are_exact() {
+        // Durations that don't divide the window evenly still start/end exactly.
+        let vt = vertex_timestamps_from_durations(4, &[1.0, 1.0, 1.0], 0, 10_000).unwrap();
+        assert_eq!(vt.len(), 4);
+        assert_eq!(*vt.first().unwrap(), 0);
+        assert_eq!(*vt.last().unwrap(), 10_000);
+        // Monotonic non-decreasing.
+        assert!(vt.windows(2).all(|w| w[1] >= w[0]));
+    }
+
+    #[test]
+    fn rejects_degenerate_inputs() {
+        assert!(vertex_timestamps_from_durations(3, &[1.0], 0, 10).is_none()); // wrong edge count
+        assert!(vertex_timestamps_from_durations(3, &[1.0, 1.0], 10, 0).is_none()); // reversed window
+        assert!(vertex_timestamps_from_durations(1, &[], 0, 10).is_none()); // < 2 coords
+        assert!(vertex_timestamps_from_durations(2, &[0.0], 0, 10).is_none()); // zero total
+    }
 }

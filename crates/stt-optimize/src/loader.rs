@@ -3,10 +3,12 @@
 //! Provides unified data loading from different sources for analysis.
 
 use anyhow::{Context, Result};
-use arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray};
+use arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampSecondArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray};
 use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::path::{Path, PathBuf};
+use stt_core::projection::tile_coords_to_lonlat;
+use stt_core::timestamp::{normalize_timestamp_to_ms, TimestampUnit};
 use stt_core::types::{BoundingBox, TimeRange};
 
 /// Data source specification
@@ -41,7 +43,6 @@ impl DataSource {
 
 /// A loaded feature for analysis
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct AnalyzableFeature {
     /// Longitude (centroid for complex geometries)
     pub lon: f64,
@@ -49,8 +50,6 @@ pub struct AnalyzableFeature {
     pub lat: f64,
     /// Timestamp in milliseconds
     pub timestamp: u64,
-    /// End timestamp for features with duration
-    pub end_timestamp: Option<u64>,
     /// Geometry type
     pub geometry_type: GeometryType,
     /// Number of vertices in the geometry
@@ -89,12 +88,10 @@ impl std::fmt::Display for GeometryType {
 
 /// Loaded dataset for analysis
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct LoadedData {
     pub features: Vec<AnalyzableFeature>,
     pub bounds: BoundingBox,
     pub time_range: TimeRange,
-    pub source_name: String,
 }
 
 /// Load data from a data source
@@ -170,7 +167,6 @@ fn load_geoparquet(path: &Path, time_field: &str, time_format: &str) -> Result<L
                 lon,
                 lat,
                 timestamp,
-                end_timestamp: None,
                 geometry_type: geom_type,
                 vertex_count,
                 estimated_size,
@@ -189,9 +185,6 @@ fn load_geoparquet(path: &Path, time_field: &str, time_format: &str) -> Result<L
         features,
         bounds: BoundingBox::new(min_lon, min_lat, max_lon, max_lat),
         time_range: TimeRange::new(min_time, max_time),
-        source_name: path.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
     })
 }
 
@@ -216,10 +209,21 @@ fn load_stt_archive(path: &Path) -> Result<LoadedData> {
 
     // Extract feature info from index entries
     for entry in entries {
+        anyhow::ensure!(
+            entry.zoom < 32,
+            "corrupt archive: tile entry {}/{}/{} has zoom {} (must be < 32)",
+            entry.zoom,
+            entry.x,
+            entry.y,
+            entry.zoom,
+        );
         // For STT archives, we estimate based on tile metadata
-        // Each tile entry gives us aggregate info
-        let lon = (entry.x as f64 + 0.5) / (1u32 << entry.zoom) as f64 * 360.0 - 180.0;
-        let lat = 85.0511 * (1.0 - 2.0 * (entry.y as f64 + 0.5) / (1u32 << entry.zoom) as f64);
+        // Each tile entry gives us aggregate info. The tile center comes from
+        // the shared Web-Mercator inverse (atan∘sinh, see
+        // stt_core::projection::tile_to_lonlat): extent 2 / (1,1) is the exact
+        // tile midpoint.
+        let center = tile_coords_to_lonlat(1, 1, entry.zoom, entry.x, entry.y, 2);
+        let (lon, lat) = (center.x(), center.y());
 
         // Create a synthetic feature per tile for analysis
         // This is a rough approximation for existing archives
@@ -227,7 +231,6 @@ fn load_stt_archive(path: &Path) -> Result<LoadedData> {
             lon,
             lat,
             timestamp: entry.time_start.max(0) as u64,
-            end_timestamp: Some(entry.time_end.max(0) as u64),
             geometry_type: GeometryType::Point, // Unknown from index
             vertex_count: 1,
             estimated_size: entry.length as usize,
@@ -249,9 +252,6 @@ fn load_stt_archive(path: &Path) -> Result<LoadedData> {
         features,
         bounds,
         time_range,
-        source_name: path.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
     })
 }
 
@@ -414,40 +414,47 @@ fn extract_timestamps_from_batch(
     let column = batch.column(col_idx);
     let mut timestamps = Vec::with_capacity(batch.num_rows());
 
-    // Try as timestamp array (milliseconds)
+    // Timestamp-unit scaling routes through the shared `normalize_timestamp_to_ms`
+    // (stt_core::timestamp) so this analysis loader agrees byte-for-byte with the
+    // stt-build scalar/vertex readers and the DuckDB reader — the divergent local
+    // `.max(0)`/hand-rolled ÷ arithmetic here was the audited bug. Null entries
+    // still coerce to 0 (this loader's historical tolerance); a pre-1970 or
+    // second→ms-overflowing value now hard-errors like the build path.
+    macro_rules! push_ts_column {
+        ($arr:expr, $unit:expr) => {{
+            for i in 0..batch.num_rows() {
+                if $arr.is_valid(i) {
+                    timestamps.push(normalize_timestamp_to_ms(i, $arr.value(i), $unit)?);
+                } else {
+                    timestamps.push(0);
+                }
+            }
+            return Ok(timestamps);
+        }};
+    }
+
+    if let Some(ts_array) = column.as_any().downcast_ref::<TimestampSecondArray>() {
+        push_ts_column!(ts_array, TimestampUnit::Second);
+    }
     if let Some(ts_array) = column.as_any().downcast_ref::<TimestampMillisecondArray>() {
-        for i in 0..batch.num_rows() {
-            if ts_array.is_valid(i) {
-                timestamps.push(ts_array.value(i) as u64);
-            } else {
-                timestamps.push(0);
-            }
-        }
-        return Ok(timestamps);
+        push_ts_column!(ts_array, TimestampUnit::Millisecond);
     }
-
-    // Try as timestamp array (microseconds)
     if let Some(ts_array) = column.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        for i in 0..batch.num_rows() {
-            if ts_array.is_valid(i) {
-                timestamps.push((ts_array.value(i) / 1000) as u64);
-            } else {
-                timestamps.push(0);
-            }
-        }
-        return Ok(timestamps);
+        push_ts_column!(ts_array, TimestampUnit::Microsecond);
+    }
+    if let Some(ts_array) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        push_ts_column!(ts_array, TimestampUnit::Nanosecond);
     }
 
-    // Try as i64 array
+    // Try as i64 array (unix timestamp), interpreted per `--time-format`.
     if let Some(int_array) = column.as_any().downcast_ref::<Int64Array>() {
+        let unit = match time_format {
+            "unix-sec" => TimestampUnit::Second,
+            _ => TimestampUnit::Millisecond,
+        };
         for i in 0..batch.num_rows() {
             if int_array.is_valid(i) {
-                let value = int_array.value(i) as u64;
-                let ts = match time_format {
-                    "unix-sec" => value * 1000,
-                    _ => value,
-                };
-                timestamps.push(ts);
+                timestamps.push(normalize_timestamp_to_ms(i, int_array.value(i), unit)?);
             } else {
                 timestamps.push(0);
             }

@@ -1,7 +1,7 @@
 //! Geometry complexity and size analysis
 //!
 //! Analyzes geometry types, vertex counts, and estimated sizes
-//! to inform compression and chunk sizing decisions.
+//! to inform complexity classification and chunk sizing decisions.
 
 use crate::loader::LoadedData;
 use anyhow::Result;
@@ -23,9 +23,6 @@ pub struct GeometryAnalysis {
     pub property_stats: PropertyStats,
     /// Geometry complexity classification
     pub complexity: GeometryComplexity,
-    /// Recommended compression method. Advisory only — the packed STT format is
-    /// zstd-only, so this is always zstd and `stt-build --auto` ignores it.
-    pub recommended_compression: String,
 }
 
 /// Vertex count statistics
@@ -128,9 +125,6 @@ pub fn analyze(data: &LoadedData) -> Result<GeometryAnalysis> {
     // Classify complexity
     let complexity = classify_complexity(&vertex_stats, &dominant_type, &type_counts);
 
-    // Recommend compression
-    let recommended_compression = recommend_compression(&complexity, &size_stats);
-
     Ok(GeometryAnalysis {
         type_distribution: type_counts,
         dominant_type,
@@ -138,7 +132,6 @@ pub fn analyze(data: &LoadedData) -> Result<GeometryAnalysis> {
         size_stats,
         property_stats,
         complexity,
-        recommended_compression,
     })
 }
 
@@ -170,7 +163,6 @@ fn empty_analysis() -> GeometryAnalysis {
             avg: 0.0,
         },
         complexity: GeometryComplexity::Simple,
-        recommended_compression: "zstd".to_string(),
     }
 }
 
@@ -271,16 +263,6 @@ fn classify_complexity(
     }
 
     GeometryComplexity::Moderate
-}
-
-/// Recommend a compression method.
-///
-/// The packed STT format is zstd-only, so this is always "zstd". The field is
-/// kept (rather than dropped) because it appears in the advisory report/JSON;
-/// `stt-build --auto` ignores it. Complexity and size are unused but retained
-/// so the signature documents the inputs this decision would consider.
-fn recommend_compression(_complexity: &GeometryComplexity, _size_stats: &SizeStats) -> String {
-    "zstd".to_string()
 }
 
 #[cfg(test)]

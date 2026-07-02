@@ -34,6 +34,7 @@ pub mod metadata;
 pub mod pack;
 pub mod projection;
 pub mod tile;
+pub mod timestamp;
 pub mod types;
 
 // Re-export commonly used types.
@@ -52,6 +53,9 @@ pub use archive::{Archive, ArchiveReader, ArchiveWriter};
 pub use curve::BlobOrdering;
 pub use error::{Error, Result};
 pub use tile::TileId;
+pub use timestamp::{
+    normalize_timestamp_to_ms, reject_negative_timestamp, scale_timestamp_to_ms, TimestampUnit,
+};
 pub use types::{BoundingBox, TimeRange};
 
 #[cfg(test)]

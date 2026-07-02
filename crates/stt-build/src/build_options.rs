@@ -1,0 +1,367 @@
+//! Shared flag → config parsing used by BOTH the `stt-build` CLI and the
+//! `stt-serve` dynamic server.
+//!
+//! A tile served live by `stt-serve` must be configured **byte-identically** to
+//! the same tile built offline by `stt-build`. Both reach the same encoder
+//! (`tiler::encode_single_tile` / `stt_core::arrow_tile`), but only if they
+//! parse the same CLI strings (`--temporal-bucket`, `--vector-group NAME=cols`,
+//! `--quantize-attr NAME=PREC`, …) into the same structures and set the same
+//! process-wide encoder globals. Centralising that here removes the drift risk
+//! of two independent copies — this module is the single source of truth for
+//! "flags → `TileConfig` fields + encoder globals".
+
+use anyhow::{Context, Result};
+use std::collections::{HashMap, HashSet};
+
+use crate::columnar::AttributeFilter;
+use stt_core::arrow_tile::{VectorElem, VectorGroup};
+use stt_core::budget::{ImportanceScorer, TileBudget};
+use stt_core::metadata::TemporalLodLevel;
+
+/// Parse a duration string like `1h`, `6h`, `1d`, `30m`, `90s`, `500ms` into
+/// milliseconds. Accepts a fractional value (`1.5h`). Bare number = ms.
+pub fn parse_duration(s: &str) -> Result<u64> {
+    let s = s.trim().to_lowercase();
+
+    let mut num_str = String::new();
+    let mut unit = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() || c == '.' {
+            num_str.push(c);
+        } else {
+            unit.push(c);
+        }
+    }
+
+    let value: f64 = num_str
+        .parse()
+        .with_context(|| format!("Invalid duration value: {s}"))?;
+
+    let multiplier: u64 = match unit.as_str() {
+        "ms" | "" => 1,
+        "s" | "sec" => 1000,
+        "m" | "min" => 60 * 1000,
+        "h" | "hr" | "hour" => 60 * 60 * 1000,
+        "d" | "day" => 24 * 60 * 60 * 1000,
+        _ => anyhow::bail!(
+            "Invalid duration unit '{unit}'. Use ms, s, m, h, or d (e.g., '1h', '30m', '6h')"
+        ),
+    };
+
+    Ok((value * multiplier as f64) as u64)
+}
+
+/// Parse a `--temporal-lod` spec like `"1d,30d"` or `"1d@8,30d@4"`. Each entry
+/// is `<duration>` (applies at every zoom) or `<duration>@<zoom>` (applies at
+/// zoom <= the given level). Entries are returned in input order so the caller
+/// can re-validate sorting against the base bucket.
+pub fn parse_temporal_lod(s: &str, fallback_max_zoom: u8) -> Result<Vec<TemporalLodLevel>> {
+    let mut levels = Vec::new();
+    for piece in s.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let (dur, zoom) = match piece.split_once('@') {
+            Some((d, z)) => {
+                let z: u8 = z
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("invalid zoom in temporal-lod entry '{piece}'"))?;
+                (d.trim(), z)
+            }
+            None => (piece, fallback_max_zoom),
+        };
+        let bucket_ms = parse_duration(dur)
+            .with_context(|| format!("invalid duration in temporal-lod entry '{piece}'"))?;
+        levels.push(TemporalLodLevel {
+            bucket_ms,
+            max_zoom_level: zoom,
+        });
+    }
+    Ok(levels)
+}
+
+/// Parse repeated `--quantize-attr NAME=PREC` specs into a `name → precision`
+/// map. Errors on a missing `=`, a non-numeric precision, or `PREC <= 0`.
+pub fn parse_quantize_attrs(specs: &[String]) -> Result<HashMap<String, f64>> {
+    let mut attrs: HashMap<String, f64> = HashMap::new();
+    for spec in specs {
+        let (name, prec) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--quantize-attr expects NAME=PREC, got {spec:?}"))?;
+        let prec: f64 = prec
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("--quantize-attr {spec:?}: PREC {prec:?} is not a number"))?;
+        if prec <= 0.0 {
+            anyhow::bail!("--quantize-attr {spec:?}: PREC must be > 0");
+        }
+        attrs.insert(name.trim().to_string(), prec);
+    }
+    Ok(attrs)
+}
+
+/// Parse repeated `--vector-group NAME=col1,col2[:f32|u8]` specs into
+/// [`VectorGroup`]s. Default leaf type is `f32`; `:u8` selects 0–255 RGBA.
+pub fn parse_vector_groups(specs: &[String]) -> Result<Vec<VectorGroup>> {
+    let mut groups: Vec<VectorGroup> = Vec::new();
+    for spec in specs {
+        let (name, rest) = spec.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("--vector-group expects NAME=COLS[:f32|u8], got {spec:?}")
+        })?;
+        // Optional trailing `:f32` / `:u8` selects the leaf upload type.
+        let (cols_str, elem) = match rest.rsplit_once(':') {
+            Some((cols, "u8")) => (cols, VectorElem::U8),
+            Some((cols, "f32")) => (cols, VectorElem::F32),
+            Some((_, other)) => {
+                anyhow::bail!("--vector-group {spec:?}: leaf type {other:?} must be f32 or u8")
+            }
+            None => (rest, VectorElem::F32),
+        };
+        let components: Vec<String> = cols_str
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if components.is_empty() {
+            anyhow::bail!("--vector-group {spec:?}: no component columns");
+        }
+        groups.push(VectorGroup {
+            name: name.trim().to_string(),
+            components,
+            elem,
+        });
+    }
+    Ok(groups)
+}
+
+/// Process-wide encoder settings shared by the offline build and the dynamic
+/// server. These map to globals on `stt_core::arrow_tile` that the encoder reads
+/// at tile-encode time (independent of [`crate::tiler::TileConfig`]).
+///
+/// Build a value from the CLI flags, then call [`EncoderSettings::apply`] ONCE
+/// before any tile is encoded. `stt-serve` calls it at startup so served tiles
+/// pick up the same quantization / vector-grouping / elevation-fold the offline
+/// build used.
+#[derive(Debug, Clone, Default)]
+pub struct EncoderSettings {
+    /// `--vertex-time-precision` (ms). `None` keeps the encoder default.
+    pub vertex_time_precision: Option<u32>,
+    /// `--quantize-coords` ground precision in meters; `0.0` = off (Float64).
+    pub quantize_coords_m: f64,
+    /// `--quantize-attr NAME=PREC` specs (parsed by [`parse_quantize_attrs`]).
+    pub quantize_attr: Vec<String>,
+    /// `--quantize-attrs-auto` (every Float64 prop → range-adaptive UInt16).
+    pub quantize_attrs_auto: bool,
+    /// `--vector-group NAME=cols[:f32|u8]` specs (parsed by [`parse_vector_groups`]).
+    pub vector_group: Vec<String>,
+    /// `--point-elevation-column NAME` (fold a property into POINT z).
+    pub point_elevation_column: Option<String>,
+}
+
+impl EncoderSettings {
+    /// Parse the string specs and install every global on
+    /// `stt_core::arrow_tile`. Idempotent for a given input; call once before
+    /// encoding. Returns a short, human-readable list of what was enabled (for
+    /// logging) so callers don't have to re-derive it.
+    pub fn apply(&self) -> Result<Vec<String>> {
+        let mut enabled: Vec<String> = Vec::new();
+
+        if let Some(p) = self.vertex_time_precision {
+            stt_core::arrow_tile::set_vertex_time_max_step_ms(p);
+            if p != stt_core::arrow_tile::DEFAULT_VERTEX_TIME_MAX_STEP_MS {
+                enabled.push(format!("vertex-time-precision={p}ms"));
+            }
+        }
+
+        stt_core::arrow_tile::set_quantize_coords_m(self.quantize_coords_m);
+        if self.quantize_coords_m > 0.0 {
+            enabled.push(format!("quantize-coords={}m", self.quantize_coords_m));
+        }
+
+        if !self.quantize_attr.is_empty() {
+            let attrs = parse_quantize_attrs(&self.quantize_attr)?;
+            enabled.push(format!("quantize-attr={attrs:?}"));
+            stt_core::arrow_tile::set_quantize_attrs(attrs);
+        }
+
+        if self.quantize_attrs_auto {
+            stt_core::arrow_tile::set_quantize_attrs_auto(true);
+            enabled.push("quantize-attrs-auto".to_string());
+        }
+
+        if !self.vector_group.is_empty() {
+            let groups = parse_vector_groups(&self.vector_group)?;
+            enabled.push(format!("vector-groups={}", groups.len()));
+            stt_core::arrow_tile::set_vector_groups(groups);
+        }
+
+        if let Some(col) = self.point_elevation_column.as_deref() {
+            if !col.is_empty() {
+                stt_core::arrow_tile::set_point_elevation_column(col);
+                enabled.push(format!("point-elevation-column={col}"));
+            }
+        }
+
+        Ok(enabled)
+    }
+
+    /// Parse the specs into an explicit [`stt_core::arrow_tile::EncoderConfig`]
+    /// WITHOUT touching any process-wide globals — the concurrency- and
+    /// multi-config-safe path a dynamic server uses (each dataset/request encodes
+    /// via [`stt_core::arrow_tile::encode_tile_with`] with its own config, never
+    /// mutating shared state). This is the non-global sibling of [`apply`].
+    pub fn resolve(&self) -> Result<stt_core::arrow_tile::EncoderConfig> {
+        Ok(stt_core::arrow_tile::EncoderConfig {
+            quantize_coords_m: (self.quantize_coords_m > 0.0).then_some(self.quantize_coords_m),
+            quantize_attrs: parse_quantize_attrs(&self.quantize_attr)?,
+            quantize_attrs_auto: self.quantize_attrs_auto,
+            vector_groups: parse_vector_groups(&self.vector_group)?,
+            point_elevation_column: self.point_elevation_column.clone().unwrap_or_default(),
+            vertex_time_max_step_ms: self
+                .vertex_time_precision
+                .unwrap_or(stt_core::arrow_tile::DEFAULT_VERTEX_TIME_MAX_STEP_MS),
+        })
+    }
+}
+
+/// Build the opt-in per-tile budget, or `None` when neither a byte nor a feature
+/// cap was set (the default "no thinning" behaviour). With `drop_densest` the
+/// budget drops the densest features first (pure `GeometrySize`); otherwise it
+/// drops the least-important features (a `Combined` geometry+property score).
+pub fn build_tile_budget(
+    max_bytes: Option<usize>,
+    max_features: Option<usize>,
+    drop_densest: bool,
+) -> Option<TileBudget> {
+    if max_bytes.is_none() && max_features.is_none() {
+        return None;
+    }
+    let max_bytes = max_bytes.unwrap_or(usize::MAX);
+    let max_features = max_features.unwrap_or(usize::MAX);
+    let scorer = if drop_densest {
+        ImportanceScorer::GeometrySize
+    } else {
+        ImportanceScorer::Combined
+    };
+    Some(TileBudget::new(max_bytes, max_bytes, max_features).with_scorer(scorer))
+}
+
+/// Resolve `--exclude` / `--include` / `--exclude-all` into an
+/// [`AttributeFilter`], validating mutual exclusivity and refusing to drop any
+/// `required` column (columns another feature still needs, e.g. a
+/// `--heatmap-weight` / `--summary-columns` / `--min-zoom-field` source).
+pub fn build_attribute_filter(
+    exclude: &[String],
+    include: &[String],
+    exclude_all: bool,
+    required: &[String],
+) -> Result<AttributeFilter> {
+    let has_exclude = !exclude.is_empty();
+    let has_include = !include.is_empty();
+
+    let modes = [has_exclude, has_include, exclude_all]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if modes > 1 {
+        anyhow::bail!(
+            "--exclude, --include and --exclude-all are mutually exclusive; pass at most one"
+        );
+    }
+
+    let filter = if exclude_all {
+        AttributeFilter::ExcludeAll
+    } else if has_include {
+        AttributeFilter::Include(include.iter().cloned().collect())
+    } else if has_exclude {
+        AttributeFilter::Exclude(exclude.iter().cloned().collect())
+    } else {
+        AttributeFilter::KeepAll
+    };
+
+    let dropped_required: Vec<&String> =
+        required.iter().filter(|p| !filter.keeps(p)).collect();
+    if !dropped_required.is_empty() {
+        let uniq: HashSet<&String> = dropped_required.into_iter().collect();
+        let mut names: Vec<&str> = uniq.iter().map(|s| s.as_str()).collect();
+        names.sort_unstable();
+        anyhow::bail!(
+            "attribute filter would drop column(s) still needed by another build feature \
+             (--heatmap-weight/--heatmap-class/--summary-columns/--min-zoom-field/\
+             --max-zoom-field): {}. Add them to --include (or drop the conflicting flag).",
+            names.join(", ")
+        );
+    }
+
+    Ok(filter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("1h").unwrap(), 3_600_000);
+        assert_eq!(parse_duration("30m").unwrap(), 1_800_000);
+        assert_eq!(parse_duration("1d").unwrap(), 86_400_000);
+        assert_eq!(parse_duration("500ms").unwrap(), 500);
+        assert_eq!(parse_duration("1.5h").unwrap(), 5_400_000);
+        assert!(parse_duration("5w").is_err());
+    }
+
+    #[test]
+    fn temporal_lod_parsing() {
+        let lod = parse_temporal_lod("1d,30d@4", 8).unwrap();
+        assert_eq!(lod.len(), 2);
+        assert_eq!(lod[0].bucket_ms, 86_400_000);
+        assert_eq!(lod[0].max_zoom_level, 8); // fallback
+        assert_eq!(lod[1].max_zoom_level, 4); // explicit @4
+    }
+
+    #[test]
+    fn quantize_attr_specs() {
+        let m = parse_quantize_attrs(&["z=0.05".into(), "speed=0.1".into()]).unwrap();
+        assert_eq!(m.get("z"), Some(&0.05));
+        assert_eq!(m.get("speed"), Some(&0.1));
+        assert!(parse_quantize_attrs(&["bad".into()]).is_err());
+        assert!(parse_quantize_attrs(&["z=0".into()]).is_err());
+    }
+
+    #[test]
+    fn vector_group_specs() {
+        let g = parse_vector_groups(&["rgba=r,g,b,a:u8".into(), "quat=qx,qy,qz,qw".into()]).unwrap();
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].name, "rgba");
+        assert_eq!(g[0].components, vec!["r", "g", "b", "a"]);
+        assert!(matches!(g[0].elem, VectorElem::U8));
+        assert!(matches!(g[1].elem, VectorElem::F32));
+        assert!(parse_vector_groups(&["bad".into()]).is_err());
+        assert!(parse_vector_groups(&["x=a:f64".into()]).is_err());
+    }
+
+    #[test]
+    fn budget_off_by_default() {
+        assert!(build_tile_budget(None, None, false).is_none());
+        let b = build_tile_budget(Some(50_000), None, false).expect("budget");
+        assert_eq!(b.max_uncompressed_size, 50_000);
+        assert_eq!(b.max_feature_count, usize::MAX);
+    }
+
+    #[test]
+    fn attribute_filter_modes_and_guard() {
+        assert!(matches!(
+            build_attribute_filter(&[], &[], false, &[]).unwrap(),
+            AttributeFilter::KeepAll
+        ));
+        // Mutually exclusive.
+        assert!(build_attribute_filter(&["a".into()], &["b".into()], false, &[]).is_err());
+        // Guard: excluding a required column errors.
+        let err = build_attribute_filter(&["mag".into()], &[], false, &["mag".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mag"), "got: {err}");
+    }
+}

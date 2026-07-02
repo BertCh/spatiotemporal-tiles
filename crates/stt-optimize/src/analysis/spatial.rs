@@ -472,7 +472,6 @@ mod tests {
                 lon,
                 lat,
                 timestamp: 0,
-                end_timestamp: None,
                 geometry_type: GeometryType::Point,
                 vertex_count: 1,
                 estimated_size: 120,
@@ -495,7 +494,6 @@ mod tests {
             features,
             bounds: BoundingBox::new(min_lon, min_lat, max_lon, max_lat),
             time_range: TimeRange::new(0, 0),
-            source_name: "synthetic".to_string(),
         }
     }
 

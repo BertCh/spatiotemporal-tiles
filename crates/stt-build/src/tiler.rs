@@ -391,9 +391,11 @@ pub fn generate_tiles(
 
 /// Encode exactly one tile `(z, x, y, t)` from a candidate feature set, without
 /// running the whole-dataset build (no rayon pool, no pack/directory writer, no
-/// cross-tile state). The returned bytes are a ready-to-serve STT tile blob
-/// (Arrow IPC + GeoArrow, per-blob zstd) — identical to what the build would
-/// emit for that tile. `Ok(None)` means the tile is empty.
+/// cross-tile state). The returned bytes are an **uncompressed** STT layer-frame
+/// tile payload (Arrow IPC + GeoArrow geometry) — byte-identical to the frame
+/// the offline build feeds INTO the pack writer *before* per-blob zstd, so a
+/// dynamic server (`stt-serve`) can hand it out directly (it does its own
+/// transport compression). `Ok(None)` means the tile is empty.
 ///
 /// This is the reusable core a dynamic per-request tile server (`stt-serve`)
 /// calls. `features` is the caller's candidate set — typically already narrowed
@@ -403,14 +405,20 @@ pub fn generate_tiles(
 ///
 /// `t` selects the temporal bucket: the tile covers
 /// `[floor(t/bucket)*bucket, …)`, matching [`chunk_by_temporal_bucket`].
-pub fn encode_single_tile(
+///
+/// Also returns the number of features placed in the tile (after
+/// clipping/placement/budget), so a dynamic server can apply a
+/// `min_features_per_tile` gate identically to the offline build's writer loop.
+/// `Ok(None)` means the tile is empty.
+pub fn encode_single_tile_counted(
     features: &[ParsedFeature],
     z: u8,
     x: u32,
     y: u32,
     t: i64,
     config: &TileConfig,
-) -> Result<Option<Vec<u8>>> {
+    encoder: &stt_core::arrow_tile::EncoderConfig,
+) -> Result<Option<(Vec<u8>, u32)>> {
     let clip_config = clip_config_from(config);
     let bucket_ms = config.temporal_bucket_ms.max(1);
     let bucket_start = (t.max(0) as u64 / bucket_ms) * bucket_ms;
@@ -471,9 +479,33 @@ pub fn encode_single_tile(
         .unwrap_or(bucket_start + bucket_ms);
     let id = TileId::new(z, x, y, bucket_start);
     match build_tile(id, &chunk, config, bucket_start as i64, time_end as i64)? {
-        Some(tile) => Ok(Some(encode_tile(&tile.layers)?)),
+        Some(tile) => {
+            let feature_count = tile.feature_count();
+            // Encode with the caller's explicit encoder config (no globals), so a
+            // dynamic server can serve several datasets/requests with different
+            // settings concurrently without touching shared state.
+            Ok(Some((
+                stt_core::arrow_tile::encode_tile_with(&tile.layers, encoder)?,
+                feature_count,
+            )))
+        }
         None => Ok(None),
     }
+}
+
+/// Encode exactly one tile `(z, x, y, t)`, discarding the placed-feature count.
+/// The convenience form of [`encode_single_tile_counted`] for callers that don't
+/// apply a `min_features_per_tile` gate. `Ok(None)` means the tile is empty.
+pub fn encode_single_tile(
+    features: &[ParsedFeature],
+    z: u8,
+    x: u32,
+    y: u32,
+    t: i64,
+    config: &TileConfig,
+    encoder: &stt_core::arrow_tile::EncoderConfig,
+) -> Result<Option<Vec<u8>>> {
+    Ok(encode_single_tile_counted(features, z, x, y, t, config, encoder)?.map(|(bytes, _)| bytes))
 }
 
 /// Generate tiles and stream them straight into a [`TileWriter`], bounding
@@ -1384,8 +1416,10 @@ mod tests {
             ..TileConfig::default()
         };
 
+        let enc = stt_core::arrow_tile::EncoderConfig::default();
+
         // The requested tile + bucket has exactly the two in-bucket points.
-        let bytes = encode_single_tile(&feats, z, x, y, bucket_start as i64, &config)
+        let bytes = encode_single_tile(&feats, z, x, y, bucket_start as i64, &config, &enc)
             .unwrap()
             .expect("tile should be non-empty");
         let rows: usize = decode_tile(&bytes)
@@ -1396,12 +1430,13 @@ mod tests {
         assert_eq!(rows, 2, "only the two points in this (tile, bucket)");
 
         // A different spatial cell is empty.
-        assert!(encode_single_tile(&feats, z, x + 9, y, bucket_start as i64, &config)
+        assert!(encode_single_tile(&feats, z, x + 9, y, bucket_start as i64, &config, &enc)
             .unwrap()
             .is_none());
 
         // The next bucket carries the single later point.
-        let next = encode_single_tile(&feats, z, x, y, (bucket_start + bucket_ms) as i64, &config)
+        let next =
+            encode_single_tile(&feats, z, x, y, (bucket_start + bucket_ms) as i64, &config, &enc)
             .unwrap()
             .expect("next bucket tile");
         let n: usize = decode_tile(&next)

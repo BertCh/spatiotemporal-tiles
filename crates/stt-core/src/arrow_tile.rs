@@ -15,6 +15,7 @@
 //! | `geometry`    | GeoArrow point / linestring / polygon   | interleaved f64 lon/lat       |
 //! | `vertex_time` | `List<UInt16>` deltas or `List<Int64>` (nullable) | per-vertex Unix ms (optional; see [`build_vertex_time_array`]) |
 //! | `vertex_value`| `List<Float32>` (nullable)              | per-vertex scalar, e.g. SST (optional) |
+//! | `triangles`   | `List<UInt16>` or `List<UInt32>`        | pre-baked earcut indices, feature-local (optional; polygon only) |
 //! | `<property>`  | `Float64` or `Dictionary<UInt16,Utf8>`   | one column per property       |
 //!
 //! All layers in one tile are concatenated with a tiny frame so a tile can
@@ -46,7 +47,7 @@ use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, UInt16Type};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -590,6 +591,12 @@ const VERTEX_TIME_STEP_KEY: &str = "stt:vertex_time_step_ms";
 /// column. The renderer reshapes the flat vertex-major list back into a
 /// `[vertex][bucket]` grid using this count.
 const VERTEX_VALUE_BUCKETS_KEY: &str = "stt:vertex_value_buckets";
+/// Baked minimum feature start-time (integer Unix ms) for the layer. The TS
+/// decoder relativizes every start/end time against this value so the times
+/// fit an f32; baking it here lets the decoder skip its client-side min-scan
+/// over the whole start-time column. Mirrors exactly what the decoder computes
+/// (the min of the `start_time` column) — see `packages/core/src/tile.ts`.
+const TIME_OFFSET_MS_KEY: &str = "stt:time_offset_ms";
 
 /// Default ceiling (ms) on the u16-delta `vertex_time` quantization step.
 ///
@@ -707,14 +714,6 @@ pub fn quantize_attrs() -> HashMap<String, f64> {
     quant_attrs_cell().read().unwrap().clone()
 }
 
-fn quantize_attr_precision(name: &str) -> Option<f64> {
-    quant_attrs_cell()
-        .read()
-        .unwrap()
-        .get(name)
-        .copied()
-        .filter(|p| *p > 0.0)
-}
 
 /// When set, EVERY `Float64` numeric property not given an explicit precision in
 /// the [`set_quantize_attrs`] map is quantized automatically: its step is sized
@@ -792,6 +791,64 @@ pub fn point_elevation_column() -> String {
     point_elevation_column_cell().read().unwrap().clone()
 }
 
+/// Resolved, explicit encoder settings — the values the tile encoder reads at
+/// encode time (coordinate + attribute quantization, vector grouping, the
+/// point-elevation fold, vertex-time precision).
+///
+/// Historically these lived only in process-wide mutable statics set via the
+/// `set_*` functions above; that made a new encode caller silently inherit
+/// whatever the last `set_*` left behind (the origin of the `stt-serve` parity
+/// bug) and made it impossible to encode two different configurations in one
+/// process (blocking multi-dataset serve + parallel per-config tests). Passing an
+/// `EncoderConfig` explicitly to [`encode_tile_with`] / [`encode_layer_with`]
+/// removes both problems. The globals + the no-arg [`encode_tile`] /
+/// [`encode_layer`] wrappers remain for the one-shot CLI and existing callers;
+/// [`EncoderConfig::from_globals`] snapshots them.
+#[derive(Debug, Clone)]
+pub struct EncoderConfig {
+    /// Fixed-point coordinate quantization ground precision in meters
+    /// (`None` = Float64 GeoArrow coordinates, the default).
+    pub quantize_coords_m: Option<f64>,
+    /// Per-property explicit fixed-point precisions (`name → precision`).
+    pub quantize_attrs: HashMap<String, f64>,
+    /// Range-adaptive `UInt16` quantization for every un-listed Float64 property.
+    pub quantize_attrs_auto: bool,
+    /// Scalar columns to fuse into interleaved `FixedSizeList` vector columns.
+    pub vector_groups: Vec<VectorGroup>,
+    /// Property folded into POINT geometry as the z coordinate (empty = none).
+    pub point_elevation_column: String,
+    /// Ceiling (ms) on the per-vertex time u16-delta quantization step.
+    pub vertex_time_max_step_ms: u32,
+}
+
+impl Default for EncoderConfig {
+    fn default() -> Self {
+        Self {
+            quantize_coords_m: None,
+            quantize_attrs: HashMap::new(),
+            quantize_attrs_auto: false,
+            vector_groups: Vec::new(),
+            point_elevation_column: String::new(),
+            vertex_time_max_step_ms: DEFAULT_VERTEX_TIME_MAX_STEP_MS,
+        }
+    }
+}
+
+impl EncoderConfig {
+    /// Snapshot the current process-wide encoder globals into an explicit config.
+    /// Used by the no-arg [`encode_tile`] / [`encode_layer`] back-compat wrappers.
+    pub fn from_globals() -> Self {
+        Self {
+            quantize_coords_m: quantize_coords_m(),
+            quantize_attrs: quantize_attrs(),
+            quantize_attrs_auto: quantize_attrs_auto(),
+            vector_groups: vector_groups(),
+            point_elevation_column: point_elevation_column(),
+            vertex_time_max_step_ms: vertex_time_max_step_ms(),
+        }
+    }
+}
+
 /// Fuse the scalar columns named by each configured [`VectorGroup`] into a single
 /// [`PropertyColumn::Vector`], leaving every other column untouched and in order.
 ///
@@ -803,8 +860,8 @@ pub fn point_elevation_column() -> String {
 fn group_vector_properties(
     props: &[(String, PropertyColumn)],
     n: usize,
+    groups: &[VectorGroup],
 ) -> Option<Vec<(String, PropertyColumn)>> {
-    let groups = vector_groups();
     if groups.is_empty() {
         return None;
     }
@@ -820,7 +877,7 @@ fn group_vector_properties(
     let mut out: Vec<(String, PropertyColumn)> = Vec::new();
     let mut consumed: HashSet<String> = HashSet::new();
     let mut any = false;
-    for g in &groups {
+    for g in groups {
         if g.components.is_empty()
             || !g.components.iter().all(|c| numeric.contains_key(c.as_str()))
         {
@@ -1174,7 +1231,7 @@ fn infer_vertex_value_buckets(matrix: &[Vec<f32>], geometry: &GeometryColumn) ->
 
 /// Encode a single layer to an Arrow IPC stream.
 pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
-    encode_layer_quantized(layer, quantize_coords_m())
+    encode_layer_cfg(layer, &EncoderConfig::from_globals())
 }
 
 /// [`encode_layer`] with optional fixed-point coordinate quantization.
@@ -1185,7 +1242,30 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
 /// them is the single largest size lever — at the cost of GeoArrow Float64
 /// self-description, hence opt-in. The per-layer affine rides in the geometry
 /// field metadata under [`STT_QUANT_META_KEY`]; the reader reconstructs Float64.
+///
+/// The non-coordinate settings (attribute quantization, vector grouping,
+/// point-elevation fold, vertex-time precision) come from the process-wide
+/// globals; use [`encode_layer_with`] to pass every setting explicitly.
 pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) -> Result<Vec<u8>> {
+    encode_layer_cfg(
+        layer,
+        &EncoderConfig {
+            quantize_coords_m: quantize_m,
+            ..EncoderConfig::from_globals()
+        },
+    )
+}
+
+/// [`encode_layer`] with a fully-explicit [`EncoderConfig`] — no process-wide
+/// globals are read. This is the concurrency- and multi-config-safe entry point
+/// (e.g. a dynamic server fronting several datasets with different settings).
+pub fn encode_layer_with(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8>> {
+    encode_layer_cfg(layer, cfg)
+}
+
+/// The single encode implementation, driven entirely by an explicit
+/// [`EncoderConfig`]. Every public `encode_layer*` entry point funnels here.
+fn encode_layer_cfg(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8>> {
     layer.validate()?;
     let n = layer.feature_count();
 
@@ -1204,7 +1284,7 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
     // 3D POINT geometry: fold the configured numeric column into the geometry's
     // 3rd coordinate, so the tile ships true 3D points the renderer binds
     // zero-copy (no per-point pad). The column is then dropped from properties.
-    let elev_col = point_elevation_column();
+    let elev_col = cfg.point_elevation_column.clone();
     let point_elev: Option<Vec<f64>> = if !elev_col.is_empty()
         && matches!(layer.geometry, GeometryColumn::Point(_))
     {
@@ -1227,7 +1307,7 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
     let elev_consumed = point_elev.is_some();
 
     // Geometry column carries the GeoArrow extension name in field metadata.
-    let quant = quantize_m.and_then(|m| {
+    let quant = cfg.quantize_coords_m.and_then(|m| {
         if point_elev.is_some() {
             world_grid_affine_3d(m)
         } else {
@@ -1236,7 +1316,14 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
     });
     let geom_array =
         build_geometry_array_q(&layer.geometry, quant.as_ref(), point_elev.as_deref());
-    let mut geom_meta = HashMap::new();
+    // Assemble field metadata in a BTreeMap so the key set is emitted in a
+    // deterministic (lexicographic) order regardless of insertion order. Arrow
+    // stores field metadata in a HashMap and serializes it in HashMap-iteration
+    // order (see the quantization note below), so building from a sorted source
+    // removes this encoder's own contribution to non-reproducible pack bytes;
+    // the residual arrow-ipc-v54 byte-order gap is tracked in
+    // docs/spec/stt-packed-format.md §7-D6.
+    let mut geom_meta = BTreeMap::new();
     geom_meta.insert(
         GEOARROW_EXT_KEY.to_string(),
         layer.geometry.geoarrow_name().to_string(),
@@ -1244,15 +1331,13 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
     match &quant {
         // A quantized tile's `xy` leaf is i32 grid indices, not Float64 lon/lat,
         // so the GeoArrow CRS doesn't apply — swap it for the reconstruction
-        // affine (whose presence is the reader's quantization signal). Keeping
-        // the field-metadata entry COUNT at two matters: arrow serializes field
-        // metadata in nondeterministic HashMap order (arrow-ipc
-        // `convert::metadata_to_fb` iterates the HashMap without sorting), and a
-        // third key would cut the odds that two identical tiles encode
-        // byte-identically (and thus dedup) from ~1/2 to ~1/6 — measured as a
-        // large size regression on dedup-heavy datasets. This is the documented
-        // cross-process reproducibility gap: see docs/spec/stt-packed-format.md
-        // §7-D6 and docs/spec/conformance.md §3.
+        // affine (whose presence is the reader's quantization signal). Field
+        // metadata is assembled in a BTreeMap (deterministic key order); Arrow
+        // (v54) still serializes it in per-process HashMap-iteration order
+        // (arrow-ipc `convert::metadata_to_fb` iterates the HashMap without
+        // sorting), so the raw metadata-region bytes remain non-reproducible
+        // across runs — the tracked gap in docs/spec/stt-packed-format.md §7-D6
+        // and docs/spec/conformance.md §3.
         Some(q) => {
             geom_meta.insert(STT_QUANT_META_KEY.to_string(), q.to_json());
         }
@@ -1266,14 +1351,14 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
     }
     fields.push(Arc::new(
         Field::new("geometry", geom_array.data_type().clone(), false)
-            .with_metadata(geom_meta),
+            .with_metadata(geom_meta.into_iter().collect()),
     ));
     columns.push(geom_array);
 
     // Track per-layer vertex-time encoding so the schema metadata (set
     // below) records the origin/step needed for the u16-delta reader path.
     let mut vertex_time_encoding: Option<(i64, u32)> = None;
-    if let Some(vt_col) = build_vertex_time_array(&layer.vertex_times, n, vertex_time_max_step_ms()) {
+    if let Some(vt_col) = build_vertex_time_array(&layer.vertex_times, n, cfg.vertex_time_max_step_ms) {
         fields.push(Arc::new(Field::new(
             "vertex_time",
             vt_col.array.data_type().clone(),
@@ -1323,16 +1408,36 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
             .unwrap_or(false);
     if has_triangles {
         let tri = layer.triangles.as_ref().unwrap();
-        let mut builder = ListBuilder::new(UInt32Builder::new());
-        for feature in tri {
-            for &idx in feature {
-                builder.values().append_value(idx);
+        // Indices are feature-LOCAL (see the field doc above), so they're
+        // almost always well under 65,536 even for large layers. Mirrors
+        // build_vertex_time_array's width-selection: scan once, use the
+        // narrower UInt16 (half the bytes) when every index fits, UInt32
+        // otherwise. The Arrow field type is derived from the array below,
+        // so this is fully self-describing — the TS decoder branches on the
+        // runtime child-array type exactly like it already does for
+        // vertex_time's UInt16-delta vs Int64-absolute split.
+        let max_index = tri.iter().flatten().copied().max().unwrap_or(0);
+        let array: ArrayRef = if max_index <= u16::MAX as u32 {
+            let mut builder = ListBuilder::new(UInt16Builder::new());
+            for feature in tri {
+                for &idx in feature {
+                    builder.values().append_value(idx as u16);
+                }
+                // Always append a (possibly empty) list — readers expect one
+                // entry per feature.
+                builder.append(true);
             }
-            // Always append a (possibly empty) list — readers expect one
-            // entry per feature.
-            builder.append(true);
-        }
-        let array: ArrayRef = Arc::new(builder.finish());
+            Arc::new(builder.finish())
+        } else {
+            let mut builder = ListBuilder::new(UInt32Builder::new());
+            for feature in tri {
+                for &idx in feature {
+                    builder.values().append_value(idx);
+                }
+                builder.append(true);
+            }
+            Arc::new(builder.finish())
+        };
         fields.push(Arc::new(Field::new(
             "triangles",
             array.data_type().clone(),
@@ -1345,7 +1450,8 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
     // (e.g. qx/qy/qz/qw → one FixedSizeList<f32,4>). Runs BEFORE the quantize
     // loop so grouped components are written as the raw vector, not individually
     // quantized. No groups configured ⇒ iterate `layer.properties` with no clone.
-    let grouped = group_vector_properties(&layer.properties, layer.feature_count());
+    let grouped =
+        group_vector_properties(&layer.properties, layer.feature_count(), &cfg.vector_groups);
     let props_iter: &[(String, PropertyColumn)] =
         grouped.as_deref().unwrap_or(&layer.properties);
     for (name, col) in props_iter {
@@ -1362,12 +1468,16 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
                 // For a LiDAR `z` column this is the single largest size lever
                 // after `id` — a raw Float64 elevation barely compresses, while
                 // the i16 grid is both smaller and far more compressible.
-                let quantized = quantize_attr_precision(name)
+                let quantized = cfg
+                    .quantize_attrs
+                    .get(name)
+                    .copied()
+                    .filter(|p| *p > 0.0)
                     .and_then(|p| build_quantized_numeric(values, p))
                     .or_else(|| {
-                        // No explicit precision — fall back to the build-global
+                        // No explicit precision — fall back to the configured
                         // automatic range-adaptive quantization when enabled.
-                        quantize_attrs_auto()
+                        cfg.quantize_attrs_auto
                             .then(|| build_quantized_numeric_auto(values))
                             .flatten()
                     });
@@ -1441,17 +1551,28 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
     // `step_ms` so the reader can reconstruct absolute timestamps as
     // `origin + delta * step`.
     //
-    // NOTE: arrow serializes this metadata in HashMap iteration order, which is
-    // per-process; identical tiles encode byte-identically WITHIN a build run
-    // (so dedup works) but not necessarily across runs. The canonical
-    // (lexicographic) key order a fully reproducible build would need is the
-    // tracked gap in docs/spec/stt-packed-format.md §7-D6.
-    let mut schema_meta = HashMap::new();
+    // Built in a BTreeMap so the key set is assembled in deterministic
+    // (lexicographic) order — this encoder contributes no ordering
+    // non-determinism, and the tile is byte-reproducible on any Arrow whose
+    // metadata serialization preserves order. NOTE: Arrow (v54) still stores
+    // this in a HashMap and serializes it in per-process HashMap-iteration
+    // order, so the *raw* metadata-region bytes of two identical tiles can
+    // differ across runs; that residual gap (which caps content-addressed pack
+    // dedup) is tracked in docs/spec/stt-packed-format.md §7-D6.
+    let mut schema_meta: BTreeMap<String, String> = BTreeMap::new();
     schema_meta.insert("stt:layer".to_string(), layer.name.clone());
     schema_meta.insert(
         "stt:geometry".to_string(),
         layer.geometry.geoarrow_name().to_string(),
     );
+    // Bake the layer's minimum feature start-time (integer Unix ms) so the TS
+    // decoder can skip its client-side min-scan over the whole start-time column
+    // and relativize times against this value directly. Mirrors exactly what the
+    // decoder computes (the min of the `start_time` column); only emitted when a
+    // start-time column is present. See packages/core/src/tile.ts.
+    if let Some(min_start) = layer.start_times.iter().copied().min() {
+        schema_meta.insert(TIME_OFFSET_MS_KEY.to_string(), min_start.to_string());
+    }
     if let Some((origin, step)) = vertex_time_encoding {
         schema_meta.insert(VERTEX_TIME_ORIGIN_KEY.to_string(), origin.to_string());
         schema_meta.insert(VERTEX_TIME_STEP_KEY.to_string(), step.to_string());
@@ -1462,7 +1583,7 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
     if has_triangles {
         schema_meta.insert(TRIANGLES_METADATA_KEY.to_string(), "true".to_string());
     }
-    let schema = Arc::new(Schema::new(fields).with_metadata(schema_meta));
+    let schema = Arc::new(Schema::new(fields).with_metadata(schema_meta.into_iter().collect()));
 
     let batch = RecordBatch::try_new(schema.clone(), columns)
         .map_err(|e| Error::Other(format!("failed to build tile RecordBatch: {e}")))?;
@@ -1489,13 +1610,34 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
 /// `ipc_len` records the exact IPC byte length (padding excluded); readers
 /// derive the pad from alignment math alone.
 pub fn encode_tile(layers: &[ColumnarLayer]) -> Result<Vec<u8>> {
-    encode_tile_quantized(layers, quantize_coords_m())
+    encode_tile_cfg(layers, &EncoderConfig::from_globals())
 }
 
 /// [`encode_tile`] with optional fixed-point coordinate quantization applied to
 /// every layer (see [`encode_layer_quantized`]). `quantize_m = None` is
-/// byte-identical to [`encode_tile`].
+/// byte-identical to [`encode_tile`]; the other encoder settings come from the
+/// process-wide globals.
 pub fn encode_tile_quantized(layers: &[ColumnarLayer], quantize_m: Option<f64>) -> Result<Vec<u8>> {
+    encode_tile_cfg(
+        layers,
+        &EncoderConfig {
+            quantize_coords_m: quantize_m,
+            ..EncoderConfig::from_globals()
+        },
+    )
+}
+
+/// [`encode_tile`] with a fully-explicit [`EncoderConfig`] — no process-wide
+/// globals are read. The concurrency- and multi-config-safe entry point a
+/// dynamic per-request tile server uses so each dataset/request encodes with its
+/// own settings without touching shared state.
+pub fn encode_tile_with(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result<Vec<u8>> {
+    encode_tile_cfg(layers, cfg)
+}
+
+/// The single tile-encode implementation, driven entirely by an explicit
+/// [`EncoderConfig`]. Every public `encode_tile*` entry point funnels here.
+fn encode_tile_cfg(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result<Vec<u8>> {
     if layers.len() >= ALIGNED_FRAME_FLAG as usize {
         return Err(Error::Other(format!(
             "tile has {} layers, exceeds the {} frame limit",
@@ -1510,7 +1652,7 @@ pub fn encode_tile_quantized(layers: &[ColumnarLayer], quantize_m: Option<f64>) 
         if name.len() > u16::MAX as usize {
             return Err(Error::Other("layer name too long".into()));
         }
-        let ipc = encode_layer_quantized(layer, quantize_m)?;
+        let ipc = encode_layer_cfg(layer, cfg)?;
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name);
         out.extend_from_slice(&(ipc.len() as u32).to_le_bytes());
@@ -1638,6 +1780,52 @@ mod tests {
                     ]),
                 ),
             ],
+        }
+    }
+
+    /// Two DIFFERENT [`EncoderConfig`]s encode the SAME layer to DIFFERENT tiles
+    /// in ONE process, and the output is driven purely by the passed config — not
+    /// by the process-wide globals. This is the property that unblocks a dynamic
+    /// server hosting several datasets/configs concurrently: if `encode_tile_with`
+    /// read the (unset) globals instead of the config, the quantized and plain
+    /// encodes would be identical and this would fail.
+    #[test]
+    fn encode_tile_with_is_config_driven_not_global() {
+        let layer = sample_point_layer();
+        let layers = std::slice::from_ref(&layer);
+
+        let plain_cfg = EncoderConfig::default();
+        let quant_cfg = EncoderConfig {
+            quantize_coords_m: Some(1.0),
+            ..EncoderConfig::default()
+        };
+        let attr_cfg = EncoderConfig {
+            quantize_attrs_auto: true,
+            ..EncoderConfig::default()
+        };
+
+        let plain = encode_tile_with(layers, &plain_cfg).unwrap();
+        let quant = encode_tile_with(layers, &quant_cfg).unwrap();
+        let attr = encode_tile_with(layers, &attr_cfg).unwrap();
+
+        // Each explicit config yields a distinct tile — the config, not shared
+        // state, decides the encoding. (If `encode_tile_with` read the unset
+        // globals instead of the config, all three would be identical.) These
+        // differences are config-driven at the WIRE COLUMN level — coord
+        // quantization changes the geometry column (i32 grid vs Float64) and
+        // attribute quantization changes the `speed` column (u16 vs Float64) — so
+        // the inequality is not attributable to the encoder's (separately
+        // tracked) non-deterministic Arrow-metadata ordering, which we therefore
+        // deliberately do NOT byte-assert here.
+        assert_ne!(plain, quant, "coord quantization must change the tile");
+        assert_ne!(plain, attr, "attribute quantization must change the tile");
+        assert_ne!(quant, attr, "the two quantizations differ from each other");
+
+        // All three still decode to the SAME feature set — encoding differs, data
+        // does not.
+        for tile in [&plain, &quant, &attr] {
+            let rows: usize = decode_tile(tile).unwrap().iter().map(|l| l.batch.num_rows()).sum();
+            assert_eq!(rows, 3);
         }
     }
 
@@ -2554,7 +2742,8 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
-        // Column exists with the expected shape.
+        // Column exists with the expected shape. Indices here are tiny
+        // (well under u16::MAX), so the narrower UInt16 encoding applies.
         let col = batch
             .column_by_name("triangles")
             .expect("triangles column present")
@@ -2563,11 +2752,51 @@ mod tests {
             .expect("triangles is a List");
         assert_eq!(col.len(), 1);
         let first = col.value(0);
+        let values: &arrow::array::UInt16Array = first
+            .as_any()
+            .downcast_ref::<arrow::array::UInt16Array>()
+            .expect("triangle values are UInt16 for small feature-local indices");
+        assert_eq!(
+            values.values().iter().map(|&v| v as u32).collect::<Vec<_>>(),
+            tris
+        );
+    }
+
+    #[test]
+    fn polygon_layer_with_oversized_triangle_index_falls_back_to_uint32() {
+        // A feature-local triangle index beyond u16::MAX (pathological, but
+        // possible for a single giant polygon) must fall back to UInt32
+        // rather than silently truncating.
+        let exterior: Vec<Coord> =
+            vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]];
+        let big_tris = vec![0u32, 1, 70_000];
+        let layer = ColumnarLayer {
+            name: "zones".into(),
+            feature_ids: vec![42],
+            start_times: vec![0],
+            end_times: vec![1000],
+            geometry: GeometryColumn::Polygon(vec![vec![exterior]]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: Some(vec![big_tris.clone()]),
+            vertex_value_matrix: None,
+            properties: vec![],
+        };
+        let ipc = encode_layer(&layer).unwrap();
+        let batch = decode_layer(&ipc).unwrap();
+
+        let col = batch
+            .column_by_name("triangles")
+            .expect("triangles column present")
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("triangles is a List");
+        let first = col.value(0);
         let values: &arrow::array::UInt32Array = first
             .as_any()
             .downcast_ref::<arrow::array::UInt32Array>()
-            .expect("triangle values are UInt32");
-        assert_eq!(values.values().to_vec(), tris);
+            .expect("triangle values fall back to UInt32 when an index exceeds u16::MAX");
+        assert_eq!(values.values().to_vec(), big_tris);
     }
 
     #[test]

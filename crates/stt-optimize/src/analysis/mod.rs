@@ -27,16 +27,4 @@ pub struct AnalysisResult {
     pub density: density::DensityAnalysis,
 }
 
-impl AnalysisResult {
-    /// Get a summary string
-    #[allow(dead_code)]
-    pub fn summary(&self) -> String {
-        format!(
-            "{} features, {} geometry, {}",
-            self.feature_count,
-            self.geometry.dominant_type,
-            self.temporal.time_range_description()
-        )
-    }
-}
 

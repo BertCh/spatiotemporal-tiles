@@ -1,6 +1,9 @@
 [package]
 name = "stt-serve"
 description = "Dynamic STT tile server — generates spatiotemporal tiles on the fly from a live PostGIS table or a DuckDB database (the ST_AsMVT analog for STT)"
+readme = "README.md"
+keywords = ["tiles", "spatiotemporal", "geospatial", "postgis", "duckdb"]
+categories = ["science::geo", "web-programming::http-server"]
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -13,8 +16,10 @@ path = "src/main.rs"
 
 [dependencies]
 # The tile encoder + the PostGIS/DuckDB row decoders live in stt-build; we need
-# both backend features for the decode helpers and `encode_single_tile`.
-stt-build = { path = "../stt-build", features = ["postgres", "duckdb"] }
+# both backend features for the decode helpers and `encode_single_tile_counted`.
+stt-build = { path = "../stt-build", version = "0.1.0", features = ["postgres", "duckdb"] }
+# Shared metadata types (HeatmapDomain) + the vertex-time-precision default const.
+stt-core = { path = "../stt-core", version = "0.1.0" }
 
 anyhow.workspace = true
 serde.workspace = true
@@ -22,7 +27,6 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
-chrono.workspace = true
 
 # HTTP server (async) + runtime.
 axum = "0.7"

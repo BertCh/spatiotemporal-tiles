@@ -163,6 +163,8 @@ fn validate_packed(manifest_path: &Path, args: &Args, report: &mut Report) -> Re
     report.version = manifest.directory.directory_version;
     report.compression = manifest.compression.clone();
 
+    verify_paged_directly(manifest_path, &manifest, args, report)?;
+
     let metadata = reader.metadata().clone();
     let entries = reader.entries().to_vec();
     report.tile_count = entries.len();
@@ -182,6 +184,52 @@ fn validate_packed(manifest_path: &Path, args: &Args, report: &mut Report) -> Re
 
     finalize_feature_check(args, report, &metadata);
     Ok(metadata)
+}
+
+/// Run the paged-structure check (leaf-descriptor bounds cover their entries,
+/// cross-page key order monotonic) DIRECTLY for a paged directory.
+///
+/// `verify_packed_objects` already runs this transitively, but the paged
+/// covering invariant is a named part of the validator's contract
+/// (`docs/spec/conformance.md` §2.3) — calling it here as well means a refactor
+/// of the integrity pass cannot silently drop it. Issues the integrity pass
+/// already reported are not duplicated.
+fn verify_paged_directly(
+    manifest_path: &Path,
+    manifest: &Manifest,
+    args: &Args,
+    report: &mut Report,
+) -> Result<()> {
+    if !manifest.directory.is_paged() {
+        return Ok(());
+    }
+    let mut push_unique = |report: &mut Report, msg: String| -> Result<()> {
+        if report.errors.contains(&msg) {
+            return Ok(());
+        }
+        push_err(report, args.fail_fast, msg)
+    };
+    let Some(root_length) = manifest.directory.root_length else {
+        push_unique(report, "integrity: paged directory: manifest missing rootLength".into())?;
+        return Ok(());
+    };
+    let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    // A missing/unreadable directory object is already reported by the
+    // content-address pass; only the structural check is re-asserted here.
+    let Ok(dir_bytes) = std::fs::read(root.join(&manifest.directory.key)) else {
+        return Ok(());
+    };
+    let zstd = manifest.directory.encoding.as_deref()
+        == Some(stt_core::pack::DIRECTORY_ENCODING_ZSTD);
+    match stt_core::verify_paged_structure(&dir_bytes, root_length, zstd) {
+        Ok(issues) => {
+            for issue in issues {
+                push_unique(report, format!("integrity: {issue}"))?;
+            }
+        }
+        Err(e) => push_unique(report, format!("integrity: paged structure check failed: {e}"))?,
+    }
+    Ok(())
 }
 
 /// Validate a legacy single-file `.stt` archive.
@@ -458,5 +506,40 @@ fn print_summary(report: &Report, metadata: &Metadata) {
         for e in &report.errors {
             println!("  - {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Doc gate (naming-types-consistency F9): every visible long flag must
+    /// appear in the `stt-validate` section of `docs/api/cli-reference.md`, so
+    /// a new flag fails the build until it is documented.
+    #[test]
+    fn cli_flags_are_documented_in_cli_reference() {
+        use clap::CommandFactory;
+        let doc = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/api/cli-reference.md"
+        ))
+        .expect("read docs/api/cli-reference.md");
+        let start = doc.find("## `stt-validate`").expect("stt-validate section heading");
+        let body = &doc[start + 1..];
+        let end = body.find("\n## `").map(|i| start + 1 + i).unwrap_or(doc.len());
+        let section = &doc[start..end];
+        let missing: Vec<String> = Args::command()
+            .get_arguments()
+            .filter(|a| !a.is_hide_set())
+            .filter_map(|a| a.get_long())
+            .filter(|l| !matches!(*l, "help" | "version"))
+            .map(|l| format!("--{l}"))
+            .filter(|f| !section.contains(f.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "flags missing from the `stt-validate` section of docs/api/cli-reference.md \
+             (document them before shipping): {missing:?}"
+        );
     }
 }

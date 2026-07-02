@@ -1,6 +1,9 @@
 [package]
 name = "stt-core"
 description = "Core library for spatiotemporal tile format"
+readme = "README.md"
+keywords = ["tiles", "spatiotemporal", "geospatial", "arrow", "gis"]
+categories = ["science::geo", "encoding"]
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -8,7 +11,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,7 +22,6 @@ hilbert_2d.workspace = true
 byteorder.workspace = true
 memmap2.workspace = true
 tracing.workspace = true
-wkt.workspace = true
 chrono.workspace = true
 blake3.workspace = true
 crc32c.workspace = true

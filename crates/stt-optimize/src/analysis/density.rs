@@ -420,7 +420,6 @@ mod tests {
                     lon,
                     lat,
                     timestamp: (i * n_side + j) as u64 * 1000,
-                    end_timestamp: None,
                     geometry_type: GeometryType::Point,
                     vertex_count: 1,
                     estimated_size: 150,
@@ -432,7 +431,6 @@ mod tests {
             features,
             bounds: BoundingBox::new(min_lon, min_lat, max_lon, max_lat),
             time_range: TimeRange::new(0, 1_000_000),
-            source_name: "grid".to_string(),
         }
     }
 

@@ -83,18 +83,8 @@ struct StateRecord {
     vertrate: Option<f64>,
     callsign: Option<String>,
     onground: String,
-    #[allow(dead_code)]
-    alert: String,
-    #[allow(dead_code)]
-    spi: String,
     squawk: Option<String>,
     baroaltitude: Option<f64>,
-    #[allow(dead_code)]
-    geoaltitude: Option<f64>,
-    #[allow(dead_code)]
-    lastposupdate: Option<f64>,
-    #[allow(dead_code)]
-    lastcontact: Option<f64>,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -191,7 +181,8 @@ pub fn run(args: Args) -> Result<()> {
             // Decompress gzip (produces .csv file)
             if gz_path.exists() && !csv_path.exists() {
                 let status = Command::new("gunzip")
-                    .args(["-k", gz_path.to_str().unwrap()])  // -k keeps the original .gz file
+                    .arg("-k") // -k keeps the original .gz file
+                    .arg(&gz_path)
                     .status();
                 if let Err(e) = status {
                     eprintln!("Warning: Failed to decompress {}: {}", gz_path.display(), e);
@@ -260,7 +251,8 @@ pub fn run(args: Args) -> Result<()> {
                 if gz_path.exists() && !csv_path.exists() {
                     println!("   Decompressing {}...", gz_path.display());
                     let status = Command::new("gunzip")
-                        .args(["-k", gz_path.to_str().unwrap()])
+                        .arg("-k")
+                        .arg(&gz_path)
                         .status();
                     if let Err(e) = status {
                         eprintln!("Warning: Failed to decompress {}: {}", gz_path.display(), e);
@@ -330,9 +322,10 @@ fn download_file(url: &str, output_path: &PathBuf) -> Result<()> {
             "-S",           // Show error messages
             "--connect-timeout", "30",
             "--max-time", "600",  // 10 minute max for large files
-            "-o", output_path.to_str().unwrap(),
-            url,
+            "-o",
         ])
+        .arg(output_path)
+        .arg(url)
         .status()
         .with_context(|| "Failed to run curl command")?;
 

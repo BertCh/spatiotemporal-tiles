@@ -34,7 +34,7 @@ use stt_core::tile::TileId;
 /// Configuration for emitting a summary tier.
 #[derive(Debug, Clone)]
 pub struct SummaryConfig {
-    /// Aggregation scheme. Only [`SummaryScheme::H3`] is implemented today.
+    /// Aggregation scheme. Both [`SummaryScheme::H3`] and [`SummaryScheme::Quadbin`] are implemented.
     pub scheme: SummaryScheme,
     /// Inclusive minimum zoom level for which summary tiles are produced.
     pub min_zoom: u8,

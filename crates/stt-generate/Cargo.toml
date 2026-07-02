@@ -1,6 +1,9 @@
 [package]
 name = "stt-generate"
 description = "Unified CLI for generating spatiotemporal tile datasets"
+readme = "README.md"
+keywords = ["tiles", "spatiotemporal", "geospatial", "datasets", "cli"]
+categories = ["science::geo", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -13,14 +16,11 @@ path = "src/main.rs"
 
 [dependencies]
 # Workspace dependencies
-stt-core = { path = "../stt-core" }
+stt-core = { path = "../stt-core", version = "0.1.0" }
 anyhow.workspace = true
-thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 geojson.workspace = true
-geo.workspace = true
-geo-types.workspace = true
 csv.workspace = true
 chrono.workspace = true
 rayon.workspace = true
@@ -32,6 +32,9 @@ flate2.workspace = true
 
 # Additional dependencies
 reqwest = { version = "0.11", features = ["blocking", "json"] }
+# 2D Delaunay triangulation for the abstract flow-network proximity graph
+# (bixi --flow-graph edge-path bundling). Tiny, pure-Rust, no deps.
+delaunator = "1"
 sgp4 = "2.3"
 zip = "0.6"
 rand = "0.8"

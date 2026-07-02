@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Robert Christie"]
 license = "MIT"
-repository = "https://github.com/robertchristie/spatiotemporal-tiles"
+repository = "https://github.com/BertCh/spatiotemporal-tiles"
 
 [workspace.dependencies]
 # Core dependencies
@@ -27,7 +27,6 @@ serde_json = "1.0"
 geo = "0.28"
 geo-types = "0.7"
 geojson = { version = "0.24", features = ["geo-types"] }
-wkt = "0.10"
 geo-traits = "0.2"
 
 # Polygon tessellation (pre-baked triangle indices, MLT-style)
@@ -60,7 +59,6 @@ crc32c = "0.6"
 
 # Parallel processing
 rayon = "1.10"
-crossbeam = "0.8"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "cargo"] }

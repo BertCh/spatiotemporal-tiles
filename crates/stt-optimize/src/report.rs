@@ -141,16 +141,6 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
         "  --max-zoom {}\n",
         recommendations.max_zoom
     ));
-    output.push_str(&format!(
-        "  --chunk-size {}\n",
-        recommendations.chunk_size
-    ));
-    // Advisory only: the packed STT format is zstd-only, so compression is not a
-    // build knob. stt-build --auto consumes only the zoom/temporal-bucket values.
-    output.push_str(&format!(
-        "  compression: {} (fixed; packed format is zstd-only)\n",
-        recommendations.compression
-    ));
     output.push('\n');
 
     // Confidence
@@ -168,12 +158,8 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
         result.source.trim_end_matches(".parquet").trim_end_matches(".geoparquet")
     ));
     output.push_str(&format!(
-        "    --time-field timestamp --min-zoom {} --max-zoom {} \\\n",
+        "    --time-field timestamp --min-zoom {} --max-zoom {}\n",
         recommendations.min_zoom, recommendations.max_zoom
-    ));
-    output.push_str(&format!(
-        "    --chunk-size {} --compression {}\n",
-        recommendations.chunk_size, recommendations.compression
     ));
     output.push('\n');
 
@@ -257,8 +243,6 @@ pub fn generate_json(result: &AnalysisResult, recommendations: &Recommendations)
         "recommendations": {
             "min_zoom": recommendations.min_zoom,
             "max_zoom": recommendations.max_zoom,
-            "chunk_size": recommendations.chunk_size,
-            "compression": recommendations.compression,
             "temporal_bucket_ms": recommendations.temporal_bucket_ms,
             "confidence": recommendations.confidence,
             "explanations": recommendations.explanations,

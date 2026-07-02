@@ -8,6 +8,7 @@ pub mod bixi;
 pub mod drifters;
 pub mod drifters_hourly;
 pub mod earthquakes;
+pub mod flow_graph;
 pub mod flights;
 pub mod hurricanes;
 pub mod nyc_rideshare;

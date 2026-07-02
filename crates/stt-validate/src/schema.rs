@@ -20,8 +20,15 @@
 //! | `vertex_time`         | `List<UInt16>` (delta) or `List<Int64>`     | opt |
 //! | `vertex_value`        | `List<Float32>`                             | opt |
 //! | `vertex_value_matrix` | `List<Float32>`                             | opt |
-//! | `triangles`           | `List<UInt32>`                              | opt |
+//! | `triangles`           | `List<UInt16>` or `List<UInt32>`            | opt |
 //! | `<property>`          | `Float64` or `Dictionary<UInt16,Utf8>`      | opt |
+//!
+//! Beyond column shapes, the self-description metadata every reader depends on
+//! is enforced too: an `Int32`-leaf (quantized) geometry must carry a parseable
+//! `stt:quant` affine, unquantized geometry the CRS84
+//! `ARROW:extension:metadata`, a `List<UInt16>` (delta) `vertex_time` its
+//! `stt:vertex_time_origin_ms`/`step_ms` keys, and `stt:vertex_value_buckets`
+//! must be a positive integer consistent with the matrix column's row widths.
 //!
 //! ## Where the expected types/names come from
 //!
@@ -33,12 +40,31 @@
 //! from the `arrow` crate, not hardcoded strings.
 
 use arrow::datatypes::{DataType, Field};
-use stt_core::arrow_tile::{DecodedLayer, STT_QUANT_ATTR_META_KEY};
+use stt_core::arrow_tile::{
+    AttrQuant, DecodedLayer, QuantAffine, STT_QUANT_ATTR_META_KEY, STT_QUANT_META_KEY,
+};
 
 /// GeoArrow extension-name metadata key. Mirrors the private
 /// `GEOARROW_EXT_KEY` in `stt_core::arrow_tile`; this is the Arrow-standard
 /// extension-name key, so it is stable across the Arrow ecosystem.
 const GEOARROW_EXT_KEY: &str = "ARROW:extension:name";
+
+/// GeoArrow extension-*metadata* key (the CRS carrier). Mirrors the private
+/// `GEOARROW_EXT_META_KEY` in `stt_core::arrow_tile` — Arrow-standard, like
+/// [`GEOARROW_EXT_KEY`].
+const GEOARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
+
+/// The CRS the conformance spec pins for unquantized geometry
+/// (`docs/spec/conformance.md` §3: writer MUST emit the CRS84
+/// `ARROW:extension:metadata`).
+const CRS84: &str = "OGC:CRS84";
+
+/// Schema-metadata keys for the u16-delta `vertex_time` encoding and the
+/// `vertex_value_matrix` bucket count. Mirror the private constants in
+/// `stt_core::arrow_tile` — keep in sync if `arrow_tile` ever renames them.
+const VERTEX_TIME_ORIGIN_KEY: &str = "stt:vertex_time_origin_ms";
+const VERTEX_TIME_STEP_KEY: &str = "stt:vertex_time_step_ms";
+const VERTEX_VALUE_BUCKETS_KEY: &str = "stt:vertex_value_buckets";
 
 /// Required columns and the Arrow type each must carry. Mirrors the leading
 /// scalar fields `encode_layer` always writes.
@@ -89,7 +115,9 @@ fn check_layer_schema(layer: &DecodedLayer, issues: &mut Vec<String>) {
     match schema.field_with_name(GEOMETRY_COLUMN) {
         Ok(field) => {
             check_geometry_extension(name, field, issues);
-            if !is_list_like(field.data_type()) {
+            if is_list_like(field.data_type()) {
+                check_geometry_self_description(name, field, issues);
+            } else {
                 issues.push(format!(
                     "layer '{name}': geometry column is {:?}, expected a (FixedSize)List of coordinates",
                     field.data_type()
@@ -106,7 +134,18 @@ fn check_layer_schema(layer: &DecodedLayer, issues: &mut Vec<String>) {
     check_optional_list(name, &schema, "vertex_time", &[DataType::UInt16, DataType::Int64], issues);
     check_optional_list(name, &schema, "vertex_value", &[DataType::Float32], issues);
     check_optional_list(name, &schema, "vertex_value_matrix", &[DataType::Float32], issues);
-    check_optional_list(name, &schema, "triangles", &[DataType::UInt32], issues);
+    check_optional_list(
+        name,
+        &schema,
+        "triangles",
+        &[DataType::UInt16, DataType::UInt32],
+        issues,
+    );
+
+    // (c') encodings that are only decodable through schema-level metadata:
+    // the u16-delta vertex_time origin/step and the value-matrix bucket count.
+    check_vertex_time_metadata(layer, issues);
+    check_vertex_value_buckets(layer, issues);
 
     // (d) every remaining (property) column must be one of the two encodable
     // property shapes the producer emits — anything else is producer drift.
@@ -118,7 +157,8 @@ fn check_layer_schema(layer: &DecodedLayer, issues: &mut Vec<String>) {
         if !is_valid_property_field(field) {
             issues.push(format!(
                 "layer '{name}': property column '{n}' has type {:?}, expected Float64, \
-                 Dictionary<UInt16,Utf8>, or a quantized UInt16/Int32 carrying '{STT_QUANT_ATTR_META_KEY}'",
+                 Dictionary<UInt16,Utf8>, or a quantized UInt16/Int32 carrying a valid \
+                 '{STT_QUANT_ATTR_META_KEY}' affine",
                 field.data_type()
             ));
         }
@@ -135,6 +175,178 @@ fn check_geometry_extension(layer: &str, field: &Field, issues: &mut Vec<String>
         None => issues.push(format!(
             "layer '{layer}': geometry column missing the '{GEOARROW_EXT_KEY}' (GeoArrow) extension name"
         )),
+    }
+}
+
+/// The geometry column's self-description contract, keyed on its leaf type:
+///
+/// - an `Int32` (fixed-point) leaf MUST carry a parseable `stt:quant`
+///   reconstruction affine — without it a reader renders raw grid indices as
+///   lon/lat (mirrors the `stt:qa` gate on quantized property columns);
+/// - an unquantized `Float64` leaf MUST carry the CRS84
+///   `ARROW:extension:metadata` (a writer MUST, `docs/spec/conformance.md` §3);
+/// - any other leaf is producer drift.
+fn check_geometry_self_description(layer: &str, field: &Field, issues: &mut Vec<String>) {
+    match geometry_leaf_type(field.data_type()) {
+        DataType::Int32 => match field.metadata().get(STT_QUANT_META_KEY) {
+            Some(json) if QuantAffine::from_json(json).is_some() => {}
+            Some(json) => issues.push(format!(
+                "layer '{layer}': geometry '{STT_QUANT_META_KEY}' metadata is not a valid \
+                 quantization affine JSON: {json}"
+            )),
+            None => issues.push(format!(
+                "layer '{layer}': quantized (Int32-leaf) geometry is missing the \
+                 '{STT_QUANT_META_KEY}' reconstruction affine"
+            )),
+        },
+        DataType::Float64 => match field.metadata().get(GEOARROW_EXT_META_KEY) {
+            Some(json) if crs_is_crs84(json) => {}
+            Some(json) => issues.push(format!(
+                "layer '{layer}': geometry '{GEOARROW_EXT_META_KEY}' does not pin the CRS \
+                 to {CRS84}: {json}"
+            )),
+            None => issues.push(format!(
+                "layer '{layer}': unquantized geometry is missing the {CRS84} \
+                 '{GEOARROW_EXT_META_KEY}' (writer MUST, docs/spec/conformance.md §3)"
+            )),
+        },
+        other => issues.push(format!(
+            "layer '{layer}': geometry leaf type is {other:?}, expected Float64 (unquantized) \
+             or Int32 (quantized, with '{STT_QUANT_META_KEY}')"
+        )),
+    }
+}
+
+/// Innermost non-nested (coordinate) type of a geometry column: Point is
+/// `FixedSizeList<leaf, 2|3>`, LineString `List<FixedSizeList<leaf, 2>>`,
+/// Polygon `List<List<FixedSizeList<leaf, 2>>>` — the leaf is what carries
+/// `Float64` vs quantized `Int32`.
+fn geometry_leaf_type(dt: &DataType) -> &DataType {
+    match dt {
+        DataType::List(inner) | DataType::LargeList(inner) | DataType::FixedSizeList(inner, _) => {
+            geometry_leaf_type(inner.data_type())
+        }
+        other => other,
+    }
+}
+
+/// True when the GeoArrow per-type extension metadata pins the CRS to CRS84
+/// (`{"crs":"OGC:CRS84",...}`) — the axis-order-correct identifier for the
+/// interleaved `[lon, lat]` storage.
+fn crs_is_crs84(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("crs").and_then(|c| c.as_str().map(String::from)))
+        .is_some_and(|crs| crs == CRS84)
+}
+
+/// The u16-delta `vertex_time` shape is only decodable with its per-layer
+/// `(origin, step)` schema metadata — the TS reader would otherwise silently
+/// reconstruct with `origin=0, step=1` (wrong timestamps, no error on either
+/// side). Whenever the column is `List<UInt16>`, both keys must be present
+/// with sane values (an integer Unix-ms origin and a positive integer step).
+fn check_vertex_time_metadata(layer: &DecodedLayer, issues: &mut Vec<String>) {
+    let schema = layer.batch.schema();
+    let name = &layer.name;
+    let Ok(field) = schema.field_with_name("vertex_time") else {
+        return;
+    };
+    let is_u16_delta = match field.data_type() {
+        DataType::List(inner) | DataType::LargeList(inner) => {
+            inner.data_type() == &DataType::UInt16
+        }
+        _ => false,
+    };
+    if !is_u16_delta {
+        return;
+    }
+    let meta = schema.metadata();
+    match meta.get(VERTEX_TIME_ORIGIN_KEY) {
+        Some(v) if v.parse::<i64>().is_ok() => {}
+        Some(v) => issues.push(format!(
+            "layer '{name}': '{VERTEX_TIME_ORIGIN_KEY}' is not an integer Unix-ms origin: {v:?}"
+        )),
+        None => issues.push(format!(
+            "layer '{name}': u16-delta vertex_time is missing '{VERTEX_TIME_ORIGIN_KEY}'"
+        )),
+    }
+    match meta.get(VERTEX_TIME_STEP_KEY) {
+        Some(v) if v.parse::<u32>().map(|s| s >= 1).unwrap_or(false) => {}
+        Some(v) => issues.push(format!(
+            "layer '{name}': '{VERTEX_TIME_STEP_KEY}' must be a positive integer ms step, got {v:?}"
+        )),
+        None => issues.push(format!(
+            "layer '{name}': u16-delta vertex_time is missing '{VERTEX_TIME_STEP_KEY}'"
+        )),
+    }
+}
+
+/// `stt:vertex_value_buckets` must be a positive integer, only appear alongside
+/// a `vertex_value_matrix` column, and agree with the matrix column's row
+/// widths: every non-empty row is `vertex_count * buckets` values (vertex-major
+/// flatten). An absent key with a present column is legal — the encoder omits
+/// it when it can't infer a clean bucket count (the matrix is then present but
+/// non-animatable).
+fn check_vertex_value_buckets(layer: &DecodedLayer, issues: &mut Vec<String>) {
+    use arrow::array::{Array, FixedSizeListArray, ListArray};
+
+    let schema = layer.batch.schema();
+    let name = &layer.name;
+    let Some(raw) = schema.metadata().get(VERTEX_VALUE_BUCKETS_KEY) else {
+        return;
+    };
+    let Some(matrix_col) = layer.batch.column_by_name("vertex_value_matrix") else {
+        issues.push(format!(
+            "layer '{name}': '{VERTEX_VALUE_BUCKETS_KEY}' is set but there is no \
+             vertex_value_matrix column"
+        ));
+        return;
+    };
+    let buckets = match raw.parse::<u64>() {
+        Ok(b) if b >= 1 => b as usize,
+        _ => {
+            issues.push(format!(
+                "layer '{name}': '{VERTEX_VALUE_BUCKETS_KEY}' must be a positive integer, got {raw:?}"
+            ));
+            return;
+        }
+    };
+
+    // Row-width consistency. Vertex counts come from the geometry column:
+    // one per feature for points, the list length for linestrings. Polygon
+    // nesting never carries a bucketed matrix (the encoder infers buckets for
+    // LineString geometry only), so it is skipped.
+    let Some(matrix) = matrix_col.as_any().downcast_ref::<ListArray>() else {
+        return; // shape already reported by check_optional_list
+    };
+    let vertex_count = |i: usize| -> Option<usize> {
+        let geom = layer.batch.column_by_name(GEOMETRY_COLUMN)?;
+        if let Some(list) = geom.as_any().downcast_ref::<ListArray>() {
+            return matches!(list.value_type(), DataType::FixedSizeList(_, _))
+                .then(|| list.value_length(i) as usize);
+        }
+        geom.as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .map(|_| 1usize)
+    };
+    for i in 0..matrix.len() {
+        if matrix.is_null(i) {
+            continue;
+        }
+        let len = matrix.value_length(i) as usize;
+        if len == 0 {
+            continue;
+        }
+        let Some(nv) = vertex_count(i) else {
+            return;
+        };
+        if nv == 0 || len != nv * buckets {
+            issues.push(format!(
+                "layer '{name}': vertex_value_matrix row {i} has {len} values, expected \
+                 vertex_count {nv} × {VERTEX_VALUE_BUCKETS_KEY} {buckets}"
+            ));
+            return; // first mismatch only — one bad width implies the rest
+        }
     }
 }
 
@@ -179,11 +391,13 @@ fn is_valid_property_field(field: &Field) -> bool {
             *n > 0
                 && matches!(item.data_type(), DataType::Float32 | DataType::UInt8)
         }
-        // Quantized numeric: only valid WITH the affine metadata — a bare
-        // UInt16/Int32 property with no `stt:qa` is producer drift.
-        DataType::UInt16 | DataType::Int32 => {
-            field.metadata().contains_key(STT_QUANT_ATTR_META_KEY)
-        }
+        // Quantized numeric: only valid WITH a parseable affine — a bare
+        // UInt16/Int32 property with no (or malformed) `stt:qa` is producer
+        // drift a reader cannot reconstruct Float64 from.
+        DataType::UInt16 | DataType::Int32 => field
+            .metadata()
+            .get(STT_QUANT_ATTR_META_KEY)
+            .is_some_and(|json| AttrQuant::from_json(json).is_some()),
         _ => false,
     }
 }
@@ -400,6 +614,252 @@ mod tests {
         let issues = check_tile_schema(&[DecodedLayer { name: "nogeo".into(), batch }]);
         assert!(
             issues.iter().any(|i| i.contains("extension name")),
+            "issues were: {issues:?}"
+        );
+    }
+
+    /// Rebuild a decoded layer's batch with the schema-level metadata replaced,
+    /// keeping every field (incl. field-level metadata) and column intact.
+    fn with_schema_metadata(
+        layer: &DecodedLayer,
+        metadata: HashMap<String, String>,
+    ) -> DecodedLayer {
+        use arrow::datatypes::Schema;
+        use arrow::record_batch::RecordBatch;
+        let schema = Arc::new(Schema::new_with_metadata(
+            layer.batch.schema().fields().clone(),
+            metadata,
+        ));
+        DecodedLayer {
+            name: layer.name.clone(),
+            batch: RecordBatch::try_new(schema, layer.batch.columns().to_vec()).unwrap(),
+        }
+    }
+
+    #[test]
+    fn quantized_geometry_with_affine_passes() {
+        use stt_core::arrow_tile::encode_tile_quantized;
+        let payload = encode_tile_quantized(&[good_point_layer()], Some(1.0)).unwrap();
+        let decoded = decode_tile(&payload).unwrap();
+        let issues = check_tile_schema(&decoded);
+        assert!(issues.is_empty(), "unexpected schema issues: {issues:?}");
+    }
+
+    #[test]
+    fn int32_geometry_without_quant_affine_is_reported() {
+        use arrow::array::{Array, FixedSizeListArray, Int32Array, Int64Array, UInt64Array};
+        use arrow::datatypes::Schema;
+        use arrow::record_batch::RecordBatch;
+
+        let id = Arc::new(UInt64Array::from(vec![1u64]));
+        let start = Arc::new(Int64Array::from(vec![0i64]));
+        let end = Arc::new(Int64Array::from(vec![10i64]));
+        let coord_field = Arc::new(Field::new("xy", DataType::Int32, false));
+        let geom = Arc::new(FixedSizeListArray::new(
+            coord_field,
+            2,
+            Arc::new(Int32Array::from(vec![100, 200])),
+            None,
+        ));
+        let build = |quant: Option<&str>| {
+            let mut geom_meta = HashMap::new();
+            geom_meta.insert(GEOARROW_EXT_KEY.to_string(), "geoarrow.point".to_string());
+            if let Some(q) = quant {
+                geom_meta.insert(STT_QUANT_META_KEY.to_string(), q.to_string());
+            }
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::UInt64, false),
+                Field::new("start_time", DataType::Int64, false),
+                Field::new("end_time", DataType::Int64, false),
+                Field::new("geometry", geom.data_type().clone(), false).with_metadata(geom_meta),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![id.clone(), start.clone(), end.clone(), geom.clone()],
+            )
+            .unwrap();
+            check_tile_schema(&[DecodedLayer { name: "q".into(), batch }])
+        };
+
+        // Missing affine entirely.
+        let issues = build(None);
+        assert!(
+            issues.iter().any(|i| i.contains("stt:quant") && i.contains("missing")),
+            "issues were: {issues:?}"
+        );
+        // Present but malformed JSON.
+        let issues = build(Some("{not json"));
+        assert!(
+            issues.iter().any(|i| i.contains("stt:quant") && i.contains("not a valid")),
+            "issues were: {issues:?}"
+        );
+        // Present and well-formed: clean.
+        let issues = build(Some(r#"{"x0":-180.0,"y0":-90.0,"sx":1e-5,"sy":1e-5}"#));
+        assert!(issues.is_empty(), "unexpected schema issues: {issues:?}");
+    }
+
+    #[test]
+    fn unquantized_geometry_without_crs84_metadata_is_reported() {
+        // Strip the geometry field's CRS metadata from a real encoded tile,
+        // keeping the extension NAME — the conformance writer-MUST is the CRS.
+        use arrow::datatypes::Schema;
+        use arrow::record_batch::RecordBatch;
+        let decoded = decode(&[good_point_layer()]);
+        let src = &decoded[0];
+        let fields: Vec<Arc<Field>> = src
+            .batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == "geometry" {
+                    let mut meta = f.metadata().clone();
+                    meta.remove(GEOARROW_EXT_META_KEY);
+                    Arc::new(f.as_ref().clone().with_metadata(meta))
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, src.batch.columns().to_vec()).unwrap();
+        let issues = check_tile_schema(&[DecodedLayer { name: src.name.clone(), batch }]);
+        assert!(
+            issues.iter().any(|i| i.contains(CRS84) && i.contains("missing")),
+            "issues were: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn u16_delta_vertex_time_requires_origin_and_step() {
+        // A tight-span line layer encodes vertex_time as u16 deltas; stripping
+        // the schema metadata must flag BOTH missing keys.
+        let layer = ColumnarLayer {
+            name: "tracks".into(),
+            feature_ids: vec![1],
+            start_times: vec![0],
+            end_times: vec![100],
+            geometry: GeometryColumn::LineString(vec![vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]]),
+            vertex_times: Some(vec![vec![0, 50, 100]]),
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![],
+        };
+        let decoded = decode(&[layer]);
+        assert!(check_tile_schema(&decoded).is_empty());
+
+        let stripped = with_schema_metadata(&decoded[0], HashMap::new());
+        let issues = check_tile_schema(&[stripped]);
+        assert!(
+            issues.iter().any(|i| i.contains(VERTEX_TIME_ORIGIN_KEY) && i.contains("missing")),
+            "issues were: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| i.contains(VERTEX_TIME_STEP_KEY) && i.contains("missing")),
+            "issues were: {issues:?}"
+        );
+
+        // Insane values (non-integer origin, zero step) are rejected too.
+        let mut bad = HashMap::new();
+        bad.insert(VERTEX_TIME_ORIGIN_KEY.to_string(), "not-a-number".to_string());
+        bad.insert(VERTEX_TIME_STEP_KEY.to_string(), "0".to_string());
+        let issues = check_tile_schema(&[with_schema_metadata(&decoded[0], bad)]);
+        assert!(
+            issues.iter().any(|i| i.contains(VERTEX_TIME_ORIGIN_KEY) && i.contains("not an integer")),
+            "issues were: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| i.contains(VERTEX_TIME_STEP_KEY) && i.contains("positive")),
+            "issues were: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn vertex_value_buckets_must_be_positive_and_match_matrix_width() {
+        // 3-vertex + 2-vertex lines, 2 buckets each → rows of 6 and 4 values.
+        let layer = ColumnarLayer {
+            name: "corridors".into(),
+            feature_ids: vec![1, 2],
+            start_times: vec![0, 0],
+            end_times: vec![100, 100],
+            geometry: GeometryColumn::LineString(vec![
+                vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]],
+                vec![[5.0, 5.0], [6.0, 6.0]],
+            ]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: Some(vec![
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                vec![7.0, 8.0, 9.0, 10.0],
+            ]),
+            properties: vec![],
+        };
+        let decoded = decode(&[layer]);
+        assert_eq!(
+            decoded[0].batch.schema().metadata().get(VERTEX_VALUE_BUCKETS_KEY).map(String::as_str),
+            Some("2")
+        );
+        assert!(check_tile_schema(&decoded).is_empty());
+
+        let tamper = |value: &str| {
+            let mut meta = decoded[0].batch.schema().metadata().clone();
+            meta.insert(VERTEX_VALUE_BUCKETS_KEY.to_string(), value.to_string());
+            check_tile_schema(&[with_schema_metadata(&decoded[0], meta)])
+        };
+        // Positive but inconsistent with the row widths.
+        let issues = tamper("4");
+        assert!(
+            issues.iter().any(|i| i.contains("vertex_value_matrix row") && i.contains("expected")),
+            "issues were: {issues:?}"
+        );
+        // Non-positive / non-integer.
+        for bad in ["0", "-2", "two"] {
+            let issues = tamper(bad);
+            assert!(
+                issues.iter().any(|i| i.contains(VERTEX_VALUE_BUCKETS_KEY) && i.contains("positive")),
+                "value {bad:?}: issues were: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantized_property_with_malformed_affine_is_reported() {
+        use arrow::array::{Array, FixedSizeListArray, Float64Array, Int64Array, UInt16Array, UInt64Array};
+        use arrow::datatypes::Schema;
+        use arrow::record_batch::RecordBatch;
+
+        let id = Arc::new(UInt64Array::from(vec![1u64]));
+        let start = Arc::new(Int64Array::from(vec![0i64]));
+        let end = Arc::new(Int64Array::from(vec![10i64]));
+        let coord_field = Arc::new(Field::new("xy", DataType::Float64, false));
+        let geom = Arc::new(FixedSizeListArray::new(
+            coord_field,
+            2,
+            Arc::new(Float64Array::from(vec![1.0, 2.0])),
+            None,
+        ));
+        let mut geom_meta = HashMap::new();
+        geom_meta.insert(GEOARROW_EXT_KEY.to_string(), "geoarrow.point".to_string());
+        geom_meta.insert(
+            GEOARROW_EXT_META_KEY.to_string(),
+            r#"{"crs":"OGC:CRS84","crs_type":"authority_code"}"#.to_string(),
+        );
+        let mut qa_meta = HashMap::new();
+        qa_meta.insert(STT_QUANT_ATTR_META_KEY.to_string(), "{broken".to_string());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("start_time", DataType::Int64, false),
+            Field::new("end_time", DataType::Int64, false),
+            Field::new("geometry", geom.data_type().clone(), false).with_metadata(geom_meta),
+            Field::new("depth", DataType::UInt16, true).with_metadata(qa_meta),
+        ]));
+        let depth = Arc::new(UInt16Array::from(vec![7u16]));
+        let batch = RecordBatch::try_new(schema, vec![id, start, end, geom, depth]).unwrap();
+        let issues = check_tile_schema(&[DecodedLayer { name: "qa".into(), batch }]);
+        assert!(
+            issues.iter().any(|i| i.contains("'depth'") && i.contains(STT_QUANT_ATTR_META_KEY)),
             "issues were: {issues:?}"
         );
     }

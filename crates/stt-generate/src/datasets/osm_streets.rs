@@ -57,13 +57,6 @@ pub enum RoadClass {
 }
 
 impl RoadClass {
-    /// Map an OSM `highway=*` tag value to a class tier for the **road** network
-    /// (NYC car mode), or `None` to exclude. Kept as the back-compat default;
-    /// see [`Self::from_highway_with_mode`] for the bike network.
-    pub fn from_highway(v: &str) -> Option<RoadClass> {
-        Self::from_highway_with_mode(v, NetworkMode::Roads)
-    }
-
     /// Map an OSM `highway=*` tag value to a class tier for the given mode, or
     /// `None` to exclude. In [`NetworkMode::Bike`] motorways/trunks are dropped
     /// and cycleways/paths/footways are admitted; everything else mirrors the
@@ -358,6 +351,32 @@ impl OsmNetwork {
         best.filter(|(d2, _)| *d2 <= SNAP_THRESH_SCALED_DEG * SNAP_THRESH_SCALED_DEG)
             .map(|(_, e)| e)
     }
+
+    /// Like [`Self::match_segment`] but returns the matched edge **oriented in
+    /// travel direction**: `from` is the endpoint nearer the segment start `p0`,
+    /// `to` the endpoint nearer `p1`. Directed flow aggregation keys on this so
+    /// A→B and B→A traffic stay separate (one-way pairs, asymmetric ridership);
+    /// a two-way street resolves to the same node pair in opposite order for the
+    /// two directions, which the offset renderer then draws as side-by-side
+    /// ribbons. Returns `None` on the same true miss as `match_segment`.
+    pub fn match_segment_directed(&self, p0: [f64; 2], p1: [f64; 2]) -> Option<(i64, i64)> {
+        let (a, b) = self.match_segment(p0, p1)?;
+        let s = self.lon_scale;
+        let d2_from_p0 = |id: i64| {
+            let (nx, ny) = self.node_coords[&id];
+            let dx = (p0[0] - nx) * s;
+            let dy = p0[1] - ny;
+            dx * dx + dy * dy
+        };
+        Some(if d2_from_p0(a) <= d2_from_p0(b) { (a, b) } else { (b, a) })
+    }
+
+    /// Longitude scale `cos(mean_lat)` for this network — exposed so stroke
+    /// synthesis can compute geometrically correct deflection angles (longitude
+    /// degrees are shorter than latitude degrees away from the equator).
+    pub fn lon_scale(&self) -> f64 {
+        self.lon_scale
+    }
 }
 
 /// Squared distance from point to segment, with longitude scaled by `lon_scale`
@@ -443,12 +462,13 @@ mod tests {
 
     #[test]
     fn class_min_zoom_table() {
-        assert_eq!(RoadClass::from_highway("motorway").unwrap().min_zoom(), 8);
-        assert_eq!(RoadClass::from_highway("primary_link").unwrap().min_zoom(), 9);
-        assert_eq!(RoadClass::from_highway("residential").unwrap().min_zoom(), 12);
-        assert_eq!(RoadClass::from_highway("service").unwrap().min_zoom(), 13);
-        assert!(RoadClass::from_highway("footway").is_none());
-        assert!(RoadClass::from_highway("cycleway").is_none());
+        use NetworkMode::Roads;
+        assert_eq!(RoadClass::from_highway_with_mode("motorway", Roads).unwrap().min_zoom(), 8);
+        assert_eq!(RoadClass::from_highway_with_mode("primary_link", Roads).unwrap().min_zoom(), 9);
+        assert_eq!(RoadClass::from_highway_with_mode("residential", Roads).unwrap().min_zoom(), 12);
+        assert_eq!(RoadClass::from_highway_with_mode("service", Roads).unwrap().min_zoom(), 13);
+        assert!(RoadClass::from_highway_with_mode("footway", Roads).is_none());
+        assert!(RoadClass::from_highway_with_mode("cycleway", Roads).is_none());
     }
 
     #[test]

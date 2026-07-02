@@ -5,7 +5,8 @@
 
 use crate::common::{self, LineStringRecord, PropertyColumn, StreamingLineStringParquetWriter};
 use crate::datasets::osrm::{
-    check_osrm_connectivity, get_osrm_route, get_osrm_route_pooled, OsrmRoute,
+    check_osrm_connectivity, get_osrm_route, get_osrm_route_pooled, vertex_timestamps_from_route,
+    OsrmRoute,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
@@ -955,63 +956,6 @@ fn parse_tlc_datetime(s: &str) -> Result<DateTime<Utc>> {
     }
 
     Err(anyhow!("Could not parse datetime: {}", s))
-}
-
-/// Compute true per-vertex absolute timestamps from OSRM annotation data.
-///
-/// OSRM's `annotations=duration` returns one duration per edge (between
-/// consecutive overview coordinates). We accumulate them to get a per-vertex
-/// absolute timestamp, then rescale to land exactly on the trip's recorded
-/// pickup→dropoff window — OSRM's predicted total duration usually differs
-/// from the actual TLC trip duration by ±10-30%, but the *shape* of the
-/// per-edge distribution (which edges are fast, which are slow) is what
-/// drives the per-segment-speed effect we want.
-///
-/// Returns `None` if the annotation arrays are missing or have the wrong
-/// length, in which case the caller falls back to even-distance
-/// interpolation in stt-build.
-fn vertex_timestamps_from_route(
-    route: &OsrmRoute,
-    start_ms: i64,
-    end_ms: i64,
-) -> Option<Vec<i64>> {
-    let coords = &route.geometry.coordinates;
-    if coords.len() < 2 || end_ms <= start_ms {
-        return None;
-    }
-
-    // Collect per-edge durations from all legs. For a single-leg request
-    // (one source → one destination) there is exactly one leg whose
-    // annotation.duration has `coords.len() - 1` entries.
-    let mut edge_durations: Vec<f64> = Vec::with_capacity(coords.len().saturating_sub(1));
-    for leg in &route.legs {
-        if let Some(ann) = &leg.annotation {
-            edge_durations.extend(ann.duration.iter().copied());
-        }
-    }
-    if edge_durations.len() != coords.len() - 1 {
-        return None;
-    }
-    let total: f64 = edge_durations.iter().sum();
-    if total <= 0.0 {
-        return None;
-    }
-
-    let trip_duration_ms = (end_ms - start_ms) as f64;
-    let mut acc = 0.0f64;
-    let mut out: Vec<i64> = Vec::with_capacity(coords.len());
-    out.push(start_ms);
-    for &d in &edge_durations {
-        acc += d;
-        let frac = acc / total;
-        // Rescale onto the trip's recorded time window so endpoints are exact.
-        out.push(start_ms + (frac * trip_duration_ms) as i64);
-    }
-    // Replace last to guarantee exact end_ms (avoids cumulative rounding drift).
-    if let Some(last) = out.last_mut() {
-        *last = end_ms;
-    }
-    Some(out)
 }
 
 fn interpolate_route(

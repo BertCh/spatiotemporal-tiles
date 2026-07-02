@@ -1,6 +1,9 @@
 [package]
 name = "stt-build"
 description = "CLI tool for building spatiotemporal tile archives"
+readme = "README.md"
+keywords = ["tiles", "spatiotemporal", "geospatial", "cli", "gis"]
+categories = ["science::geo", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -16,19 +19,15 @@ name = "stt-build"
 path = "src/main.rs"
 
 [dependencies]
-stt-core = { path = "../stt-core" }
-stt-optimize = { path = "../stt-optimize" }
+stt-core = { path = "../stt-core", version = "0.1.0" }
+stt-optimize = { path = "../stt-optimize", version = "0.1.0" }
 anyhow.workspace = true
-thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 geojson.workspace = true
 geo.workspace = true
-geo-types.workspace = true
 geozero.workspace = true
-earcutr.workspace = true
 rayon.workspace = true
-crossbeam.workspace = true
 clap.workspace = true
 indicatif.workspace = true
 tracing.workspace = true

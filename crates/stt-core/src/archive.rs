@@ -928,6 +928,29 @@ mod tests {
     }
 
     #[test]
+    fn compression_byte_set_is_frozen() {
+        // The wire compression byte-set is FROZEN: 0=None, 2=Zstd. Byte 1 (the
+        // never-shipped gzip) is retired/reserved and must be REJECTED, not
+        // silently mapped. This locks the spec's compression codes to the
+        // canonical Rust reader (see data-format.md).
+        assert_eq!(compression_to_byte(Compression::None), 0);
+        assert_eq!(compression_to_byte(Compression::Zstd), 2);
+
+        assert_eq!(compression_from_byte(0).unwrap(), Compression::None);
+        assert_eq!(compression_from_byte(2).unwrap(), Compression::Zstd);
+
+        // Byte 1 (retired gzip) and any other code are hard-rejected.
+        assert!(compression_from_byte(1).is_err(), "byte 1 (gzip) must be rejected");
+        assert!(compression_from_byte(3).is_err());
+        assert!(compression_from_byte(255).is_err());
+
+        // Round-trip closure for the two live codes.
+        for c in [Compression::None, Compression::Zstd] {
+            assert_eq!(compression_from_byte(compression_to_byte(c)).unwrap(), c);
+        }
+    }
+
+    #[test]
     fn header_roundtrips() {
         let header = ArchiveHeader {
             version: FORMAT_VERSION,

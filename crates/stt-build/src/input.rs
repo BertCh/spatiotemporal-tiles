@@ -1,7 +1,7 @@
 //! GeoParquet input parsing and feature loading
 
 use anyhow::{Context, Result};
-use arrow::array::{Array, BinaryViewArray, Float32Array, Float64Array, Int64Array, LargeBinaryArray, ListArray, StringArray, TimestampMillisecondArray, TimestampMicrosecondArray};
+use arrow::array::{Array, BinaryViewArray, Float32Array, Float64Array, Int64Array, LargeBinaryArray, ListArray, StringArray, TimestampSecondArray, TimestampMillisecondArray, TimestampMicrosecondArray, TimestampNanosecondArray};
 use arrow::datatypes::DataType;
 use geojson::{Feature, Geometry, Value as GeomValue};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -68,13 +68,20 @@ pub enum InputStrictness {
 /// Wire format of the `--time-field` column. Only consulted for integer
 /// (Int64) time columns — Arrow Timestamp columns are self-describing and
 /// String columns are always parsed as ISO 8601 regardless of this flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+///
+/// The `serde` rename spellings match the clap `ValueEnum` value names exactly,
+/// so a JSON config file (e.g. `stt-serve --config`) accepts the same
+/// `"iso8601"`/`"unix-sec"`/`"unix-ms"` strings the CLI does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
 pub enum TimeFormat {
     /// ISO 8601 strings (e.g. `2024-06-21T12:00:00Z`).
+    #[serde(rename = "iso8601")]
     Iso8601,
     /// Integer seconds since the Unix epoch.
+    #[serde(rename = "unix-sec")]
     UnixSec,
     /// Integer milliseconds since the Unix epoch.
+    #[serde(rename = "unix-ms")]
     UnixMs,
 }
 
@@ -197,10 +204,8 @@ where
             let is_meta = name == &geom_col_name
                 || name == time_field
                 || end_time_field.map(|f| name == f).unwrap_or(false)
-                || name == "vertex_timestamps"
-                || name == "vertex_values"
-                || name == "vertex_value_matrix"
-                || matches!(name.as_str(), "lon" | "lat" | "longitude" | "latitude" | "x" | "y");
+                || is_vertex_metadata_column(name)
+                || is_coordinate_column_name(name);
             if is_meta {
                 None
             } else {
@@ -210,6 +215,10 @@ where
         .collect();
 
     let mut row_count = 0usize;
+    // Aligned with `property_cols`: flips true the first time the column
+    // yields a value, so columns that never do can be reported at EOF (the
+    // silent-drop accounting the PostGIS/DuckDB readers already have).
+    let mut seen_props = vec![false; property_cols.len()];
     for batch_result in reader {
         let batch = batch_result.context("Failed to read Parquet batch")?;
         let parsed = parse_batch(
@@ -222,6 +231,7 @@ where
             vertex_values_col_idx,
             vertex_value_matrix_col_idx,
             &property_cols,
+            &mut seen_props,
             time_format,
             time_strictness,
             geometry_strictness,
@@ -230,7 +240,44 @@ where
         row_count += batch.num_rows();
         on_batch(parsed)?;
     }
+    warn_dropped_property_columns(&schema, &property_cols, &seen_props, row_count);
     Ok(())
+}
+
+/// Warn once about property columns present in the source but carrying no
+/// value in any row — the silent-drop cases (unmappable Arrow column type, or
+/// entirely NULL) made visible so a missing tile column isn't a mystery.
+/// Mirrors the PostGIS/DuckDB readers' `warn_dropped_columns` so all three
+/// input adaptors degrade equally loudly.
+fn warn_dropped_property_columns(
+    schema: &arrow::datatypes::Schema,
+    property_cols: &[usize],
+    seen: &[bool],
+    total_rows: usize,
+) {
+    if total_rows == 0 {
+        return;
+    }
+    // Report `name (arrow_type)` so an operator can tell an unmappable-type
+    // drop (e.g. `foo (Decimal128(38, 9))`) from an all-NULL column at a glance.
+    let dropped: Vec<String> = property_cols
+        .iter()
+        .zip(seen)
+        .filter(|&(_, &s)| !s)
+        .map(|(&idx, _)| {
+            let field = schema.field(idx);
+            format!("{} ({})", field.name(), field.data_type())
+        })
+        .collect();
+    if !dropped.is_empty() {
+        tracing::warn!(
+            "{} source column(s) carried no value in any of {total_rows} rows and were \
+             dropped from tiles (unmappable Arrow column type — e.g. decimal/struct/binary — \
+             or entirely NULL): {}",
+            dropped.len(),
+            dropped.join(", ")
+        );
+    }
 }
 
 /// Materialise one record batch into a `Vec<ParsedFeature>` without holding
@@ -247,6 +294,7 @@ fn parse_batch(
     vertex_values_col_idx: Option<usize>,
     vertex_value_matrix_col_idx: Option<usize>,
     property_cols: &[usize],
+    seen_props: &mut [bool],
     time_format: TimeFormat,
     time_strictness: InputStrictness,
     geometry_strictness: InputStrictness,
@@ -310,8 +358,9 @@ fn parse_batch(
         // map when the row actually has property values; an empty map is
         // dropped so empty rows pay no allocation.
         let mut properties = serde_json::Map::new();
-        for &col_idx in property_cols {
+        for (pc, &col_idx) in property_cols.iter().enumerate() {
             if let Some(value) = extract_property_value(batch, col_idx, i) {
+                seen_props[pc] = true;
                 let name = schema.field(col_idx).name();
                 properties.insert(name.clone(), value);
             }
@@ -349,6 +398,27 @@ fn parse_batch(
 /// column. Tolerates both `List<Timestamp(Millisecond)>` and `List<Int64>`
 /// children (ms in either case). Null rows return `None` for that slot;
 /// non-list columns return an error.
+/// Column names every input adaptor treats as geometry-component coordinates
+/// rather than user properties — excluded from the property set so a tile never
+/// carries coordinates twice. Case-SENSITIVE lowercase. Shared by the GeoParquet
+/// file reader and the PostGIS/DuckDB readers so all adaptors exclude the
+/// identical set (one source of truth — see also [`is_vertex_metadata_column`]).
+pub fn is_coordinate_column_name(name: &str) -> bool {
+    matches!(name, "lon" | "lat" | "longitude" | "latitude" | "x" | "y")
+}
+
+/// The per-vertex array column names recognised as geometry metadata (LineString
+/// trajectory timing / per-vertex values / animated-overview matrix). These
+/// populate the `ParsedFeature.vertex_*` fields, not the property set. Shared
+/// across all input adaptors so a new reader can't silently disagree.
+pub const VERTEX_METADATA_COLUMNS: [&str; 3] =
+    ["vertex_timestamps", "vertex_values", "vertex_value_matrix"];
+
+/// Whether `name` is one of [`VERTEX_METADATA_COLUMNS`].
+pub fn is_vertex_metadata_column(name: &str) -> bool {
+    VERTEX_METADATA_COLUMNS.contains(&name)
+}
+
 fn extract_vertex_timestamps_from_batch(
     batch: &arrow::record_batch::RecordBatch,
     col_idx: usize,
@@ -367,36 +437,45 @@ fn extract_vertex_timestamps_from_batch(
             continue;
         }
         let values = list.value(row);
-        // The child can be either a TimestampMillisecondArray (preferred —
-        // self-describing) or a plain Int64Array (fallback for callers that
-        // wrote raw integers). Both store ms-since-epoch.
+        // The child can be a Timestamp array of ANY precision (Second/
+        // Millisecond/Microsecond/Nanosecond — all normalized to ms via the
+        // shared `normalize_timestamp_to_ms`, so this path, the scalar
+        // `--time-field` path, and the DuckDB reader agree) or a plain
+        // Int64Array (raw integer ms). A null element pushes `0` to preserve
+        // per-vertex alignment.
+        let row_no = row_offset + row;
+        // `normalize_timestamp_to_ms` now lives in stt-core and returns a
+        // `stt_core::Error`; map it into anyhow here so the `.collect::<Result<…>>()`
+        // (anyhow) call sites below infer the right error type.
+        let scale = |value: i64, unit: TimestampUnit| -> Result<u64> {
+            Ok(normalize_timestamp_to_ms(row_no, value, unit)?)
+        };
         let row_times: Vec<u64> = if let Some(ts) =
-            values.as_any().downcast_ref::<TimestampMillisecondArray>()
+            values.as_any().downcast_ref::<TimestampSecondArray>()
         {
-            let mut v = Vec::with_capacity(ts.len());
-            for i in 0..ts.len() {
-                if ts.is_valid(i) {
-                    reject_negative_timestamp(row_offset + row, ts.value(i))?;
-                    v.push(ts.value(i) as u64);
-                } else {
-                    v.push(0);
-                }
-            }
-            v
+            (0..ts.len())
+                .map(|i| if ts.is_valid(i) { scale(ts.value(i), TimestampUnit::Second) } else { Ok(0) })
+                .collect::<Result<Vec<u64>>>()?
+        } else if let Some(ts) = values.as_any().downcast_ref::<TimestampMillisecondArray>() {
+            (0..ts.len())
+                .map(|i| if ts.is_valid(i) { scale(ts.value(i), TimestampUnit::Millisecond) } else { Ok(0) })
+                .collect::<Result<Vec<u64>>>()?
+        } else if let Some(ts) = values.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+            (0..ts.len())
+                .map(|i| if ts.is_valid(i) { scale(ts.value(i), TimestampUnit::Microsecond) } else { Ok(0) })
+                .collect::<Result<Vec<u64>>>()?
+        } else if let Some(ts) = values.as_any().downcast_ref::<TimestampNanosecondArray>() {
+            (0..ts.len())
+                .map(|i| if ts.is_valid(i) { scale(ts.value(i), TimestampUnit::Nanosecond) } else { Ok(0) })
+                .collect::<Result<Vec<u64>>>()?
         } else if let Some(ints) = values.as_any().downcast_ref::<Int64Array>() {
-            let mut v = Vec::with_capacity(ints.len());
-            for i in 0..ints.len() {
-                if ints.is_valid(i) {
-                    reject_negative_timestamp(row_offset + row, ints.value(i))?;
-                    v.push(ints.value(i) as u64);
-                } else {
-                    v.push(0);
-                }
-            }
-            v
+            (0..ints.len())
+                .map(|i| if ints.is_valid(i) { scale(ints.value(i), TimestampUnit::Millisecond) } else { Ok(0) })
+                .collect::<Result<Vec<u64>>>()?
         } else {
             anyhow::bail!(
-                "vertex_timestamps child must be Timestamp(Millisecond) or Int64; got {:?}",
+                "vertex_timestamps child must be a Timestamp (second/millisecond/microsecond/\
+                 nanosecond) or Int64 (raw ms) array; got {:?}",
                 values.data_type()
             );
         };
@@ -869,20 +948,14 @@ fn extract_geometries_from_batch(
     )
 }
 
-/// Pre-1970 timestamps cannot be represented — the temporal index stores
-/// unsigned ms-since-epoch, so a negative value would wrap to a huge
-/// positive one (`as u64`) and silently corrupt the index. This hard-errors
-/// in BOTH strictness modes; coercion is never sound here.
-fn reject_negative_timestamp(row: usize, value: i64) -> Result<()> {
-    if value < 0 {
-        anyhow::bail!(
-            "row {row}: negative timestamp {value} (pre-1970). The STT temporal \
-             index stores unsigned ms-since-epoch and cannot represent pre-1970 \
-             times; filter or re-epoch these rows before building."
-        );
-    }
-    Ok(())
-}
+// Timestamp-unit normalization now lives in `stt_core::timestamp` so every
+// input adaptor (this GeoParquet reader's scalar + per-vertex paths, the DuckDB
+// reader, and the stt-optimize analysis loader) shares ONE implementation. The
+// re-exports below keep this module's historical call sites and public surface
+// (`input::normalize_timestamp_to_ms`, `input::TimestampUnit`, etc.) unchanged.
+pub use stt_core::timestamp::{
+    normalize_timestamp_to_ms, reject_negative_timestamp, scale_timestamp_to_ms, TimestampUnit,
+};
 
 /// Extract timestamps from a column. `row_offset` is the batch's absolute
 /// row position in the file, used for error context.
@@ -911,52 +984,49 @@ fn extract_timestamps_from_batch(
             Ok(0)
         };
 
-    // Try as timestamp array (milliseconds)
+    // Arrow Timestamp columns are self-describing: scale any precision to ms
+    // through the shared `normalize_timestamp_to_ms` (agrees with the per-vertex
+    // path and the DuckDB reader). A null pushes epoch 0 (Warn) or fails
+    // (Strict) via `record_failure`.
+    macro_rules! push_timestamp_column {
+        ($arr:expr, $unit:expr) => {{
+            for i in 0..batch.num_rows() {
+                if $arr.is_valid(i) {
+                    timestamps.push(normalize_timestamp_to_ms(row_offset + i, $arr.value(i), $unit)?);
+                } else {
+                    timestamps.push(record_failure(row_offset + i, &mut parse_failures, "null timestamp")?);
+                }
+            }
+            warn_timestamp_failures(parse_failures, batch.num_rows());
+            return Ok(timestamps);
+        }};
+    }
+
+    if let Some(ts_array) = column.as_any().downcast_ref::<TimestampSecondArray>() {
+        push_timestamp_column!(ts_array, TimestampUnit::Second);
+    }
     if let Some(ts_array) = column.as_any().downcast_ref::<TimestampMillisecondArray>() {
-        for i in 0..batch.num_rows() {
-            if ts_array.is_valid(i) {
-                reject_negative_timestamp(row_offset + i, ts_array.value(i))?;
-                timestamps.push(ts_array.value(i) as u64);
-            } else {
-                timestamps.push(record_failure(row_offset + i, &mut parse_failures, "null timestamp")?);
-            }
-        }
-        warn_timestamp_failures(parse_failures, batch.num_rows());
-        return Ok(timestamps);
+        push_timestamp_column!(ts_array, TimestampUnit::Millisecond);
     }
-
-    // Try as timestamp array (microseconds) - convert to milliseconds
     if let Some(ts_array) = column.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        for i in 0..batch.num_rows() {
-            if ts_array.is_valid(i) {
-                reject_negative_timestamp(row_offset + i, ts_array.value(i))?;
-                timestamps.push((ts_array.value(i) / 1000) as u64);
-            } else {
-                timestamps.push(record_failure(row_offset + i, &mut parse_failures, "null timestamp")?);
-            }
-        }
-        warn_timestamp_failures(parse_failures, batch.num_rows());
-        return Ok(timestamps);
+        push_timestamp_column!(ts_array, TimestampUnit::Microsecond);
+    }
+    if let Some(ts_array) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        push_timestamp_column!(ts_array, TimestampUnit::Nanosecond);
     }
 
-    // Try as i64 array (unix timestamp)
+    // Try as i64 array (unix timestamp). The integer is interpreted per
+    // `--time-format`: unix-sec ⇒ Second (×1000, overflow-checked), unix-ms /
+    // iso8601 ⇒ Millisecond passthrough (Int64 + iso8601 warned once at schema
+    // time in stream_features).
     if let Some(int_array) = column.as_any().downcast_ref::<Int64Array>() {
+        let unit = match time_format {
+            TimeFormat::UnixSec => TimestampUnit::Second,
+            TimeFormat::UnixMs | TimeFormat::Iso8601 => TimestampUnit::Millisecond,
+        };
         for i in 0..batch.num_rows() {
             if int_array.is_valid(i) {
-                reject_negative_timestamp(row_offset + i, int_array.value(i))?;
-                let value = int_array.value(i) as u64;
-                let ts = match time_format {
-                    TimeFormat::UnixSec => value.checked_mul(1000).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "row {}: unix-sec timestamp {value} overflows ms range",
-                            row_offset + i
-                        )
-                    })?,
-                    // Int64 + iso8601 falls back to unix-ms (warned once at
-                    // schema time in stream_features).
-                    TimeFormat::UnixMs | TimeFormat::Iso8601 => value,
-                };
-                timestamps.push(ts);
+                timestamps.push(normalize_timestamp_to_ms(row_offset + i, int_array.value(i), unit)?);
             } else {
                 timestamps.push(record_failure(row_offset + i, &mut parse_failures, "null timestamp")?);
             }
@@ -988,7 +1058,12 @@ fn extract_timestamps_from_batch(
         return Ok(timestamps);
     }
 
-    anyhow::bail!("Unsupported timestamp column type")
+    anyhow::bail!(
+        "unsupported timestamp column type {:?}: expected a Timestamp \
+         (second/millisecond/microsecond/nanosecond), an Int64 (unix seconds or \
+         milliseconds per --time-format), or an ISO 8601 String column",
+        column.data_type()
+    )
 }
 
 /// Emit a warning summary if any rows had unparseable/null timestamps that

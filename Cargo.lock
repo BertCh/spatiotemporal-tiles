@@ -1160,28 +1160,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1137cd7e7fc0fb5d3c5a8678be38ec56e819125d8d7907411fe24ccb943faca8"
-dependencies = [
- "crossbeam-channel",
- "crossbeam-deque",
- "crossbeam-epoch",
- "crossbeam-queue",
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-channel"
-version = "0.5.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1196,15 +1174,6 @@ name = "crossbeam-epoch"
 version = "0.9.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-queue"
-version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f58bbc28f91df819d0aa2a2c00cd19754769c2fad90579b3592b1c9ba7a3115"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -1307,6 +1276,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 dependencies = [
  "tokio",
+]
+
+[[package]]
+name = "delaunator"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e1ee323c1275374f7e612d3724d12707079fb6a2117349fe144def656f5a880"
+dependencies = [
+ "robust",
 ]
 
 [[package]]
@@ -4247,11 +4225,8 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
- "crossbeam",
  "duckdb",
- "earcutr 0.5.0",
  "geo",
- "geo-types",
  "geoarrow",
  "geojson",
  "geozero",
@@ -4267,7 +4242,6 @@ dependencies = [
  "stt-core",
  "stt-optimize",
  "tempfile",
- "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4276,7 +4250,6 @@ dependencies = [
 name = "stt-core"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "arrow 54.3.1",
  "blake3",
  "byteorder",
@@ -4295,7 +4268,6 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
- "wkt 0.10.3",
  "zstd 0.13.3",
 ]
 
@@ -4310,9 +4282,8 @@ dependencies = [
  "clap",
  "contour",
  "csv",
+ "delaunator",
  "flate2",
- "geo",
- "geo-types",
  "geojson",
  "indicatif",
  "nexrad-data",
@@ -4329,7 +4300,6 @@ dependencies = [
  "sgp4",
  "stt-core",
  "tempfile",
- "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4343,20 +4313,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow 54.3.1",
- "arrow-array 54.3.1",
- "arrow-schema 54.3.1",
  "chrono",
  "clap",
- "geo",
- "geo-types",
- "geojson",
  "indicatif",
  "parquet",
- "rayon",
  "serde",
  "serde_json",
  "stt-core",
- "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4367,7 +4330,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "chrono",
  "clap",
  "deadpool-postgres",
  "duckdb",
@@ -4375,6 +4337,7 @@ dependencies = [
  "serde",
  "serde_json",
  "stt-build",
+ "stt-core",
  "tokio",
  "tokio-postgres",
  "tracing",
@@ -5508,18 +5471,6 @@ dependencies = [
  "byteorder",
  "geo-traits",
  "num_enum",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "wkt"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3c2252781f8927974e8ba6a67c965a759a2b88ea2b1825f6862426bbb1c8f41"
-dependencies = [
- "geo-types",
- "log",
- "num-traits",
  "thiserror 1.0.69",
 ]
 

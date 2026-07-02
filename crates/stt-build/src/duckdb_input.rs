@@ -27,7 +27,13 @@ use duckdb::{AccessMode, Config, Connection, Row};
 use geojson::Feature;
 use std::sync::Arc;
 
-use crate::input::{parse_iso8601, parse_wkb_geometry, InputStrictness, ParsedFeature, TimeFormat};
+use crate::db_input_common::{
+    apply_int_time_format, json_number_or_null, warn_dropped_columns, RowOutcome, VertexCoercions,
+};
+use crate::input::{
+    parse_iso8601, parse_wkb_geometry, reject_negative_timestamp, InputStrictness, ParsedFeature,
+    TimeFormat,
+};
 
 /// Alias the wrapped query projects the geometry into (as a `BLOB` of WKB).
 /// Public so a dynamic tile server building its own per-tile query keeps the
@@ -95,32 +101,62 @@ impl QuerySpec {
 
 /// Build a per-tile query for a dynamic server: project geometry to a WKB
 /// `BLOB` aliased [`WKB_ALIAS`], pass every other column through, and filter by
-/// a WGS84 bounding box (`ST_Intersects` against an envelope — RTREE-index
-/// accelerable) and a half-open time window `[t_start_ms, t_end_ms)`. The
+/// a WGS84 bounding box (envelope-overlap: `ST_Intersects` between the
+/// geometry's `ST_Envelope` and the tile envelope — a SUPERSET prefilter
+/// matching the PostGIS `&&` bbox semantics, so a feature the tiler places by
+/// centroid is never dropped by an exact-intersection test; the authoritative
+/// per-tile placement happens in `encode_single_tile`) and a half-open time
+/// window `[t_start_ms, t_end_ms)`. The
 /// geometry / time literals are server-formatted numbers (request `z/x/y/t` are
 /// parsed to integers upstream), so there is no request-controlled SQL. The
 /// time column must be a `TIMESTAMP`/`TIMESTAMP WITH TIME ZONE` (compared via
 /// `epoch_ms`, which yields a UTC `TIMESTAMP`; pin the session to UTC).
 ///
 /// Feed the result to [`decode_query`].
+#[allow(clippy::too_many_arguments)]
 pub fn build_tile_query(
     table: &str,
     geom_column: &str,
     time_field: &str,
+    time_format: TimeFormat,
     bbox: [f64; 4],
     t_start_ms: i64,
     t_end_ms: i64,
 ) -> String {
     let geom = format!("q.{}", QuerySpec::quote_ident(geom_column));
     let time = format!("q.{}", QuerySpec::quote_ident(time_field));
+    let time_where = duckdb_time_window(&time, time_format, t_start_ms, t_end_ms);
     format!(
         "SELECT ST_AsWKB({geom}) AS {WKB_ALIAS}, q.* \
          FROM ( SELECT * FROM {table} ) AS q \
-         WHERE ST_Intersects({geom}, ST_MakeEnvelope({}, {}, {}, {})) \
-           AND {time} >= epoch_ms({}::BIGINT) \
-           AND {time} <  epoch_ms({}::BIGINT)",
-        bbox[0], bbox[1], bbox[2], bbox[3], t_start_ms, t_end_ms
+         WHERE ST_Intersects(ST_Envelope({geom}), ST_MakeEnvelope({}, {}, {}, {})) \
+           AND {time_where}",
+        bbox[0], bbox[1], bbox[2], bbox[3]
     )
+}
+
+/// The half-open `[t_start_ms, t_end_ms)` predicate for the time column, chosen
+/// by `--time-format` (mirrors the PostGIS reader): `Iso8601` (default) assumes a
+/// `TIMESTAMP` column and compares via `epoch_ms`; `UnixMs`/`UnixSec` assume an
+/// integer column and compare numerically (scaling seconds to ms). Literals are
+/// server-formatted numbers — no request-controlled SQL.
+fn duckdb_time_window(
+    time: &str,
+    time_format: TimeFormat,
+    t_start_ms: i64,
+    t_end_ms: i64,
+) -> String {
+    match time_format {
+        TimeFormat::Iso8601 => format!(
+            "{time} >= epoch_ms({t_start_ms}::BIGINT) AND {time} <  epoch_ms({t_end_ms}::BIGINT)"
+        ),
+        TimeFormat::UnixMs => {
+            format!("{time} >= {t_start_ms} AND {time} < {t_end_ms}")
+        }
+        TimeFormat::UnixSec => {
+            format!("{time} * 1000 >= {t_start_ms} AND {time} * 1000 < {t_end_ms}")
+        }
+    }
 }
 
 /// Build the one-shot startup aggregate a dynamic server runs to advertise its
@@ -129,13 +165,25 @@ pub fn build_tile_query(
 /// turns it into a `BOX_2D` for `ST_XMin`/… `epoch_ms(TIMESTAMP)` yields BIGINT
 /// epoch-ms. The bounds + time values are NULL-safe (read as `Option`) for an
 /// empty table; `cnt` (`COUNT(*)`) is never NULL.
-pub fn build_metadata_query(table: &str, geom_column: &str, time_field: &str) -> String {
+pub fn build_metadata_query(
+    table: &str,
+    geom_column: &str,
+    time_field: &str,
+    time_format: TimeFormat,
+) -> String {
     let geom = QuerySpec::quote_ident(geom_column);
     let time = QuerySpec::quote_ident(time_field);
+    // Convert the aggregated min/max time to epoch-ms per `--time-format`, so an
+    // integer-epoch column advertises the same extent it would when ingested.
+    let (tmin_ms, tmax_ms) = match time_format {
+        TimeFormat::Iso8601 => ("epoch_ms(tmin)::BIGINT", "epoch_ms(tmax)::BIGINT"),
+        TimeFormat::UnixMs => ("tmin::BIGINT", "tmax::BIGINT"),
+        TimeFormat::UnixSec => ("(tmin * 1000)::BIGINT", "(tmax * 1000)::BIGINT"),
+    };
     format!(
         "SELECT ST_XMin(ext) AS min_lon, ST_YMin(ext) AS min_lat, \
                 ST_XMax(ext) AS max_lon, ST_YMax(ext) AS max_lat, \
-                epoch_ms(tmin)::BIGINT AS t_start, epoch_ms(tmax)::BIGINT AS t_end, cnt \
+                {tmin_ms} AS t_start, {tmax_ms} AS t_end, cnt \
          FROM ( \
             SELECT ST_Extent(ST_Extent_Agg({geom})) AS ext, \
                    MIN({time}) AS tmin, MAX({time}) AS tmax, COUNT(*) AS cnt \
@@ -241,8 +289,16 @@ where
         .as_ref()
         .map(|s| s.column_names())
         .unwrap_or_default();
-    let schema = RowSchema::resolve(
+    // Capture the result column types once so the end-of-read dropped-column
+    // warning can print `name (TYPE)` (helps distinguish an unmappable-type drop
+    // from an all-NULL column). Ingest path only.
+    let column_types: Vec<String> = rows
+        .as_ref()
+        .map(|s| (0..column_names.len()).map(|i| format!("{:?}", s.column_type(i))).collect())
+        .unwrap_or_default();
+    let schema = RowSchema::resolve_with_types(
         &column_names,
+        &column_types,
         time_field,
         end_time_field,
         &spec.geom_column,
@@ -253,10 +309,33 @@ where
     let mut batch = Vec::with_capacity(cap);
     let mut total_rows = 0usize;
     let mut geom_failures = 0usize;
+    // Property columns that carried a value in ANY row — to warn once about
+    // source columns that produced nothing (unmappable type, or all-NULL).
+    let mut seen_props: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Per-vertex array elements silently defaulted (NULL/unmappable element → 0
+    // for timestamps, NaN for values), tallied once for an end-of-read summary.
+    let mut vertex_coercions = VertexCoercions::default();
 
     while let Some(row) = rows.next().context("DuckDB row fetch failed")? {
-        match schema.parse_row(row, time_strictness, geometry_strictness, total_rows)? {
-            RowOutcome::Feature(f) => batch.push(*f),
+        match schema.parse_row(
+            row,
+            time_strictness,
+            geometry_strictness,
+            total_rows,
+            &mut vertex_coercions,
+        )? {
+            RowOutcome::Feature(f) => {
+                // Track which property columns actually produced a value, before
+                // the feature moves into the batch (stop once all have).
+                if seen_props.len() < schema.props.len() {
+                    if let Some(props) = &f.shared_properties {
+                        for k in props.keys() {
+                            seen_props.insert(k.clone());
+                        }
+                    }
+                }
+                batch.push(*f);
+            }
             RowOutcome::GeomSkip => geom_failures += 1,
         }
         total_rows += 1;
@@ -277,6 +356,14 @@ where
             "{geom_failures}/{total_rows} DuckDB rows had null/unparseable geometry and were skipped"
         );
     }
+    warn_dropped_columns(
+        schema.props.iter().map(|p| (p.name.as_str(), p.ty.clone())),
+        &seen_props,
+        total_rows,
+        "DuckDB",
+        "GEOMETRY/DECIMAL/LIST",
+    );
+    vertex_coercions.warn("DuckDB");
     Ok(())
 }
 
@@ -312,9 +399,11 @@ pub fn decode_query(
 
     let mut out = Vec::new();
     let mut i = 0usize;
+    // Per-tile serve path: don't tally coercions (no end-of-read summary, no spam).
+    let mut sink = VertexCoercions::default();
     while let Some(row) = rows.next().context("DuckDB tile row fetch failed")? {
         if let RowOutcome::Feature(f) =
-            schema.parse_row(row, time_strictness, geometry_strictness, i)?
+            schema.parse_row(row, time_strictness, geometry_strictness, i, &mut sink)?
         {
             out.push(*f);
         }
@@ -323,10 +412,14 @@ pub fn decode_query(
     Ok(out)
 }
 
-/// A property column: index in the result and its output name.
+/// A property column: index in the result, its output name, and (when the
+/// caller captured it) the DuckDB result type — used only to enrich the
+/// end-of-read dropped-column warning; `None` on the serve path (which never
+/// warns).
 struct PropCol {
     idx: usize,
     name: String,
+    ty: Option<String>,
 }
 
 /// Result-set schema resolved once from the result's column names. Indices only
@@ -335,18 +428,35 @@ struct RowSchema {
     wkb_idx: usize,
     time_idx: usize,
     end_time_idx: Option<usize>,
+    /// Optional per-vertex array columns, detected by the exact column names the
+    /// GeoParquet reader hardcodes (`vertex_timestamps` / `vertex_values` /
+    /// `vertex_value_matrix`). `None` when the query exposes no such column.
+    vertex_timestamps_idx: Option<usize>,
+    vertex_values_idx: Option<usize>,
+    vertex_value_matrix_idx: Option<usize>,
     props: Vec<PropCol>,
     time_format: TimeFormat,
-}
-
-enum RowOutcome {
-    Feature(Box<ParsedFeature>),
-    GeomSkip,
 }
 
 impl RowSchema {
     fn resolve(
         names: &[String],
+        time_field: &str,
+        end_time_field: Option<&str>,
+        geom_column: &str,
+        time_format: TimeFormat,
+    ) -> Result<Self> {
+        Self::resolve_with_types(names, &[], time_field, end_time_field, geom_column, time_format)
+    }
+
+    /// As [`resolve`], but records the per-column DuckDB result type string (from
+    /// `Statement::column_type`, formatted by the caller) on each [`PropCol`] so
+    /// the ingest-path dropped-column warning can print `name (TYPE)`. Pass an
+    /// empty `types` slice to skip the type capture (the serve path, which never
+    /// warns).
+    fn resolve_with_types(
+        names: &[String],
+        types: &[String],
         time_field: &str,
         end_time_field: Option<&str>,
         geom_column: &str,
@@ -367,33 +477,35 @@ impl RowSchema {
             None => None,
         };
 
+        // Optional per-vertex array columns, detected by the exact column names
+        // the GeoParquet reader hardcodes.
+        let vertex_timestamps_idx = find("vertex_timestamps");
+        let vertex_values_idx = find("vertex_values");
+        let vertex_value_matrix_idx = find("vertex_value_matrix");
+
         // Every remaining column becomes a property, except the system columns
-        // (wkb, time, end-time), the original geometry column, and the
-        // geometry-component coordinate names (`lon`/`lat`/`x`/`y`/…) — which
-        // the GeoParquet reader also treats as geometry metadata, not
-        // properties (`crate::input` `property_cols`), so the ingest paths stay
-        // consistent and tiles don't carry coordinates twice. Columns whose
-        // type we can't map (raw GEOMETRY, decimals, arrays, …) decode to None
-        // at read time and are silently dropped per-row.
-        let is_coord_name = |n: &str| {
-            matches!(
-                n.to_ascii_lowercase().as_str(),
-                "lon" | "lat" | "longitude" | "latitude" | "x" | "y"
-            )
-        };
+        // (wkb, time, end-time), the original geometry column, the per-vertex
+        // array columns, and the geometry-component coordinate names — all
+        // excluded via the SHARED `crate::input` predicates so every input
+        // adaptor (file/PostGIS/DuckDB) excludes the identical set and tiles
+        // don't carry coordinates twice. Columns whose type we can't map (raw
+        // GEOMETRY, decimals, unmapped arrays, …) decode to None at read time
+        // and are silently dropped per-row.
         let mut props = Vec::new();
         for (idx, name) in names.iter().enumerate() {
             if idx == wkb_idx
                 || idx == time_idx
                 || end_time_idx == Some(idx)
                 || name == geom_column
-                || is_coord_name(name)
+                || crate::input::is_coordinate_column_name(name)
+                || crate::input::is_vertex_metadata_column(name)
             {
                 continue;
             }
             props.push(PropCol {
                 idx,
                 name: name.clone(),
+                ty: types.get(idx).cloned(),
             });
         }
 
@@ -401,6 +513,9 @@ impl RowSchema {
             wkb_idx,
             time_idx,
             end_time_idx,
+            vertex_timestamps_idx,
+            vertex_values_idx,
+            vertex_value_matrix_idx,
             props,
             time_format,
         })
@@ -412,6 +527,7 @@ impl RowSchema {
         time_strictness: InputStrictness,
         geometry_strictness: InputStrictness,
         row_no: usize,
+        coercions: &mut VertexCoercions,
     ) -> Result<RowOutcome> {
         // Geometry (WKB blob -> GeoJSON + centroid lon/lat).
         let parsed = match row.get_ref(self.wkb_idx) {
@@ -445,6 +561,21 @@ impl RowSchema {
             None => None,
         };
 
+        // Per-vertex arrays (None when the column is absent or SQL NULL),
+        // mirroring the GeoParquet reader's `vertex_*` columns.
+        let vertex_timestamps = match self.vertex_timestamps_idx {
+            Some(idx) => decode_u64_ms_list(row, idx, row_no, &mut coercions.timestamps)?,
+            None => None,
+        };
+        let vertex_values = match self.vertex_values_idx {
+            Some(idx) => decode_f32_list(row, idx, &mut coercions.values),
+            None => None,
+        };
+        let vertex_value_matrix = match self.vertex_value_matrix_idx {
+            Some(idx) => decode_f32_list(row, idx, &mut coercions.values),
+            None => None,
+        };
+
         // Properties.
         let mut properties = serde_json::Map::new();
         for p in &self.props {
@@ -472,9 +603,9 @@ impl RowSchema {
             shared_properties,
             timestamp,
             end_timestamp,
-            vertex_timestamps: None,
-            vertex_values: None,
-            vertex_value_matrix: None,
+            vertex_timestamps,
+            vertex_values,
+            vertex_value_matrix,
             lon,
             lat,
         })))
@@ -490,60 +621,137 @@ fn decode_time(
     row_no: usize,
 ) -> Result<Option<u64>> {
     let ms: Option<i64> = match row.get_ref(idx) {
-        Ok(v) => decode_time_value(v, time_format),
+        Ok(v) => decode_time_value(v, time_format, row_no)?,
         Err(_) => None,
     };
     match ms {
-        Some(v) if v < 0 => anyhow::bail!(
-            "row {row_no}: negative timestamp {v} (pre-1970). The STT temporal index stores \
-             unsigned ms-since-epoch; filter or re-epoch these rows before building."
-        ),
-        Some(v) => Ok(Some(v as u64)),
+        Some(v) => {
+            reject_negative_timestamp(row_no, v)?;
+            Ok(Some(v as u64))
+        }
         None => Ok(None),
     }
 }
 
 /// Map a `ValueRef` to Unix-ms for the time column, mirroring the GeoParquet
 /// reader: TIMESTAMP/TIMESTAMPTZ directly, DATE at midnight UTC, integer
-/// columns via `--time-format`, text parsed as ISO 8601.
-fn decode_time_value(v: ValueRef, time_format: TimeFormat) -> Option<i64> {
-    match v {
-        ValueRef::Timestamp(unit, value) => Some(timestamp_unit_to_ms(unit, value)),
+/// columns via `--time-format` (second→ms overflow-checked, like the file
+/// path), text parsed as ISO 8601.
+fn decode_time_value(v: ValueRef, time_format: TimeFormat, row_no: usize) -> Result<Option<i64>> {
+    Ok(match v {
+        ValueRef::Timestamp(unit, value) => Some(timestamp_unit_to_ms(unit, value)?),
         ValueRef::Date32(days) => Some((days as i64) * 86_400_000),
-        ValueRef::BigInt(n) => Some(apply_int_time_format(n, time_format)),
-        ValueRef::Int(n) => Some(apply_int_time_format(n as i64, time_format)),
-        ValueRef::UInt(n) => Some(apply_int_time_format(n as i64, time_format)),
+        ValueRef::BigInt(n) => Some(apply_int_time_format(n, time_format, row_no)?),
+        ValueRef::Int(n) => Some(apply_int_time_format(n as i64, time_format, row_no)?),
+        ValueRef::UInt(n) => Some(apply_int_time_format(n as i64, time_format, row_no)?),
         ValueRef::UBigInt(n) if n <= i64::MAX as u64 => {
-            Some(apply_int_time_format(n as i64, time_format))
+            Some(apply_int_time_format(n as i64, time_format, row_no)?)
         }
         ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok().and_then(|s| parse_iso8601(s).ok()),
         _ => None,
-    }
+    })
 }
 
 /// DuckDB `TIMESTAMP`/`TIMESTAMPTZ` value (in `unit`) → Unix milliseconds.
-fn timestamp_unit_to_ms(unit: TimeUnit, value: i64) -> i64 {
-    match unit {
-        TimeUnit::Second => value.saturating_mul(1000),
-        TimeUnit::Millisecond => value,
-        TimeUnit::Microsecond => value / 1_000,
-        TimeUnit::Nanosecond => value / 1_000_000,
-    }
+/// Delegates to the shared [`crate::input::scale_timestamp_to_ms`] so the DuckDB
+/// reader scales precision identically to the GeoParquet file reader, including
+/// the overflow-CHECKED second→ms multiply (the non-negative guard is applied by
+/// the wire-timestamp callers, [`decode_time`] / [`decode_u64_ms_list`]; a
+/// `Timestamp` emitted as a plain *property* keeps signed ms so a pre-1970 value
+/// survives).
+fn timestamp_unit_to_ms(unit: TimeUnit, value: i64) -> Result<i64> {
+    use crate::input::TimestampUnit;
+    let unit = match unit {
+        TimeUnit::Second => TimestampUnit::Second,
+        TimeUnit::Millisecond => TimestampUnit::Millisecond,
+        TimeUnit::Microsecond => TimestampUnit::Microsecond,
+        TimeUnit::Nanosecond => TimestampUnit::Nanosecond,
+    };
+    Ok(crate::input::scale_timestamp_to_ms(value, unit)?)
 }
 
-/// Integer time column → ms, per `--time-format` (matches the GeoParquet path).
-fn apply_int_time_format(v: i64, time_format: TimeFormat) -> i64 {
-    match time_format {
-        TimeFormat::UnixSec => v.saturating_mul(1000),
-        // Int + iso8601 falls back to unix-ms, same as the GeoParquet reader.
-        TimeFormat::UnixMs | TimeFormat::Iso8601 => v,
+/// Decode a per-vertex timestamp LIST/ARRAY cell to `Vec<u64>` ms-since-epoch,
+/// mirroring the GeoParquet reader's `vertex_timestamps` rules: integer elements
+/// are RAW ms (never reinterpreted via `--time-format`), timestamp/date elements
+/// convert to UTC ms, a whole-cell SQL NULL yields `None`, a NULL element
+/// becomes `0` (preserving per-vertex alignment), and any negative (pre-1970)
+/// value is a hard error in both strictness modes. DuckDB picks `Value::List`
+/// for `BIGINT[]`/`TIMESTAMP[]` and `Value::Array` for fixed-size declarations.
+fn decode_u64_ms_list(
+    row: &Row,
+    idx: usize,
+    row_no: usize,
+    coerced: &mut usize,
+) -> Result<Option<Vec<u64>>> {
+    use duckdb::types::Value;
+    let items = match row.get::<usize, Value>(idx) {
+        Ok(Value::List(items)) | Ok(Value::Array(items)) => items,
+        // Whole-cell NULL, a scalar, or an unconvertible value → no per-vertex data.
+        _ => return Ok(None),
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for v in items {
+        let ms: i64 = match v {
+            Value::BigInt(n) => n,
+            Value::Int(n) => n as i64,
+            Value::UInt(n) => n as i64,
+            Value::UBigInt(n) if n <= i64::MAX as u64 => n as i64,
+            Value::Timestamp(unit, val) => timestamp_unit_to_ms(unit, val)?,
+            Value::Date32(days) => (days as i64) * 86_400_000,
+            // NULL element (and any other type) → 0, matching the file reader.
+            _ => {
+                *coerced += 1;
+                0
+            }
+        };
+        if ms < 0 {
+            anyhow::bail!(
+                "row {row_no}: negative vertex timestamp {ms} (pre-1970). The STT temporal index \
+                 stores unsigned ms-since-epoch; filter or re-epoch these rows."
+            );
+        }
+        out.push(ms as u64);
     }
+    Ok(Some(out))
 }
 
-/// Map one property cell to a JSON value, mirroring
-/// `crate::input::extract_property_value`. SQL NULL and unmappable types
-/// (raw GEOMETRY/other BLOBs, decimals, intervals, nested types, …) return
-/// `None` and are dropped.
+/// Decode a per-vertex float LIST/ARRAY cell to `Vec<f32>`, mirroring the
+/// GeoParquet reader's `vertex_values` rules: `DOUBLE`/`FLOAT` elements map to
+/// f32, a whole-cell SQL NULL yields `None`, and a NULL element becomes
+/// `f32::NAN` (preserving per-vertex alignment).
+fn decode_f32_list(row: &Row, idx: usize, coerced: &mut usize) -> Option<Vec<f32>> {
+    use duckdb::types::Value;
+    let items = match row.get::<usize, Value>(idx) {
+        Ok(Value::List(items)) | Ok(Value::Array(items)) => items,
+        _ => return None,
+    };
+    Some(
+        items
+            .into_iter()
+            .map(|v| match v {
+                Value::Double(d) => d as f32,
+                Value::Float(f) => f,
+                // NULL element (and any other type) → NaN, matching the file reader.
+                _ => {
+                    *coerced += 1;
+                    f32::NAN
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Map one property cell to a JSON value. SQL NULL and unmappable types (raw
+/// GEOMETRY/other BLOBs, decimals, intervals, nested types, …) return `None` and
+/// are dropped.
+///
+/// This is a documented **superset** of `crate::input::extract_property_value`,
+/// not an exact mirror: it shares the six core types (bool / Int32 / Int64 /
+/// Float32 / Float64 / text) and the NaN→JSON-null rule, but additionally maps
+/// `TinyInt`/`SmallInt`, all unsigned ints, `HugeInt`, and `Timestamp`/`Date32`
+/// (→ epoch-ms numbers) — types a GeoParquet file can't express the same way, so
+/// they only ever add properties a file build couldn't carry, never diverge on
+/// the common type set. The DuckDB and PostGIS readers stay in lockstep here.
 fn decode_property_value(v: ValueRef) -> Option<serde_json::Value> {
     use serde_json::Value;
     match v {
@@ -560,12 +768,15 @@ fn decode_property_value(v: ValueRef) -> Option<serde_json::Value> {
         ValueRef::USmallInt(n) => Some(Value::from(n as u64)),
         ValueRef::UInt(n) => Some(Value::from(n as u64)),
         ValueRef::UBigInt(n) => Some(Value::from(n)),
-        ValueRef::Float(f) => serde_json::Number::from_f64(f as f64).map(Value::Number),
-        ValueRef::Double(f) => serde_json::Number::from_f64(f).map(Value::Number),
+        ValueRef::Float(f) => Some(json_number_or_null(f as f64)),
+        ValueRef::Double(f) => Some(json_number_or_null(f)),
         ValueRef::Text(bytes) => {
             std::str::from_utf8(bytes).ok().map(|s| Value::String(s.to_string()))
         }
-        ValueRef::Timestamp(unit, value) => Some(Value::from(timestamp_unit_to_ms(unit, value))),
+        // Overflowing timestamps are dropped like any other unmappable cell.
+        ValueRef::Timestamp(unit, value) => {
+            timestamp_unit_to_ms(unit, value).ok().map(Value::from)
+        }
         ValueRef::Date32(days) => Some(Value::from((days as i64) * 86_400_000)),
         // NULL, Blob (incl. raw GEOMETRY/WKB), Decimal, Time64, Interval, and
         // the nested List/Struct/Map/Enum/Array/Union types are dropped.
@@ -609,26 +820,56 @@ mod tests {
 
     #[test]
     fn tile_query_filters_bbox_and_time() {
-        let q = build_tile_query("obs", "geom", "ts", [-10.0, -5.0, 10.0, 5.0], 1000, 2000);
+        // Default (Iso8601 → timestamp column): epoch_ms comparison.
+        let q = build_tile_query(
+            "obs",
+            "geom",
+            "ts",
+            TimeFormat::Iso8601,
+            [-10.0, -5.0, 10.0, 5.0],
+            1000,
+            2000,
+        );
         assert!(q.contains("ST_AsWKB(q.\"geom\")"), "{q}");
-        assert!(q.contains("ST_Intersects(q.\"geom\", ST_MakeEnvelope(-10, -5, 10, 5))"), "{q}");
+        assert!(
+            q.contains("ST_Intersects(ST_Envelope(q.\"geom\"), ST_MakeEnvelope(-10, -5, 10, 5))"),
+            "{q}"
+        );
         assert!(q.contains("q.\"ts\" >= epoch_ms(1000::BIGINT)"), "{q}");
         assert!(q.contains("q.\"ts\" <  epoch_ms(2000::BIGINT)"), "{q}");
-    }
 
-    #[test]
-    fn int_time_format_mapping() {
-        assert_eq!(apply_int_time_format(5, TimeFormat::UnixSec), 5000);
-        assert_eq!(apply_int_time_format(5, TimeFormat::UnixMs), 5);
-        assert_eq!(apply_int_time_format(5, TimeFormat::Iso8601), 5);
+        // Integer-epoch column: numeric comparison, no epoch_ms.
+        let ms = build_tile_query(
+            "obs",
+            "geom",
+            "ts",
+            TimeFormat::UnixMs,
+            [-10.0, -5.0, 10.0, 5.0],
+            1000,
+            2000,
+        );
+        assert!(ms.contains("q.\"ts\" >= 1000 AND q.\"ts\" < 2000"), "{ms}");
+        assert!(!ms.contains("epoch_ms"), "{ms}");
+
+        // Seconds: scaled ×1000 so the ms bucket bounds stay exact.
+        let sec = build_tile_query(
+            "obs",
+            "geom",
+            "ts",
+            TimeFormat::UnixSec,
+            [-10.0, -5.0, 10.0, 5.0],
+            1000,
+            2000,
+        );
+        assert!(sec.contains("q.\"ts\" * 1000 >= 1000 AND q.\"ts\" * 1000 < 2000"), "{sec}");
     }
 
     #[test]
     fn timestamp_units_to_ms() {
-        assert_eq!(timestamp_unit_to_ms(TimeUnit::Second, 5), 5000);
-        assert_eq!(timestamp_unit_to_ms(TimeUnit::Millisecond, 5), 5);
-        assert_eq!(timestamp_unit_to_ms(TimeUnit::Microsecond, 5_000), 5);
-        assert_eq!(timestamp_unit_to_ms(TimeUnit::Nanosecond, 5_000_000), 5);
+        assert_eq!(timestamp_unit_to_ms(TimeUnit::Second, 5).unwrap(), 5000);
+        assert_eq!(timestamp_unit_to_ms(TimeUnit::Millisecond, 5).unwrap(), 5);
+        assert_eq!(timestamp_unit_to_ms(TimeUnit::Microsecond, 5_000).unwrap(), 5);
+        assert_eq!(timestamp_unit_to_ms(TimeUnit::Nanosecond, 5_000_000).unwrap(), 5);
     }
 
     #[test]
@@ -668,8 +909,9 @@ mod tests {
             RowSchema::resolve(&names, "timestamp", None, "g", TimeFormat::Iso8601).unwrap();
 
         let row = rows.next().unwrap().unwrap();
+        let mut coercions = VertexCoercions::default();
         let out = schema
-            .parse_row(row, InputStrictness::Warn, InputStrictness::Warn, 0)
+            .parse_row(row, InputStrictness::Warn, InputStrictness::Warn, 0, &mut coercions)
             .unwrap();
         let RowOutcome::Feature(f) = out else {
             panic!("expected a decoded feature");
@@ -718,7 +960,15 @@ mod tests {
             .timestamp_millis();
         let t1 = t0 + 86_400_000;
         // bbox around NYC — excludes the Paris point.
-        let sql = build_tile_query("obs", "geom", "ts", [-74.5, 40.0, -73.0, 41.0], t0, t1);
+        let sql = build_tile_query(
+            "obs",
+            "geom",
+            "ts",
+            TimeFormat::Iso8601,
+            [-74.5, 40.0, -73.0, 41.0],
+            t0,
+            t1,
+        );
         let feats = decode_query(
             &conn,
             &sql,
@@ -768,7 +1018,7 @@ mod tests {
         assert!((f2[0].lat - 40.7).abs() < 1e-4, "reprojected lat {}", f2[0].lat);
 
         // Metadata aggregate: bounds, [t_start, t_end] epoch-ms, count.
-        let mq = build_metadata_query("obs", "geom", "ts");
+        let mq = build_metadata_query("obs", "geom", "ts", TimeFormat::Iso8601);
         let mut stmt = conn.prepare(&mq).unwrap();
         let mut rows = stmt.query([]).unwrap();
         let row = rows.next().unwrap().unwrap();

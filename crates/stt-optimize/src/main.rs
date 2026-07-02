@@ -234,3 +234,50 @@ fn run_recommend(
 }
 
 
+
+#[cfg(test)]
+mod cli_doc_tests {
+    use super::*;
+
+    /// Doc gate (naming-types-consistency F9): every visible long flag on every
+    /// subcommand must appear in the `stt-optimize` section of
+    /// `docs/api/cli-reference.md`, so a new flag fails the build until it is
+    /// documented.
+    #[test]
+    fn cli_flags_are_documented_in_cli_reference() {
+        use clap::CommandFactory;
+        let doc = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/api/cli-reference.md"
+        ))
+        .expect("read docs/api/cli-reference.md");
+        let start = doc.find("## `stt-optimize`").expect("stt-optimize section heading");
+        let body = &doc[start + 1..];
+        let end = body.find("\n## `").map(|i| start + 1 + i).unwrap_or(doc.len());
+        let section = &doc[start..end];
+        let cmd = Cli::command();
+        let mut missing: Vec<String> = Vec::new();
+        for sub in cmd.get_subcommands() {
+            for a in sub.get_arguments() {
+                if a.is_hide_set() {
+                    continue;
+                }
+                let Some(l) = a.get_long() else { continue };
+                if matches!(l, "help" | "version") {
+                    continue;
+                }
+                let flag = format!("--{l}");
+                if !section.contains(flag.as_str()) {
+                    missing.push(format!("{} {flag}", sub.get_name()));
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "flags missing from the `stt-optimize` section of docs/api/cli-reference.md \
+             (document them before shipping): {missing:?}"
+        );
+    }
+}

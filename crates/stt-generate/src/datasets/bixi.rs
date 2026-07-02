@@ -50,10 +50,6 @@ use crate::common::{
 use crate::datasets::nyc_rideshare_flows::parse_bin_ms;
 use crate::edge_bundle::{self, BundleParams};
 
-/// Public BIXI GBFS station feed (stable, no auth) — fallback for resolving
-/// legacy station codes to lat/lon when no stations CSV is present.
-const GBFS_STATION_INFO_URL: &str = "https://gbfs.velobixi.com/gbfs/en/station_information.json";
-
 #[derive(Parser, Debug)]
 #[command(about = "Generate a Montreal BIXI origin→destination flowmap dataset")]
 pub struct Args {
@@ -162,9 +158,115 @@ pub struct Args {
     #[arg(long, default_value = "http://localhost:5001")]
     pub osrm_url: String,
 
+    /// Emit one OSRM-routed LineString per INDIVIDUAL trip (not aggregated OD
+    /// flows): route each trip once on the Montréal **bicycle** network
+    /// (`--osrm-url`) and bake per-vertex timestamps, so the client animates a
+    /// moving head-dot per cyclist (`type: 'trip-heads'`, the `bixi-points`
+    /// demo) or flowing trails — the BIXI counterpart of `nyc-rideshare
+    /// --paths`. Mutually exclusive with the aggregate modes (`--streets` /
+    /// `--merged-paths` / `--flow-graph` / `--bake-bundling`). Honours `--from` /
+    /// `--to`; identical dock pairs are routed once and the geometry re-timed per
+    /// trip onto its real ride window.
+    #[arg(long)]
+    pub paths: bool,
+
+    /// `--paths`: cap the number of individual trips, evenly subsampled across
+    /// the span for a legible moving fleet. Default: keep every trip in span.
+    #[arg(long)]
+    pub max_trips: Option<usize>,
+
     /// Skip the stt-build step (write only the intermediate GeoParquet).
     #[arg(long)]
     pub skip_build: bool,
+
+    /// `--streets`: also bake per-segment travel DIRECTION. Tracks each edge's
+    /// signed net flow and PRE-ORIENTS every corridor's geometry toward its
+    /// month-dominant direction, so the client can march directional chevrons
+    /// along each segment (the `bixi-streets-flow` demo). Requires `--streets`;
+    /// the magnitude matrix is unchanged, so it only reorders geometry (this is
+    /// the per-way heatmap's directional cut, distinct from `--merged-paths`).
+    #[arg(long)]
+    pub directional: bool,
+
+    /// `--streets`: encode PER-BUCKET travel direction so the client can flip the
+    /// chevrons per time-step (morning inbound → evening outbound), rather than
+    /// baking one static winding. Emits a SIGNED per-bucket value matrix
+    /// (`|value|` = volume for colour, sign = that bucket's net direction along
+    /// the winding). Implies `--directional`; requires `--streets`. Render with
+    /// `flowSignedDirection` + `ChevronFlowExtension({ perBucketDirection: true })`.
+    #[arg(long)]
+    pub per_bucket_direction: bool,
+
+    /// Synthesize **coherent directed corridors** instead of straight OD arcs or
+    /// per-way street segments: route each OD pair once on the bike network
+    /// (`--osm-pbf` + the bicycle `--osrm-url`, like `--streets`), accumulate
+    /// *directed* per-edge ridership, then contract + good-continuation-merge
+    /// edges into long corridors carrying a per-vertex × per-hour volume matrix.
+    /// Rendered as twin offset ribbons whose width = √(active-hour travellers).
+    /// Mutually exclusive with `--streets` / `--bake-bundling` / `--no-cluster`.
+    #[arg(long)]
+    pub merged_paths: bool,
+
+    /// `--merged-paths`: max junction deflection angle (degrees) to keep a
+    /// corridor going. Larger = longer, less-straight corridors.
+    #[arg(long, default_value = "50")]
+    pub stroke_angle: f64,
+
+    /// `--merged-paths`: flow-similarity ratio gate `[0,1]` for corridor
+    /// continuation — lower splits less (longer corridors), higher splits where
+    /// volume changes (more, shorter corridors).
+    #[arg(long, default_value = "0.35")]
+    pub stroke_flow_ratio: f64,
+
+    /// `--merged-paths`: drop corridors whose busiest segment carries fewer than
+    /// this many trips (the legibility floor for the overview).
+    #[arg(long, default_value = "10")]
+    pub stroke_min_trips: u32,
+
+    /// `--merged-paths`: collapse the whole span into a **typical day** — bin by
+    /// HOUR-OF-DAY (summing every day's trips at that hour) instead of absolute
+    /// time. Turns a month of hourly data (744 buckets) into a 24-bucket daily
+    /// loop that shows the commute rhythm directly AND shrinks the per-vertex
+    /// value matrix ~31×, so the dense corridor-overview tiles decode on the web
+    /// (the full-span matrix is otherwise tens–hundreds of MB per overview tile).
+    #[arg(long)]
+    pub typical_day: bool,
+
+    /// Build an ABSTRACT coherent **flow network** (Sankey-like) instead of street
+    /// corridors: cluster stations into hubs, connect them with a Delaunay
+    /// proximity graph, and route each OD flow along shortest paths (cost
+    /// `length^k`) so flows merge onto shared trunk lines that little tributaries
+    /// enter and leave — Edge-Path Bundling, no streets, no OSRM. Rendered by the
+    /// same breathing twin-ribbon `FlowStrokeLayer`. Mutually exclusive with
+    /// `--streets` / `--merged-paths` / `--bake-bundling`.
+    #[arg(long)]
+    pub flow_graph: bool,
+
+    /// `--flow-graph`: hub clustering radius in METRES. Larger = fewer, bolder
+    /// trunk lines; 0 = one hub per station (finest mesh).
+    #[arg(long, default_value = "250")]
+    pub hub_radius: f64,
+
+    /// `--flow-graph`: path-cost exponent `k` (> 1). Higher = flows detour more
+    /// aggressively onto shared trunks (more bundling). ~2 is moderate.
+    #[arg(long, default_value = "2.0")]
+    pub bundle_k: f64,
+
+    /// `--flow-graph`: Catmull-Rom spline sub-samples per hub segment — the
+    /// flowing, force-directed curve through the hubs. 1 = angular (off), ~6 smooth.
+    #[arg(long, default_value = "6")]
+    pub spline: usize,
+
+    /// `--flow-graph`: Laplacian smoothing passes applied AFTER splining (removes
+    /// overshoot). ~2.
+    #[arg(long, default_value = "2")]
+    pub smooth: usize,
+
+    /// `--flow-graph`: perpendicular offset (metres) baked into each directed
+    /// trunk so opposing directions draw as side-by-side twin ribbons. 0 =
+    /// overlap (single-line look). ~10 m separates at neighbourhood zoom.
+    #[arg(long, default_value = "10")]
+    pub ribbon_offset: f64,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -189,6 +291,57 @@ pub fn run(args: Args) -> Result<()> {
              relaxes straight OD arcs, while --streets routes trips onto the bike \
              network (street corridors, no bundling)"
         ));
+    }
+    // --merged-paths is a third, distinct geometry (routed → directed → merged
+    // corridors), exclusive with both the OD-arc bundling and the per-way
+    // street-segment heatmap.
+    if args.merged_paths && (args.streets || args.bake_bundling) {
+        return Err(anyhow!(
+            "--merged-paths is mutually exclusive with --streets and \
+             --bake-bundling: it routes OD pairs on the bike network (like \
+             --streets) but emits MERGED directed corridors, not per-way segments \
+             or relaxed OD arcs"
+        ));
+    }
+    // --flow-graph is a third distinct geometry (abstract bundled flow network,
+    // no streets), exclusive with every street/arc mode.
+    if args.flow_graph && (args.streets || args.merged_paths || args.bake_bundling) {
+        return Err(anyhow!(
+            "--flow-graph is mutually exclusive with --streets / --merged-paths / \
+             --bake-bundling: it builds an ABSTRACT Delaunay-bundled flow network \
+             (no street routing), not routed corridors or relaxed OD arcs"
+        ));
+    }
+    // --directional is a modifier of the per-way street heatmap (it pre-orients
+    // corridor geometry), so it only applies with --streets.
+    if args.directional && !args.streets {
+        return Err(anyhow!(
+            "--directional applies only to --streets: it bakes per-segment travel \
+             direction into the street-corridor heatmap so the client can march \
+             chevrons. For coherent directed ribbons use --merged-paths instead."
+        ));
+    }
+    // --per-bucket-direction is a --streets modifier too (it emits the signed
+    // per-bucket matrix), implying --directional.
+    if args.per_bucket_direction && !args.streets {
+        return Err(anyhow!(
+            "--per-bucket-direction applies only to --streets: it emits a signed \
+             per-bucket flow matrix so the client can flip chevrons per time-step."
+        ));
+    }
+
+    // Per-trip routed trajectories are a distinct pipeline (individual trips,
+    // not OD-pair aggregates), so validate exclusivity and dispatch before the
+    // aggregator does any work.
+    if args.paths {
+        if args.streets || args.merged_paths || args.flow_graph || args.bake_bundling {
+            return Err(anyhow!(
+                "--paths (per-trip OSRM-routed trajectories, animated as moving \
+                 head-dots) is mutually exclusive with the aggregate flow modes \
+                 --streets / --merged-paths / --flow-graph / --bake-bundling"
+            ));
+        }
+        return generate_paths(&args, from_ms, to_ms);
     }
 
     println!("📋 Configuration:");
@@ -252,6 +405,15 @@ pub fn run(args: Args) -> Result<()> {
     // per-segment counts into corridors (a different geometry + build path).
     if args.streets {
         return generate_streets(&args, &agg, bin_ms);
+    }
+
+    // Coherent merged corridors: route + directed-accumulate + stroke-synthesize.
+    if args.flow_graph {
+        return generate_flow_network(&args, &agg, bin_ms);
+    }
+
+    if args.merged_paths {
+        return generate_merged_paths(&args, &agg, bin_ms);
     }
 
     let (intermediate_path, output_is_intermediate) = resolve_intermediate(&args.output);
@@ -343,6 +505,281 @@ fn resolve_intermediate(output: &Path) -> (PathBuf, bool) {
     (path, is_intermediate)
 }
 
+// ---------------------------------------------------------------------------
+// `--paths`: per-trip OSRM-routed trajectories (moving head-dots)
+// ---------------------------------------------------------------------------
+
+/// One individual trip with a real ride window, ready to route + time.
+#[derive(Clone, Copy)]
+struct PathTrip {
+    origin: [f64; 2],
+    dest: [f64; 2],
+    start_ms: i64,
+    end_ms: i64,
+}
+
+/// ~1 m-quantized (origin, dest) key so identical docks collapse to one route.
+type PairKey = (i64, i64, i64, i64);
+
+fn quant(v: f64) -> i64 {
+    (v * 1e5).round() as i64
+}
+
+fn pair_key(o: [f64; 2], d: [f64; 2]) -> PairKey {
+    (quant(o[0]), quant(o[1]), quant(d[0]), quant(d[1]))
+}
+
+/// Total-order compare of two lon/lat points (for deterministic trip sorting).
+fn cmp_pt(a: [f64; 2], b: [f64; 2]) -> std::cmp::Ordering {
+    a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1]))
+}
+
+/// Legibility bounds on a trip's ride duration: sub-minute and >3 h rows are
+/// almost always bad clocks / docked-but-not-returned, and would animate as a
+/// flicker or a frozen dot. (Not temporal thinning — kept trips keep their full
+/// geometry; this only drops rows we can't time.)
+const MIN_TRIP_MS: i64 = 60_000;
+const MAX_TRIP_MS: i64 = 3 * 3_600_000;
+
+/// `--paths`: route each INDIVIDUAL BIXI trip once on the Montréal bike network
+/// (OSRM bicycle profile) and emit one LineString per trip carrying per-vertex
+/// absolute timestamps — the BIXI counterpart of `nyc-rideshare --paths`. The
+/// archive animates as a moving head-dot per cyclist (`type: 'trip-heads'`, the
+/// `bixi-points` demo) or as flowing trails (`type: 'trips'`) from one build.
+///
+/// Cheap-routing lever: many trips share the same origin→destination dock pair,
+/// so we route each UNIQUE pair once and re-time the shared geometry per trip
+/// onto that trip's real `[start, end]` window (OSRM's per-edge duration shape,
+/// stretched to the recorded ride length — highway-like paths sweep fast, dense
+/// grid creeps slow).
+fn generate_paths(args: &Args, from_ms: Option<i64>, to_ms: Option<i64>) -> Result<()> {
+    use crate::datasets::osrm::{
+        check_osrm_connectivity, get_osrm_route_pooled, route_geometry,
+        vertex_timestamps_from_durations,
+    };
+    use chrono::{DateTime, Utc};
+    use rayon::prelude::*;
+
+    println!("📋 Configuration:");
+    println!("   Input:     {}", args.input.display());
+    println!("   Output:    {}", args.output.display());
+    println!("   Mode:      per-trip OSRM paths (moving head-dots)");
+    println!("   Routing:   {} (bicycle)", args.osrm_url);
+    println!("   Span:      {} → {}", args.from.as_deref().unwrap_or("(start)"), args.to.as_deref().unwrap_or("(end)"));
+    if let Some(max) = args.max_trips {
+        println!("   Max trips: {max}");
+    }
+    println!();
+
+    // Fail fast before reading big trip CSVs if the bike server isn't up.
+    check_osrm_connectivity(&args.osrm_url)?;
+
+    // 1. Collect individual trips within the span, keeping only those with a
+    //    real, sane ride duration (needed to time the animation). Endpoints and
+    //    times come from the same schema detection the aggregate modes use.
+    let stations = load_stations_map(&args.input);
+    let mut trips: Vec<PathTrip> = Vec::new();
+    let mut read: u64 = 0;
+    for csv in find_trip_csvs(&args.input)? {
+        println!("📂 Reading {} …", csv.label);
+        let mut rdr = csv::ReaderBuilder::new()
+            .flexible(true)
+            .from_reader(BufReader::with_capacity(1 << 20, csv.reader));
+        let headers = rdr.headers()?.clone();
+        let schema = TripSchema::detect(&headers)
+            .ok_or_else(|| anyhow!("unrecognized BIXI CSV header: {:?}", headers))?;
+        let mut record = csv::StringRecord::new();
+        while rdr.read_record(&mut record)? {
+            read += 1;
+            let Some(t) = schema.parse_row(&record, &stations) else {
+                continue;
+            };
+            if let Some(f) = from_ms {
+                if t.start_ms < f {
+                    continue;
+                }
+            }
+            if let Some(to) = to_ms {
+                if t.start_ms >= to {
+                    continue;
+                }
+            }
+            if t.origin_key == t.dest_key {
+                continue; // self-loop → no path to route
+            }
+            // Need a real end time to animate; drop rows without one or with an
+            // implausible duration.
+            let Some(end_ms) = t.end_ms else {
+                continue;
+            };
+            let dur = end_ms - t.start_ms;
+            if !(MIN_TRIP_MS..=MAX_TRIP_MS).contains(&dur) {
+                continue;
+            }
+            trips.push(PathTrip {
+                origin: t.origin_pos,
+                dest: t.dest_pos,
+                start_ms: t.start_ms,
+                end_ms,
+            });
+        }
+    }
+    println!(
+        "\n   ✓ Read {read} trips, {} within span with a usable ride duration",
+        trips.len()
+    );
+    if trips.is_empty() {
+        return Err(anyhow!(
+            "No trips fell within the requested span with a usable ride duration"
+        ));
+    }
+
+    // 2. Deterministic ordering, then optional even-stride subsample to a
+    //    legible fleet. Sorting first (stable, content-addressable) makes the
+    //    subsample a uniform temporal slice rather than "whatever the files
+    //    happened to list first".
+    trips.sort_by(|a, b| {
+        a.start_ms
+            .cmp(&b.start_ms)
+            .then(a.end_ms.cmp(&b.end_ms))
+            .then(cmp_pt(a.origin, b.origin))
+            .then(cmp_pt(a.dest, b.dest))
+    });
+    if let Some(max) = args.max_trips {
+        if max > 0 && trips.len() > max {
+            let n = trips.len();
+            let sampled: Vec<PathTrip> = (0..max).map(|i| trips[i * n / max]).collect();
+            println!("   📊 Subsampled {n} → {} trips (even temporal stride)", sampled.len());
+            trips = sampled;
+        }
+    }
+
+    // 3. Route each UNIQUE dock pair once, in parallel over a pooled client.
+    //    A representative endpoint per key is the first trip seen for it.
+    let unique_pairs: Vec<(PairKey, [f64; 2], [f64; 2])> = {
+        let mut seen: HashMap<PairKey, ([f64; 2], [f64; 2])> = HashMap::new();
+        for t in &trips {
+            seen.entry(pair_key(t.origin, t.dest))
+                .or_insert((t.origin, t.dest));
+        }
+        seen.into_iter().map(|(k, (o, d))| (k, o, d)).collect()
+    };
+    println!(
+        "🚲 Routing {} unique OD pairs ({} trips) through OSRM (bicycle) on {} …",
+        unique_pairs.len(),
+        trips.len(),
+        args.osrm_url
+    );
+    let routed: HashMap<PairKey, (Vec<[f64; 2]>, Option<Vec<f64>>)> = unique_pairs
+        .par_iter()
+        .filter_map(|(k, o, d)| {
+            match get_osrm_route_pooled(&args.osrm_url, o[0], o[1], d[0], d[1]) {
+                Ok(Some(route)) => {
+                    let (coords, edge) = route_geometry(&route);
+                    (coords.len() >= 2).then_some((*k, (coords, edge)))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    println!("   ✓ routed {} / {} unique pairs", routed.len(), unique_pairs.len());
+    if routed.is_empty() {
+        return Err(anyhow!(
+            "No OD pairs routed — is the OSRM bicycle server at {} loaded with the \
+             Montréal (Québec) extract?",
+            args.osrm_url
+        ));
+    }
+
+    // 4. Emit one LineString per trip, re-timing the shared route geometry onto
+    //    that trip's real window. Trips whose pair was unroutable are dropped.
+    let (intermediate_path, output_is_intermediate) = resolve_intermediate(&args.output);
+    let property_columns = vec![
+        PropertyColumn::numeric("trip_id"),
+        PropertyColumn::numeric("duration_min"),
+    ];
+    let mut writer =
+        StreamingLineStringParquetWriter::with_columns(&intermediate_path, property_columns)?;
+
+    let mut dropped_unroutable = 0usize;
+    let mut annotated = 0usize;
+    let mut span_min = i64::MAX;
+    let mut span_max = i64::MIN;
+    for (trip_id, t) in trips.iter().enumerate() {
+        let Some((coords, edge)) = routed.get(&pair_key(t.origin, t.dest)) else {
+            dropped_unroutable += 1;
+            continue;
+        };
+        let (Some(start_dt), Some(end_dt)) = (
+            DateTime::<Utc>::from_timestamp_millis(t.start_ms),
+            DateTime::<Utc>::from_timestamp_millis(t.end_ms),
+        ) else {
+            continue;
+        };
+
+        let mut props = Map::new();
+        props.insert("trip_id".to_string(), json!(trip_id));
+        props.insert(
+            "duration_min".to_string(),
+            json!((t.end_ms - t.start_ms) as f64 / 60_000.0),
+        );
+
+        let mut record = LineStringRecord::new(coords.clone(), start_dt, Some(end_dt), props);
+        // Attach per-vertex timing when the pair's route carried OSRM
+        // annotations; otherwise stt-build falls back to uniform-by-distance.
+        if let Some(edge) = edge {
+            if let Some(vt) =
+                vertex_timestamps_from_durations(coords.len(), edge, t.start_ms, t.end_ms)
+            {
+                if vt.len() == record.coordinates.len() {
+                    record.vertex_timestamps_ms = Some(vt);
+                    annotated += 1;
+                }
+            }
+        }
+        writer.write_linestring(&record)?;
+        span_min = span_min.min(t.start_ms);
+        span_max = span_max.max(t.end_ms);
+    }
+    let rows = writer.finish()?;
+    println!(
+        "\n   ✓ {rows} trip paths written ({annotated} with OSRM per-vertex timing, \
+         {dropped_unroutable} dropped as unroutable)"
+    );
+    println!("   ⏱  archive time span (set showcase timeRange to this):");
+    println!("       start = {span_min}");
+    println!("       end   = {span_max}");
+
+    if args.skip_build || output_is_intermediate {
+        println!(
+            "\n📦 Skipping stt-build (intermediate written to {})",
+            intermediate_path.display()
+        );
+        return Ok(());
+    }
+
+    // Build the packed `.stt`. Mirrors `nyc-rideshare --paths`: `timestamp` +
+    // `end_timestamp` for the per-trip window, real multi-vertex geometry (tile
+    // clipping is fine, unlike OD arcs), and the bin as the temporal bucket. A
+    // street-level pyramid (10-16) so head-dots stay crisp when zoomed in — the
+    // OD-arc `--max-zoom` default (13) doesn't apply here. The per-vertex
+    // `vertex_time` column rides through automatically from the LineStringRecord.
+    common::run_stt_build_with_options(
+        &intermediate_path,
+        &args.output,
+        "timestamp",
+        Some("end_timestamp"),
+        10,
+        16,
+        "zstd",
+        Some(&args.bin),
+    )?;
+
+    println!("\n✅ BIXI trip paths built: {}", args.output.display());
+    println!("   Set datasets.ts timeRange to {{ start: {span_min}, end: {span_max} }}");
+    Ok(())
+}
+
 /// `--streets`: route each unique OD pair once through the OSRM **bicycle**
 /// server, then distribute its per-bucket trip count onto every street edge the
 /// route traverses, emitting one corridor per trafficked OSM way carrying a
@@ -414,6 +851,15 @@ fn generate_streets(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Result<()
 
     // Distribute sequentially (the aggregator mutates shared edge counts).
     let mut flow_agg = FlowAggregator::new(bin_ms, network);
+    // --directional: also track signed net flow per edge so corridors are
+    // pre-oriented toward their dominant travel direction (for the chevrons).
+    flow_agg.set_directional(args.directional);
+    // --per-bucket-direction: emit a SIGNED per-bucket matrix so chevrons flip
+    // per time-step (implies directional; must be set before ingestion so the
+    // signed net map is populated).
+    if args.per_bucket_direction {
+        flow_agg.set_per_bucket_direction(true);
+    }
     for (coords, bins) in &routed {
         flow_agg.add_route_bins(coords, bins);
     }
@@ -484,6 +930,286 @@ fn generate_streets(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Result<()
     })?;
 
     println!("\n✅ BIXI street network built: {}", args.output.display());
+    println!("   Set datasets.ts timeRange to {{ start: {bucket0}, end: {range_end} }}");
+    Ok(())
+}
+
+/// `--merged-paths`: route each unique OD pair once through the OSRM **bicycle**
+/// server (like `--streets`), accumulate **directed** per-edge ridership, then
+/// synthesize long coherent corridors ("strokes") via degree-2 contraction +
+/// good-continuation merging at junctions. Emits each directed corridor as one
+/// LineString carrying a per-vertex × per-hour volume matrix + a volume-based
+/// `min_zoom` LOD — rendered as twin offset ribbons whose width breathes hourly.
+/// Collapse an absolute-time `bin → count` histogram onto hour-of-day for
+/// `--typical-day`: each absolute bin index is folded modulo `buckets_per_day`
+/// (24 for 1 h bins), summing every day's contribution at that time of day.
+fn fold_bins_to_day(bins: &HashMap<i64, u32>, buckets_per_day: i64) -> HashMap<i64, u32> {
+    let mut out: HashMap<i64, u32> = HashMap::new();
+    for (&abs_bin, &count) in bins {
+        *out.entry(abs_bin.rem_euclid(buckets_per_day)).or_insert(0) += count;
+    }
+    out
+}
+
+fn generate_merged_paths(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Result<()> {
+    use crate::datasets::nyc_rideshare_flows::{FlowAggregator, StrokeParams};
+    use crate::datasets::osm_streets::{NetworkMode, OsmNetwork};
+    use crate::datasets::osrm::{check_osrm_connectivity, get_osrm_route_pooled};
+    use rayon::prelude::*;
+
+    let osm_pbf = args.osm_pbf.as_ref().ok_or_else(|| {
+        anyhow!(
+            "--merged-paths routes BIXI trips onto the OSM bicycle network; pass \
+             --osm-pbf <file.osm.pbf> (the extract OSRM's bicycle profile was \
+             built from, e.g. scripts/data-generation/osrm-data/quebec-latest.osm.pbf)"
+        )
+    })?;
+
+    check_osrm_connectivity(&args.osrm_url)?;
+
+    println!("🗺  Loading OSM bicycle network from {} …", osm_pbf.display());
+    let network = OsmNetwork::from_pbf_with_mode(osm_pbf, NetworkMode::Bike)?;
+
+    // Unique OD pairs above the legibility threshold (route once per pair).
+    let pairs: Vec<([f64; 2], [f64; 2], &HashMap<i64, u32>)> = agg
+        .counts
+        .iter()
+        .filter(|(_, bins)| bins.values().sum::<u32>() >= args.min_trips)
+        .filter_map(|((o, d), bins)| {
+            let op = agg.station_pos.get(o)?;
+            let dp = agg.station_pos.get(d)?;
+            Some((*op, *dp, bins))
+        })
+        .collect();
+    println!(
+        "🚲 Routing {} OD pairs (≥{} trips) through OSRM (bicycle) on {} …",
+        pairs.len(),
+        args.min_trips,
+        args.osrm_url
+    );
+
+    // Route every pair once, in parallel. Unroutable pairs are dropped (a straight
+    // line would smear counts onto streets no rider used).
+    let routed: Vec<(Vec<[f64; 2]>, &HashMap<i64, u32>)> = pairs
+        .par_iter()
+        .filter_map(|(op, dp, bins)| match get_osrm_route_pooled(
+            &args.osrm_url,
+            op[0],
+            op[1],
+            dp[0],
+            dp[1],
+        ) {
+            Ok(Some(route)) => {
+                let coords: Vec<[f64; 2]> =
+                    route.geometry.coordinates.iter().map(|c| [c[0], c[1]]).collect();
+                (coords.len() >= 2).then_some((coords, *bins))
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Distribute DIRECTED (sequential — the aggregator mutates shared edge counts).
+    // With --typical-day, fold each pair's absolute-hour bins onto hour-of-day
+    // (0..buckets_per_day) so the whole span collapses into one representative day
+    // — the commute rhythm reads directly AND the per-vertex value matrix shrinks
+    // ~buckets/day× (a month of hourly data → 24 buckets), which is what keeps the
+    // dense corridor-overview tiles decodable on the web.
+    let buckets_per_day = (86_400_000 / bin_ms).max(1);
+    if args.typical_day {
+        println!(
+            "📅 Collapsing to a TYPICAL DAY: {} buckets of {} (hour-of-day, summed over the span)",
+            buckets_per_day, args.bin
+        );
+    }
+    let mut flow_agg = FlowAggregator::new(bin_ms, network);
+    for (coords, bins) in &routed {
+        if args.typical_day {
+            flow_agg.add_route_bins_directed(coords, &fold_bins_to_day(bins, buckets_per_day));
+        } else {
+            flow_agg.add_route_bins_directed(coords, bins);
+        }
+    }
+
+    let (added, _skipped, exact, fallback, miss) = flow_agg.stats();
+    let seg_total = exact + fallback + miss;
+    let match_pct = if seg_total > 0 {
+        100.0 * (exact + fallback) as f64 / seg_total as f64
+    } else {
+        0.0
+    };
+    println!(
+        "   ✓ routed {} / {} pairs · segments {:.1}% matched ({} exact, {} fallback, {} unmatched)",
+        added,
+        pairs.len(),
+        match_pct,
+        exact,
+        fallback,
+        miss
+    );
+    if added == 0 {
+        return Err(anyhow!(
+            "No OD pairs routed — is the OSRM bicycle server at {} loaded with the \
+             Montréal extract?",
+            args.osrm_url
+        ));
+    }
+
+    let span = flow_agg.bucket_span_ms();
+    let (intermediate_path, output_is_intermediate) = resolve_intermediate(&args.output);
+    let stroke_params = StrokeParams {
+        angle_threshold_deg: args.stroke_angle,
+        flow_similarity_ratio: args.stroke_flow_ratio,
+        min_stroke_trips: args.stroke_min_trips,
+    };
+    println!(
+        "🧵 Synthesizing corridors (angle ≤{}°, flow-ratio ≥{}, min-trips {}) …",
+        stroke_params.angle_threshold_deg,
+        stroke_params.flow_similarity_ratio,
+        stroke_params.min_stroke_trips
+    );
+    let (features, num_buckets) =
+        flow_agg.write_parquet_strokes(&intermediate_path, &stroke_params)?;
+    let (bucket0, range_end) = span.unwrap_or((0, 0));
+    println!("\n   ✓ {features} merged corridors · {num_buckets} buckets");
+    println!("   ⏱  matrix span (set showcase timeRange to this):");
+    println!("       start = {bucket0}");
+    println!("       end   = {range_end}");
+
+    if args.skip_build || output_is_intermediate {
+        println!(
+            "\n📦 Skipping stt-build (intermediate written to {})",
+            intermediate_path.display()
+        );
+        return Ok(());
+    }
+
+    // Volume LOD (open-ended `min_zoom` from corridor throughput, no max field):
+    // heaviest trunks anchor the city overview, light corridors fill in deep.
+    // Corridors are multi-vertex real geometry, so tile clipping is fine. The
+    // per-vertex-varying matrix doesn't zstd-collapse like bundled rows, so
+    // coordinate-quantize (~1 m, invisible at corridor zooms) to shrink it.
+    common::run_stt_build_with_full_options(SttBuildOptions {
+        input: intermediate_path.clone(),
+        output: args.output.clone(),
+        time_field: "timestamp".to_string(),
+        end_time_field: Some("end_timestamp".to_string()),
+        min_zoom: 10,
+        max_zoom: 15,
+        compression: "zstd".to_string(),
+        temporal_bucket: Some(args.bin.clone()),
+        temporal_lod: None,
+        summary: None,
+        summary_sub_buckets: None,
+        min_features_per_tile: None,
+        min_zoom_field: Some("min_zoom".to_string()),
+        max_zoom_field: None,
+        no_clip: false,
+        quantize_coords: Some(1.0),
+        quantize_attrs: Vec::new(),
+    })?;
+
+    println!("\n✅ BIXI merged corridors built: {}", args.output.display());
+    println!("   Set datasets.ts timeRange to {{ start: {bucket0}, end: {range_end} }}");
+    Ok(())
+}
+
+/// `--flow-graph`: build an abstract Sankey-like flow network (NO streets, no
+/// OSRM) via Edge-Path Bundling on a Delaunay hub graph, then emit + build like
+/// the other corridor modes. Reuses the breathing twin-ribbon FlowStrokeLayer.
+fn generate_flow_network(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Result<()> {
+    use crate::datasets::flow_graph::{self, FlowGraphParams, OdPair};
+    use crate::datasets::nyc_rideshare_flows::StrokeParams;
+
+    // Index the stations referenced by legible OD pairs; build OdPairs (folded to
+    // hour-of-day when --typical-day).
+    let buckets_per_day = (86_400_000 / bin_ms).max(1);
+    let mut station_index: HashMap<String, usize> = HashMap::new();
+    let mut station_coords: Vec<[f64; 2]> = Vec::new();
+    let mut od: Vec<OdPair> = Vec::new();
+    for ((o, d), bins) in &agg.counts {
+        if bins.values().sum::<u32>() < args.min_trips {
+            continue;
+        }
+        let (op, dp) = match (agg.station_pos.get(o), agg.station_pos.get(d)) {
+            (Some(op), Some(dp)) => (*op, *dp),
+            _ => continue,
+        };
+        let oi = *station_index.entry(o.clone()).or_insert_with(|| {
+            station_coords.push(op);
+            station_coords.len() - 1
+        });
+        let di = *station_index.entry(d.clone()).or_insert_with(|| {
+            station_coords.push(dp);
+            station_coords.len() - 1
+        });
+        let bins_out =
+            if args.typical_day { fold_bins_to_day(bins, buckets_per_day) } else { bins.clone() };
+        od.push(OdPair { origin: oi, dest: di, bins: bins_out });
+    }
+    println!(
+        "🌐 Flow network: {} stations · {} OD pairs (≥{} trips){}",
+        station_coords.len(),
+        od.len(),
+        args.min_trips,
+        if args.typical_day { " · typical day" } else { "" }
+    );
+    if od.is_empty() {
+        return Err(anyhow!("No OD pairs ≥ --min-trips {} to bundle", args.min_trips));
+    }
+
+    let params = FlowGraphParams {
+        hub_radius_m: args.hub_radius,
+        bundle_k: args.bundle_k,
+        max_edge_m: 2500.0,
+        spline_samples: args.spline,
+        smooth_iters: args.smooth,
+        ribbon_offset_m: args.ribbon_offset,
+        stroke: StrokeParams {
+            angle_threshold_deg: args.stroke_angle,
+            flow_similarity_ratio: args.stroke_flow_ratio,
+            min_stroke_trips: args.stroke_min_trips,
+        },
+    };
+
+    let (intermediate_path, output_is_intermediate) = resolve_intermediate(&args.output);
+    let (features, num_buckets, bucket0, range_end) =
+        flow_graph::build_and_write(&intermediate_path, &station_coords, &od, bin_ms, &params)?;
+    println!("\n   ✓ {features} flow-network corridors · {num_buckets} buckets");
+    println!("   ⏱  matrix span (set showcase timeRange to this):");
+    println!("       start = {bucket0}");
+    println!("       end   = {range_end}");
+
+    if args.skip_build || output_is_intermediate {
+        println!(
+            "\n📦 Skipping stt-build (intermediate written to {})",
+            intermediate_path.display()
+        );
+        return Ok(());
+    }
+
+    // Same tile build as the merged corridors: volume-based min_zoom LOD, matrix
+    // bin as the temporal bucket, coordinate quantization to shrink geometry.
+    common::run_stt_build_with_full_options(SttBuildOptions {
+        input: intermediate_path.clone(),
+        output: args.output.clone(),
+        time_field: "timestamp".to_string(),
+        end_time_field: Some("end_timestamp".to_string()),
+        min_zoom: 10,
+        max_zoom: 15,
+        compression: "zstd".to_string(),
+        temporal_bucket: Some(args.bin.clone()),
+        temporal_lod: None,
+        summary: None,
+        summary_sub_buckets: None,
+        min_features_per_tile: None,
+        min_zoom_field: Some("min_zoom".to_string()),
+        max_zoom_field: None,
+        no_clip: false,
+        quantize_coords: Some(1.0),
+        quantize_attrs: Vec::new(),
+    })?;
+
+    println!("\n✅ BIXI flow network built: {}", args.output.display());
     println!("   Set datasets.ts timeRange to {{ start: {bucket0}, end: {range_end} }}");
     Ok(())
 }
@@ -1058,6 +1784,10 @@ struct ParsedTrip {
     origin_pos: [f64; 2],
     dest_pos: [f64; 2],
     start_ms: i64,
+    /// Ride end time, when the schema carries one (`ENDTIMEMS` / `end_date`).
+    /// The aggregate OD/flow modes bin by `start_ms` only and ignore this; the
+    /// per-trip `--paths` mode needs it to time each trajectory.
+    end_ms: Option<i64>,
 }
 
 /// Resolved column indices for one CSV. Supports the embedded-coordinate family
@@ -1072,6 +1802,9 @@ struct TripSchema {
     start_code: Option<usize>,
     end_code: Option<usize>,
     start_time: usize,
+    /// Optional ride end-time column (`ENDTIMEMS` / `end_date`). Only the
+    /// per-trip `--paths` mode reads it; the OD/flow modes bin by start only.
+    end_time: Option<usize>,
 }
 
 /// Normalize a header cell for tolerant matching: lowercase, alphanumeric only.
@@ -1098,12 +1831,27 @@ impl TripSchema {
             find(&|c| (c.contains("end") && c.contains("code")) || c == "emplacementpkend");
         // Start time: prefer an explicit start-time/date column that isn't a
         // station attribute. `starttimems`, `startdate`, `startedat`.
+        // `startedat`/`endedat` (Lyft/GBFS `started_at`/`ended_at`) carry no
+        // "time"/"date" substring, so they must bypass that gate via an exact
+        // match — otherwise they'd never resolve and such CSVs would be rejected
+        // (start) or silently un-timed (end).
         let start_time = find(&|c| {
-            (c.contains("start") || c == "startedat")
-                && (c.contains("time") || c.contains("date"))
-                && !c.contains("station")
-                && !c.contains("name")
+            c == "startedat"
+                || (c.contains("start")
+                    && (c.contains("time") || c.contains("date"))
+                    && !c.contains("station")
+                    && !c.contains("name"))
         })?;
+        // Ride end time (`ENDTIMEMS`, `end_date`, `ended_at`). Optional — the
+        // aggregate modes don't need it; `--paths` does. The station-attribute
+        // guards keep `ENDSTATIONLATITUDE`/`ENDSTATIONNAME` from matching.
+        let end_time = find(&|c| {
+            c == "endedat"
+                || (c.contains("end")
+                    && (c.contains("time") || c.contains("date"))
+                    && !c.contains("station")
+                    && !c.contains("name"))
+        });
 
         // Need a station identity AND a position source on both ends.
         let has_pos = start_lat.is_some() && start_lon.is_some() && end_lat.is_some() && end_lon.is_some();
@@ -1121,6 +1869,7 @@ impl TripSchema {
             start_code,
             end_code,
             start_time,
+            end_time,
         })
     }
 
@@ -1139,7 +1888,14 @@ impl TripSchema {
         let origin_key = self.identity(rec, self.start_name, self.start_code, origin_pos);
         let dest_key = self.identity(rec, self.end_name, self.end_code, dest_pos);
 
-        Some(ParsedTrip { origin_key, dest_key, origin_pos, dest_pos, start_ms })
+        // Ride end time, when the schema has one and it parses. Left as `None`
+        // otherwise — the OD/flow modes ignore it; `--paths` skips such rows.
+        let end_ms = self
+            .end_time
+            .and_then(|i| rec.get(i))
+            .and_then(parse_time_ms);
+
+        Some(ParsedTrip { origin_key, dest_key, origin_pos, dest_pos, start_ms, end_ms })
     }
 
     fn position(
@@ -1366,30 +2122,6 @@ fn gather_station_files(path: &Path, out: &mut Vec<String>) {
     }
 }
 
-/// Fetch the public BIXI GBFS station feed → `short_name` → (lon, lat). Used
-/// only for legacy code-based files with no stations CSV. Kept simple; failures
-/// degrade to an empty map (such rows then drop for lack of a position).
-#[allow(dead_code)]
-fn gbfs_stations() -> HashMap<String, [f64; 2]> {
-    let mut map = HashMap::new();
-    let Ok(resp) = reqwest::blocking::get(GBFS_STATION_INFO_URL) else {
-        return map;
-    };
-    let Ok(json): Result<serde_json::Value, _> = resp.json() else {
-        return map;
-    };
-    if let Some(arr) = json["data"]["stations"].as_array() {
-        for s in arr {
-            if let (Some(sn), Some(lat), Some(lon)) =
-                (s["short_name"].as_str(), s["lat"].as_f64(), s["lon"].as_f64())
-            {
-                map.insert(sn.to_string(), [lon, lat]);
-            }
-        }
-    }
-    map
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1419,6 +2151,8 @@ mod tests {
         assert_eq!(s.end_lon, Some(7));
         assert_eq!(s.start_name, Some(0));
         assert_eq!(s.start_time, 8);
+        // ENDTIMEMS detected as the end-time column (not ENDSTATION* columns).
+        assert_eq!(s.end_time, Some(9));
 
         let row = rec(&[
             "A", "Ville-Marie", "45.5", "-73.5", "B", "Ville-Marie", "45.6", "-73.6",
@@ -1429,6 +2163,7 @@ mod tests {
         assert_eq!(t.dest_key, "B");
         assert_eq!(t.origin_pos, [-73.5, 45.5]);
         assert_eq!(t.start_ms, 1704230756167);
+        assert_eq!(t.end_ms, Some(1704231106232));
     }
 
     #[test]
@@ -1445,6 +2180,8 @@ mod tests {
         assert_eq!(s.start_code, Some(1));
         assert_eq!(s.end_code, Some(3));
         assert_eq!(s.start_time, 0);
+        // `end_date` detected as the end-time column (not `end_station_code`).
+        assert_eq!(s.end_time, Some(2));
 
         let mut stations = HashMap::new();
         stations.insert("6001".to_string(), [-73.57, 45.49]);
@@ -1455,6 +2192,65 @@ mod tests {
         assert_eq!(t.origin_pos, [-73.57, 45.49]);
         assert_eq!(t.start_ms, NaiveDate::from_ymd_opt(2019, 4, 15).unwrap()
             .and_hms_opt(8, 23, 0).unwrap().and_utc().timestamp_millis());
+        assert_eq!(t.end_ms, NaiveDate::from_ymd_opt(2019, 4, 15).unwrap()
+            .and_hms_opt(8, 31, 0).map(|d| d.and_utc().timestamp_millis()));
+    }
+
+    #[test]
+    fn detects_lyft_started_ended_at_schema() {
+        // Lyft/GBFS-standard headers (e.g. newer BIXI exports): the time columns
+        // are `started_at`/`ended_at`, which carry no "time"/"date" substring.
+        let headers = rec(&[
+            "ride_id",
+            "rideable_type",
+            "started_at",
+            "ended_at",
+            "start_station_name",
+            "start_station_id",
+            "end_station_name",
+            "end_station_id",
+            "start_lat",
+            "start_lng",
+            "end_lat",
+            "end_lng",
+            "member_casual",
+        ]);
+        let s = TripSchema::detect(&headers).expect("schema");
+        assert_eq!(s.start_time, 2); // started_at
+        assert_eq!(s.end_time, Some(3)); // ended_at
+        assert_eq!(s.start_lat, Some(8));
+        assert_eq!(s.end_lon, Some(11));
+
+        let row = rec(&[
+            "abc", "classic_bike", "2024-08-15 08:00:00", "2024-08-15 08:12:00",
+            "A", "1", "B", "2", "45.50", "-73.57", "45.53", "-73.54", "member",
+        ]);
+        let t = s.parse_row(&row, &HashMap::new()).expect("trip");
+        assert_eq!(t.origin_pos, [-73.57, 45.50]);
+        assert!(t.end_ms.unwrap() > t.start_ms);
+    }
+
+    #[test]
+    fn path_pair_key_collapses_nearby_docks_and_keeps_direction() {
+        let o = [-73.5678, 45.4901];
+        let d = [-73.5432, 45.5301];
+        // Sub-metre jitter collapses to the same key…
+        assert_eq!(pair_key(o, d), pair_key([o[0] + 1e-7, o[1]], d));
+        // …but direction matters (A→B ≠ B→A) and distinct docks differ.
+        assert_ne!(pair_key(o, d), pair_key(d, o));
+        assert_ne!(pair_key(o, d), pair_key(o, [d[0] + 0.01, d[1]]));
+    }
+
+    #[test]
+    fn path_even_stride_subsample_is_uniform_and_bounded() {
+        // The stride formula the --paths cap uses: i*n/max over a sorted vec.
+        let n = 100usize;
+        let max = 10usize;
+        let idx: Vec<usize> = (0..max).map(|i| i * n / max).collect();
+        assert_eq!(idx.len(), max);
+        assert_eq!(*idx.first().unwrap(), 0);
+        assert!(*idx.last().unwrap() < n); // never out of bounds
+        assert!(idx.windows(2).all(|w| w[1] > w[0])); // strictly increasing → no dupes
     }
 
     #[test]
@@ -1468,6 +2264,7 @@ mod tests {
             origin_pos: op,
             dest_pos: dp,
             start_ms: ms,
+            end_ms: None,
         };
         let a = [-73.5, 45.5];
         let b = [-73.6, 45.6];
@@ -1498,11 +2295,11 @@ mod tests {
     fn min_trips_threshold_drops_sparse_pairs() {
         let h = 3_600_000i64;
         let mut agg = BixiAggregator::new(h, None, None);
-        let busy = ParsedTrip { origin_key: "A".into(), dest_key: "B".into(), origin_pos: [0.0, 0.0], dest_pos: [1.0, 1.0], start_ms: 0 };
+        let busy = ParsedTrip { origin_key: "A".into(), dest_key: "B".into(), origin_pos: [0.0, 0.0], dest_pos: [1.0, 1.0], start_ms: 0, end_ms: None };
         for _ in 0..5 {
             agg.add_trip(ParsedTrip { ..clone_trip(&busy) });
         }
-        agg.add_trip(ParsedTrip { origin_key: "C".into(), dest_key: "D".into(), origin_pos: [0.0, 0.0], dest_pos: [2.0, 2.0], start_ms: 0 });
+        agg.add_trip(ParsedTrip { origin_key: "C".into(), dest_key: "D".into(), origin_pos: [0.0, 0.0], dest_pos: [2.0, 2.0], start_ms: 0, end_ms: None });
         let dir = std::env::temp_dir().join("bixi-test-thresh.parquet");
         let (features, _, _, _) = agg.write_parquet(&dir, 3, None, 10, 13, None).unwrap();
         assert_eq!(features, 1); // only A→B (5) clears min_trips=3
@@ -1516,6 +2313,7 @@ mod tests {
             origin_pos: t.origin_pos,
             dest_pos: t.dest_pos,
             start_ms: t.start_ms,
+            end_ms: t.end_ms,
         }
     }
 
@@ -1546,8 +2344,8 @@ mod tests {
         let s1 = [-73.561, 45.508];
         let s2 = [-73.566, 45.512];
         let s3 = [-73.500, 45.560];
-        agg.add_trip(ParsedTrip { origin_key: "S1".into(), dest_key: "S3".into(), origin_pos: s1, dest_pos: s3, start_ms: 0 });
-        agg.add_trip(ParsedTrip { origin_key: "S2".into(), dest_key: "S3".into(), origin_pos: s2, dest_pos: s3, start_ms: 0 });
+        agg.add_trip(ParsedTrip { origin_key: "S1".into(), dest_key: "S3".into(), origin_pos: s1, dest_pos: s3, start_ms: 0, end_ms: None });
+        agg.add_trip(ParsedTrip { origin_key: "S2".into(), dest_key: "S3".into(), origin_pos: s2, dest_pos: s3, start_ms: 0, end_ms: None });
         agg
     }
 

@@ -11,6 +11,9 @@
 //! drifting along the current. Tracks are colour-banded by sea-surface
 //! temperature so warm western-boundary currents (Gulf Stream, Kuroshio)
 //! read as bright ribbons peeling poleward.
+//!
+//! The pipeline itself ([`run_product`]) is shared with the hourly variant
+//! (`drifters_hourly`), which only swaps the [`Product`] knobs.
 
 use crate::common::{
     self, LineStringRecord, PropertyColumn, SttBuildOptions, StreamingLineStringParquetWriter,
@@ -26,8 +29,33 @@ use std::fs::{self, File};
 use std::path::PathBuf;
 use std::process::Command;
 
-const ERDDAP_BASE: &str =
-    "https://data.pmel.noaa.gov/generic/erddap/tabledap/gdp_interpolated_drifter.csv";
+/// The knobs that differ between the 6-hourly and hourly GDP products. Both
+/// subcommands run the identical pipeline (`run_product`) over one of these.
+pub(crate) struct Product {
+    pub erddap_base: &'static str,
+    /// Temperature column name in the ERDDAP schema.
+    pub temp_column: &'static str,
+    /// Raw column value → °C (the hourly product reports Kelvin and needs a
+    /// plausibility filter for fill sentinels; the 6-hourly is already °C).
+    pub temp_to_celsius: fn(f64) -> Option<f64>,
+    /// Monthly cache file name. Only the hourly key encodes the bounds tag —
+    /// the 6-hourly name predates it and must keep hitting existing caches.
+    pub cache_file: fn(i32, u32, &str) -> String,
+    pub banner: &'static str,
+    /// Product noun in the fetch progress line ("6-hourly" / "hourly").
+    pub fetch_noun: &'static str,
+    pub done_message: &'static str,
+}
+
+const SIX_HOURLY: Product = Product {
+    erddap_base: "https://data.pmel.noaa.gov/generic/erddap/tabledap/gdp_interpolated_drifter.csv",
+    temp_column: "temp",
+    temp_to_celsius: |c| Some(c),
+    cache_file: |y, m, _bounds_tag| format!("drifters-{:04}-{:02}.csv", y, m),
+    banner: "🌊 Global Drifter Program Generator\n===================================\n",
+    fetch_noun: "6-hourly",
+    done_message: "\n✅ Drifter generation complete!",
+};
 
 #[derive(Parser, Debug)]
 #[command(about = "Generate Global Drifter Program ocean-current trajectories")]
@@ -79,7 +107,7 @@ pub struct Args {
     pub skip_build: bool,
 }
 
-/// One 6-hour fix.
+/// One fix.
 #[derive(Debug, Clone)]
 struct Fix {
     ms: i64,
@@ -89,8 +117,13 @@ struct Fix {
 }
 
 pub fn run(args: Args) -> Result<()> {
-    println!("🌊 Global Drifter Program Generator");
-    println!("===================================\n");
+    run_product(args, &SIX_HOURLY)
+}
+
+/// The shared GDP pipeline: download monthly CSVs, group fixes into
+/// per-drifter tracks, split at gaps/antimeridian, and emit LineStrings.
+pub(crate) fn run_product(args: Args, product: &Product) -> Result<()> {
+    println!("{}", product.banner);
 
     let start = NaiveDate::parse_from_str(&args.start, "%Y-%m-%d")
         .with_context(|| format!("Invalid --start date: {}", args.start))?;
@@ -109,7 +142,11 @@ pub fn run(args: Args) -> Result<()> {
     // Download month-by-month (one ERDDAP request per month is far more
     // reliable than a single year-long global scan, which tends to time out).
     let months = month_starts(start, end);
-    println!("📥 Fetching {} month(s) of 6-hourly drifter fixes...\n", months.len());
+    println!(
+        "📥 Fetching {} month(s) of {} drifter fixes...\n",
+        months.len(),
+        product.fetch_noun
+    );
     let pb = ProgressBar::new(months.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -117,16 +154,25 @@ pub fn run(args: Args) -> Result<()> {
             .progress_chars("#>-"),
     );
 
+    // Bounds tag for cache keys that encode it (hourly): without it a bounded
+    // run (e.g. a smoke test) and a later global run collide on the same
+    // monthly file and the global run silently reuses the bounded subset.
+    let bounds_tag = match bounds {
+        None => "global".to_string(),
+        Some((a, b, c, d)) => format!("{:.2}_{:.2}_{:.2}_{:.2}", a, b, c, d),
+    };
+
     let mut csv_files: Vec<PathBuf> = Vec::new();
     for (y, m) in &months {
         let m_start = NaiveDate::from_ymd_opt(*y, *m, 1).unwrap();
         let (ny, nm) = next_month(*y, *m);
         let m_end = NaiveDate::from_ymd_opt(ny, nm, 1).unwrap().min(end);
-        let path = args.cache_dir.join(format!("drifters-{:04}-{:02}.csv", y, m));
+        let path = args.cache_dir.join((product.cache_file)(*y, *m, &bounds_tag));
 
         if args.refresh || !path.exists() || fs::metadata(&path).map(|m| m.len() < 64).unwrap_or(true)
         {
             let url = build_url(
+                product,
                 &format!("{}T00:00:00Z", m_start.format("%Y-%m-%d")),
                 &format!("{}T00:00:00Z", m_end.format("%Y-%m-%d")),
                 bounds,
@@ -150,7 +196,7 @@ pub fn run(args: Args) -> Result<()> {
     let mut wmo_of: HashMap<String, String> = HashMap::new();
     let mut total = 0usize;
     for path in &csv_files {
-        parse_csv(path, &mut tracks, &mut wmo_of, &mut total)?;
+        parse_csv(path, product, &mut tracks, &mut wmo_of, &mut total)?;
     }
     println!("   {} fixes across {} drifters", total, tracks.len());
 
@@ -199,8 +245,8 @@ pub fn run(args: Args) -> Result<()> {
                 Some(temps.iter().sum::<f64>() / temps.len() as f64)
             };
 
-            // Per-vertex SST drives the along-track color gradient. Gaps in the
-            // 6-hourly record are gap-filled (forward then backward) so every
+            // Per-vertex SST drives the along-track color gradient. Gaps in
+            // the record are gap-filled (forward then backward) so every
             // vertex has a value; a segment with no temps at all stays NaN
             // (rendered gray). Aligned 1:1 with `coordinates`.
             let vertex_temps = fill_vertex_temps(seg);
@@ -253,7 +299,7 @@ pub fn run(args: Args) -> Result<()> {
         let _ = fs::remove_file(&intermediate);
     }
 
-    println!("\n✅ Drifter generation complete!");
+    println!("{}", product.done_message);
     println!("   Output: {}", args.output.display());
     Ok(())
 }
@@ -272,9 +318,15 @@ fn erddap_encode(s: &str) -> String {
         .replace(' ', "%20")
 }
 
-fn build_url(start: &str, end: &str, bounds: Option<(f64, f64, f64, f64)>) -> String {
+fn build_url(
+    product: &Product,
+    start: &str,
+    end: &str,
+    bounds: Option<(f64, f64, f64, f64)>,
+) -> String {
+    let columns = format!("ID,WMO,time,longitude,latitude,{},ve,vn", product.temp_column);
     let mut parts: Vec<String> = vec![
-        erddap_encode("ID,WMO,time,longitude,latitude,temp,ve,vn"),
+        erddap_encode(&columns),
         format!("time%3E={}", erddap_encode(start)),
         format!("time%3C={}", erddap_encode(end)),
     ];
@@ -285,7 +337,7 @@ fn build_url(start: &str, end: &str, bounds: Option<(f64, f64, f64, f64)>) -> St
         parts.push(format!("longitude%3C={}", max_lon));
     }
     parts.push(erddap_encode(r#"orderBy("ID,time")"#));
-    format!("{}?{}", ERDDAP_BASE, parts.join("&"))
+    format!("{}?{}", product.erddap_base, parts.join("&"))
 }
 
 fn download(url: &str, out: &PathBuf) -> Result<()> {
@@ -299,9 +351,9 @@ fn download(url: &str, out: &PathBuf) -> Result<()> {
             "--max-time",
             "600",
             "-o",
-            out.to_str().unwrap(),
-            url,
         ])
+        .arg(out)
+        .arg(url)
         .status()
         .context("failed to run curl")?;
     if !status.success() {
@@ -313,6 +365,7 @@ fn download(url: &str, out: &PathBuf) -> Result<()> {
 
 fn parse_csv(
     path: &PathBuf,
+    product: &Product,
     tracks: &mut HashMap<String, Vec<Fix>>,
     wmo_of: &mut HashMap<String, String>,
     total: &mut usize,
@@ -329,7 +382,7 @@ fn parse_csv(
         idx("time").context("missing time column")?,
         idx("longitude").context("missing longitude column")?,
         idx("latitude").context("missing latitude column")?,
-        idx("temp"),
+        idx(product.temp_column),
     );
 
     for rec in rdr.records() {
@@ -355,7 +408,10 @@ fn parse_csv(
             Some(s) if !s.is_empty() => s.to_string(),
             _ => continue,
         };
-        let temp = ci_temp.and_then(|i| rec.get(i)).and_then(parse_f64);
+        let temp = ci_temp
+            .and_then(|i| rec.get(i))
+            .and_then(parse_f64)
+            .and_then(|v| (product.temp_to_celsius)(v));
 
         if let Some(i) = ci_wmo {
             if let Some(w) = rec.get(i) {
