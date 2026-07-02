@@ -1,5 +1,6 @@
 //! GeoParquet input parsing and feature loading
 
+use crate::columnar::{PropertyKind, PropertyTypes};
 use anyhow::{Context, Result};
 use arrow::array::{Array, BinaryViewArray, Float32Array, Float64Array, Int64Array, LargeBinaryArray, ListArray, StringArray, TimestampSecondArray, TimestampMillisecondArray, TimestampMicrosecondArray, TimestampNanosecondArray};
 use arrow::datatypes::DataType;
@@ -200,16 +201,10 @@ where
         .iter()
         .enumerate()
         .filter_map(|(idx, field)| {
-            let name = field.name();
-            let is_meta = name == &geom_col_name
-                || name == time_field
-                || end_time_field.map(|f| name == f).unwrap_or(false)
-                || is_vertex_metadata_column(name)
-                || is_coordinate_column_name(name);
-            if is_meta {
-                None
-            } else {
+            if is_property_column(field.name(), &geom_col_name, time_field, end_time_field) {
                 Some(idx)
+            } else {
+                None
             }
         })
         .collect();
@@ -219,6 +214,11 @@ where
     // yields a value, so columns that never do can be reported at EOF (the
     // silent-drop accounting the PostGIS/DuckDB readers already have).
     let mut seen_props = vec![false; property_cols.len()];
+    // Whole-input accounting for the main time column. Scattered failures are
+    // per-row dirt (warn + coerce to epoch 0); EVERY row failing means the
+    // column/format is wrong, and the all-1970 archive it would produce is
+    // silent garbage — fail the build instead, even in Warn mode.
+    let mut time_parse_failures = 0usize;
     for batch_result in reader {
         let batch = batch_result.context("Failed to read Parquet batch")?;
         let parsed = parse_batch(
@@ -236,9 +236,18 @@ where
             time_strictness,
             geometry_strictness,
             row_count,
+            &mut time_parse_failures,
         )?;
         row_count += batch.num_rows();
         on_batch(parsed)?;
+    }
+    if row_count > 0 && time_parse_failures == row_count {
+        anyhow::bail!(
+            "all {row_count} rows in time column '{time_field}' were null or unparseable — \
+             refusing to write an archive whose every feature is coerced to epoch 0 \
+             (1970-01-01). Check --time-field/--time-format: zone-less ISO 8601 strings \
+             are read as UTC; integer columns are unix-ms unless --time-format unix-sec"
+        );
     }
     warn_dropped_property_columns(&schema, &property_cols, &seen_props, row_count);
     Ok(())
@@ -299,13 +308,16 @@ fn parse_batch(
     time_strictness: InputStrictness,
     geometry_strictness: InputStrictness,
     row_offset: usize,
+    time_parse_failures: &mut usize,
 ) -> Result<Vec<ParsedFeature>> {
     let geometries = extract_geometries_from_batch(batch, geom_col_name)?;
-    let timestamps =
+    let (timestamps, batch_time_failures) =
         extract_timestamps_from_batch(batch, time_col_idx, time_format, time_strictness, row_offset)?;
+    *time_parse_failures += batch_time_failures;
     let end_timestamps = end_time_col_idx
         .map(|idx| extract_timestamps_from_batch(batch, idx, time_format, time_strictness, row_offset))
-        .transpose()?;
+        .transpose()?
+        .map(|(ts, _)| ts);
     let vertex_times = vertex_times_col_idx
         .map(|idx| extract_vertex_timestamps_from_batch(batch, idx, row_offset))
         .transpose()?;
@@ -417,6 +429,74 @@ pub const VERTEX_METADATA_COLUMNS: [&str; 3] =
 /// Whether `name` is one of [`VERTEX_METADATA_COLUMNS`].
 pub fn is_vertex_metadata_column(name: &str) -> bool {
     VERTEX_METADATA_COLUMNS.contains(&name)
+}
+
+/// Whether a source column is a user property (vs geometry / time / vertex
+/// metadata / coordinate component). The single predicate behind BOTH the
+/// row-reading property selection in [`stream_features`] and the schema-level
+/// [`property_kinds`] map, so the two can't disagree.
+fn is_property_column(
+    name: &str,
+    geom_col_name: &str,
+    time_field: &str,
+    end_time_field: Option<&str>,
+) -> bool {
+    !(name == geom_col_name
+        || name == time_field
+        || end_time_field.map(|f| name == f).unwrap_or(false)
+        || is_vertex_metadata_column(name)
+        || is_coordinate_column_name(name))
+}
+
+/// Schema-level mirror of [`extract_property_value`]'s downcasts: the tile
+/// kind an Arrow property column of this type will produce. `None` =
+/// unmappable (decimal/struct/binary/…) — such columns yield no values and
+/// are reported by the EOF drop accounting.
+fn property_kind_for(dt: &DataType) -> Option<PropertyKind> {
+    match dt {
+        DataType::Float64 | DataType::Float32 | DataType::Int64 | DataType::Int32 => {
+            Some(PropertyKind::Numeric)
+        }
+        DataType::Utf8 | DataType::Boolean => Some(PropertyKind::Categorical),
+        _ => None,
+    }
+}
+
+/// Derive the authoritative property-type map from a GeoParquet input's
+/// schema — the source of truth `TileConfig::property_types` wants so a
+/// column that happens to be all-null within one tile still gets its column
+/// there (per-tile value sniffing otherwise drops it and the layer schema
+/// drifts across tiles; see `ColumnarOptions::property_types`).
+///
+/// Uses the same geometry-column detection and property-column selection as
+/// [`stream_features`], and the same type mapping as its per-row value
+/// extraction. Note the schema is authoritative by design: a Utf8 column
+/// whose values all happen to look numeric stays Categorical (cast it in the
+/// source if you want a numeric column).
+pub fn property_kinds(
+    path: &Path,
+    time_field: &str,
+    end_time_field: Option<&str>,
+) -> Result<PropertyTypes> {
+    let file = File::open(path).context("Failed to open GeoParquet file")?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let schema = builder.schema().clone();
+    let geo_meta = parse_geo_metadata(
+        builder.metadata().file_metadata().key_value_metadata(),
+        &schema,
+    );
+    let geom_col_name = find_geometry_column(&schema, geo_meta.as_ref())?;
+
+    let mut kinds = PropertyTypes::new();
+    for field in schema.fields() {
+        if !is_property_column(field.name(), &geom_col_name, time_field, end_time_field) {
+            continue;
+        }
+        if let Some(kind) = property_kind_for(field.data_type()) {
+            kinds.insert(field.name().clone(), kind);
+        }
+    }
+    Ok(kinds)
 }
 
 fn extract_vertex_timestamps_from_batch(
@@ -958,14 +1038,16 @@ pub use stt_core::timestamp::{
 };
 
 /// Extract timestamps from a column. `row_offset` is the batch's absolute
-/// row position in the file, used for error context.
+/// row position in the file, used for error context. Returns the parsed
+/// values plus the number of rows that failed (null or unparseable, coerced
+/// to epoch 0 in Warn mode) so the caller can account across the whole input.
 fn extract_timestamps_from_batch(
     batch: &arrow::record_batch::RecordBatch,
     col_idx: usize,
     time_format: TimeFormat,
     strictness: InputStrictness,
     row_offset: usize,
-) -> Result<Vec<u64>> {
+) -> Result<(Vec<u64>, usize)> {
     let column = batch.column(col_idx);
     let mut timestamps = Vec::with_capacity(batch.num_rows());
 
@@ -998,7 +1080,7 @@ fn extract_timestamps_from_batch(
                 }
             }
             warn_timestamp_failures(parse_failures, batch.num_rows());
-            return Ok(timestamps);
+            return Ok((timestamps, parse_failures));
         }};
     }
 
@@ -1032,7 +1114,7 @@ fn extract_timestamps_from_batch(
             }
         }
         warn_timestamp_failures(parse_failures, batch.num_rows());
-        return Ok(timestamps);
+        return Ok((timestamps, parse_failures));
     }
 
     // Try as string array (ISO8601)
@@ -1055,7 +1137,7 @@ fn extract_timestamps_from_batch(
             }
         }
         warn_timestamp_failures(parse_failures, batch.num_rows());
-        return Ok(timestamps);
+        return Ok((timestamps, parse_failures));
     }
 
     anyhow::bail!(
@@ -1137,9 +1219,15 @@ pub(crate) fn parse_iso8601(s: &str) -> Result<i64> {
         return Ok(dt.timestamp_millis());
     }
 
-    // Try parsing as NaiveDateTime
-    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        return Ok(dt.and_utc().timestamp_millis());
+    // Zone-less (naive) datetimes are interpreted as UTC: both the T- and
+    // space-separated forms, with optional fractional seconds (`%.f` also
+    // matches no fraction). Real-world CSV/Parquet exports (e.g. NOAA Marine
+    // Cadastre AIS BaseDateTime) are commonly `2024-09-28T12:00:00` with no
+    // zone suffix, which the zoned parse above rejects.
+    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Ok(dt.and_utc().timestamp_millis());
+        }
     }
 
     // Try parsing as date only
@@ -1172,4 +1260,43 @@ pub(crate) fn parse_wkb_geometry(wkb: &[u8]) -> Option<(Geometry, f64, f64)> {
         centroid.x(),
         centroid.y(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_iso8601;
+
+    const SEP_28_2024_NOON_MS: i64 = 1_727_524_800_000; // 2024-09-28T12:00:00Z
+
+    #[test]
+    fn parses_zoned_timestamps() {
+        assert_eq!(parse_iso8601("2024-09-28T12:00:00Z").unwrap(), SEP_28_2024_NOON_MS);
+        assert_eq!(parse_iso8601("2024-09-28T14:00:00+02:00").unwrap(), SEP_28_2024_NOON_MS);
+    }
+
+    #[test]
+    fn parses_naive_timestamps_as_utc() {
+        // The T-separated zone-less form (NOAA AIS BaseDateTime and most CSV
+        // exports) and the space-separated form must agree, both = UTC.
+        assert_eq!(parse_iso8601("2024-09-28T12:00:00").unwrap(), SEP_28_2024_NOON_MS);
+        assert_eq!(parse_iso8601("2024-09-28 12:00:00").unwrap(), SEP_28_2024_NOON_MS);
+    }
+
+    #[test]
+    fn parses_naive_fractional_seconds() {
+        assert_eq!(parse_iso8601("2024-09-28T12:00:00.250").unwrap(), SEP_28_2024_NOON_MS + 250);
+        assert_eq!(parse_iso8601("2024-09-28 12:00:00.250").unwrap(), SEP_28_2024_NOON_MS + 250);
+    }
+
+    #[test]
+    fn parses_date_only_as_utc_midnight() {
+        assert_eq!(parse_iso8601("2024-09-28").unwrap(), SEP_28_2024_NOON_MS - 12 * 3_600_000);
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_iso8601("not a time").is_err());
+        assert!(parse_iso8601("2024-13-40T99:00:00").is_err());
+        assert!(parse_iso8601("").is_err());
+    }
 }

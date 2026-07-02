@@ -18,8 +18,8 @@ name = "stt_build"
 path = "src/lib.rs"
 
 [dependencies]
-stt-core = { path = "../stt-core", version = "0.1.0" }
-stt-optimize = { path = "../stt-optimize", version = "0.1.0" }
+stt-core = { path = "../stt-core", version = "0.1.1" }
+stt-optimize = { path = "../stt-optimize", version = "0.1.1" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

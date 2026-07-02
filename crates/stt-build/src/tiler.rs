@@ -10,6 +10,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use stt_core::arrow_tile::{encode_tile, ColumnarLayer};
 use stt_core::budget::TileBudget;
 use stt_core::projection;
@@ -133,6 +134,13 @@ pub struct TileConfig {
     /// Default [`AttributeFilter::KeepAll`] — every user property kept. System
     /// columns always survive regardless.
     pub attribute_filter: AttributeFilter,
+    /// Authoritative per-property kinds from the input source's schema (see
+    /// [`crate::columnar::ColumnarOptions::property_types`]). GeoParquet/DB
+    /// inputs populate this so a column that is all-null within one tile still
+    /// gets its column there — per-tile value sniffing otherwise drops it and
+    /// the layer schema drifts across tiles. Default empty (schema-less
+    /// producers keep sniffing).
+    pub property_types: Arc<crate::columnar::PropertyTypes>,
 }
 
 impl Default for TileConfig {
@@ -155,6 +163,7 @@ impl Default for TileConfig {
             max_zoom_field: None,
             tile_budget: None,
             attribute_filter: AttributeFilter::KeepAll,
+            property_types: Arc::default(),
         }
     }
 }
@@ -166,6 +175,7 @@ impl TileConfig {
         ColumnarOptions {
             pre_tessellate: self.pre_tessellate,
             attribute_filter: self.attribute_filter.clone(),
+            property_types: Arc::clone(&self.property_types),
         }
     }
 }
@@ -820,7 +830,7 @@ fn build_tile(
         layers.push(build_layer_from_segments(
             &segments,
             &config.layer_name,
-            &config.attribute_filter,
+            &config.columnar_options(),
         )?);
     }
     if !originals.is_empty() {
@@ -1320,7 +1330,7 @@ fn flush_bucket<W: TileWriter>(
         layers.push(crate::columnar::build_layer_from_segments(
             &segments,
             &config.layer_name,
-            &config.attribute_filter,
+            &config.columnar_options(),
         )?);
     }
     if !originals.is_empty() {

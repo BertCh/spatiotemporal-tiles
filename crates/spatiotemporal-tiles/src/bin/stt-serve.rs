@@ -38,8 +38,13 @@
 //! reproject at ingest with `stt-build --source-srid` if needed — reprojecting
 //! in a per-tile filter would defeat the spatial index).
 
+// `serve-core` alone is the backend-less plumbing feature — building the bin
+// from it directly is a misconfiguration (the public `serve` feature enables
+// both backends; `serve-postgres` / `serve-duckdb` pick one).
 #[cfg(not(any(feature = "serve-postgres", feature = "serve-duckdb")))]
-compile_error!("stt-serve needs at least one backend: enable `serve-postgres` and/or `serve-duckdb`");
+compile_error!(
+    "stt-serve needs at least one backend: enable `serve` (both backends), `serve-postgres`, or `serve-duckdb`"
+);
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1137,6 +1142,10 @@ fn build_config(
         max_zoom_field: args.max_zoom_field.clone(),
         tile_budget,
         attribute_filter,
+        // DB-backed serving keeps per-tile type sniffing for now — the row
+        // decode knows the column types but doesn't thread them here yet
+        // (see ColumnarOptions::property_types).
+        property_types: Default::default(),
     };
     Ok((config, encoder))
 }

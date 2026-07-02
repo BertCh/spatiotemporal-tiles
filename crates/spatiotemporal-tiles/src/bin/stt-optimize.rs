@@ -20,12 +20,8 @@ enum Commands {
     /// Analyze a dataset and generate optimization report
     Analyze {
         /// Input GeoParquet file path
-        #[arg(short, long, conflicts_with = "stt")]
-        input: Option<PathBuf>,
-
-        /// Input STT archive path (alternative to --input)
-        #[arg(long, conflicts_with = "input")]
-        stt: Option<PathBuf>,
+        #[arg(short, long)]
+        input: PathBuf,
 
         /// Field name containing timestamps
         #[arg(short, long, default_value = "timestamp")]
@@ -78,7 +74,6 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Analyze {
             input,
-            stt,
             time_field,
             time_format,
             format,
@@ -95,7 +90,7 @@ fn main() -> Result<()> {
                 .finish();
             tracing::subscriber::set_global_default(subscriber).ok();
 
-            run_analyze(input, stt, &time_field, &time_format, &format, output)
+            run_analyze(input, &time_field, &time_format, &format, output)
         }
         Commands::Recommend {
             input,
@@ -111,8 +106,7 @@ fn main() -> Result<()> {
 }
 
 fn run_analyze(
-    input: Option<PathBuf>,
-    stt: Option<PathBuf>,
+    input: PathBuf,
     time_field: &str,
     time_format: &str,
     format: &str,
@@ -121,17 +115,10 @@ fn run_analyze(
     use analysis::AnalysisResult;
     use loader::DataSource;
 
-    // Determine input source
-    let source = if let Some(path) = input {
-        DataSource::GeoParquet {
-            path,
-            time_field: time_field.to_string(),
-            time_format: time_format.to_string(),
-        }
-    } else if let Some(path) = stt {
-        DataSource::SttArchive { path }
-    } else {
-        anyhow::bail!("Either --input or --stt must be provided");
+    let source = DataSource::GeoParquet {
+        path: input,
+        time_field: time_field.to_string(),
+        time_format: time_format.to_string(),
     };
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");

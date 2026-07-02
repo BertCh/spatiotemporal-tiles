@@ -104,6 +104,7 @@ fn streaming_pipeline_bounds_peak_rss_for_5m_features() {
         max_zoom_field: None,
         tile_budget: None,
         attribute_filter: Default::default(),
+        property_types: Default::default(),
     };
 
     let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
@@ -200,6 +201,7 @@ fn streaming_pipeline_runs_and_emits_tiles() {
         max_zoom_field: None,
         tile_budget: None,
         attribute_filter: Default::default(),
+        property_types: Default::default(),
     };
 
     let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();

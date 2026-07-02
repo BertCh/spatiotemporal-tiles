@@ -14,7 +14,7 @@ built publish-quality.
 > git clone https://github.com/BertCh/spatiotemporal-tiles
 > cd spatiotemporal-tiles
 > cargo install --path crates/stt-generate
-> cargo install --path crates/spatiotemporal-tiles --features build-cli  # stt-generate shells out to stt-build
+> cargo install --path crates/spatiotemporal-tiles  # stt-generate shells out to stt-build
 > ```
 
 ## Example

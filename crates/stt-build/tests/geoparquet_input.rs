@@ -3,7 +3,9 @@
 //! pre-1970 timestamp rejection, invalid-geometry skip/strict handling,
 //! and the LargeBinary WKB arm.
 
-use arrow::array::{ArrayRef, BinaryArray, Int64Array, LargeBinaryArray, TimestampMillisecondArray};
+use arrow::array::{
+    ArrayRef, BinaryArray, Int64Array, LargeBinaryArray, StringArray, TimestampMillisecondArray,
+};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -391,4 +393,209 @@ fn unix_sec_format_scales_int64_to_ms() {
     )
     .unwrap();
     assert_eq!(features[0].timestamp, 1_700_000_000_000);
+}
+
+/// A schema whose time column is a Utf8 ISO-8601 string (the shape most
+/// CSV-derived Parquet exports have).
+fn string_time_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("geometry", DataType::Binary, true),
+        Field::new("timestamp", DataType::Utf8, true),
+    ]))
+}
+
+fn string_time_columns(times: Vec<Option<&str>>) -> Vec<ArrayRef> {
+    let wkbs: Vec<Vec<u8>> = (0..times.len())
+        .map(|i| wkb_point(1.0 + i as f64, 2.0))
+        .collect();
+    vec![
+        Arc::new(BinaryArray::from_opt_vec(
+            wkbs.iter().map(|b| Some(b.as_slice())).collect(),
+        )),
+        Arc::new(StringArray::from(times)),
+    ]
+}
+
+/// Zone-less T-separated ISO strings (NOAA AIS BaseDateTime shape) must build
+/// end-to-end, interpreted as UTC — the space form already worked; the T form
+/// regressed real onboarding data.
+#[test]
+fn naive_iso_timestamps_build_as_utc() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("naive_iso.parquet");
+    write_parquet(
+        &path,
+        string_time_schema(),
+        string_time_columns(vec![Some("2024-09-28T12:00:00"), Some("2024-09-28 12:00:00")]),
+        None,
+    );
+    let features = load_features(
+        &path,
+        "timestamp",
+        None,
+        TimeFormat::Iso8601,
+        InputStrictness::Warn,
+        InputStrictness::Warn,
+    )
+    .expect("zone-less ISO timestamps must parse as UTC");
+    assert_eq!(features.len(), 2);
+    assert_eq!(features[0].timestamp, 1_727_524_800_000); // 2024-09-28T12:00:00Z
+    assert_eq!(features[0].timestamp, features[1].timestamp, "T and space forms agree");
+}
+
+/// EVERY row failing to parse means the column/format is wrong, and the
+/// all-1970 archive Warn mode would write is silent garbage — the build must
+/// fail even without --strict-times. Scattered failures still coerce.
+#[test]
+fn all_timestamps_unparseable_fails_even_in_warn_mode() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 100% unparseable -> hard error naming the column.
+    let all_bad = dir.path().join("all_bad.parquet");
+    write_parquet(
+        &all_bad,
+        string_time_schema(),
+        string_time_columns(vec![Some("28/09/2024 12:00"), Some("29/09/2024 12:00")]),
+        None,
+    );
+    let err = load_features(
+        &all_bad,
+        "timestamp",
+        None,
+        TimeFormat::Iso8601,
+        InputStrictness::Warn,
+        InputStrictness::Warn,
+    )
+    .expect_err("an input whose every timestamp fails must not build");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("'timestamp'"), "must name the time column: {msg}");
+    assert!(msg.contains("epoch 0"), "must explain the coercion hazard: {msg}");
+
+    // One bad row among good ones keeps the documented warn+coerce behavior.
+    let one_bad = dir.path().join("one_bad.parquet");
+    write_parquet(
+        &one_bad,
+        string_time_schema(),
+        string_time_columns(vec![Some("2024-09-28T12:00:00"), Some("junk")]),
+        None,
+    );
+    let features = load_features(
+        &one_bad,
+        "timestamp",
+        None,
+        TimeFormat::Iso8601,
+        InputStrictness::Warn,
+        InputStrictness::Warn,
+    )
+    .expect("scattered timestamp failures still coerce in warn mode");
+    assert_eq!(features.len(), 2);
+    assert_eq!(features[1].timestamp, 0, "bad row coerced to epoch 0");
+}
+
+/// An entirely-NULL time column is the same wrong-column hazard as an
+/// unparseable one — refuse it too.
+#[test]
+fn all_null_timestamps_fail_even_in_warn_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("all_null.parquet");
+    write_parquet(
+        &path,
+        binary_geom_schema("geometry"),
+        vec![
+            Arc::new(BinaryArray::from_opt_vec(vec![Some(wkb_point(1.0, 2.0).as_slice())])),
+            Arc::new(Int64Array::from(vec![None::<i64>])),
+        ],
+        None,
+    );
+    let err = load(&path, InputStrictness::Warn, InputStrictness::Warn)
+        .expect_err("an all-NULL time column must not build");
+    assert!(format!("{err:#}").contains("null or unparseable"));
+}
+
+/// A numeric column that happens to be all-null within one tile must still
+/// produce an (all-null) Float64 column there: `property_kinds` derives the
+/// authoritative kinds from the Parquet schema and the tiler pins every tile's
+/// layer schema to them. Without this, per-tile value sniffing silently drops
+/// the column from that tile and the layer schema drifts across tiles (the
+/// real-world AIS `SOG` case that forced a COALESCE workaround upstream).
+#[test]
+fn schema_kinds_pin_all_null_column_across_tiles() {
+    use arrow::array::Float64Array;
+    use stt_build::columnar::PropertyKind;
+    use stt_build::tiler::TileConfig;
+    use stt_core::arrow_tile::{decode_tile, EncoderConfig};
+    use stt_core::projection::lonlat_to_tile;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sparse_sog.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("geometry", DataType::Binary, true),
+        Field::new("timestamp", DataType::Int64, true),
+        Field::new("sog", DataType::Float64, true),
+        Field::new("class", DataType::Utf8, true),
+    ]));
+    // Two points far apart → two different z8 tiles. `sog` is populated in
+    // the first tile and NULL in the second.
+    let (lon_a, lat_a) = (-122.4, 37.7);
+    let (lon_b, lat_b) = (10.0, 50.0);
+    write_parquet(
+        &path,
+        schema,
+        vec![
+            Arc::new(BinaryArray::from_opt_vec(vec![
+                Some(wkb_point(lon_a, lat_a).as_slice()),
+                Some(wkb_point(lon_b, lat_b).as_slice()),
+            ])),
+            Arc::new(Int64Array::from(vec![1_000i64, 1_000])),
+            Arc::new(Float64Array::from(vec![Some(3.5), None])),
+            Arc::new(StringArray::from(vec![Some("cargo"), Some("tanker")])),
+        ],
+        None,
+    );
+
+    // Schema-derived kinds: exactly the two user property columns.
+    let kinds = stt_build::input::property_kinds(&path, "timestamp", None).unwrap();
+    assert_eq!(kinds.get("sog"), Some(&PropertyKind::Numeric));
+    assert_eq!(kinds.get("class"), Some(&PropertyKind::Categorical));
+    assert_eq!(kinds.len(), 2, "geometry/time excluded: {kinds:?}");
+
+    let features = load(&path, InputStrictness::Warn, InputStrictness::Warn).unwrap();
+    let z = 8u8;
+    let config = TileConfig {
+        min_zoom: z,
+        max_zoom: z,
+        clip_trajectories: false,
+        property_types: Arc::new(kinds),
+        ..TileConfig::default()
+    };
+    let enc = EncoderConfig::default();
+
+    // Both tiles must decode with the IDENTICAL property schema — including
+    // an all-null Float64 `sog` in tile B.
+    let mut schemas = Vec::new();
+    for (lon, lat) in [(lon_a, lat_a), (lon_b, lat_b)] {
+        let (x, y) = lonlat_to_tile(lon, lat, z).unwrap();
+        let bytes = stt_build::encode_single_tile(&features, z, x, y, 0, &config, &enc)
+            .unwrap()
+            .expect("tile non-empty");
+        let layers = decode_tile(&bytes).unwrap();
+        assert_eq!(layers.len(), 1);
+        let fields: Vec<(String, String)> = layers[0]
+            .batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), f.data_type().to_string()))
+            .collect();
+        schemas.push(fields);
+    }
+    assert_eq!(
+        schemas[0], schemas[1],
+        "layer schema must not drift between the populated and the all-null tile"
+    );
+    assert!(
+        schemas[1].iter().any(|(n, t)| n == "sog" && t == "Float64"),
+        "all-null tile still carries Float64 sog: {:?}",
+        schemas[1]
+    );
 }

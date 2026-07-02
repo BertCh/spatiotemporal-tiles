@@ -116,10 +116,12 @@ pub fn to_command(
     input: &Path,
     time_field: &str,
 ) -> String {
-    let output = input.with_extension("stt");
+    // Suggest the packed dataset DIRECTORY (the input's stem): stt-build's
+    // output is a directory tree, not a single file.
+    let output = input.with_extension("");
     let output_str = output.file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "output.stt".to_string());
+        .unwrap_or_else(|| "output".to_string());
 
     let input_str = input.file_name()
         .map(|n| n.to_string_lossy().to_string())

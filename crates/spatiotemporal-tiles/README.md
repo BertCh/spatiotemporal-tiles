@@ -8,8 +8,11 @@ renderers live on npm under [`@poopdeck.gl`](https://www.npmjs.com/org/poopdeck.
 
 ## Library
 
+The default features exist so `cargo install` ships the CLIs — as a
+*dependency*, disable them and opt into just the pieces you need:
+
 ```sh
-cargo add spatiotemporal-tiles
+cargo add spatiotemporal-tiles --no-default-features
 ```
 
 ```rust
@@ -20,7 +23,7 @@ let reader = stt::core::PackedReader::open("dataset/")?;
 
 | feature | adds |
 |---|---|
-| *(default)* | `stt::core` — archive/tile format reader + writer |
+| *(always)* | `stt::core` — archive/tile format reader + writer |
 | `build` | `stt::build` — the tiler/encoder library |
 | `optimize` | `stt::optimize` — dataset analysis + encoding recommendations |
 | `postgres`, `duckdb` | database input sources for `build` |
@@ -36,7 +39,7 @@ version in lockstep.
 ## CLI tools
 
 ```sh
-cargo install spatiotemporal-tiles --features cli
+cargo install spatiotemporal-tiles
 ```
 
 installs the four binaries (prebuilt binaries and a shell installer are on the
@@ -44,15 +47,22 @@ installs the four binaries (prebuilt binaries and a shell installer are on the
 
 | binary | role |
 |---|---|
-| `stt-build` | build packed STT archives from GeoJSON / GeoParquet / PostGIS / DuckDB |
+| `stt-build` | build packed STT archives from GeoParquet / PostGIS / DuckDB |
 | `stt-optimize` | analyze a dataset and recommend encoder settings |
 | `stt-validate` | validate archives: header, content hashes, Arrow IPC decode, schema |
 | `stt-serve` | dynamic per-request tile server over live PostGIS/DuckDB (the `ST_AsMVT` analog) |
 
-A lighter `stt-serve` without the bundled-DuckDB compile:
-`cargo install spatiotemporal-tiles --features build-cli,optimize-cli,validate-cli,serve-postgres`.
+By default `stt-serve` gets the PostGIS backend; add the embedded-DuckDB
+backend (a heavy C++ compile) with `--features cli`.
 
-See `docs/api/cli-reference.md` in the repository for every flag, and
+Upgrading from a pre-0.1.0 source checkout that installed via
+`cargo install --path crates/stt-build`? Those binary names are now owned by
+this crate — run `cargo uninstall stt-build stt-optimize stt-validate` once
+(or pass `--force`).
+
+New to STT? `docs/guides/csv-quickstart.md` in the repository walks the
+whole path — CSV → GeoParquet (one DuckDB command) → `stt-build --auto` →
+animated deck.gl map. See `docs/api/cli-reference.md` for every flag, and
 `docs/spec/stt-packed-format.md` for the format specification.
 
 ## License

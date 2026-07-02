@@ -1,8 +1,10 @@
 //! stt-validate — inspect and verify an STT dataset.
 //!
-//! Accepts either the canonical **packed format** (a dataset directory or its
-//! `manifest.json`) or a legacy single-file `.stt` archive. For packed inputs
-//! it additionally verifies the content-addressing contract.
+//! Accepts the **packed format** only (a dataset directory or its
+//! `manifest.json`) and verifies the content-addressing contract. The
+//! single-file `.stt` container is an internal streaming/transcode
+//! intermediate (spec D3), never a deployment artifact, so it is not
+//! accepted here.
 //!
 //! Checks performed:
 //! 1. (packed) Every pack and the directory object blake3-hash to the name the
@@ -39,13 +41,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use stt_core::archive::TileEntry;
 use stt_core::metadata::Metadata;
-use stt_core::{Archive, Manifest, PackedReader};
+use stt_core::{Manifest, PackedReader};
 
 #[derive(Parser)]
 #[command(name = "stt-validate", version, about = "Validate an STT dataset")]
 struct Args {
-    /// Dataset to validate: a packed dataset directory, its `manifest.json`,
-    /// or a legacy single-file `.stt` archive.
+    /// Dataset to validate: a packed dataset directory or its `manifest.json`.
     archive: PathBuf,
 
     /// Emit a JSON report instead of a human summary.
@@ -74,7 +75,7 @@ struct Args {
 #[derive(Serialize, Default)]
 struct Report {
     archive: String,
-    /// Packed: directory codec version (5). Single-file: archive header version.
+    /// The packed directory codec version (5).
     version: u8,
     compression: String,
     tile_count: usize,
@@ -108,10 +109,16 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let metadata = match packed_manifest_path(&args.archive) {
-        Some(manifest_path) => validate_packed(&manifest_path, &args, &mut report)?,
-        None => validate_single_file(&args, &mut report)?,
+    let Some(manifest_path) = packed_manifest_path(&args.archive) else {
+        anyhow::bail!(
+            "{} is not a packed STT dataset (expected a directory containing \
+             manifest.json, or the manifest.json itself). Single-file `.stt` \
+             archives are an internal build intermediate and are not \
+             validated — rebuild with `stt-build` (packed output is the default)",
+            args.archive.display()
+        );
     };
+    let metadata = validate_packed(&manifest_path, &args, &mut report)?;
 
     report.elapsed_ms = start.elapsed().as_millis();
 
@@ -131,8 +138,7 @@ fn main() -> Result<()> {
     }
 }
 
-/// If `input` denotes a packed dataset, return its `manifest.json` path;
-/// otherwise `None` (treat as a legacy single-file `.stt`).
+/// If `input` denotes a packed dataset, return its `manifest.json` path.
 fn packed_manifest_path(input: &Path) -> Option<PathBuf> {
     if input.is_dir() {
         let manifest = input.join("manifest.json");
@@ -203,7 +209,7 @@ fn verify_paged_directly(
     if !manifest.directory.is_paged() {
         return Ok(());
     }
-    let mut push_unique = |report: &mut Report, msg: String| -> Result<()> {
+    let push_unique = |report: &mut Report, msg: String| -> Result<()> {
         if report.errors.contains(&msg) {
             return Ok(());
         }
@@ -230,34 +236,6 @@ fn verify_paged_directly(
         Err(e) => push_unique(report, format!("integrity: paged structure check failed: {e}"))?,
     }
     Ok(())
-}
-
-/// Validate a legacy single-file `.stt` archive.
-fn validate_single_file(args: &Args, report: &mut Report) -> Result<Metadata> {
-    let reader = Archive::open(&args.archive)
-        .with_context(|| format!("failed to open archive {}", args.archive.display()))?;
-    report.version = reader.header().version;
-    report.compression = format!("{:?}", reader.header().compression);
-
-    let metadata = reader.metadata().clone();
-    let entries = reader.entries().to_vec();
-    report.tile_count = entries.len();
-
-    let pb = make_progress(args, entries.len());
-    validate_entries(
-        &entries,
-        &metadata,
-        |e| reader.read_payload(e).map_err(|err| err.to_string()),
-        args,
-        report,
-        pb.as_ref(),
-    )?;
-    if let Some(p) = &pb {
-        p.finish_and_clear();
-    }
-
-    finalize_feature_check(args, report, &metadata);
-    Ok(metadata)
 }
 
 /// Whether the per-tile decode covers EVERY tile. The grand-total feature-count
@@ -427,6 +405,15 @@ fn finalize_feature_check(args: &Args, report: &mut Report, metadata: &Metadata)
         report.errors.push(format!(
             "metadata feature_count={} disagrees with decoded sum {}",
             metadata.feature_count, report.feature_count_decoded
+        ));
+    }
+    // tile_count needs no decode at all — the directory entry list is the
+    // ground truth. A zero is tolerated: pre-0.1.1 writers never set the
+    // manifest totals.
+    if metadata.tile_count != 0 && metadata.tile_count != report.tile_count as u64 {
+        report.errors.push(format!(
+            "metadata tile_count={} disagrees with directory entry count {}",
+            metadata.tile_count, report.tile_count
         ));
     }
 }

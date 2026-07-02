@@ -37,13 +37,13 @@ required-features = ["validate-cli"]
 [[bin]]
 name = "stt-serve"
 path = "src/bin/stt-serve.rs"
-required-features = ["serve"]
+required-features = ["serve-core"]
 
 [dependencies]
 # The reader/format core is always present (the facade is useless without it).
-stt-core = { path = "../stt-core", version = "0.1.0" }
-stt-build = { path = "../stt-build", version = "0.1.0", optional = true }
-stt-optimize = { path = "../stt-optimize", version = "0.1.0", optional = true }
+stt-core = { path = "../stt-core", version = "0.1.1" }
+stt-build = { path = "../stt-build", version = "0.1.1", optional = true }
+stt-optimize = { path = "../stt-optimize", version = "0.1.1", optional = true }
 
 # CLI support (feature `cli-core`).
 anyhow = { workspace = true, optional = true }
@@ -77,7 +77,11 @@ duckdb = { version = "1", features = ["bundled", "r2d2"], optional = true }
 r2d2 = { version = "0.8", optional = true }
 
 [features]
-default = []
+# A bare `cargo install spatiotemporal-tiles` installs all four CLIs with the
+# light pure-Rust dependency set (stt-serve gets the PostGIS backend; the
+# bundled-DuckDB backend is a heavy C++ build, opt in via `serve-duckdb` or
+# `cli`). Library consumers should depend with `default-features = false`.
+default = ["build-cli", "optimize-cli", "validate-cli", "serve-postgres"]
 # Library re-exports: `spatiotemporal_tiles::build` / `::optimize`.
 build = ["dep:stt-build"]
 optimize = ["dep:stt-optimize"]
@@ -102,13 +106,16 @@ cli-core = [
 build-cli = ["build", "cli-core", "dep:tempfile"]
 optimize-cli = ["optimize", "cli-core"]
 validate-cli = ["cli-core", "dep:arrow"]
-# stt-serve needs at least one backend; enabling only `serve` is a compile
-# error (see the compile_error! guard in src/bin/stt-serve.rs).
-serve = ["build", "cli-core", "dep:axum", "dep:tokio"]
-serve-postgres = ["serve", "postgres", "dep:tokio-postgres", "dep:deadpool-postgres"]
-serve-duckdb = ["serve", "duckdb", "dep:duckdb", "dep:r2d2"]
+# stt-serve plumbing (HTTP server + runtime), backend-less. Internal: enabling
+# it without a backend is a compile error (see the compile_error! guard in
+# src/bin/stt-serve.rs) — enable `serve` or a `serve-*` backend instead.
+serve-core = ["build", "cli-core", "dep:axum", "dep:tokio"]
+serve-postgres = ["serve-core", "postgres", "dep:tokio-postgres", "dep:deadpool-postgres"]
+serve-duckdb = ["serve-core", "duckdb", "dep:duckdb", "dep:r2d2"]
+# The full stt-serve binary as documented: both backends.
+serve = ["serve-postgres", "serve-duckdb"]
 # Everything: all four binaries, both serve backends.
-cli = ["build-cli", "optimize-cli", "validate-cli", "serve-postgres", "serve-duckdb"]
+cli = ["build-cli", "optimize-cli", "validate-cli", "serve"]
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -119,4 +126,6 @@ tempfile = "3.10"
 features = ["cli"]
 
 [package.metadata.docs.rs]
+# Library docs only — the defaults exist for `cargo install`, not for docs.
+no-default-features = true
 features = ["build", "optimize", "postgres", "duckdb"]

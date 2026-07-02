@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 #[derive(Parser)]
@@ -543,6 +544,40 @@ impl InputSource {
         }
     }
 
+    /// Authoritative property kinds from the source's schema, for
+    /// `TileConfig::property_types` — pins every schema column's tile kind so
+    /// a column that is all-null within one tile still gets its (all-null)
+    /// column there instead of drifting the layer schema. GeoParquet derives
+    /// this from the Arrow schema. The DB adaptors return an empty map for
+    /// now (their row decode knows the types but doesn't thread them here
+    /// yet), which keeps their pre-0.1.1 per-tile sniffing behaviour.
+    fn property_kinds(
+        &self,
+        time_field: &str,
+        end_time_field: Option<&str>,
+    ) -> Arc<stt_build::columnar::PropertyTypes> {
+        match self {
+            InputSource::File(path) => {
+                match input::property_kinds(path, time_field, end_time_field) {
+                    Ok(kinds) => Arc::new(kinds),
+                    Err(e) => {
+                        // The real load will surface the underlying error with
+                        // full context; don't fail the build from here.
+                        warn!(
+                            "could not derive property kinds from the input schema ({e}); \
+                             falling back to per-tile type sniffing"
+                        );
+                        Arc::default()
+                    }
+                }
+            }
+            #[cfg(feature = "postgres")]
+            InputSource::Postgres { .. } => Arc::default(),
+            #[cfg(feature = "duckdb")]
+            InputSource::DuckDb { .. } => Arc::default(),
+        }
+    }
+
     /// Eager load — collect every feature into memory.
     fn load(
         &self,
@@ -962,6 +997,8 @@ fn main() -> Result<()> {
             // their inert defaults here.
             tile_budget: None,
             attribute_filter: stt_build::columnar::AttributeFilter::KeepAll,
+            property_types: source
+                .property_kinds(&args.time_field, args.end_time_field.as_deref()),
         };
         // --streaming-arrow stays bounded-RAM: it streams tiles into a TEMP
         // single-file archive (the only writer that doesn't buffer all
@@ -1215,6 +1252,7 @@ fn main() -> Result<()> {
         max_zoom_field: args.max_zoom_field.clone(),
         tile_budget,
         attribute_filter,
+        property_types: source.property_kinds(&args.time_field, args.end_time_field.as_deref()),
     };
 
     if args.pre_tessellate {

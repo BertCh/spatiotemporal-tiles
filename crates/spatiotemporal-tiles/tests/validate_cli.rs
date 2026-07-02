@@ -1,9 +1,11 @@
 //! End-to-end tests for the `stt-validate` binary.
 //!
-//! Each test builds a tiny single-file `.stt` archive in a temp dir using the
-//! `stt_core` writers, then runs the compiled binary (`CARGO_BIN_EXE_*`) over it
-//! with `--json` and asserts on the parsed report. This exercises the real
-//! decode path, the schema checks, and the `--sample` accounting end to end.
+//! Each test builds a tiny packed dataset in a temp dir (via the `stt_core`
+//! writers + the single-file → packed transcode, the same pipeline
+//! `stt-build --streaming-arrow` uses), then runs the compiled binary
+//! (`CARGO_BIN_EXE_*`) over it with `--json` and asserts on the parsed report.
+//! This exercises the real decode path, the schema checks, and the `--sample`
+//! accounting end to end.
 
 // The stt-validate binary (and CARGO_BIN_EXE_stt-validate) only exists when
 // the `validate-cli` feature is on; compile the suite out otherwise.
@@ -15,7 +17,7 @@ use std::process::Command;
 use stt_core::arrow_tile::{encode_tile, ColumnarLayer, GeometryColumn, PropertyColumn};
 use stt_core::metadata::Metadata;
 use stt_core::types::{Compression, TimeRange};
-use stt_core::{Archive, TileId};
+use stt_core::{transcode_archive_to_packs, Archive, BlobOrdering, TileId};
 
 /// Build a point layer of `n` features whose times fall inside [start, end].
 fn point_layer(name: &str, base_id: u64, n: usize, start: i64, end: i64) -> ColumnarLayer {
@@ -36,11 +38,14 @@ fn point_layer(name: &str, base_id: u64, n: usize, start: i64, end: i64) -> Colu
     }
 }
 
-/// Write a valid single-file archive of `tile_count` tiles, each holding
-/// `per_tile` point features, into `path`. Returns the total feature count so
+/// Write a valid packed dataset of `tile_count` tiles, each holding `per_tile`
+/// point features, into the directory `out_dir`. Builds a temp single-file
+/// archive and transcodes it to packs — the same staging pipeline
+/// `stt-build --streaming-arrow` uses. Returns the total feature count so
 /// callers can assert the metadata grand total matches.
-fn write_archive(path: &Path, tile_count: u32, per_tile: usize) -> u64 {
-    let mut writer = Archive::create(path, Compression::Zstd).unwrap();
+fn write_dataset(out_dir: &Path, tile_count: u32, per_tile: usize) -> u64 {
+    let staging = tempfile::Builder::new().suffix(".stt").tempfile().unwrap();
+    let mut writer = Archive::create(staging.path(), Compression::Zstd).unwrap();
     let t_start = 1_000i64;
     let t_end = 2_000i64;
     let mut features = 0u64;
@@ -60,6 +65,9 @@ fn write_archive(path: &Path, tile_count: u32, per_tile: usize) -> u64 {
     meta.feature_count = features;
     meta.tile_count = tile_count as u64;
     writer.finalize(&meta).unwrap();
+
+    transcode_archive_to_packs(staging.path(), out_dir, BlobOrdering::Auto, 64 * 1024 * 1024)
+        .unwrap();
     features
 }
 
@@ -81,8 +89,8 @@ fn run_json(archive: &Path, extra: &[&str]) -> (bool, serde_json::Value) {
 #[test]
 fn valid_archive_passes_full_validation() {
     let dir = tempfile::tempdir().unwrap();
-    let archive = dir.path().join("ok.stt");
-    let features = write_archive(&archive, 10, 4);
+    let archive = dir.path().join("ok");
+    let features = write_dataset(&archive, 10, 4);
 
     let (ok, report) = run_json(&archive, &[]);
     assert!(ok, "valid archive should exit 0; report: {report}");
@@ -99,8 +107,8 @@ fn valid_archive_passes_full_validation() {
 #[test]
 fn sample_limits_decoded_tile_count_and_skips_grand_total() {
     let dir = tempfile::tempdir().unwrap();
-    let archive = dir.path().join("big.stt");
-    write_archive(&archive, 20, 4);
+    let archive = dir.path().join("big");
+    write_dataset(&archive, 20, 4);
 
     // --sample 5 over 20 tiles → stride = ceil(20/5) = 4 → indices 0,4,8,12,16
     // → exactly 5 decoded tiles.
@@ -117,8 +125,8 @@ fn sample_limits_decoded_tile_count_and_skips_grand_total() {
 #[test]
 fn sample_is_deterministic() {
     let dir = tempfile::tempdir().unwrap();
-    let archive = dir.path().join("det.stt");
-    write_archive(&archive, 20, 4);
+    let archive = dir.path().join("det");
+    write_dataset(&archive, 20, 4);
 
     let (_, a) = run_json(&archive, &["--sample", "5"]);
     let (_, b) = run_json(&archive, &["--sample", "5"]);
@@ -129,8 +137,8 @@ fn sample_is_deterministic() {
 #[test]
 fn sample_larger_than_archive_decodes_everything() {
     let dir = tempfile::tempdir().unwrap();
-    let archive = dir.path().join("small.stt");
-    write_archive(&archive, 3, 4);
+    let archive = dir.path().join("small");
+    write_dataset(&archive, 3, 4);
 
     let (ok, report) = run_json(&archive, &["--sample", "100"]);
     assert!(ok, "report: {report}");
@@ -141,8 +149,8 @@ fn sample_larger_than_archive_decodes_everything() {
 #[test]
 fn skip_decode_reports_zero_decoded_and_incomplete() {
     let dir = tempfile::tempdir().unwrap();
-    let archive = dir.path().join("skip.stt");
-    write_archive(&archive, 5, 4);
+    let archive = dir.path().join("skip");
+    write_dataset(&archive, 5, 4);
 
     let (ok, report) = run_json(&archive, &["--skip-decode"]);
     assert!(ok, "report: {report}");

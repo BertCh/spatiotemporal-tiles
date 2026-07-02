@@ -1,4 +1,4 @@
-//! Data loading for GeoParquet files and STT archives
+//! Data loading for GeoParquet files
 //!
 //! Provides unified data loading from different sources for analysis.
 
@@ -7,7 +7,6 @@ use arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampSecond
 use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::path::{Path, PathBuf};
-use stt_core::projection::tile_coords_to_lonlat;
 use stt_core::timestamp::{normalize_timestamp_to_ms, TimestampUnit};
 use stt_core::types::{BoundingBox, TimeRange};
 
@@ -19,20 +18,12 @@ pub enum DataSource {
         time_field: String,
         time_format: String,
     },
-    SttArchive {
-        path: PathBuf,
-    },
 }
 
 impl DataSource {
     pub fn display_name(&self) -> String {
         match self {
             DataSource::GeoParquet { path, .. } => {
-                path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            }
-            DataSource::SttArchive { path } => {
                 path.file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "unknown".to_string())
@@ -99,9 +90,6 @@ pub fn load_data(source: &DataSource) -> Result<LoadedData> {
     match source {
         DataSource::GeoParquet { path, time_field, time_format } => {
             load_geoparquet(path, time_field, time_format)
-        }
-        DataSource::SttArchive { path } => {
-            load_stt_archive(path)
         }
     }
 }
@@ -189,72 +177,6 @@ fn load_geoparquet(path: &Path, time_field: &str, time_format: &str) -> Result<L
 }
 
 /// Load features from an STT archive
-fn load_stt_archive(path: &Path) -> Result<LoadedData> {
-    use indicatif::{ProgressBar, ProgressStyle};
-    use stt_core::ArchiveReader;
-
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .unwrap(),
-    );
-    pb.set_message("Loading STT archive...");
-
-    let reader = ArchiveReader::open(path)?;
-    let metadata = reader.metadata();
-    let entries = reader.entries();
-
-    let mut features = Vec::new();
-
-    // Extract feature info from index entries
-    for entry in entries {
-        anyhow::ensure!(
-            entry.zoom < 32,
-            "corrupt archive: tile entry {}/{}/{} has zoom {} (must be < 32)",
-            entry.zoom,
-            entry.x,
-            entry.y,
-            entry.zoom,
-        );
-        // For STT archives, we estimate based on tile metadata
-        // Each tile entry gives us aggregate info. The tile center comes from
-        // the shared Web-Mercator inverse (atan∘sinh, see
-        // stt_core::projection::tile_to_lonlat): extent 2 / (1,1) is the exact
-        // tile midpoint.
-        let center = tile_coords_to_lonlat(1, 1, entry.zoom, entry.x, entry.y, 2);
-        let (lon, lat) = (center.x(), center.y());
-
-        // Create a synthetic feature per tile for analysis
-        // This is a rough approximation for existing archives
-        features.push(AnalyzableFeature {
-            lon,
-            lat,
-            timestamp: entry.time_start.max(0) as u64,
-            geometry_type: GeometryType::Point, // Unknown from index
-            vertex_count: 1,
-            estimated_size: entry.length as usize,
-            property_count: 0,
-        });
-    }
-
-    pb.finish_with_message(format!("Loaded {} tile entries", features.len()));
-
-    // Extract bounds from metadata
-    let b = metadata.bounds;
-    let bounds = BoundingBox::new(b.min_lon, b.min_lat, b.max_lon, b.max_lat);
-
-    // Extract time range from metadata
-    let tr = metadata.time_range;
-    let time_range = TimeRange::new(tr.start, tr.end);
-
-    Ok(LoadedData {
-        features,
-        bounds,
-        time_range,
-    })
-}
-
 // =============================================================================
 // Helper Functions
 // =============================================================================

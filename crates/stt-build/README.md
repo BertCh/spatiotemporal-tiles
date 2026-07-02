@@ -17,7 +17,7 @@ all flags away.
 > `stt-build` CLI ships with the facade:
 >
 > ```bash
-> cargo install spatiotemporal-tiles --features cli
+> cargo install spatiotemporal-tiles
 > ```
 >
 > Database inputs stay feature-gated (`postgres` / `duckdb`) on both the

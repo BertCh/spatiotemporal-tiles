@@ -486,6 +486,16 @@ impl PackWriter {
         // entries so the encoded directory is byte-reproducible too.
         entries.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start, e.temporal_bucket_ms));
 
+        // The manifest's totals are derived from the directory itself, not
+        // taken from the caller: `tile_count` = directory entries,
+        // `feature_count` = sum of per-entry counts (the same total
+        // stt-validate reports as `feature_count_index`). Deriving here keeps
+        // manifest and directory consistent by construction for every writer
+        // path — historically no caller set these and manifests shipped 0s.
+        let mut metadata = metadata.clone();
+        metadata.tile_count = entries.len() as u64;
+        metadata.feature_count = entries.iter().map(|e| u64::from(e.feature_count)).sum();
+
         // --- Write objects ----------------------------------------------
         fs::create_dir_all(&out_dir)?;
         let index_dir = out_dir.join("index");
@@ -559,7 +569,7 @@ impl PackWriter {
                 page_entries: page_entries_field,
             },
             packs: pack_refs,
-            metadata: metadata.clone(),
+            metadata,
         };
         let manifest_bytes = manifest.to_json_bytes()?;
         let manifest_path = out_dir.join("manifest.json");
@@ -1311,6 +1321,13 @@ mod tests {
         assert_eq!(reader.metadata().name, "packed-roundtrip");
         assert_eq!(reader.metadata().temporal_bucket_ms, bucket as u64);
         assert_eq!(reader.entries().len(), 30);
+
+        // The manifest totals are derived from the directory at finalize —
+        // the caller's Metadata left them 0 and finalize must overwrite them.
+        assert_eq!(manifest.metadata.tile_count, 30);
+        assert_eq!(manifest.metadata.feature_count, 30 * 6);
+        assert_eq!(reader.metadata().tile_count, 30);
+        assert_eq!(reader.metadata().feature_count, 30 * 6);
 
         // Every tile's decompressed payload is byte-identical.
         for (id, ts, _te, payload) in &expected {

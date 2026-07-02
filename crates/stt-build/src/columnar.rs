@@ -8,6 +8,7 @@ use crate::clip::ClippedSegment;
 use crate::input::ParsedFeature;
 use anyhow::Result;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use stt_core::arrow_tile::{
     tessellate_polygon, ColumnarLayer, Coord, GeometryColumn, PropertyColumn,
 };
@@ -53,6 +54,21 @@ impl AttributeFilter {
     }
 }
 
+/// Authoritative kind of one user property, derived from the input source's
+/// schema (Arrow/GeoParquet column type, DB column type) rather than sniffed
+/// from values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyKind {
+    /// Emitted as a Float64 (or quantized) tile column.
+    Numeric,
+    /// Emitted as a Dictionary<UInt16, Utf8> tile column.
+    Categorical,
+}
+
+/// Map property name → authoritative kind. Empty = no schema known
+/// (GeoJSON-shaped producers) — per-tile value sniffing applies.
+pub type PropertyTypes = BTreeMap<String, PropertyKind>;
+
 /// Per-tile build options that influence the columnar layout (independent of
 /// the tile-level partitioning logic the tiler owns).
 #[derive(Debug, Clone, Default)]
@@ -64,6 +80,14 @@ pub struct ColumnarOptions {
     /// Opt-in user-property selection. Default [`AttributeFilter::KeepAll`] —
     /// inert unless `--exclude`/`--include`/`--exclude-all` is passed.
     pub attribute_filter: AttributeFilter,
+    /// Authoritative per-property kinds from the input source's schema. A
+    /// listed key produces a column of the declared kind in EVERY tile — even
+    /// a tile where all its values happen to be null. Without this, per-tile
+    /// value sniffing silently DROPS an all-null-in-tile column (and can
+    /// reclassify a column tile-by-tile), drifting the layer schema across
+    /// tiles. Keys not listed keep the sniffing behaviour, which schema-less
+    /// producers rely on.
+    pub property_types: Arc<PropertyTypes>,
 }
 
 /// Build layers from a set of features sharing a tile. Features are grouped by
@@ -134,7 +158,7 @@ pub fn build_layers_from_features_with(
 pub fn build_layer_from_segments(
     segments: &[&ClippedSegment],
     layer_name: &str,
-    filter: &AttributeFilter,
+    opts: &ColumnarOptions,
 ) -> Result<ColumnarLayer> {
     let n = segments.len();
     let mut feature_ids = Vec::with_capacity(n);
@@ -147,7 +171,10 @@ pub fn build_layer_from_segments(
     let mut any_values = false;
     let mut any_matrix = false;
 
-    let mut props = PropertyAccumulator::with_filter(filter.clone());
+    let mut props = PropertyAccumulator::new(
+        opts.attribute_filter.clone(),
+        Arc::clone(&opts.property_types),
+    );
 
     for seg in segments {
         feature_ids.push(segment_feature_id(seg));
@@ -227,7 +254,7 @@ fn build_point_layer(
     name: String,
     opts: &ColumnarOptions,
 ) -> Result<ColumnarLayer> {
-    let (mut ids, start, end, props) = common_columns(features, &opts.attribute_filter);
+    let (mut ids, start, end, props) = common_columns(features, opts);
     // Points are never split across tile boundaries, so a point feature needs no
     // globally stable id (unlike a clipped line/polygon, which must keep one id
     // across the tiles it spans). When the source carries no explicit id, the
@@ -263,7 +290,7 @@ fn build_line_layer(
     name: String,
     opts: &ColumnarOptions,
 ) -> Result<ColumnarLayer> {
-    let (ids, start, end, props) = common_columns(features, &opts.attribute_filter);
+    let (ids, start, end, props) = common_columns(features, opts);
 
     let mut geometry: Vec<Vec<Coord>> = Vec::with_capacity(features.len());
     let mut vertex_times: Vec<Vec<i64>> = Vec::with_capacity(features.len());
@@ -363,7 +390,7 @@ fn build_polygon_layer(
     name: String,
     opts: &ColumnarOptions,
 ) -> Result<ColumnarLayer> {
-    let (ids, start, end, props) = common_columns(features, &opts.attribute_filter);
+    let (ids, start, end, props) = common_columns(features, opts);
     let mut geometry: Vec<Vec<Vec<Coord>>> = Vec::with_capacity(features.len());
     for f in features {
         geometry.push(extract_polygon_rings(f)?);
@@ -410,12 +437,15 @@ fn build_polygon_layer(
 /// Build the id / start / end / property columns shared by every layer kind.
 fn common_columns(
     features: &[&ParsedFeature],
-    filter: &AttributeFilter,
+    opts: &ColumnarOptions,
 ) -> (Vec<u64>, Vec<i64>, Vec<i64>, Vec<(String, PropertyColumn)>) {
     let mut ids = Vec::with_capacity(features.len());
     let mut start = Vec::with_capacity(features.len());
     let mut end = Vec::with_capacity(features.len());
-    let mut props = PropertyAccumulator::with_filter(filter.clone());
+    let mut props = PropertyAccumulator::new(
+        opts.attribute_filter.clone(),
+        Arc::clone(&opts.property_types),
+    );
 
     for f in features {
         ids.push(determine_feature_id(f));
@@ -451,6 +481,10 @@ struct PropertyAccumulator {
     /// (every key kept) keeps output byte-for-byte identical to the no-flag
     /// build.
     filter: AttributeFilter,
+    /// Authoritative kinds from the input schema — see
+    /// [`ColumnarOptions::property_types`]. Declared keys bypass the sniffed
+    /// evidence entirely at seal time.
+    declared: Arc<PropertyTypes>,
 }
 
 /// Type evidence for one property key across a feature group.
@@ -477,16 +511,17 @@ fn value_as_f64(v: &serde_json::Value) -> Option<f64> {
 }
 
 impl PropertyAccumulator {
-    /// Construct with an opt-in user-property selection. Pass
-    /// [`AttributeFilter::KeepAll`] for the default "keep every property"
-    /// behaviour.
-    fn with_filter(filter: AttributeFilter) -> Self {
+    /// Construct with an opt-in user-property selection and the (possibly
+    /// empty) authoritative schema kinds. Pass [`AttributeFilter::KeepAll`] +
+    /// an empty map for the default "keep everything, sniff types" behaviour.
+    fn new(filter: AttributeFilter, declared: Arc<PropertyTypes>) -> Self {
         Self {
             seen: BTreeMap::new(),
             numeric: BTreeMap::new(),
             categorical: BTreeMap::new(),
             sealed: false,
             filter,
+            declared,
         }
     }
 
@@ -523,14 +558,36 @@ impl PropertyAccumulator {
         }
     }
 
-    /// Freeze the schema: a key is numeric iff every observed value was a
-    /// number (or a numeric-looking string) and nothing forced it categorical.
+    /// Freeze the schema. Declared keys (input-schema authority) come first:
+    /// each produces a column of its declared kind in EVERY tile, even one
+    /// where all its values are null — per-tile evidence would otherwise
+    /// silently drop such a column (or reclassify it), drifting the layer
+    /// schema across tiles. Undeclared keys keep the evidence rule: numeric
+    /// iff every observed value was a number (or a numeric-looking string)
+    /// and nothing forced it categorical.
     fn seal(&mut self) {
         if self.sealed {
             return;
         }
         self.sealed = true;
+        let declared = Arc::clone(&self.declared);
+        for (key, kind) in declared.iter() {
+            if !self.filter.keeps(key) {
+                continue;
+            }
+            match kind {
+                PropertyKind::Numeric => {
+                    self.numeric.insert(key.clone(), Vec::new());
+                }
+                PropertyKind::Categorical => {
+                    self.categorical.insert(key.clone(), Vec::new());
+                }
+            }
+        }
         for (key, kind) in &self.seen {
+            if self.numeric.contains_key(key) || self.categorical.contains_key(key) {
+                continue; // declared — schema wins over sniffed evidence
+            }
             let is_numeric = (kind.has_number || kind.has_numeric_string) && !kind.has_other;
             if is_numeric {
                 self.numeric.insert(key.clone(), Vec::new());
@@ -996,6 +1053,69 @@ mod tests {
         assert_eq!(layers[0].geometry.len(), 1);
     }
 
+    /// Declared property kinds pin the tile schema: a column that is all-null
+    /// within one tile still yields a (all-null) column of the declared kind
+    /// there, instead of vanishing — the cross-tile schema-drift regression a
+    /// GeoParquet input with a sparsely-populated column hits (e.g. AIS `sog`
+    /// null for every row that lands in one tile).
+    #[test]
+    fn declared_property_kinds_pin_schema_for_all_null_tiles() {
+        // Tile A's features: `sog` present. Tile B's: `sog` all-null (absent
+        // from the JSON map — how the parquet reader materialises NULL).
+        let with_val = point_feature(-122.4, 37.7, json!({ "sog": 3.5, "class": "cargo" }));
+        let all_null = point_feature(10.0, 50.0, json!({ "class": "tanker" }));
+
+        let declared: PropertyTypes = [
+            ("sog".to_string(), PropertyKind::Numeric),
+            ("class".to_string(), PropertyKind::Categorical),
+        ]
+        .into_iter()
+        .collect();
+        let opts = ColumnarOptions {
+            property_types: Arc::new(declared),
+            ..Default::default()
+        };
+
+        // Without the declared map, this tile would have NO `sog` column.
+        let tile_b =
+            build_layers_from_features_with(&[&all_null], "default", opts.clone()).unwrap();
+        let names_b: Vec<&str> =
+            tile_b[0].properties.iter().map(|(n, _)| n.as_str()).collect();
+        // finish() emits numeric columns first, then categorical.
+        assert_eq!(names_b, vec!["sog", "class"], "declared columns always present");
+        match &tile_b[0].properties.iter().find(|(n, _)| n == "sog").unwrap().1 {
+            PropertyColumn::Numeric(v) => assert_eq!(v, &vec![None]),
+            other => panic!("declared-numeric sog must stay Numeric, got {other:?}"),
+        }
+
+        // The populated tile has the identical property schema.
+        let tile_a =
+            build_layers_from_features_with(&[&with_val], "default", opts).unwrap();
+        let names_a: Vec<&str> =
+            tile_a[0].properties.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names_a, names_b, "schema identical across tiles");
+        match &tile_a[0].properties.iter().find(|(n, _)| n == "sog").unwrap().1 {
+            PropertyColumn::Numeric(v) => assert_eq!(v, &vec![Some(3.5)]),
+            other => panic!("expected Numeric sog, got {other:?}"),
+        }
+
+        // Declared kind beats sniffed evidence: a numeric-looking string in a
+        // declared-Categorical column stays categorical (schema authority).
+        let numeric_string = point_feature(0.0, 0.0, json!({ "class": "42" }));
+        let opts2 = ColumnarOptions {
+            property_types: Arc::new(
+                [("class".to_string(), PropertyKind::Categorical)].into_iter().collect(),
+            ),
+            ..Default::default()
+        };
+        let tile_c =
+            build_layers_from_features_with(&[&numeric_string], "default", opts2).unwrap();
+        match &tile_c[0].properties.iter().find(|(n, _)| n == "class").unwrap().1 {
+            PropertyColumn::Categorical(v) => assert_eq!(v, &vec![Some("42".to_string())]),
+            other => panic!("declared-categorical must stay Categorical, got {other:?}"),
+        }
+    }
+
     /// Clipped-segment layers honour the same attribute filter.
     #[test]
     fn segment_layer_honours_attribute_filter() {
@@ -1020,7 +1140,12 @@ mod tests {
         let layer = build_layer_from_segments(
             &[&seg],
             "tracks",
-            &AttributeFilter::Include(["road".to_string()].into_iter().collect()),
+            &ColumnarOptions {
+                attribute_filter: AttributeFilter::Include(
+                    ["road".to_string()].into_iter().collect(),
+                ),
+                ..Default::default()
+            },
         )
         .unwrap();
         let names: Vec<&str> = layer.properties.iter().map(|(n, _)| n.as_str()).collect();

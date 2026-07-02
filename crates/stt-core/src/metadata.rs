@@ -157,9 +157,14 @@ pub struct Metadata {
     pub min_zoom: u8,
     /// Maximum zoom level
     pub max_zoom: u8,
-    /// Total number of tiles
+    /// Total number of tiles. For packed manifests this is derived from the
+    /// directory at write time (`PackWriter::finalize`); caller-set values are
+    /// ignored there.
     pub tile_count: u64,
-    /// Total number of features
+    /// Total feature records summed across tiles — a feature that lands in N
+    /// tiles (zoom pyramid, clipping, temporal LOD) counts N times. Matches
+    /// stt-validate's `feature_count_index`; derived from the directory at
+    /// write time for packed manifests.
     pub feature_count: u64,
     /// Layer names
     pub layers: Vec<String>,

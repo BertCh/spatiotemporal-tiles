@@ -152,8 +152,10 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
 
     // Suggested Command
     output.push_str("📋 Suggested Command:\n");
+    // The suggested --output is the packed dataset DIRECTORY (the input's
+    // stem): stt-build's output is a directory tree, not a single file.
     output.push_str(&format!(
-        "  stt-build --input {} --output {}.stt \\\n",
+        "  stt-build --input {} --output {} \\\n",
         result.source,
         result.source.trim_end_matches(".parquet").trim_end_matches(".geoparquet")
     ));

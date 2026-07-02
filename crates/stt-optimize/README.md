@@ -13,13 +13,13 @@ the reasoning (`--verbose`), or emit machine-readable reports.
 > `stt-optimize` CLI ships with the facade:
 >
 > ```bash
-> cargo install spatiotemporal-tiles --features cli
+> cargo install spatiotemporal-tiles
 > ```
 
 ## Example
 
 ```bash
-# Analyze an input (also accepts an existing single-file archive via --stt):
+# Analyze a GeoParquet input:
 stt-optimize analyze --input data.parquet --time-field timestamp \
   --time-format unix-ms
 
