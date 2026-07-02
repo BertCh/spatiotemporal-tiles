@@ -1,0 +1,41 @@
+# release-plz: versioning + changelog + crates.io publishing for the Rust side.
+# Flow: merge to main -> release-plz opens/updates a release PR (lockstep bump
+# via version_group + changelog) -> merge it -> release-plz publishes the four
+# crates in topo order (Trusted Publishing token from crates-io-auth-action)
+# and pushes the v{version} tag -> cargo-dist's release.yml builds binaries.
+
+[workspace]
+changelog_update = true
+# cargo-dist owns the GitHub Release (it attaches the binary artifacts).
+git_release_enable = false
+# Only the facade emits the single lockstep tag (see its [[package]] below).
+git_tag_enable = false
+# Enable for stt-core once the 0.x API stabilizes.
+semver_check = false
+dependencies_update = false
+# Bundled-DuckDB verify builds are slow.
+publish_timeout = "30m"
+
+[[package]]
+name = "stt-core"
+version_group = "stt"
+
+[[package]]
+name = "stt-build"
+version_group = "stt"
+
+[[package]]
+name = "stt-optimize"
+version_group = "stt"
+
+[[package]]
+name = "spatiotemporal-tiles"
+version_group = "stt"
+git_tag_enable = true
+# One tag per lockstep release; matches cargo-dist's unified tag format.
+git_tag_name = "v{{ version }}"
+
+[[package]]
+name = "stt-generate"
+# publish = false internal tooling; never released.
+release = false
