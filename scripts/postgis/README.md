@@ -1,6 +1,6 @@
 # PostGIS integration — local benchmark harness
 
-Reproduces the numbers in [`docs/roadmap/postgis-integration.md`](../../docs/roadmap/postgis-integration.md):
+Reproduces the numbers in [`docs/roadmap/db-input-adaptors.md`](../../docs/roadmap/db-input-adaptors.md):
 PostGIS as an `stt-build` input source, and `stt-serve` generating STT tiles on
 the fly from a live PostGIS table.
 

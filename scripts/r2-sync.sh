@@ -95,6 +95,14 @@ COMMON_FLAGS=(
   --s3-no-check-bucket
 )
 
+# License gate: Waymo Open Dataset terms forbid redistribution, so waymo-*
+# dataset bundles must never reach the public bucket. The all-datasets walk
+# excludes them (exclude precedes the includes: rclone filters are ordered,
+# first match wins), single-stem sync refuses outright, and the prune pass
+# treats any remote waymo-* object as unreferenced so an accidental prior
+# upload self-heals (gets deleted once past the retention window).
+LICENSE_EXCLUDE_FLAGS=(--exclude "waymo-*/**")
+
 # Cache-Control headers, one per regime.
 #   immutable: content-addressed packs/index never change under a stable name →
 #     cache forever, never purge. A re-sync simply skips unchanged objects.
@@ -140,6 +148,7 @@ sync_tree() {
 
   echo ">> [immutable] ${src} (packs/index) -> ${dst}"
   rclone copy "${COMMON_FLAGS[@]}" ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
+    "${LICENSE_EXCLUDE_FLAGS[@]}" \
     --header-upload "${IMMUTABLE_HEADER}" \
     --include "packs/**" --include "index/**" \
     --include "**/packs/**" --include "**/index/**" \
@@ -147,6 +156,7 @@ sync_tree() {
 
   echo ">> [manifest]  ${src} (manifest.json) -> ${dst}"
   rclone copy "${COMMON_FLAGS[@]}" ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
+    "${LICENSE_EXCLUDE_FLAGS[@]}" \
     --header-upload "${MANIFEST_HEADER}" \
     --include "manifest.json" --include "**/manifest.json" \
     "${src}" "${dst}"
@@ -159,6 +169,7 @@ sync_tree() {
   # are never garbage-collected.
   echo ">> [av-sidecar] ${src} (scene/telemetry/cameras/cam) -> ${dst}"
   rclone copy "${COMMON_FLAGS[@]}" ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
+    "${LICENSE_EXCLUDE_FLAGS[@]}" \
     --header-upload "${MANIFEST_HEADER}" \
     --include "scene.json" --include "**/scene.json" \
     --include "telemetry.json" --include "**/telemetry.json" \
@@ -191,6 +202,10 @@ prune_tree() {
     rel="$(dirname "${manifest#"${src}"/}")"
     [[ "${rel}" == "." ]] && rel=""
     [[ -n "${rel}" ]] && rel="${rel}/"
+    # License gate: don't let a local waymo-* manifest protect remote objects —
+    # nothing waymo should exist on R2, so leaving them unreferenced lets the
+    # prune below clean up any accidental upload.
+    case "${rel}" in waymo-*) continue ;; esac
     python3 - "$manifest" "$rel" <<'PY' >> "${filter_file}"
 import json, sys
 manifest_path, rel = sys.argv[1], sys.argv[2]
@@ -225,6 +240,13 @@ PY
 }
 
 if [[ -n "${SINGLE_STEM}" ]]; then
+  case "${SINGLE_STEM}" in
+    waymo-*)
+      echo "error: '${SINGLE_STEM}' is a Waymo Open Dataset bundle — the license forbids" >&2
+      echo "       redistribution, so it must never be synced to the public bucket." >&2
+      exit 1
+      ;;
+  esac
   if [[ ! -d "${DATA_DIR}/${SINGLE_STEM}" ]]; then
     echo "error: ${DATA_DIR}/${SINGLE_STEM} is not a directory. Pass a dataset STEM" >&2
     echo "       (the dir name under public/data, e.g. 'flights'), not a .stt file." >&2
