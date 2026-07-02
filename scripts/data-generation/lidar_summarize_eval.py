@@ -14,8 +14,9 @@ import sys
 import numpy as np
 from scipy.spatial import cKDTree
 
+from av_common import SURFEL_K  # the k-NN size compute_surfels/_surfel_frame use
+
 REF = "../../examples/showcase/public/data/waymo-sf-day-splat/lidar-high.parquet"
-SURFEL_K = 12          # matches compute_surfels in waymo_extract.py
 RNG = np.random.default_rng(0)
 
 

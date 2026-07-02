@@ -125,9 +125,10 @@ CAMERA_NAMES: dict[int, str] = {
     4: "SIDE_LEFT",
     5: "SIDE_RIGHT",
 }
-# Cool slate-grey for returns no camera can see (the rear wedge) — dim enough
-# that the camera-colored front/sides read as the "real" part of the cloud.
-FALLBACK_RGB = (70, 78, 96)
+# Cool slate-grey for returns no camera can see (the rear wedge) — the shared
+# av_common constant, dim enough that the camera-colored front/sides read as
+# the "real" part of the cloud.
+FALLBACK_RGB = avc.FALLBACK_RGB
 # Returns closer than this (m) to the camera are skipped — they're on the ego
 # vehicle / its shadow and would smear a single pixel's color across the hood.
 MIN_CAM_DEPTH_M = 1.0
@@ -387,15 +388,6 @@ def decode_frame_lidar(path: Path, cal: dict, ts: int) -> np.ndarray:
     return np.concatenate(chunks) if chunks else np.empty((0, 3))
 
 
-def _depth_ramp(depth: np.ndarray, lo: float, hi: float) -> np.ndarray:
-    """Jet-ish depth → RGB uint8 (N×3) ramp for the debug overlay (no matplotlib)."""
-    t = np.clip((depth - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
-    r = np.clip(1.5 - np.abs(4.0 * t - 3.0), 0.0, 1.0)
-    g = np.clip(1.5 - np.abs(4.0 * t - 2.0), 0.0, 1.0)
-    b = np.clip(1.5 - np.abs(4.0 * t - 1.0), 0.0, 1.0)
-    return (np.stack([r, g, b], axis=1) * 255).astype(np.uint8)
-
-
 def debug_overlay(out: Path, lidar_path: Path, lidar_cal: dict,
                   colorizer: "CameraColorizer", frame_ts: list[int], frame_index: int):
     """Project one frame's full sweep into every camera, dots colored by DEPTH.
@@ -420,7 +412,7 @@ def debug_overlay(out: Path, lidar_path: Path, lidar_cal: dict,
         canvas = img.copy()
         bi = np.where(valid)[0]
         if len(bi):
-            colors = _depth_ramp(depth[bi], depth[bi].min(), np.percentile(depth[bi], 95))
+            colors = avc.depth_ramp(depth[bi], depth[bi].min(), np.percentile(depth[bi], 95))
             h, w = canvas.shape[0], canvas.shape[1]
             for dy in (-1, 0, 1):  # 3×3 splat so the dots read at full res
                 for dx in (-1, 0, 1):
@@ -435,6 +427,9 @@ def debug_overlay(out: Path, lidar_path: Path, lidar_cal: dict,
 
 def _yaw_of(R: np.ndarray) -> float:
     """Yaw (rad, CCW about +z) of a 3×3 rotation."""
+    # Per-dataset ON PURPOSE (not an av_common hoist): Waymo poses are 4×4
+    # matrices; argoverse_extract._yaw_of takes vectorised quaternion columns,
+    # nuscenes_extract._yaw_of a devkit quaternion record.
     return math.atan2(R[1, 0], R[0, 0])
 
 
@@ -471,30 +466,6 @@ def extract_ego(frame_ts, pose_by_ts, origin, to_lonlat):
     dt = np.gradient(t_ms / 1000.0)
     speed = np.hypot(np.gradient(wx), np.gradient(wy)) / np.maximum(np.abs(dt), 1e-3)
     return t_ms, np.asarray(lon), np.asarray(lat), speed, yaw
-
-
-def derive_telemetry(t_ms, speed, yaw) -> dict:
-    """Ego-pose-derived telemetry fields (Waymo Perception ships no CAN bus).
-
-    Mirrors argoverse_extract.derive_telemetry exactly so the cockpit gauge panel
-    lights up, honestly labelled "derived from ego pose".
-    """
-    t_s = np.asarray(t_ms, dtype="float64") / 1000.0
-    dt = np.gradient(t_s)
-    dt = np.where(np.abs(dt) < 1e-3, 1e-3, dt)
-    speed = np.asarray(speed, dtype="float64")
-    accel = np.gradient(speed) / dt
-    yaw_rate = np.gradient(np.unwrap(np.asarray(yaw, dtype="float64"))) / dt
-
-    def series(vals):
-        return [[int(t), float(v)] for t, v in zip(t_ms, vals)]
-
-    return {
-        "speed": {"unit": "m/s", "label": "Speed", "samples": series(speed)},
-        "accel": {"unit": "m/s²", "label": "Accel", "samples": series(accel)},
-        "yaw_rate": {"unit": "rad/s", "label": "Yaw rate", "samples": series(yaw_rate)},
-        "heading": {"unit": "rad", "label": "Heading", "samples": series(yaw)},
-    }
 
 
 # ── objects ──────────────────────────────────────────────────────────────────
@@ -636,11 +607,7 @@ def extract_lidar(path: Path, cal: dict, pose_by_ts, origin, to_lonlat,
 # frame (where the disk offsets live). Orientation comes from the FULL-density
 # neighbourhood (clean normals); the disk SIZE is scaled to the DECIMATED point
 # spacing so the sparser rendered set still tiles the surface without gaps.
-SURFEL_K = 12          # neighbours for the covariance estimate
-SURFEL_FILL = 0.70     # disk radius as a fraction of the decimated point spacing
-SURFEL_S_MIN = 0.03    # m — floor (avoid sub-cm slivers)
-SURFEL_S_MAX = 0.45    # m — ceil (far/sparse returns don't become giant blobs)
-SURFEL_ASPECT_FLOOR = 0.45  # keep disks from collapsing to needles on edges
+SURFEL_K = avc.SURFEL_K  # neighbours for the covariance estimate (shared tuning)
 # Default render decimation for the surfel tier. Denser than the round-dot point
 # tiers: at low density each SWEEP is too sparse to tile, so the per-point disk
 # is sized large and reads as blobs — a denser sample makes each disk small and
@@ -649,45 +616,6 @@ SURFEL_ASPECT_FLOOR = 0.45  # keep disks from collapsing to needles on edges
 # render time. ~1/6 of the first-return cloud ≈ 4.8M oriented disks for a 20 s
 # segment (~few hundred k drawn at any instant).
 SURFEL_DECIMATE = 6
-
-
-def mat3_to_quat(R: np.ndarray) -> np.ndarray:
-    """Batched rotation matrices ``(M,3,3)`` → unit quaternions ``(M,4)`` [x,y,z,w].
-
-    Shepperd's method (the numerically-stable four-case branch on which diagonal
-    term is largest), vectorised: compute all four candidate quaternions and
-    select per row by the same case mask, so a near-180° rotation never divides
-    by a vanishing ``sqrt(trace+1)``.
-    """
-    m00, m01, m02 = R[:, 0, 0], R[:, 0, 1], R[:, 0, 2]
-    m10, m11, m12 = R[:, 1, 0], R[:, 1, 1], R[:, 1, 2]
-    m20, m21, m22 = R[:, 2, 0], R[:, 2, 1], R[:, 2, 2]
-    trace = m00 + m11 + m22
-
-    def _sqrt(v):
-        return np.sqrt(np.maximum(v, 1e-12))
-
-    # case 0: trace positive
-    s0 = _sqrt(trace + 1.0) * 2.0  # = 4w
-    q0 = np.stack([(m21 - m12) / s0, (m02 - m20) / s0, (m10 - m01) / s0, 0.25 * s0], 1)
-    # case 1: m00 dominant
-    s1 = _sqrt(1.0 + m00 - m11 - m22) * 2.0  # = 4x
-    q1 = np.stack([0.25 * s1, (m01 + m10) / s1, (m02 + m20) / s1, (m21 - m12) / s1], 1)
-    # case 2: m11 dominant
-    s2 = _sqrt(1.0 + m11 - m00 - m22) * 2.0  # = 4y
-    q2 = np.stack([(m01 + m10) / s2, 0.25 * s2, (m12 + m21) / s2, (m02 - m20) / s2], 1)
-    # case 3: m22 dominant
-    s3 = _sqrt(1.0 + m22 - m00 - m11) * 2.0  # = 4z
-    q3 = np.stack([(m02 + m20) / s3, (m12 + m21) / s3, 0.25 * s3, (m10 - m01) / s3], 1)
-
-    use0 = trace > 0.0
-    use1 = (~use0) & (m00 >= m11) & (m00 >= m22)
-    use2 = (~use0) & (~use1) & (m11 >= m22)
-    q = np.where(use0[:, None], q0,
-        np.where(use1[:, None], q1,
-        np.where(use2[:, None], q2, q3)))
-    q /= np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-12)
-    return q
 
 
 def compute_surfels(pts: np.ndarray, sel: np.ndarray, R_ego: np.ndarray):
@@ -994,20 +922,6 @@ def extract_worldbuild(path: Path, cal: dict, pose_by_ts, origin,
     if collect_scans:
         return acc, dynamic, scans
     return acc, dynamic
-
-
-def downsample_ego_path(ego_t, ego_lon, ego_lat, target: int = 60):
-    """Tiny [{t,lon,lat}] polyline for the cockpit follow-camera (av-cockpit.md §3d)."""
-    n = len(ego_t)
-    if n <= target:
-        idx = list(range(n))
-    else:
-        step = max(1, n // target)
-        idx = list(range(0, n, step))
-        if idx[-1] != n - 1:
-            idx.append(n - 1)
-    return [{"t": int(ego_t[i]), "lon": round(float(ego_lon[i]), 7),
-             "lat": round(float(ego_lat[i]), 7)} for i in idx]
 
 
 # ── driver ───────────────────────────────────────────────────────────────────
@@ -1346,7 +1260,7 @@ def generate(args):
                                     "radius": radius_px, "radiusMinPixels": radius_min_px})
         n_lidar = lidar_densities[0]["points"]  # default = low tier
 
-    telemetry_fields = derive_telemetry(ego_t, ego_speed, ego_yaw)
+    telemetry_fields = avc.derive_telemetry(ego_t, ego_speed, ego_yaw)
     tel_hz = round(len(ego_t) / max((t_end - t_start) / 1000.0, 1e-3), 1)
     avc.write_telemetry_json(out / "telemetry.json", t0=t_start, hz=tel_hz,
                              fields=telemetry_fields)
@@ -1381,7 +1295,7 @@ def generate(args):
                   # frontend keys the static-vs-dynamic styling on it.
                   **({"style": "world"} if worldbuild_mode else {})},
         "ego": {"url": "ego/manifest.json",
-                "path": downsample_ego_path(ego_t, ego_lon, ego_lat)},
+                "path": avc.downsample_ego_path(ego_t, ego_lon, ego_lat)},
         "objects": {"url": "objects/manifest.json", "categories": obj_categories},
         # Feature 2: per-object motion-trail LineStrings (ego folded in as "ego").
         "tracks": {"url": "tracks/manifest.json", "count": int(n_tracks),

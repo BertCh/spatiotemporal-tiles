@@ -91,34 +91,6 @@ def make_ego(rng: np.random.Generator):
     return t_ms, x, y, heading, speed
 
 
-def downsample_ego_path(ego_t, ego_lon, ego_lat, target=60):
-    """Downsample the ego trajectory to a tiny ``[{t, lon, lat}, …]`` polyline.
-
-    Reuses the SAME lon/lat/t samples the ego trips archive is built from (passed
-    in by the caller) so the follow-camera path is byte-for-byte the rendered ego
-    trail — never a recomputed path. Picks ~``target`` evenly-spaced vertices and
-    always keeps the first and last (so the polyline spans the full timeRange).
-    ``t`` is Unix-ms int; deterministic for a fixed seed. ~40–80 points keeps
-    ego-follow smooth while staying a few KB in scene.json.
-    """
-    n = len(ego_t)
-    if n <= target:
-        idx = list(range(n))
-    else:
-        step = max(1, n // target)
-        idx = list(range(0, n, step))
-        if idx[-1] != n - 1:
-            idx.append(n - 1)  # always pin the final vertex
-    return [
-        {
-            "t": int(ego_t[i]),
-            "lon": round(float(ego_lon[i]), 7),
-            "lat": round(float(ego_lat[i]), 7),
-        }
-        for i in idx
-    ]
-
-
 # ── Tracked agents ───────────────────────────────────────────────────────────
 def make_objects(rng: np.random.Generator, ego):
     """~12 plausible agents on straight / curved paths, sampled at SCENE_HZ.
@@ -298,7 +270,7 @@ def make_telemetry(ego):
 def make_map():
     """A small FABRICATED HD map in the boston-seaport local frame (no download).
 
-    Demonstrates the static map substrate (av-refinement.md §R2.2) with NO
+    Demonstrates the static map substrate (av-cockpit.md §2 R2.2) with NO
     external map data: a ``drivable_area`` polygon covering the road corridor the
     ego drives, ``lane_divider`` + ``road_divider`` lines along the lanes, and a
     ``ped_crossing`` polygon at the intersection. All geometry is built in local
@@ -478,7 +450,7 @@ def generate(
     # --- lightweight ego polyline for the ego-follow camera (av-cockpit.md §3d).
     # Same lon/lat/t samples as the ego trips archive above → the follow path
     # tracks the rendered ego trail exactly. ~40–80 pts; pure JSON, no rebuild.
-    ego_path = downsample_ego_path(ego_t, ego_lon, ego_lat)
+    ego_path = avc.downsample_ego_path(ego_t, ego_lon, ego_lat)
 
     # --- scene.json manifest (streams reference the packed manifests) ---
     streams = {

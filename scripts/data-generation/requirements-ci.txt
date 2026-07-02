@@ -1,0 +1,10 @@
+# Minimal dependencies for the CI-run data-generation tests:
+#   test_av_palette_parity.py      (stdlib + av_common import)
+#   test_av_common_world_tracks.py (numpy, pyarrow, shapely, scipy via av_common)
+#   test_lod_home_zoom.py          (numpy, pyarrow)
+# Dataset extractors need more (skimage, Pillow, devkits, ...) — see the
+# per-dataset venvs; this file is only the CI test surface.
+numpy
+pyarrow
+scipy
+shapely

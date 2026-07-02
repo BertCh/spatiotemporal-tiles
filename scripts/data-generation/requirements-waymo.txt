@@ -1,0 +1,14 @@
+ImageIO==2.37.3
+lazy-loader==0.5
+networkx==3.6.1
+numpy==2.4.6
+packaging==26.2
+pandas==3.0.3
+pillow==12.2.0
+pyarrow==24.0.0
+python-dateutil==2.9.0.post0
+scikit-image==0.26.0
+scipy==1.18.0
+shapely==2.1.2
+six==1.17.0
+tifffile==2026.6.1

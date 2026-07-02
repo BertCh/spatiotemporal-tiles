@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -105,7 +106,7 @@ _UTM_TRANSFORMERS: dict[int, object] = {}
 def utm_to_lonlat(easting, northing, epsg: int):
     """City-frame UTM metres → (lon, lat) degrees via a cached pyproj transform.
 
-    For the Argoverse 2 *city* frame (av-refinement.md §R2.1): AV2 ego/object
+    For the Argoverse 2 *city* frame (av-cockpit.md §2 R2.1): AV2 ego/object
     coordinates live in a city-specific UTM CRS (e.g. Pittsburgh ``EPSG:32617``),
     and a scene can sit several km from the UTM origin where the flat-earth
     equirectangular approximation drifts ~75 m. A real CRS transform removes that
@@ -169,45 +170,47 @@ OBJECT_COLORS: dict[str, list[int]] = {
 }
 
 
-# ── HD-map layer palette ─────────────────────────────────────────────────────
-# Colors for the static HD-map substrate (av-refinement.md §R2.2), keyed by the
-# ``map_layer`` string written into the map_poly/ + map_line/ archives. Written
-# into scene.json (Dataset.mapColors) so the renderer fills polygons / colors
-# paths by ``map_layer``. RGBA; map fills read low-alpha so lidar/objects layer
-# on top, dividers read more opaque.
+# ── HD-map layer names ────────────────────────────────────────────────────────
+# The set of valid ``map_layer`` strings written into the map_poly/ + map_line/
+# archives (av-cockpit.md §2 R2.2). Extractors validate the layer name they emit
+# against this set (see ``argoverse_extract._lane_mark_layer``); a bundle emits
+# only the layers present in its source map.
 #
-# nuScenes layers use the devkit's own ColorBrewer-paired-12 map palette
-# (`nuscenes/map_expansion/map_api.py`); Argoverse 2 layers use the AV2 lane /
-# drivable / crosswalk convention. A given bundle only emits the layers present
-# in its source map; the renderer falls back to a neutral grey for any unmapped
-# layer name.
-MAP_COLORS: dict[str, list[int]] = {
-    # ── nuScenes map layers (devkit palette) ──
-    "drivable_area": [166, 206, 227, 90],  # light blue road surface (low alpha = substrate)
-    "road_segment": [31, 120, 180, 110],  # blue
-    "road_block": [31, 120, 180, 110],  # blue (alias of road_segment grouping)
-    "lane": [51, 160, 44, 110],  # green lane polygon
-    "ped_crossing": [251, 154, 153, 150],  # pink crosswalk
-    "walkway": [227, 26, 28, 110],  # red sidewalk
-    "stop_line": [253, 191, 111, 200],  # orange stop line
-    "carpark_area": [255, 127, 0, 90],  # orange parking
-    "road_divider": [202, 178, 214, 230],  # light purple — line
-    "lane_divider": [106, 61, 154, 230],  # deep purple — line
-    # ── Argoverse 2 map layers (AV2 convention) ──
-    "drivable": [122, 122, 122, 90],  # AV2 drivable area — neutral grey
-    "crosswalk": [150, 60, 200, 150],  # AV2 pedestrian crossing — violet
+# COLORS LIVE ONLY IN TS — there is NO Python color copy to keep in lockstep.
+# ``write_scene_json`` has no ``mapColors`` field, so the HD-map substrate is
+# colored purely on the render side by ``examples/showcase/src/datasets.ts
+# AV_MAP_COLORS`` (keyed by these same ``map_layer`` names; nuScenes layers
+# follow the devkit map palette, Argoverse 2 layers the AV2 lane / drivable /
+# crosswalk convention, unmapped names fall back to a neutral grey). Only this
+# KEY-SET is the cross-language contract (guarded by ``test_av_palette_parity``).
+# (Historical note: this used to be a dict of RGBA values that silently drifted
+# in hue from the TS copy precisely because it was dead — reduced to keys.)
+MAP_LAYERS: frozenset[str] = frozenset({
+    # ── nuScenes map layers ──
+    "drivable_area",
+    "road_segment",
+    "road_block",
+    "lane",
+    "ped_crossing",
+    "walkway",
+    "stop_line",
+    "carpark_area",
+    "road_divider",  # line
+    "lane_divider",  # line
+    # ── Argoverse 2 map layers ──
+    "drivable",
+    "crosswalk",
     # AV2 lane boundaries, colored by ``LaneMarkType`` (white/yellow/blue/red).
-    "lane_white": [235, 235, 235, 230],
-    "lane_yellow": [240, 200, 40, 230],
-    "lane_blue": [60, 120, 235, 230],
-    "lane_red": [225, 60, 60, 230],
-    "lane_boundary": [210, 210, 210, 220],  # generic AV2 boundary fallback
-    # AV2 lane CENTERLINES (the dataset's signature map feature) — drawn as
-    # subtle steel-blue threads under the action; centerlines inside an
-    # intersection read amber so junctions pop.
-    "lane_centerline": [90, 130, 165, 95],
-    "lane_centerline_intersection": [255, 170, 50, 160],
-}
+    "lane_white",
+    "lane_yellow",
+    "lane_blue",
+    "lane_red",
+    "lane_boundary",  # generic AV2 boundary fallback
+    # AV2 lane CENTERLINES (the dataset's signature map feature); intersection
+    # centerlines read amber so junctions pop.
+    "lane_centerline",
+    "lane_centerline_intersection",
+})
 
 # A generous set of native→canonical aliases covering the nuScenes / Argoverse
 # detection-name taxonomies. Adapters can extend per-source if needed.
@@ -337,11 +340,12 @@ def height_band(z) -> str | np.ndarray:
 # compact, visually-distinct taxonomy so the cloud reads as a labelled scene
 # (orange cars, blue people, green canopy, grey road) rather than a height ramp.
 #
-# Like ``OBJECT_COLORS`` / ``MAP_COLORS``, this palette lives in TWO copies that
-# MUST stay in lockstep: this Python dict (baked into ``scene.json`` for the
-# cockpit legend) and ``datasets.ts AV_LIDARSEG_COLORS`` (the ACTUAL rendered
-# point colors, via the dataset's ``lidarColorMapping``). Change one → change
-# both. Keys are non-numeric strings (the categorical-column rule above).
+# Like ``OBJECT_COLORS`` / ``HEIGHT_BAND_COLORS``, this palette lives in TWO
+# copies that MUST stay in lockstep: this Python dict (baked into ``scene.json``
+# for the cockpit legend) and ``datasets.ts AV_LIDARSEG_COLORS`` (the ACTUAL
+# rendered point colors, via the dataset's ``lidarColorMapping``). Change one →
+# change both — ``test_av_palette_parity`` guards their key-set + RGBA equality.
+# Keys are non-numeric strings (the categorical-column rule above).
 LIDARSEG_CLASSES: tuple[str, ...] = (
     "vehicle",
     "cyclist",
@@ -806,15 +810,16 @@ def write_objects_points(
 
 
 # ── HD-map GeoParquet writers ─────────────────────────────────────────────────
-# The static HD-map substrate (av-refinement.md §R2.2). Both archives carry a
+# The static HD-map substrate (av-cockpit.md §2 R2.2). Both archives carry a
 # single time row spanning the WHOLE scene window (``timestamp = t_start``,
 # ``end_timestamp = t_end``) so they load once and persist for the entire replay
 # (built with a temporal bucket >= the scene duration — see ``run_stt_build``
 # ``map_poly`` / ``map_line`` kinds). ``map_layer`` is a categorical Utf8 layer
 # name (e.g. ``"drivable_area"``, ``"lane_divider"``) — NEVER a bare number — so
-# stt-build keeps it categorical and the renderer can color by ``MAP_COLORS``.
+# stt-build keeps it categorical and the renderer colors by ``map_layer`` via the
+# TS ``AV_MAP_COLORS`` palette (see ``MAP_LAYERS`` for the valid layer-name set).
 def write_map_polygons(out_parquet: Path, polys, t_start: int, t_end: int) -> int:
-    """Write the ``map_poly/`` source GeoParquet (av-refinement.md §R2.2).
+    """Write the ``map_poly/`` source GeoParquet (av-cockpit.md §2 R2.2).
 
     ``polys`` is an iterable of ``(polygon, map_layer)`` where ``polygon`` is a
     shapely ``Polygon`` in **lon/lat** degrees and ``map_layer`` is the layer
@@ -847,7 +852,7 @@ def write_map_polygons(out_parquet: Path, polys, t_start: int, t_end: int) -> in
 
 
 def write_map_lines(out_parquet: Path, lines, t_start: int, t_end: int) -> int:
-    """Write the ``map_line/`` source GeoParquet (av-refinement.md §R2.2).
+    """Write the ``map_line/`` source GeoParquet (av-cockpit.md §2 R2.2).
 
     ``lines`` is an iterable of ``(linestring, map_layer)`` where ``linestring``
     is a shapely ``LineString`` in **lon/lat** degrees. Columns: ``geometry``
@@ -1324,6 +1329,98 @@ def scene_split_config(args) -> dict:
         actor_grade=dict(saturation=args.actor_saturation, exposure=args.actor_exposure,
                          gamma=args.stage_gamma, white_balance=args.stage_white_balance),
     )
+
+
+# ── Shared adapter helpers (ego path / telemetry / camera frames) ────────────
+def downsample_ego_path(ego_t, ego_lon, ego_lat, target: int = 60):
+    """Downsample the ego trajectory to a tiny ``[{t, lon, lat}, …]`` polyline.
+
+    Reuses the SAME lon/lat/t samples the ego trips archive is built from (passed
+    in by the caller) so the cockpit's follow-camera path is byte-for-byte the
+    rendered ego trail — never a recomputed path. Picks ~``target`` evenly-spaced
+    vertices and always keeps the first and last (so the polyline spans the full
+    timeRange). ~40–80 points keeps ego-follow smooth while staying a few KB in
+    scene.json (av-cockpit.md §3d).
+    """
+    n = len(ego_t)
+    if n <= target:
+        idx = list(range(n))
+    else:
+        step = max(1, n // target)
+        idx = list(range(0, n, step))
+        if idx[-1] != n - 1:
+            idx.append(n - 1)  # always pin the final vertex
+    return [
+        {
+            "t": int(ego_t[i]),
+            "lon": round(float(ego_lon[i]), 7),
+            "lat": round(float(ego_lat[i]), 7),
+        }
+        for i in idx
+    ]
+
+
+def derive_telemetry(ego_t_ms, ego_speed, ego_yaw) -> dict:
+    """Build a ``telemetry.json`` fields dict from the ego trajectory.
+
+    For sources that ship **no CAN bus** (Argoverse 2, Waymo Perception) the
+    cockpit's gauge panel would stay empty. Instead we DERIVE a plausible
+    telemetry set from the 6-DoF ego pose so the panel lights up (honestly
+    labelled "derived from ego pose", not CAN):
+
+    * ``speed`` — m/s, finite-difference of the local-frame position (already
+      computed by the adapter's ``extract``); the cockpit formats it as km/h.
+    * ``accel`` — m/s², d(speed)/dt (longitudinal accel).
+    * ``yaw_rate`` — rad/s, d(yaw)/dt on the UNWRAPPED yaw (so the ±π seam
+      doesn't spike the derivative).
+    * ``heading`` — rad, the ego yaw (0 = east, CCW+); the cockpit shows it in deg.
+
+    Returns the ``fields`` mapping for ``write_telemetry_json``.
+    """
+    t_s = np.asarray(ego_t_ms, dtype="float64") / 1000.0
+    dt = np.gradient(t_s)
+    dt = np.where(np.abs(dt) < 1e-3, 1e-3, dt)
+    speed = np.asarray(ego_speed, dtype="float64")
+    accel = np.gradient(speed) / dt
+    yaw_rate = np.gradient(np.unwrap(np.asarray(ego_yaw, dtype="float64"))) / dt
+    heading = np.asarray(ego_yaw, dtype="float64")
+
+    def series(vals):
+        return [[int(t), float(v)] for t, v in zip(ego_t_ms, vals)]
+
+    return {
+        "speed": {"unit": "m/s", "label": "Speed", "samples": series(speed)},
+        "accel": {"unit": "m/s²", "label": "Accel", "samples": series(accel)},
+        "yaw_rate": {"unit": "rad/s", "label": "Yaw rate", "samples": series(yaw_rate)},
+        "heading": {"unit": "rad", "label": "Heading", "samples": series(heading)},
+    }
+
+
+def copy_camera_frames(keyframes, out: Path, decimate: int, label: str):
+    """Decimate ``(t_ms, src_jpg_path)`` keyframes into ``<out>/cam/`` and return
+    the rewritten ``[{t, url}, …]`` frame list (url relative to the scene dir).
+
+    Takes every ``decimate``-th frame (always pinning the last) so the inset is
+    ~20 frames, renaming to ``0000.jpg…`` for a deterministic, source-path-
+    independent bundle. The adapters own frame DISCOVERY (nuScenes keyframe
+    records, AV2 sensor dirs — Waymo's ``extract_camera`` stays separate because
+    its JPEGs are parquet-embedded bytes, not files); this owns the shared
+    decimate / copy / url-rewrite step.
+    """
+    n = len(keyframes)
+    idx = list(range(0, n, max(1, decimate)))
+    if idx and idx[-1] != n - 1:
+        idx.append(n - 1)  # pin the final keyframe so the inset spans the scene
+    cam_dir = out / "cam"
+    cam_dir.mkdir(parents=True, exist_ok=True)
+    frames = []
+    for j, i in enumerate(idx):
+        t_ms, src = keyframes[i]
+        dst_name = f"{j:04d}.jpg"
+        shutil.copyfile(src, cam_dir / dst_name)
+        frames.append({"t": int(t_ms), "url": f"cam/{dst_name}"})
+    print(f"  copied {len(frames)} {label} keyframe(s) → {cam_dir}")
+    return frames
 
 
 # ── Sidecar JSON writers ─────────────────────────────────────────────────────
@@ -1915,8 +2012,9 @@ def denoise_actors(xy, z, t, *, sor=True, sor_k=ACTOR_SOR_K, sor_std=ACTOR_SOR_S
 # ── shared surfel frame (eigen → quaternion core) ────────────────────────────
 # The eigen→quaternion core of the per-sweep ``compute_surfels`` (in
 # waymo_extract / argoverse_extract) factored out so the per-sweep paths AND the
-# new merged Worldbuild path fit surfels the SAME way (the dual-copy hazard this
-# repo keeps hitting). Tuning constants mirror the extractors' SURFEL_* values.
+# merged Worldbuild path fit surfels the SAME way (the dual-copy hazard this
+# repo keeps hitting). These tuning constants are the SINGLE copy — the
+# extractors alias ``SURFEL_K`` from here.
 SURFEL_K = 12               # k-NN for the covariance estimate (== ADAPTIVE_K)
 SURFEL_FILL = 0.70          # disk radius as a fraction of the local point spacing
 SURFEL_S_MIN = 0.03         # m — floor (avoid sub-cm slivers)
@@ -1928,8 +2026,8 @@ def mat3_to_quat(R: np.ndarray) -> np.ndarray:
     """Batched rotation matrices ``(M,3,3)`` → unit quaternions ``(M,4)`` [x,y,z,w].
 
     Shepperd's method (the numerically-stable four-case branch on which diagonal
-    term is largest), vectorised. Same implementation the per-sweep extractors
-    carry; kept here so the merged Worldbuild path shares it.
+    term is largest), vectorised. The single copy — the per-sweep extractors and
+    the merged Worldbuild path both resolve here.
     """
     m00, m01, m02 = R[:, 0, 0], R[:, 0, 1], R[:, 0, 2]
     m10, m11, m12 = R[:, 1, 0], R[:, 1, 1], R[:, 1, 2]
@@ -2040,7 +2138,16 @@ def _surfel_frame(pts: np.ndarray, sel: np.ndarray, view_dir, R_post=None):
 # doesn't smear into a solid streak). The static voxel grid is built by a
 # STREAMING accumulator (``WorldVoxelAccumulator``) so peak memory is ∝ the
 # occupied-voxel count, NOT the ~180M raw returns.
-FALLBACK_RGB = (70, 78, 96)  # slate for returns no camera saw (== the colorizers)
+FALLBACK_RGB = (70, 78, 96)  # slate for returns no camera saw (the colorizers alias this)
+
+
+def depth_ramp(depth: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Jet-ish depth → RGB uint8 (N×3) ramp for the debug overlays (no matplotlib)."""
+    t = np.clip((depth - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    r = np.clip(1.5 - np.abs(4.0 * t - 3.0), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4.0 * t - 2.0), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4.0 * t - 1.0), 0.0, 1.0)
+    return (np.stack([r, g, b], axis=1) * 255).astype(np.uint8)
 
 
 # ── photographic colour: linear-light fusion + grade ─────────────────────────
@@ -2672,7 +2779,7 @@ def run_stt_build(
     * ``"trips"`` (ego): adds ``--end-time-field end_timestamp --simplify`` (the
       animated-LineString form, identical to ``ecco_advect.py``).
     * ``"map_poly"`` (HD-map polygons) / ``"map_line"`` (HD-map lines): the
-      **static** full-range form (av-refinement.md §R2.2). Adds
+      **static** full-range form (av-cockpit.md §2 R2.2). Adds
       ``--end-time-field end_timestamp`` and FORCES a temporal bucket that spans
       the whole scene (overriding ``temporal_bucket`` with a large default, see
       ``map_temporal_bucket``) so every map feature lands in a single bucket and

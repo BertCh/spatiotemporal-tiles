@@ -53,7 +53,7 @@ COORDINATE / FRAME NOTES (verified against the av2-api)
   **ego frame** → ego → city → lon/lat with the matching pose.
 * AV2 uses a city-specific UTM frame. Cities with a documented UTM origin
   (``AV2_CITY_UTM``) are georeferenced with a REAL CRS transform
-  (``av_common.utm_to_lonlat(E0 + x, N0 + y, epsg)``, av-refinement.md §R2.1) —
+  (``av_common.utm_to_lonlat(E0 + x, N0 + y, epsg)``, av-cockpit.md §2 R2.1) —
   e.g. PIT ``E0=583710.0070 N0=4477259.9999 EPSG:32617``. The old flat-earth
   equirectangular transform drifts ~75 m at a scene ~6.9 km from the origin, so
   the UTM path removes that error. Cities without a published origin fall back
@@ -65,7 +65,7 @@ COORDINATE / FRAME NOTES (verified against the av2-api)
   stream (lane boundaries as lines, drivable areas + crosswalks as polygons).
 * ``annotations.feather`` carries NO velocity, so per-object ``speed`` is
   finite-differenced from the city-frame center grouped by ``track_uuid``
-  (av-refinement.md §R2.3) — the cockpit's velocity arrows read it.
+  (av-cockpit.md §2 R2.3) — the cockpit's velocity arrows read it.
 
 Pipeline:  Argoverse 2  →  GeoParquet + JSON  →  stt-build  →  packed bundle.
 """
@@ -96,9 +96,9 @@ AV2_RING_CAMERAS = (
     "ring_front_center", "ring_front_left", "ring_front_right",
     "ring_side_left", "ring_side_right", "ring_rear_left", "ring_rear_right",
 )
-# Cool slate for returns no camera sees — same value as the Waymo/nuScenes
-# colorizers so colored scenes read consistently across sources.
-FALLBACK_RGB = (70, 78, 96)
+# Cool slate for returns no camera sees — the shared av_common constant, so all
+# colorizers (Waymo/nuScenes/AV2/Worldbuild) read consistently across sources.
+FALLBACK_RGB = avc.FALLBACK_RGB
 
 
 def _bilinear_sample(img: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
@@ -213,15 +213,6 @@ class Av2Colorizer:
         return rgb_u8, got, weight
 
 
-def _depth_ramp(depth: np.ndarray, lo: float, hi: float) -> np.ndarray:
-    """Jet-ish depth → RGB uint8 ramp for the debug overlay (no matplotlib)."""
-    t = np.clip((depth - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
-    r = np.clip(1.5 - np.abs(4.0 * t - 3.0), 0.0, 1.0)
-    g = np.clip(1.5 - np.abs(4.0 * t - 2.0), 0.0, 1.0)
-    b = np.clip(1.5 - np.abs(4.0 * t - 1.0), 0.0, 1.0)
-    return (np.stack([r, g, b], axis=1) * 255).astype(np.uint8)
-
-
 def debug_overlay_av2(log_dir: Path, out: Path, colorizer: "Av2Colorizer",
                       sweep_index: int):
     """Project one sweep into every ring camera, dots colored by DEPTH → PNGs.
@@ -254,7 +245,7 @@ def debug_overlay_av2(log_dir: Path, out: Path, colorizer: "Av2Colorizer",
         bi = np.where(valid)[0]
         if len(bi):
             depth = pts_cam[bi, 2]
-            colors = _depth_ramp(depth, depth.min(), np.percentile(depth, 95))
+            colors = avc.depth_ramp(depth, depth.min(), np.percentile(depth, 95))
             for dy in (-1, 0, 1):
                 for dx in (-1, 0, 1):
                     canvas[np.clip(vi[bi] + dy, 0, h - 1),
@@ -263,11 +254,12 @@ def debug_overlay_av2(log_dir: Path, out: Path, colorizer: "Av2Colorizer",
         Image.fromarray(canvas).save(path)
         print(f"    wrote {path}  ({len(bi)} projected returns)")
 
-# AV2 lane-marking colour → ``MAP_COLORS`` key (av-refinement.md §R2.2). The AV2
+# AV2 lane-marking colour → ``map_layer`` name (av-cockpit.md §2 R2.2). The AV2
 # ``LaneMarkType`` enum encodes both colour and pattern (e.g.
 # ``DOUBLE_SOLID_YELLOW``); we collapse to the painted colour — white / yellow /
 # blue / red — and fall back to the generic ``lane_boundary`` for unpainted
-# (``NONE``) / ``UNKNOWN`` boundaries. Keys must exist in ``avc.MAP_COLORS``.
+# (``NONE``) / ``UNKNOWN`` boundaries. Every layer name returned must be a member
+# of ``avc.MAP_LAYERS`` (the valid ``map_layer`` name set; colors live in TS).
 def _lane_mark_layer(mark_type) -> str:
     name = str(mark_type).rsplit(".", 1)[-1].upper()  # "LaneMarkType.SOLID_WHITE" → "SOLID_WHITE"
     if "YELLOW" in name:
@@ -309,34 +301,6 @@ LIDAR_MIN_ZOOM = 14
 LIDAR_QUANTIZE_M = 0.05
 
 
-def downsample_ego_path(ego_t, ego_lon, ego_lat, target: int = 60):
-    """Downsample the ego trajectory to a tiny ``[{t, lon, lat}, …]`` polyline.
-
-    Reuses the SAME lon/lat/t samples the ego trips archive is built from so the
-    cockpit follow-camera path tracks the rendered ego trail exactly (never a
-    recomputed path). Picks ~``target`` evenly-spaced vertices, always keeping the
-    first and last so the polyline spans the full timeRange. ~40–80 pts keeps
-    ego-follow smooth while staying a few KB in scene.json. Identical contract to
-    ``av_synthetic.downsample_ego_path`` (av-cockpit.md §3d).
-    """
-    n = len(ego_t)
-    if n <= target:
-        idx = list(range(n))
-    else:
-        step = max(1, n // target)
-        idx = list(range(0, n, step))
-        if idx[-1] != n - 1:
-            idx.append(n - 1)  # always pin the final vertex
-    return [
-        {
-            "t": int(ego_t[i]),
-            "lon": round(float(ego_lon[i]), 7),
-            "lat": round(float(ego_lat[i]), 7),
-        }
-        for i in idx
-    ]
-
-
 def _city_name(city: str):
     """Resolve a city code string to the av2 ``CityName`` enum (or exit clearly)."""
     from av2.geometry.utm import CityName
@@ -372,6 +336,9 @@ def _read_feather(path: Path):
 
 def _yaw_of(qw, qx, qy, qz) -> np.ndarray:
     """Yaw (rad, CCW about +z) from quaternion columns (vectorised)."""
+    # Per-dataset ON PURPOSE (not an av_common hoist): AV2 poses arrive as
+    # vectorised quaternion COLUMNS; waymo_extract._yaw_of takes a 3×3 rotation,
+    # nuscenes_extract._yaw_of a devkit quaternion record.
     # Standard quaternion → yaw about z.
     siny = 2.0 * (qw * qz + qx * qy)
     cosy = 1.0 - 2.0 * (qy * qy + qz * qz)
@@ -414,70 +381,21 @@ def _make_city_to_lonlat(city: str):
     return to_lonlat, f"av2 devkit CRS for {cn.name}"
 
 
-def derive_telemetry(ego_t_ms, ego_speed, ego_yaw) -> dict:
-    """Build a ``telemetry.json`` fields dict from the ego trajectory.
-
-    Argoverse 2 ships **no CAN bus**, so the cockpit's gauge panel would stay
-    empty. Instead we DERIVE a plausible telemetry set from the 6-DoF ego pose so
-    the panel lights up (honestly labelled "derived from ego pose", not CAN):
-
-    * ``speed`` — m/s, finite-difference of the city-frame position (already
-      computed by ``extract``); the cockpit formats it as km/h.
-    * ``accel`` — m/s², d(speed)/dt (longitudinal accel).
-    * ``yaw_rate`` — rad/s, d(yaw)/dt on the UNWRAPPED yaw (so the ±π seam
-      doesn't spike the derivative).
-    * ``heading`` — rad, the ego yaw (0 = east, CCW+); the cockpit shows it in deg.
-
-    Returns the ``fields`` mapping for ``avc.write_telemetry_json``.
-    """
-    t_s = np.asarray(ego_t_ms, dtype="float64") / 1000.0
-    dt = np.gradient(t_s)
-    dt = np.where(np.abs(dt) < 1e-3, 1e-3, dt)
-    speed = np.asarray(ego_speed, dtype="float64")
-    accel = np.gradient(speed) / dt
-    yaw_rate = np.gradient(np.unwrap(np.asarray(ego_yaw, dtype="float64"))) / dt
-    heading = np.asarray(ego_yaw, dtype="float64")
-
-    def series(vals):
-        return [[int(t), float(v)] for t, v in zip(ego_t_ms, vals)]
-
-    return {
-        "speed": {"unit": "m/s", "label": "Speed", "samples": series(speed)},
-        "accel": {"unit": "m/s²", "label": "Accel", "samples": series(accel)},
-        "yaw_rate": {"unit": "rad/s", "label": "Yaw rate", "samples": series(yaw_rate)},
-        "heading": {"unit": "rad", "label": "Heading", "samples": series(heading)},
-    }
-
-
 def copy_camera_frames(log_dir: Path, camera: str, out: Path, decimate: int):
-    """Decimate one ring camera's JPGs, copy them into ``<out>/cam/``, and return
-    the rewritten ``[{t, url}, …]`` frame list (url relative to the scene dir).
+    """Discover one ring camera's JPGs and bundle them into ``<out>/cam/``.
 
-    AV2 frames live at ``sensors/cameras/<camera>/<timestamp_ns>.jpg``; we take
-    every ``decimate``-th frame (always pinning the last) so the inset is ~20
-    frames, and rename them ``0000.jpg…`` for a deterministic, source-path-
-    independent bundle. Mirrors ``nuscenes_extract.copy_camera_frames``. Returns
-    ``None`` (and omits the camera stream) if the camera dir is absent/empty.
+    AV2 frames live at ``sensors/cameras/<camera>/<timestamp_ns>.jpg`` (t_ms =
+    stem ns ÷ 1e6); the shared ``avc.copy_camera_frames`` owns the decimate /
+    copy / url-rewrite step. Returns ``None`` (and omits the camera stream) if
+    the camera dir is absent/empty.
     """
     cam_src_dir = log_dir / "sensors" / "cameras" / camera
     jpgs = sorted(cam_src_dir.glob("*.jpg"), key=lambda p: int(p.stem))
     if not jpgs:
         print(f"  no {camera} frames found under {cam_src_dir}; omitting camera stream")
         return None
-    n = len(jpgs)
-    idx = list(range(0, n, max(1, decimate)))
-    if idx and idx[-1] != n - 1:
-        idx.append(n - 1)  # pin the final keyframe so the inset spans the scene
-    cam_dir = out / "cam"
-    cam_dir.mkdir(parents=True, exist_ok=True)
-    frames = []
-    for j, i in enumerate(idx):
-        src = jpgs[i]
-        dst_name = f"{j:04d}.jpg"
-        shutil.copyfile(src, cam_dir / dst_name)
-        frames.append({"t": int(src.stem) // 1_000_000, "url": f"cam/{dst_name}"})
-    print(f"  copied {len(frames)} {camera} keyframe(s) → {cam_dir}")
-    return frames
+    keyframes = [(int(p.stem) // 1_000_000, p) for p in jpgs]
+    return avc.copy_camera_frames(keyframes, out, decimate, camera)
 
 
 # ── surfel covariance (build-time, per-sweep k-NN) ───────────────────────────
@@ -492,11 +410,7 @@ def copy_camera_frames(log_dir: Path, camera: str, out: Path, decimate: int):
 # (one file per sweep, so neighbourhoods are already a coherent range-image
 # sampling) and AV2's yaw-only city lift (the render keeps vehicle-frame z, so
 # disks are yawed — not full-pose-rotated — into the render frame).
-SURFEL_K = 12          # neighbours for the covariance estimate
-SURFEL_FILL = 0.70     # disk radius as a fraction of the decimated point spacing
-SURFEL_S_MIN = 0.03    # m — floor (avoid sub-cm slivers)
-SURFEL_S_MAX = 0.45    # m — ceil (far/sparse returns don't become giant blobs)
-SURFEL_ASPECT_FLOOR = 0.45  # keep disks from collapsing to needles on edges
+SURFEL_K = avc.SURFEL_K  # neighbours for the covariance estimate (shared tuning)
 # Default render decimation for the surfel tier. Denser than the round-dot point
 # tiers (the default `small` is 1/16): at low density each SWEEP is too sparse to
 # tile, so the per-point disk is sized large and reads as blobs — a denser sample
@@ -505,45 +419,6 @@ SURFEL_ASPECT_FLOOR = 0.45  # keep disks from collapsing to needles on edges
 # density is nearly free at render time. ~1/6 of the ~14M-return log ≈ 2.3M
 # oriented disks (~few hundred k drawn at any instant).
 SURFEL_DECIMATE = 6
-
-
-def mat3_to_quat(R: np.ndarray) -> np.ndarray:
-    """Batched rotation matrices ``(M,3,3)`` → unit quaternions ``(M,4)`` [x,y,z,w].
-
-    Shepperd's method (the numerically-stable four-case branch on which diagonal
-    term is largest), vectorised: compute all four candidate quaternions and
-    select per row by the same case mask, so a near-180° rotation never divides
-    by a vanishing ``sqrt(trace+1)``.
-    """
-    m00, m01, m02 = R[:, 0, 0], R[:, 0, 1], R[:, 0, 2]
-    m10, m11, m12 = R[:, 1, 0], R[:, 1, 1], R[:, 1, 2]
-    m20, m21, m22 = R[:, 2, 0], R[:, 2, 1], R[:, 2, 2]
-    trace = m00 + m11 + m22
-
-    def _sqrt(v):
-        return np.sqrt(np.maximum(v, 1e-12))
-
-    # case 0: trace positive
-    s0 = _sqrt(trace + 1.0) * 2.0  # = 4w
-    q0 = np.stack([(m21 - m12) / s0, (m02 - m20) / s0, (m10 - m01) / s0, 0.25 * s0], 1)
-    # case 1: m00 dominant
-    s1 = _sqrt(1.0 + m00 - m11 - m22) * 2.0  # = 4x
-    q1 = np.stack([0.25 * s1, (m01 + m10) / s1, (m02 + m20) / s1, (m21 - m12) / s1], 1)
-    # case 2: m11 dominant
-    s2 = _sqrt(1.0 + m11 - m00 - m22) * 2.0  # = 4y
-    q2 = np.stack([(m01 + m10) / s2, 0.25 * s2, (m12 + m21) / s2, (m02 - m20) / s2], 1)
-    # case 3: m22 dominant
-    s3 = _sqrt(1.0 + m22 - m00 - m11) * 2.0  # = 4z
-    q3 = np.stack([(m02 + m20) / s3, (m12 + m21) / s3, 0.25 * s3, (m10 - m01) / s3], 1)
-
-    use0 = trace > 0.0
-    use1 = (~use0) & (m00 >= m11) & (m00 >= m22)
-    use2 = (~use0) & (~use1) & (m11 >= m22)
-    q = np.where(use0[:, None], q0,
-        np.where(use1[:, None], q1,
-        np.where(use2[:, None], q2, q3)))
-    q /= np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-12)
-    return q
 
 
 def compute_surfels(pts: np.ndarray, sel: np.ndarray, yaw: float):
@@ -881,7 +756,7 @@ def extract(log_dir: Path, city: str, drop_empty_boxes: bool = True,
 
     # Derived telemetry (AV2 ships no CAN bus) — finite-difference the ego pose so
     # the cockpit's gauge panel still lights up (honestly labelled "derived").
-    telemetry_fields = derive_telemetry(ego_t, ego_speed, ego_yaw)
+    telemetry_fields = avc.derive_telemetry(ego_t, ego_speed, ego_yaw)
 
     # Per-ego-timestamp pose lookup for transforming ego-frame data → city.
     def ego_pose_at(t_ns_ms):
@@ -931,7 +806,7 @@ def extract(log_dir: Path, city: str, drop_empty_boxes: bool = True,
     else:
         o_lon, o_lat = [], []
 
-    # Pass 2: real per-object velocity (av-refinement.md §R2.3). Group rows by
+    # Pass 2: real per-object velocity (av-cockpit.md §2 R2.3). Group rows by
     # track_uuid, sort by timestamp, finite-diff the city-frame center → speed
     # (m/s) + vel_heading (atan2(dy,dx)). The cockpit's velocity arrows derive
     # (vx,vy) from speed + heading, so writing a real speed (was hardcoded 0.0)
@@ -1065,7 +940,7 @@ def extract(log_dir: Path, city: str, drop_empty_boxes: bool = True,
                  np.concatenate(l_rgb) if l_rgb is not None else None,
                  None)  # no surfels in the default (round-dot) path
 
-    # --- HD map (static substrate, av-refinement.md §R2.2) ---
+    # --- HD map (static substrate, av-cockpit.md §2 R2.2) ---
     map_polys, map_lines = extract_map(log_dir, to_lonlat)
     return ego, objects, lidar, telemetry_fields, map_polys, map_lines
 
@@ -1110,6 +985,7 @@ def extract_map(log_dir: Path, to_lonlat):
 
     map_lines: list[tuple] = []
     n_center = 0
+    n_center_err = 0
     for lane_id, seg in smap.vector_lane_segments.items():
         for bound, mark in (
             (seg.left_lane_boundary, seg.left_mark_type),
@@ -1122,7 +998,10 @@ def extract_map(log_dir: Path, to_lonlat):
         # signature AV2 map feature. Intersection lanes get a distinct layer.
         try:
             centerline = smap.get_lane_segment_centerline(lane_id)  # (N,3) city m
-        except Exception:
+        except (KeyError, IndexError, ValueError, ZeroDivisionError):
+            # Degenerate boundaries the devkit can't interpolate — counted and
+            # reported below rather than silently thinning the map.
+            n_center_err += 1
             centerline = None
         cls = _line(centerline[:, :2]) if centerline is not None else None
         if cls is not None:
@@ -1145,6 +1024,9 @@ def extract_map(log_dir: Path, to_lonlat):
           f"{len(map_lines)} line(s) ({n_center} centerline), {len(map_polys)} polygon(s) "
           f"({len(smap.vector_drivable_areas)} drivable + "
           f"{len(smap.vector_pedestrian_crossings)} crosswalk)")
+    if n_center_err:
+        print(f"  warning: {n_center_err} lane centerline(s) failed devkit "
+              f"interpolation and were skipped")
     return map_polys, map_lines
 
 
@@ -1469,7 +1351,7 @@ def generate(args):
                                     "radius": radius_px, "radiusMinPixels": radius_min_px})
         n_lidar = lidar_densities[0]["points"]  # default = small tier
 
-    # --- HD map (static, full-range) parquet (av-refinement.md §R2.2) ---
+    # --- HD map (static, full-range) parquet (av-cockpit.md §2 R2.2) ---
     map_poly_pq = out / "map_poly.parquet"
     map_line_pq = out / "map_line.parquet"
     n_map_poly = avc.write_map_polygons(map_poly_pq, map_polys, t_start, t_end)
@@ -1482,7 +1364,7 @@ def generate(args):
 
     # lightweight ego polyline for the cockpit ego-follow camera (av-cockpit.md
     # §3d): same lon/lat/t samples as the ego trips archive → tracks it exactly.
-    ego_path = downsample_ego_path(ego_t, ego_lon, ego_lat)
+    ego_path = avc.downsample_ego_path(ego_t, ego_lon, ego_lat)
 
     # --- derived telemetry sidecar (AV2 ships no CAN bus; this is ego-derived) ---
     tel_hz = round(len(ego_t) / max((t_end - t_start) / 1000.0, 1e-3), 1)

@@ -77,9 +77,11 @@ stt-generate nyc-rideshare --flows --flow-bin 15m \
 ## Custom Data
 
 For data not covered by built-in datasets, use `stt-build` directly.
-`stt-build` accepts **GeoParquet only** — convert other formats first
-(`ogr2ogr -f Parquet out.parquet in.geojson`, or see the
-[Python guide](../../docs/guides/python.md)):
+It reads **GeoParquet** (convert other file formats first, e.g.
+`ogr2ogr -f Parquet out.parquet in.geojson`, or see the
+[Python guide](../../docs/guides/python.md)) — or a **PostGIS/DuckDB**
+source directly via `--postgres`/`--duckdb` (see the
+[CLI reference](../../docs/api/cli-reference.md)):
 
 ```bash
 stt-build \
@@ -100,8 +102,16 @@ Downloaded data is cached locally and gitignored:
 
 - `generate-all.sh` - Convenience wrapper to generate all datasets
 - `setup-osrm.sh` - Set up OSRM server for NYC routing (optional for nyc-rideshare)
-- `generate-datasets-config.js` - Generate TypeScript config from metadata
+- `generate-datasets-config.js` - Generate a datasets.ts-style config from
+  stt-build metadata. Prints to **stdout** by default — redirect to a file to
+  keep it (`node generate-datasets-config.js ./metadata > datasets.generated.ts`).
+  Never point it at `examples/showcase/src/datasets.ts`; that registry is
+  hand-maintained and this scaffold would clobber it.
 - `validate-ais-coords.js` - Validate AIS coordinate data
+- `lidar_summarize_eval.py` - Measurement tool (not a pipeline step): bake-off of
+  LiDAR decimation strategies on a real full-density Waymo sweep, scoring
+  fidelity / detail / coverage at matched point budgets. Run with
+  `venv-waymo/bin/python lidar_summarize_eval.py`.
 
 ### Python adapters (research / domain pipelines)
 
@@ -128,6 +138,37 @@ These produce GeoParquet for `stt-build` outside the Rust generators:
   (**non-commercial, no redistribution**) at waymo.com/open, then `gcloud auth
   login`. Needs the `venv-waymo` python (`pyarrow numpy shapely pandas`) + a
   release `stt-build`. Run `bash waymo_batch.sh` (`FORCE=1` to rebuild).
+
+### Python virtualenvs
+
+The Python pipelines run out of per-domain virtualenvs in this directory (the
+heavy devkits conflict, so they are NOT merged). Each venv is reproducible from
+its `pip freeze` snapshot:
+
+| venv | requirements file | used by |
+|------|-------------------|---------|
+| `venv` | `requirements-venv.txt` | `ecco_advect.py` (ECCO advection; `requirements-ecco.txt` is the curated unpinned list, see [ECCO.md](./ECCO.md)) |
+| `venv-dl` | `requirements-dl.txt` | `download_ecco.py` (NASA Earthdata `earthaccess` download) |
+| `venv-av2` | `requirements-av2.txt` | `argoverse_extract.py` + every `argoverse_*_batch.sh` (av2 devkit) |
+| `venv-waymo` | `requirements-waymo.txt` | `waymo_extract.py` + every `waymo_*_batch.sh`, `lidar_summarize_eval.py` |
+| `venv-nuscenes` | `requirements-nuscenes.txt` | `nuscenes_extract.py`, `av_synthetic.py` (nuscenes-devkit) |
+| `venv-comma` | `requirements-comma.txt` | `comma_extract.py` (comma2k19) |
+| `venv-test` | `requirements-test.txt` | the test files below (numpy/pyarrow/scipy/shapely only) |
+
+Recreate one with `python3 -m venv <name> && <name>/bin/pip install -r
+requirements-<suffix>.txt`. After changing a venv, re-freeze it
+(`<name>/bin/python -m pip freeze > requirements-<suffix>.txt`).
+
+### Tests
+
+Three standalone (also pytest-discoverable) test files guard the shared AV
+helpers; run them with `venv-test`:
+
+```bash
+venv-test/bin/python test_av_palette_parity.py      # Python⇄TS palette/legend parity
+venv-test/bin/python test_av_common_world_tracks.py # worldbuild merge + track builders
+venv-test/bin/python test_lod_home_zoom.py          # additive zoom-LOD assignment
+```
 
 ## Notes
 

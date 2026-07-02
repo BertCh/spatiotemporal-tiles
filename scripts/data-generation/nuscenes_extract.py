@@ -78,7 +78,6 @@ from __future__ import annotations
 import argparse
 import collections
 import math
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -101,7 +100,7 @@ LIDAR_QUANTIZE_M = 0.05  # ~3.75 cm grid (av_common warns to keep AV quantize <=
 # (every Nth keyframe). 40 keyframes / 2 ≈ 20, the contract's camera band.
 CAMERA_DECIMATE = 2
 
-# HD-map substrate (av-refinement.md §R2.2). The polygon vs line layers of the
+# HD-map substrate (av-cockpit.md §2 R2.2). The polygon vs line layers of the
 # nuScenes map-expansion we surface, in the cockpit's painter order. ``MAP_PAD_M``
 # expands the ego bounding box by this many metres so the visible map extends a
 # little past the drive (clip patch is in map-frame ground metres, same as
@@ -128,9 +127,9 @@ NUSCENES_CAMERAS = (
     "CAM_FRONT", "CAM_FRONT_RIGHT", "CAM_FRONT_LEFT",
     "CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT",
 )
-# Cool slate for returns no camera sees (above the FOV / occluded) — same value
-# as the Waymo colorizer so colored scenes read consistently across sources.
-FALLBACK_RGB = (70, 78, 96)
+# Cool slate for returns no camera sees (above the FOV / occluded) — the shared
+# av_common constant, so colored scenes read consistently across sources.
+FALLBACK_RGB = avc.FALLBACK_RGB
 # Returns nearer than this (m) to a camera are skipped (on the ego shell).
 MIN_CAM_DEPTH_M = 1.0
 
@@ -150,6 +149,7 @@ class NuScenesColorizer:
         self.dataroot = dataroot
         self._cache: "collections.OrderedDict[str, np.ndarray]" = \
             collections.OrderedDict()
+        self.missing: set[str] = set()
 
     def _image(self, filename: str):
         """Decode (LRU-cached, ≤12) one camera JPG under the dataroot → HxWx3."""
@@ -161,6 +161,11 @@ class NuScenesColorizer:
             return arr
         path = self.dataroot / filename
         if not path.exists():
+            if not self.missing:
+                print(f"  warning: camera JPG missing under {self.dataroot} "
+                      f"(first: {filename}) — affected returns fall back to "
+                      f"FALLBACK_RGB; total reported at end")
+            self.missing.add(filename)
             return None
         arr = np.asarray(Image.open(path).convert("RGB"))
         self._cache[filename] = arr
@@ -213,15 +218,6 @@ class NuScenesColorizer:
         return rgb, got
 
 
-def _depth_ramp(depth: np.ndarray, lo: float, hi: float) -> np.ndarray:
-    """Jet-ish depth → RGB uint8 ramp for the debug overlay (no matplotlib)."""
-    t = np.clip((depth - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
-    r = np.clip(1.5 - np.abs(4.0 * t - 3.0), 0.0, 1.0)
-    g = np.clip(1.5 - np.abs(4.0 * t - 2.0), 0.0, 1.0)
-    b = np.clip(1.5 - np.abs(4.0 * t - 1.0), 0.0, 1.0)
-    return (np.stack([r, g, b], axis=1) * 255).astype(np.uint8)
-
-
 def debug_overlay_nuscenes(nusc, scene, dataroot: Path, out: Path,
                            colorizer: "NuScenesColorizer", sample_index: int):
     """Project one keyframe's full sweep into every camera, dots colored by DEPTH.
@@ -270,7 +266,7 @@ def debug_overlay_nuscenes(nusc, scene, dataroot: Path, out: Path,
         canvas = img.copy()
         bi = np.where(valid)[0]
         if len(bi):
-            colors = _depth_ramp(depth[bi], depth[bi].min(), np.percentile(depth[bi], 95))
+            colors = avc.depth_ramp(depth[bi], depth[bi].min(), np.percentile(depth[bi], 95))
             for dy in (-1, 0, 1):
                 for dx in (-1, 0, 1):
                     canvas[np.clip(vi[bi] + dy, 0, h - 1), np.clip(ui[bi] + dx, 0, w - 1)] = colors
@@ -279,59 +275,22 @@ def debug_overlay_nuscenes(nusc, scene, dataroot: Path, out: Path,
         print(f"    wrote {path}  ({len(bi)} projected returns)")
 
 
-def downsample_ego_path(ego_t, ego_lon, ego_lat, target=60):
-    """Downsample the ego trajectory to a tiny ``[{t, lon, lat}, …]`` polyline.
-
-    Mirrors ``av_synthetic.downsample_ego_path`` exactly so the cockpit's
-    ego-follow camera path is byte-for-byte the rendered ego trail (same lon/lat/t
-    samples the ego trips archive is built from — never a recomputed path). Picks
-    ~``target`` evenly-spaced vertices and always pins the first and last so the
-    polyline spans the full timeRange. ~40–80 pts keeps follow smooth at a few KB.
-    """
-    n = len(ego_t)
-    if n <= target:
-        idx = list(range(n))
-    else:
-        step = max(1, n // target)
-        idx = list(range(0, n, step))
-        if idx[-1] != n - 1:
-            idx.append(n - 1)  # always pin the final vertex
-    return [
-        {
-            "t": int(ego_t[i]),
-            "lon": round(float(ego_lon[i]), 7),
-            "lat": round(float(ego_lat[i]), 7),
-        }
-        for i in idx
-    ]
-
-
 def copy_camera_frames(cam_frames, dataroot: Path, out: Path, decimate: int):
-    """Decimate CAM_FRONT keyframes, copy the JPGs into ``<out>/cam/``, and return
-    the rewritten ``[{t, url}, …]`` frame list (url relative to the scene dir).
+    """Resolve CAM_FRONT keyframe records against the dataroot and bundle them
+    into ``<out>/cam/``.
 
-    Frames are taken every ``decimate``-th keyframe (always pinning the last) so
-    the inset is ~20 frames; JPGs are renamed ``0000.jpg``, ``0001.jpg``, … for a
-    deterministic, dataroot-independent bundle.
+    ``cam_frames`` entries are ``{"t": t_ms, "src": relative_jpg_path}``; the
+    shared ``avc.copy_camera_frames`` owns the decimate / copy / url-rewrite step.
     """
-    n = len(cam_frames)
-    idx = list(range(0, n, max(1, decimate)))
-    if idx and idx[-1] != n - 1:
-        idx.append(n - 1)  # pin the final keyframe so the inset spans the scene
-    cam_dir = out / "cam"
-    cam_dir.mkdir(parents=True, exist_ok=True)
-    frames = []
-    for j, i in enumerate(idx):
-        src = dataroot / cam_frames[i]["src"]
-        dst_name = f"{j:04d}.jpg"
-        shutil.copyfile(src, cam_dir / dst_name)
-        frames.append({"t": int(cam_frames[i]["t"]), "url": f"cam/{dst_name}"})
-    print(f"  copied {len(frames)} CAM_FRONT keyframe(s) → {cam_dir}")
-    return frames
+    keyframes = [(f["t"], dataroot / f["src"]) for f in cam_frames]
+    return avc.copy_camera_frames(keyframes, out, decimate, "CAM_FRONT")
 
 
 def _yaw_of(rotation) -> float:
     """Global-frame yaw (rad, CCW about +z) from a nuScenes quaternion [w,x,y,z]."""
+    # Per-dataset ON PURPOSE (not an av_common hoist): nuScenes annotations carry
+    # devkit quaternion records; argoverse_extract._yaw_of takes vectorised
+    # quaternion columns, waymo_extract._yaw_of a 3×3 rotation.
     from pyquaternion import Quaternion
 
     return float(Quaternion(rotation).yaw_pitch_roll[0])
@@ -487,7 +446,7 @@ def extract_can(nusc_can, scene_name: str):
 
     * ``vehicle_monitor`` (2 Hz): speed (km/h→m/s), throttle (0–1000→frac),
       brake (**bar [0,126]**→frac — NOT 0–1000), plus the richer channels
-      (av-refinement.md §R2.4) ``yaw_rate`` (rad/s, + = left), ``left_signal`` /
+      (av-cockpit.md §2 R2.4) ``yaw_rate`` (rad/s, + = left), ``left_signal`` /
       ``right_signal`` (0/1 turn-indicators).
     * ``steeranglefeedback`` (100 Hz, native radians) for a smooth steering gauge,
       else vehicle_monitor's 2 Hz degrees.
@@ -510,7 +469,7 @@ def extract_can(nusc_can, scene_name: str):
     speed = [[m["utime"] // 1000, m["vehicle_speed"] / 3.6] for m in vm]  # km/h → m/s
     throttle = [[m["utime"] // 1000, m["throttle"] / 1000.0] for m in vm]  # 0–1000 → frac
     brake = [[m["utime"] // 1000, m["brake"] / 126.0] for m in vm]  # bar [0,126] → frac
-    # Richer CAN channels (av-refinement.md §R2.4): yaw-rate (rad/s, + = left turn)
+    # Richer CAN channels (av-cockpit.md §2 R2.4): yaw-rate (rad/s, + = left turn)
     # and the turn-signal indicators (0/1 booleans) — all straight off
     # vehicle_monitor, so R1.4's strip-charts auto-render them.
     yaw_rate = [[m["utime"] // 1000, float(m["yaw_rate"])] for m in vm]  # rad/s
@@ -580,7 +539,7 @@ def _line_to_lonlat(line, origin_lat: float, origin_lon: float):
 
 
 def extract_map(dataroot: Path, location: str, ego_x, ego_y, origin_lat, origin_lon):
-    """Extract the HD-map substrate clipped to the scene (av-refinement.md §R2.2).
+    """Extract the HD-map substrate clipped to the scene (av-cockpit.md §2 R2.2).
 
     Loads ``NuScenesMap`` for the scene's ``location`` (requires the map-expansion
     unpacked under ``<dataroot>/maps/expansion/``), clips to the ego bounding box
@@ -729,12 +688,15 @@ def generate(args):
         n_seen = int((l_rgb != np.asarray(FALLBACK_RGB, np.uint8)).any(axis=1).sum())
         print(f"  camera colorize: {n_seen}/{len(l_rgb)} returns "
               f"({100 * n_seen / max(len(l_rgb), 1):.0f}%) got a camera color")
+        if colorizer is not None and colorizer.missing:
+            print(f"  warning: {len(colorizer.missing)} camera JPG(s) missing under "
+                  f"{dataroot} — those views contributed no color (FALLBACK_RGB)")
     lid_pq = out / "lidar.parquet"
     n_lidar = avc.write_lidar_points(lid_pq, lon=l_lon, lat=l_lat,
                                      timestamp=l_t, z=l_z, intensity=l_i,
                                      seg_class=l_seg, rgb=l_rgb)
 
-    # --- HD-map substrate (static, full-range — av-refinement.md §R2.2) ---
+    # --- HD-map substrate (static, full-range — av-cockpit.md §2 R2.2) ---
     # Clip the nuScenes map-expansion to the ego bbox+pad. ego_x/ego_y are raw
     # map-frame (ground) metres, the patch units get_records_in_patch wants;
     # extract_map projects every geom through the same ground-metre georef.
@@ -753,7 +715,7 @@ def generate(args):
     # --- lightweight ego polyline for the ego-follow camera (av-cockpit.md §3d).
     # Same lon/lat/t samples as the ego trips archive → the follow path tracks the
     # rendered ego trail exactly. ~40–80 pts; pure JSON, no rebuild.
-    ego_path = downsample_ego_path(ego_t, ego_lon, ego_lat)
+    ego_path = avc.downsample_ego_path(ego_t, ego_lon, ego_lat)
 
     # --- telemetry (CAN bus, optional) ---
     streams = {

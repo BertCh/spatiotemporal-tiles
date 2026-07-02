@@ -157,7 +157,8 @@ def extract(seg: Path, epoch_ms: int):
     try:
         vel = _load(seg, "global_pose", "frame_velocities")  # (N,3) ECEF m/s
     except FileNotFoundError:
-        pass
+        print("  warning: global_pose/frame_velocities missing — ego speed falls "
+              "back to finite difference and the heading channel is omitted")
 
     pos = pos[::EGO_DECIMATE]
     ftimes = ftimes[::EGO_DECIMATE]
