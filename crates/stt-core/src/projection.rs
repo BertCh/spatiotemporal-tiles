@@ -12,33 +12,22 @@ use geo_types::Point;
 
 #[cfg(feature = "projection")]
 use proj::Proj;
-#[cfg(feature = "projection")]
-use std::sync::OnceLock;
 
+// PROJ contexts hold raw C pointers and are neither Send nor Sync, so the
+// cached transform objects must be per-thread (`thread_local!`), never a
+// `static` (which requires Sync). Each thread pays one `Proj::new_known_crs`
+// on first use — negligible next to the transforms themselves.
 #[cfg(feature = "projection")]
-/// Cached projection from WGS84 to Web Mercator
-static WGS84_TO_WEB_MERCATOR: OnceLock<Proj> = OnceLock::new();
-
-#[cfg(feature = "projection")]
-/// Cached projection from Web Mercator to WGS84  
-static WEB_MERCATOR_TO_WGS84: OnceLock<Proj> = OnceLock::new();
-
-#[cfg(feature = "projection")]
-/// Get or initialize the WGS84 to Web Mercator projection
-fn wgs84_to_web_mercator() -> &'static Proj {
-    WGS84_TO_WEB_MERCATOR.get_or_init(|| {
+thread_local! {
+    /// Cached projection from WGS84 to Web Mercator (per thread).
+    static WGS84_TO_WEB_MERCATOR: Proj =
         Proj::new_known_crs("EPSG:4326", "EPSG:3857", None)
-            .expect("Failed to initialize WGS84 to Web Mercator projection")
-    })
-}
+            .expect("Failed to initialize WGS84 to Web Mercator projection");
 
-#[cfg(feature = "projection")]
-/// Get or initialize the Web Mercator to WGS84 projection
-fn web_mercator_to_wgs84() -> &'static Proj {
-    WEB_MERCATOR_TO_WGS84.get_or_init(|| {
+    /// Cached projection from Web Mercator to WGS84 (per thread).
+    static WEB_MERCATOR_TO_WGS84: Proj =
         Proj::new_known_crs("EPSG:3857", "EPSG:4326", None)
-            .expect("Failed to initialize Web Mercator to WGS84 projection")
-    })
+            .expect("Failed to initialize Web Mercator to WGS84 projection");
 }
 
 /// Convert WGS84 lon/lat to Web Mercator tile coordinates
@@ -196,9 +185,8 @@ pub fn tile_coords_to_lonlat(
 /// Without it, uses a simple approximation.
 #[cfg(feature = "projection")]
 pub fn wgs84_to_meters(point: Point<f64>) -> Result<Point<f64>> {
-    let proj = wgs84_to_web_mercator();
-    let (x, y) = proj
-        .convert((point.x(), point.y()))
+    let (x, y) = WGS84_TO_WEB_MERCATOR
+        .with(|proj| proj.convert((point.x(), point.y())))
         .map_err(|e| Error::Other(format!("Projection error: {}", e)))?;
     Ok(Point::new(x, y))
 }
@@ -222,9 +210,8 @@ pub fn wgs84_to_meters(point: Point<f64>) -> Result<Point<f64>> {
 /// Without it, uses a simple approximation.
 #[cfg(feature = "projection")]
 pub fn meters_to_wgs84(point: Point<f64>) -> Result<Point<f64>> {
-    let proj = web_mercator_to_wgs84();
-    let (x, y) = proj
-        .convert((point.x(), point.y()))
+    let (x, y) = WEB_MERCATOR_TO_WGS84
+        .with(|proj| proj.convert((point.x(), point.y())))
         .map_err(|e| Error::Other(format!("Projection error: {}", e)))?;
     Ok(Point::new(x, y))
 }
