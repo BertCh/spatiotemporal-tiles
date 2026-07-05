@@ -31,7 +31,7 @@ clap.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 
-# Temp single-file archive staging for the --streaming-arrow -> packed transcode.
+# Temp dirs for the integration/unit tests (packed-dataset round-trips).
 tempfile = "3.10"
 
 # H3 hexagonal aggregation cells for the summary tier.
@@ -40,10 +40,9 @@ h3o = "0.7"
 # Optional advanced projection support (requires system libproj)
 proj = { version = "0.27", optional = true }
 
-# GeoParquet/GeoArrow support. Mandatory: the tiler's Arrow IPC encode path
-# uses arrow/parquet unconditionally, so a geoparquet-less stt-build cannot
-# exist — the `geoparquet` feature below is a no-op kept for CLI compat.
-geoarrow = { workspace = true }
+# GeoParquet support. Mandatory: the tiler's Arrow IPC encode path uses
+# arrow/parquet unconditionally, so a geoparquet-less stt-build cannot exist —
+# the `geoparquet` feature below is a no-op kept for CLI compat.
 parquet = { workspace = true }
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
