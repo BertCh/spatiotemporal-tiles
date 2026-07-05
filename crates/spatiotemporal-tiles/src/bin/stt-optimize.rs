@@ -1,6 +1,8 @@
 //! stt-optimize CLI — a thin wrapper around the library in `lib.rs`.
 
-use stt_optimize::{analysis, loader, recommend, report};
+use stt_optimize::{
+    advisors, analysis, diff, doctor, loader, measure, recommend, report, PackedTileset,
+};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -65,6 +67,92 @@ enum Commands {
         /// Show suggested stt-build command
         #[arg(long)]
         show_command: bool,
+
+        /// Print an evidence table of every advisor suggestion after the
+        /// config JSON — flag, value, confidence, projected effect, and the
+        /// dataset-specific rationale. Includes LOSSY levers (marked); those
+        /// never join the suggested command and are never auto-applied.
+        #[arg(long)]
+        explain: bool,
+    },
+
+    /// Inspect a built packed tileset: per-zoom directory stats, dedup and
+    /// compression ratios, per-column compressed cost
+    Inspect {
+        /// Packed dataset directory (or its manifest.json)
+        #[arg(short, long)]
+        archive: PathBuf,
+
+        /// Decode only a deterministic, evenly-spread sample of at most N
+        /// tiles (0 skips the decode pass). Directory-derived stats always
+        /// cover every entry.
+        #[arg(long, value_name = "N")]
+        sample: Option<usize>,
+
+        /// Output format: "text" or "json"
+        #[arg(long, default_value = "text")]
+        format: String,
+
+        /// Output file path (default: stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Compare two built tilesets (totals, per-zoom, per-column deltas) —
+    /// e.g. before/after a re-encode
+    Diff {
+        /// Baseline packed dataset directory (or its manifest.json)
+        #[arg(long)]
+        before: PathBuf,
+
+        /// Comparison packed dataset directory (or its manifest.json)
+        #[arg(long)]
+        after: PathBuf,
+
+        /// Sample the decode pass on both sides (as `inspect --sample`);
+        /// totals and the growth gate stay exact.
+        #[arg(long, value_name = "N")]
+        sample: Option<usize>,
+
+        /// Output format: "text" or "json"
+        #[arg(long, default_value = "text")]
+        format: String,
+
+        /// Output file path (default: stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Exit non-zero after printing if `after` total compressed blob
+        /// bytes exceed `before` by more than this percentage
+        #[arg(long, value_name = "PCT")]
+        fail_on_growth: Option<f64>,
+    },
+
+    /// Lint a built packed tileset: severity-ranked findings, each with a
+    /// concrete remediation flag and a projected win from measured column
+    /// costs
+    Doctor {
+        /// Packed dataset directory (or its manifest.json)
+        #[arg(short, long)]
+        archive: PathBuf,
+
+        /// Sample the inspect decode pass (as `inspect --sample`); the
+        /// directory-derived rules always cover every entry
+        #[arg(long, value_name = "N")]
+        sample: Option<usize>,
+
+        /// Output format: "text" or "json"
+        #[arg(long, default_value = "text")]
+        format: String,
+
+        /// Output file path (default: stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Exit non-zero after printing if any Warning-or-worse finding
+        /// exists (CI gate; Info findings never trip it)
+        #[arg(long)]
+        strict: bool,
     },
 }
 
@@ -98,10 +186,32 @@ fn main() -> Result<()> {
             time_format,
             output,
             show_command,
+            explain,
         } => {
             tracing_subscriber::fmt::init();
-            run_recommend(&input, &time_field, &time_format, output, show_command)
+            run_recommend(&input, &time_field, &time_format, output, show_command, explain)
         }
+        Commands::Inspect {
+            archive,
+            sample,
+            format,
+            output,
+        } => run_inspect(&archive, sample, &format, output),
+        Commands::Diff {
+            before,
+            after,
+            sample,
+            format,
+            output,
+            fail_on_growth,
+        } => run_diff(&before, &after, sample, &format, output, fail_on_growth),
+        Commands::Doctor {
+            archive,
+            sample,
+            format,
+            output,
+            strict,
+        } => run_doctor(&archive, sample, &format, output, strict),
     }
 }
 
@@ -121,30 +231,38 @@ fn run_analyze(
         time_format: time_format.to_string(),
     };
 
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("         STT Optimization Analysis");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    // Progress banner on stderr — stdout stays pure report so
+    // `--format json` output can be piped straight into jq/a file.
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("         STT Optimization Analysis");
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
     // Load and analyze data
     let data = loader::load_data(&source)?;
-    
-    // Run all analyses
+
+    // Run all analyses (measured sample encoding calibrates the size
+    // estimates; None when the sample is too small).
     let spatial = analysis::spatial::analyze(&data)?;
     let temporal = analysis::temporal::analyze(&data)?;
     let geometry = analysis::geometry::analyze(&data)?;
-    let density = analysis::density::analyze(&data, &spatial)?;
+    let measured = measure::measure_sample(&data.sample, &measure::MeasureSettings::default())?;
+    let density = analysis::density::analyze(&data, &spatial, &temporal, measured.as_ref())?;
 
     let result = AnalysisResult {
         source: source.display_name(),
         feature_count: data.features.len(),
+        bounds: data.bounds,
         spatial,
         temporal,
         geometry,
         density,
+        measured,
     };
 
-    // Generate recommendations
-    let recommendations = recommend::generate_recommendations(&result);
+    // Generate recommendations (with the evidence-based advisor suggestions —
+    // the report carries them in its Advisor section / `advice` array).
+    let advice = advisors::run_all(&result, &data)?;
+    let recommendations = recommend::generate_recommendations(&result, advice);
 
     // Generate report
     let report_output = match format {
@@ -155,7 +273,7 @@ fn run_analyze(
     // Output report
     if let Some(output_path) = output {
         std::fs::write(&output_path, &report_output)?;
-        println!("Report written to: {}", output_path.display());
+        eprintln!("Report written to: {}", output_path.display());
     } else {
         println!("{}", report_output);
     }
@@ -169,6 +287,7 @@ fn run_recommend(
     time_format: &str,
     output: Option<PathBuf>,
     show_command: bool,
+    explain: bool,
 ) -> Result<()> {
     use loader::DataSource;
 
@@ -178,28 +297,33 @@ fn run_recommend(
         time_format: time_format.to_string(),
     };
 
-    println!("Analyzing dataset for optimal parameters...\n");
+    // Progress line on stderr — stdout stays pure config JSON when piped.
+    eprintln!("Analyzing dataset for optimal parameters...\n");
 
     // Load and analyze data
     let data = loader::load_data(&source)?;
-    
+
     // Run analyses
     let spatial = analysis::spatial::analyze(&data)?;
     let temporal = analysis::temporal::analyze(&data)?;
     let geometry = analysis::geometry::analyze(&data)?;
-    let density = analysis::density::analyze(&data, &spatial)?;
+    let measured = measure::measure_sample(&data.sample, &measure::MeasureSettings::default())?;
+    let density = analysis::density::analyze(&data, &spatial, &temporal, measured.as_ref())?;
 
     let result = analysis::AnalysisResult {
         source: source.display_name(),
         feature_count: data.features.len(),
+        bounds: data.bounds,
         spatial,
         temporal,
         geometry,
         density,
+        measured,
     };
 
-    // Generate recommendations
-    let recommendations = recommend::generate_recommendations(&result);
+    // Generate recommendations (with the evidence-based advisor suggestions)
+    let advice = advisors::run_all(&result, &data)?;
+    let recommendations = recommend::generate_recommendations(&result, advice);
 
     // Output as JSON config
     let config = recommend::to_build_config(&recommendations, input, time_field);
@@ -207,9 +331,13 @@ fn run_recommend(
 
     if let Some(output_path) = output {
         std::fs::write(&output_path, &json)?;
-        println!("Build config written to: {}", output_path.display());
+        eprintln!("Build config written to: {}", output_path.display());
     } else {
         println!("{}", json);
+    }
+
+    if explain {
+        print_advice_table(&recommendations.advice);
     }
 
     if show_command {
@@ -217,6 +345,140 @@ fn run_recommend(
         println!("{}", recommend::to_command(&recommendations, input, time_field));
     }
 
+    Ok(())
+}
+
+/// Print the `recommend --explain` evidence table: every advisor suggestion
+/// (including LOSSY levers, marked — those never join the suggested command
+/// and are never auto-applied), each with its dataset-specific rationale on a
+/// continuation line.
+fn print_advice_table(advice: &[advisors::Advice]) {
+    println!("\nAdvisor evidence:");
+    if advice.is_empty() {
+        println!("  (no advice — the defaults already fit this dataset)");
+        return;
+    }
+    println!(
+        "  {:<28} {:<12} {:<10} {}",
+        "FLAG", "VALUE", "CONFIDENCE", "PROJECTED"
+    );
+    for a in advice {
+        let value = a.value.as_deref().unwrap_or("—");
+        let mut projected = a.projected.clone().unwrap_or_else(|| "—".to_string());
+        if a.lossy {
+            projected.push_str("  [LOSSY - opt-in]");
+        }
+        // `to_string()` first: width specs only apply through `str`'s
+        // Display, not AdviceConfidence's `write_str`-based impl.
+        println!(
+            "  {:<28} {:<12} {:<10} {}",
+            a.flag,
+            value,
+            a.confidence.to_string(),
+            projected
+        );
+        println!("      → {}", a.why);
+    }
+}
+
+fn run_inspect(
+    archive: &PathBuf,
+    sample: Option<usize>,
+    format: &str,
+    output: Option<PathBuf>,
+) -> Result<()> {
+    let tileset = PackedTileset::open(archive)?;
+    let report = analysis::inspect::inspect(&tileset, sample)?;
+
+    let rendered = match format {
+        "json" => serde_json::to_string_pretty(&report)?,
+        _ => analysis::inspect::format_text(&report),
+    };
+    write_or_print(&rendered, output)
+}
+
+fn run_diff(
+    before: &PathBuf,
+    after: &PathBuf,
+    sample: Option<usize>,
+    format: &str,
+    output: Option<PathBuf>,
+    fail_on_growth: Option<f64>,
+) -> Result<()> {
+    let before_report = analysis::inspect::inspect(&PackedTileset::open(before)?, sample)?;
+    let after_report = analysis::inspect::inspect(&PackedTileset::open(after)?, sample)?;
+    let report = diff::diff(&before_report, &after_report);
+
+    let rendered = match format {
+        "json" => serde_json::to_string_pretty(&report)?,
+        _ => diff::format_text(&report),
+    };
+    write_or_print(&rendered, output)?;
+
+    if let Some(threshold) = fail_on_growth {
+        // Gate on the exact directory totals (unaffected by --sample). A zero
+        // baseline with a non-empty `after` counts as unbounded growth.
+        let d = &report.compressed_bytes;
+        let growth = d
+            .pct
+            .unwrap_or(if d.after > 0 { f64::INFINITY } else { 0.0 });
+        if growth > threshold {
+            eprintln!(
+                "FAIL: compressed blob bytes grew {growth:.2}% ({} -> {}), \
+                 over the --fail-on-growth gate of {threshold}%",
+                d.before, d.after
+            );
+            std::process::exit(1);
+        }
+        eprintln!("--fail-on-growth gate OK: {growth:.2}% <= {threshold}%");
+    }
+    Ok(())
+}
+
+fn run_doctor(
+    archive: &PathBuf,
+    sample: Option<usize>,
+    format: &str,
+    output: Option<PathBuf>,
+    strict: bool,
+) -> Result<()> {
+    let tileset = PackedTileset::open(archive)?;
+    let inspect_report = analysis::inspect::inspect(&tileset, sample)?;
+    let report = doctor::doctor(&tileset, &inspect_report)?;
+
+    let rendered = match format {
+        "json" => serde_json::to_string_pretty(&report)?,
+        _ => doctor::format_text(&report),
+    };
+    write_or_print(&rendered, output)?;
+
+    if strict {
+        // Gate on Warning-or-worse only (Critical sorts before Warning);
+        // Info findings never trip CI. Print first, exit after — the
+        // `diff --fail-on-growth` pattern.
+        let bad = report
+            .findings
+            .iter()
+            .filter(|f| f.severity <= doctor::Severity::Warning)
+            .count();
+        if bad > 0 {
+            eprintln!("FAIL: --strict gate — {bad} Warning-or-worse finding(s)");
+            std::process::exit(1);
+        }
+        eprintln!("--strict gate OK: no Warning-or-worse findings");
+    }
+    Ok(())
+}
+
+/// Write `rendered` to `output`, or print it to stdout. The status line goes
+/// to stderr so piped stdout stays pure report.
+fn write_or_print(rendered: &str, output: Option<PathBuf>) -> Result<()> {
+    if let Some(path) = output {
+        std::fs::write(&path, rendered)?;
+        eprintln!("Report written to: {}", path.display());
+    } else {
+        println!("{}", rendered);
+    }
     Ok(())
 }
 

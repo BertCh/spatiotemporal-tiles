@@ -1,10 +1,13 @@
-//! Tile density simulation and chunk size analysis
+//! Tile density analysis
 //!
-//! Simulates tile generation at various chunk sizes to predict
-//! optimal parameters and identify potential issues.
+//! Buckets features into (zoom, x, y, time-bucket) tiles — the same cut a
+//! real `stt-build` run makes with `--temporal-bucket` — to predict tile
+//! counts, per-tile feature loads, and archive size, and to flag issues.
 
 use crate::analysis::spatial::SpatialAnalysis;
+use crate::analysis::temporal::TemporalAnalysis;
 use crate::loader::LoadedData;
+use crate::measure::MeasuredEncoding;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -13,11 +16,9 @@ use stt_core::projection;
 /// Density analysis results
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DensityAnalysis {
-    /// Simulated results at different chunk sizes
-    pub chunk_simulations: Vec<ChunkSimulation>,
-    /// Recommended chunk size in bytes
-    pub recommended_chunk_size: usize,
-    /// Estimated total tile count at recommended settings
+    /// Per-zoom tile statistics across the recommended zoom range
+    pub per_zoom: Vec<ZoomDensity>,
+    /// Estimated total tile count at recommended settings (summed over zooms)
     pub estimated_tile_count: usize,
     /// Estimated archive size in bytes (compressed)
     pub estimated_archive_size: usize,
@@ -25,12 +26,13 @@ pub struct DensityAnalysis {
     pub issues: Vec<DensityIssue>,
 }
 
-/// Simulation results for a specific chunk size
+/// Tile statistics for one zoom level, with features split into
+/// (x, y, time-bucket) tiles by the recommended temporal bucket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkSimulation {
-    /// Target chunk size in bytes
-    pub chunk_size: usize,
-    /// Estimated number of tiles
+pub struct ZoomDensity {
+    /// Zoom level
+    pub zoom: u8,
+    /// Number of (x, y, time-bucket) tiles at this zoom
     pub tile_count: usize,
     /// Average features per tile
     pub avg_features_per_tile: f64,
@@ -38,13 +40,16 @@ pub struct ChunkSimulation {
     pub median_features_per_tile: usize,
     /// Maximum features in any tile
     pub max_features_per_tile: usize,
-    /// Number of oversized tiles (> max recommended features)
+    /// Number of oversized tiles (> 10,000 features)
     pub oversized_tiles: usize,
     /// Number of undersized tiles (< 10 features)
     pub undersized_tiles: usize,
-    /// Estimated total size (uncompressed)
+    /// Estimated total size at this zoom, uncompressed (measured-sample
+    /// calibrated when a measurement is available, else summed per-feature
+    /// formula estimates)
     pub estimated_size_uncompressed: usize,
-    /// Estimated total size (compressed, assuming 3x ratio)
+    /// Estimated total size at this zoom, compressed (measured bytes/feature
+    /// and zstd ratio when available, else an assumed 3x ratio)
     pub estimated_size_compressed: usize,
 }
 
@@ -77,254 +82,165 @@ impl std::fmt::Display for IssueSeverity {
     }
 }
 
-/// Analyze density characteristics and simulate chunk sizing
-pub fn analyze(data: &LoadedData, spatial: &SpatialAnalysis) -> Result<DensityAnalysis> {
-    // Chunk sizes to simulate (in bytes)
-    let chunk_sizes = [
-        64_000,   // 64 KB
-        128_000,  // 128 KB
-        256_000,  // 256 KB
-        500_000,  // 500 KB (default)
-        1_000_000, // 1 MB
-        2_000_000, // 2 MB
-    ];
-
-    // A real build emits tiles across the whole recommended [min_zoom, max_zoom]
-    // range, not just at max_zoom. Simulate every zoom in that range and
-    // aggregate, so predicted tile counts / archive size reflect a multi-zoom
-    // build rather than a single deepest level.
+/// Analyze tile density across the recommended zoom range.
+///
+/// Models the real build: at every zoom in the recommended
+/// `[min_zoom, max_zoom]` range each feature lands in its containing (x, y)
+/// tile, split by fixed `--temporal-bucket`-sized time buckets (the
+/// recommended bucket from the temporal analysis). This is the cut `stt-build`
+/// actually makes, so predicted tile counts and sizes track a real build.
+///
+/// When a `measured` sample encoding is present, size estimates use its real
+/// encoder bytes/feature and zstd ratio; otherwise the per-feature formula
+/// estimate with an assumed 3x compression ratio is the fallback.
+pub fn analyze(
+    data: &LoadedData,
+    spatial: &SpatialAnalysis,
+    temporal: &TemporalAnalysis,
+    measured: Option<&MeasuredEncoding>,
+) -> Result<DensityAnalysis> {
+    let bucket_ms = temporal.recommended_bucket_ms;
     let zooms: Vec<u8> = (spatial.recommended_min_zoom..=spatial.recommended_max_zoom).collect();
     tracing::debug!(
-        "density sim: simulating zooms {:?} over {} features (no per-zoom sampling cap)",
-        zooms,
-        data.features.len()
+        "density: bucketing {} features into (x, y, t/{}ms) tiles at zooms {:?}",
+        data.features.len(),
+        bucket_ms,
+        zooms
     );
 
-    let mut simulations = Vec::new();
-    for &chunk_size in &chunk_sizes {
-        let sim = simulate_chunk_size_multizoom(data, chunk_size, &zooms);
-        simulations.push(sim);
+    let mut per_zoom = Vec::with_capacity(zooms.len());
+    for &zoom in &zooms {
+        per_zoom.push(bucket_zoom(data, zoom, bucket_ms, measured));
     }
 
-    // Find optimal chunk size (minimize oversized tiles while keeping tile count reasonable)
-    let (recommended_chunk_size, best_sim_idx) = find_optimal_chunk_size(&simulations);
+    let estimated_tile_count = per_zoom.iter().map(|z| z.tile_count).sum();
+    let estimated_archive_size = per_zoom.iter().map(|z| z.estimated_size_compressed).sum();
 
-    let estimated_tile_count = simulations[best_sim_idx].tile_count;
-    let estimated_archive_size = simulations[best_sim_idx].estimated_size_compressed;
-
-    // Identify issues
-    let issues = identify_issues(data, spatial, &simulations[best_sim_idx]);
+    let issues = identify_issues(
+        data,
+        spatial,
+        &per_zoom,
+        estimated_tile_count,
+        estimated_archive_size,
+    );
 
     Ok(DensityAnalysis {
-        chunk_simulations: simulations,
-        recommended_chunk_size,
+        per_zoom,
         estimated_tile_count,
         estimated_archive_size,
         issues,
     })
 }
 
-/// Simulate a build across multiple zoom levels for a fixed chunk size, then
-/// aggregate into one [`ChunkSimulation`]. This mirrors a real multi-zoom build:
-/// the same features are re-tiled at each zoom and the resulting tile/chunk
-/// counts and byte totals are summed across all zooms. The per-tile feature
-/// distribution (avg/median/max, oversized/undersized counts) pools every
-/// chunk from every zoom.
-fn simulate_chunk_size_multizoom(
+/// Bucket every feature into its (x, y, time-bucket) tile at one zoom and
+/// compute per-tile statistics. `bucket_ms == 0` (no temporal bucketing, e.g.
+/// an instantaneous dataset) collapses to a single time bucket per tile.
+fn bucket_zoom(
     data: &LoadedData,
-    chunk_size: usize,
-    zooms: &[u8],
-) -> ChunkSimulation {
-    let mut tile_count = 0usize;
-    let mut feature_counts: Vec<usize> = Vec::new();
-    let mut total_uncompressed = 0usize;
+    zoom: u8,
+    bucket_ms: u64,
+    measured: Option<&MeasuredEncoding>,
+) -> ZoomDensity {
+    // (feature count, estimated bytes) per (x, y, t_bucket) tile.
+    let mut tiles: HashMap<(u32, u32, u64), (usize, usize)> = HashMap::new();
 
-    for &zoom in zooms {
-        let per_zoom = simulate_zoom_chunks(data, chunk_size, zoom);
-        tile_count += per_zoom.tile_count;
-        total_uncompressed += per_zoom.total_uncompressed;
-        feature_counts.extend(per_zoom.feature_counts);
-    }
-
-    finalize_simulation(chunk_size, tile_count, feature_counts, total_uncompressed)
-}
-
-/// Raw per-zoom chunking result, before stats aggregation.
-struct ZoomChunkResult {
-    tile_count: usize,
-    feature_counts: Vec<usize>,
-    total_uncompressed: usize,
-}
-
-/// Chunk the dataset at a single zoom into size-bounded chunks. Returns the raw
-/// counts so callers can aggregate across zooms before computing statistics.
-fn simulate_zoom_chunks(data: &LoadedData, chunk_size: usize, zoom: u8) -> ZoomChunkResult {
-    // Group features by spatial tile at the target zoom
-    let mut tile_features: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
-
-    for (idx, feature) in data.features.iter().enumerate() {
+    for feature in &data.features {
         if let Ok((x, y)) = projection::lonlat_to_tile(feature.lon, feature.lat, zoom) {
-            tile_features.entry((x, y)).or_insert_with(Vec::new).push(idx);
+            let t_bucket = if bucket_ms > 0 {
+                feature.timestamp / bucket_ms
+            } else {
+                0
+            };
+            let entry = tiles.entry((x, y, t_bucket)).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += feature.estimated_size;
         }
     }
 
-    // Simulate chunking based on size
-    let mut tile_count = 0;
-    let mut feature_counts = Vec::new();
-    let mut total_uncompressed = 0;
+    let mut feature_counts: Vec<usize> = tiles.values().map(|&(count, _)| count).collect();
+    feature_counts.sort_unstable();
+    let total_uncompressed: usize = tiles.values().map(|&(_, bytes)| bytes).sum();
 
-    for (_, feature_indices) in &tile_features {
-        // Sort by timestamp
-        let mut indices = feature_indices.clone();
-        indices.sort_by_key(|&i| data.features[i].timestamp);
-
-        // Chunk by size
-        let mut current_chunk_size = 0;
-        let mut current_chunk_features = 0;
-
-        for &idx in &indices {
-            let feature_size = data.features[idx].estimated_size;
-
-            if current_chunk_size > 0 && current_chunk_size + feature_size > chunk_size {
-                // Start new chunk
-                tile_count += 1;
-                feature_counts.push(current_chunk_features);
-                total_uncompressed += current_chunk_size;
-                current_chunk_size = 0;
-                current_chunk_features = 0;
-            }
-
-            current_chunk_size += feature_size;
-            current_chunk_features += 1;
-        }
-
-        // Last chunk
-        if current_chunk_features > 0 {
-            tile_count += 1;
-            feature_counts.push(current_chunk_features);
-            total_uncompressed += current_chunk_size;
-        }
-    }
-
-    ZoomChunkResult {
-        tile_count,
-        feature_counts,
-        total_uncompressed,
-    }
-}
-
-/// Compute the aggregate statistics for a (possibly multi-zoom) chunk run.
-fn finalize_simulation(
-    chunk_size: usize,
-    tile_count: usize,
-    mut feature_counts: Vec<usize>,
-    total_uncompressed: usize,
-) -> ChunkSimulation {
-    // Calculate statistics
-    feature_counts.sort();
-    let avg_features = if tile_count > 0 {
+    let tile_count = feature_counts.len();
+    let avg_features_per_tile = if tile_count > 0 {
         feature_counts.iter().sum::<usize>() as f64 / tile_count as f64
     } else {
         0.0
     };
-
-    let median_features = if !feature_counts.is_empty() {
-        feature_counts[feature_counts.len() / 2]
-    } else {
-        0
-    };
-
-    let max_features = feature_counts.iter().copied().max().unwrap_or(0);
+    let median_features_per_tile = feature_counts.get(tile_count / 2).copied().unwrap_or(0);
+    let max_features_per_tile = feature_counts.last().copied().unwrap_or(0);
     // 10,000-feature "oversized" threshold is a rough rule of thumb for a tile
     // that will be slow to decode/render; it is not a hard format limit.
-    let oversized = feature_counts.iter().filter(|&&c| c > 10_000).count();
-    let undersized = feature_counts.iter().filter(|&&c| c < 10).count();
+    let oversized_tiles = feature_counts.iter().filter(|&&c| c > 10_000).count();
+    let undersized_tiles = feature_counts.iter().filter(|&&c| c < 10).count();
 
-    // Estimate compressed size. The 3x ratio is a rough estimate (zstd on
-    // mixed coordinate/property payloads); real ratios vary by dataset.
-    let estimated_compressed = total_uncompressed / 3;
+    // Size estimates: calibrated by the measured sample encoding when present
+    // (real encoder + zstd bytes/feature). Without a measurement, fall back to
+    // the summed per-feature formula estimates with an assumed 3x zstd ratio
+    // (a rough guess; real ratios vary by dataset).
+    let (estimated_size_uncompressed, estimated_size_compressed) = match measured {
+        Some(m) => {
+            let bucketed_features: usize = feature_counts.iter().sum();
+            let compressed = (bucketed_features as f64 * m.bytes_per_feature).round() as usize;
+            let uncompressed = (compressed as f64 * m.zstd_ratio).round() as usize;
+            (uncompressed, compressed)
+        }
+        None => (total_uncompressed, total_uncompressed / 3),
+    };
 
-    ChunkSimulation {
-        chunk_size,
+    ZoomDensity {
+        zoom,
         tile_count,
-        avg_features_per_tile: avg_features,
-        median_features_per_tile: median_features,
-        max_features_per_tile: max_features,
-        oversized_tiles: oversized,
-        undersized_tiles: undersized,
-        estimated_size_uncompressed: total_uncompressed,
-        estimated_size_compressed: estimated_compressed,
+        avg_features_per_tile,
+        median_features_per_tile,
+        max_features_per_tile,
+        oversized_tiles,
+        undersized_tiles,
+        estimated_size_uncompressed,
+        estimated_size_compressed,
     }
 }
 
-/// Find the optimal chunk size from simulations
-fn find_optimal_chunk_size(simulations: &[ChunkSimulation]) -> (usize, usize) {
-    // Score each simulation
-    // Prefer: low oversized, reasonable tile count, good compression potential
-    let scores: Vec<(usize, f64)> = simulations
-        .iter()
-        .enumerate()
-        .map(|(idx, sim)| {
-            let mut score = 100.0;
-
-            // Penalize oversized tiles heavily
-            score -= sim.oversized_tiles as f64 * 10.0;
-
-            // Penalize too many undersized tiles
-            score -= (sim.undersized_tiles as f64 / 10.0).min(20.0);
-
-            // Prefer moderate tile counts (1000-5000)
-            if sim.tile_count < 100 {
-                score -= 20.0;
-            } else if sim.tile_count > 10000 {
-                score -= (sim.tile_count as f64 - 10000.0) / 1000.0;
-            }
-
-            // Prefer chunk sizes around 256-500 KB
-            let chunk_kb = sim.chunk_size / 1000;
-            if chunk_kb < 100 {
-                score -= 5.0;
-            } else if chunk_kb > 1000 {
-                score -= 5.0;
-            }
-
-            (idx, score)
-        })
-        .collect();
-
-    // Find best score
-    let (best_idx, _) = scores
-        .iter()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .cloned()
-        .unwrap_or((2, 0.0)); // Default to 256 KB
-
-    (simulations[best_idx].chunk_size, best_idx)
-}
-
-/// Identify potential issues
+/// Identify potential issues from the per-zoom breakdown. Every suggestion
+/// names real `stt-build` flags; per-tile budgets are always described as
+/// opt-in with a data-loss tradeoff.
 fn identify_issues(
     data: &LoadedData,
     spatial: &SpatialAnalysis,
-    sim: &ChunkSimulation,
+    per_zoom: &[ZoomDensity],
+    total_tile_count: usize,
+    estimated_archive_size: usize,
 ) -> Vec<DensityIssue> {
     let mut issues = Vec::new();
 
+    let oversized: usize = per_zoom.iter().map(|z| z.oversized_tiles).sum();
+    let undersized: usize = per_zoom.iter().map(|z| z.undersized_tiles).sum();
+    let max_features = per_zoom
+        .iter()
+        .map(|z| z.max_features_per_tile)
+        .max()
+        .unwrap_or(0);
+
     // Check for oversized tiles
-    if sim.oversized_tiles > 0 {
+    if oversized > 0 {
         issues.push(DensityIssue {
             severity: IssueSeverity::Warning,
             description: format!(
                 "{} tiles exceed 10,000 features (max: {})",
-                sim.oversized_tiles, sim.max_features_per_tile
+                oversized, max_features
             ),
-            suggestion: "Consider enabling tile budgets or reducing max zoom level".to_string(),
+            suggestion: "Use a finer --temporal-bucket to spread features over more time \
+                         buckets, or opt into per-tile budgets (--maximum-tile-bytes / \
+                         --maximum-tile-features, optionally --drop-densest-as-needed) — \
+                         budgets drop features to fit, trading data loss for tile size. For \
+                         very dense point sets, --summary-tier bakes aggregate overview tiles"
+                .to_string(),
         });
     }
 
     // Check for many undersized tiles
-    let undersized_pct = if sim.tile_count > 0 {
-        sim.undersized_tiles as f64 / sim.tile_count as f64 * 100.0
+    let undersized_pct = if total_tile_count > 0 {
+        undersized as f64 / total_tile_count as f64 * 100.0
     } else {
         0.0
     };
@@ -335,24 +251,32 @@ fn identify_issues(
                 "{:.1}% of tiles have fewer than 10 features",
                 undersized_pct
             ),
-            suggestion: "Consider reducing max zoom or increasing temporal bucketing".to_string(),
+            suggestion: "Lower --max-zoom or use a coarser --temporal-bucket so tiles \
+                         aggregate more features"
+                .to_string(),
         });
     }
 
     // Check for very high tile count
-    if sim.tile_count > 50_000 {
+    if total_tile_count > 50_000 {
         issues.push(DensityIssue {
             severity: IssueSeverity::Warning,
             description: format!(
                 "High tile count ({}) may impact loading performance",
-                sim.tile_count
+                total_tile_count
             ),
-            suggestion: "Consider reducing zoom range or increasing chunk size".to_string(),
+            suggestion: "Narrow the zoom range (--min-zoom / --max-zoom) or use a coarser \
+                         --temporal-bucket"
+                .to_string(),
         });
     }
 
     // Check for sparse data at high zooms
-    if let Some(z_max) = spatial.zoom_coverage.iter().find(|z| z.zoom == spatial.recommended_max_zoom) {
+    if let Some(z_max) = spatial
+        .zoom_coverage
+        .iter()
+        .find(|z| z.zoom == spatial.recommended_max_zoom)
+    {
         if z_max.coverage_percent < 0.1 {
             issues.push(DensityIssue {
                 severity: IssueSeverity::Info,
@@ -360,18 +284,23 @@ fn identify_issues(
                     "Only {:.2}% coverage at zoom {}",
                     z_max.coverage_percent, spatial.recommended_max_zoom
                 ),
-                suggestion: "Data is sparse at this zoom level, consider reducing max zoom".to_string(),
+                suggestion: "Data is sparse at this zoom level; lower --max-zoom".to_string(),
             });
         }
     }
 
     // Check estimated archive size
-    let size_mb = sim.estimated_size_compressed as f64 / 1_048_576.0;
+    let size_mb = estimated_archive_size as f64 / 1_048_576.0;
     if size_mb > 500.0 {
         issues.push(DensityIssue {
             severity: IssueSeverity::Warning,
             description: format!("Large estimated archive size ({:.1} MB)", size_mb),
-            suggestion: "Consider splitting into multiple archives or reducing data scope".to_string(),
+            suggestion: "Lower --max-zoom, or opt into per-tile budgets \
+                         (--maximum-tile-bytes / --maximum-tile-features, optionally \
+                         --drop-densest-as-needed) which drop features to fit (data loss). \
+                         For very dense point sets, --summary-tier bakes aggregate overview \
+                         tiles instead of full-resolution features"
+                .to_string(),
         });
     }
 
@@ -387,7 +316,12 @@ fn identify_issues(
                     hotspot_pct,
                     top_hotspot.name.as_deref().unwrap_or("one region")
                 ),
-                suggestion: "Hotspot areas may have larger tiles; budgets recommended".to_string(),
+                suggestion: "Hotspot tiles will be large; opt-in per-tile budgets \
+                             (--maximum-tile-bytes / --maximum-tile-features, which drop \
+                             features to fit — data loss) cap them, or a per-feature \
+                             --min-zoom-field keeps coarse zooms light by holding minor \
+                             features back to deeper zooms"
+                    .to_string(),
             });
         }
     }
@@ -401,7 +335,20 @@ mod tests {
     use crate::loader::{AnalyzableFeature, GeometryType};
     use stt_core::types::{BoundingBox, TimeRange};
 
-    /// Build synthetic data spread over a small region for density simulation.
+    fn feature(lon: f64, lat: f64, timestamp: u64) -> AnalyzableFeature {
+        AnalyzableFeature {
+            lon,
+            lat,
+            timestamp,
+            geometry_type: GeometryType::Point,
+            vertex_count: 1,
+            estimated_size: 150,
+            property_count: 2,
+        }
+    }
+
+    /// Build synthetic data spread over a small region with timestamps spread
+    /// over ~n² seconds.
     fn make_grid_data(n_side: usize) -> LoadedData {
         let mut features = Vec::new();
         let mut min_lon = f64::MAX;
@@ -416,98 +363,126 @@ mod tests {
                 max_lon = max_lon.max(lon);
                 min_lat = min_lat.min(lat);
                 max_lat = max_lat.max(lat);
-                features.push(AnalyzableFeature {
-                    lon,
-                    lat,
-                    timestamp: (i * n_side + j) as u64 * 1000,
-                    geometry_type: GeometryType::Point,
-                    vertex_count: 1,
-                    estimated_size: 150,
-                    property_count: 2,
-                });
+                features.push(feature(lon, lat, (i * n_side + j) as u64 * 1000));
             }
         }
         LoadedData {
             features,
             bounds: BoundingBox::new(min_lon, min_lat, max_lon, max_lat),
             time_range: TimeRange::new(0, 1_000_000),
+            sample: Vec::new(),
         }
     }
 
     #[test]
-    fn test_multizoom_sim_more_tiles_than_single_zoom() {
-        // Simulating across a zoom *range* must produce at least as many tiles as
-        // any single zoom in that range (it sums tiles from every level), and the
-        // aggregate must be strictly positive.
+    fn test_bucket_zoom_splits_by_temporal_bucket() {
+        // 100 features at ONE location spread over 100s: with a 10s bucket the
+        // single spatial tile must split into 10 (x, y, t) tiles; with no
+        // bucketing (bucket_ms = 0) it stays a single tile.
+        let features: Vec<_> = (0..100u64).map(|i| feature(-100.0, 40.0, i * 1_000)).collect();
+        let data = LoadedData {
+            features,
+            bounds: BoundingBox::new(-100.0, 40.0, -100.0, 40.0),
+            time_range: TimeRange::new(0, 100_000),
+            sample: Vec::new(),
+        };
+
+        let bucketed = bucket_zoom(&data, 10, 10_000, None);
+        assert_eq!(bucketed.tile_count, 10);
+        assert_eq!(bucketed.max_features_per_tile, 10);
+        assert_eq!(bucketed.estimated_size_uncompressed, 100 * 150);
+
+        let unbucketed = bucket_zoom(&data, 10, 0, None);
+        assert_eq!(unbucketed.tile_count, 1);
+        assert_eq!(unbucketed.max_features_per_tile, 100);
+    }
+
+    #[test]
+    fn test_measured_calibration_replaces_formula() {
+        // A measured sample encoding must drive both size estimates (real
+        // bytes/feature and zstd ratio), replacing the formula + /3 fallback.
+        let features: Vec<_> = (0..100u64).map(|i| feature(-100.0, 40.0, i * 1_000)).collect();
+        let data = LoadedData {
+            features,
+            bounds: BoundingBox::new(-100.0, 40.0, -100.0, 40.0),
+            time_range: TimeRange::new(0, 100_000),
+            sample: Vec::new(),
+        };
+        let measured = MeasuredEncoding {
+            features: 100,
+            geometry_kind: "point".to_string(),
+            bytes_total: 4_200,
+            bytes_per_feature: 42.0,
+            zstd_ratio: 2.0,
+            per_column: Vec::new(),
+        };
+
+        let calibrated = bucket_zoom(&data, 10, 0, Some(&measured));
+        assert_eq!(calibrated.estimated_size_compressed, 100 * 42);
+        assert_eq!(calibrated.estimated_size_uncompressed, 100 * 42 * 2);
+
+        // The no-measurement fallback keeps the formula estimates.
+        let fallback = bucket_zoom(&data, 10, 0, None);
+        assert_eq!(fallback.estimated_size_uncompressed, 100 * 150);
+        assert_eq!(fallback.estimated_size_compressed, 100 * 150 / 3);
+    }
+
+    #[test]
+    fn test_analyze_aggregates_across_zoom_range() {
+        // End-to-end: analyze() must produce one ZoomDensity per zoom in the
+        // recommended range, and the aggregates must sum the per-zoom stats.
         let data = make_grid_data(20); // 400 points
-        let chunk_size = 256_000;
-
-        let single = simulate_zoom_chunks(&data, chunk_size, 8);
-        let multi = simulate_chunk_size_multizoom(&data, chunk_size, &[4, 6, 8, 10, 12]);
-
-        assert!(multi.tile_count > 0, "multi-zoom sim produced zero tiles");
-        assert!(
-            multi.tile_count >= single.tile_count,
-            "multi-zoom tile_count {} should be >= single-zoom z8 {}",
-            multi.tile_count,
-            single.tile_count
-        );
-        assert!(multi.estimated_size_uncompressed > 0);
-        assert!(multi.estimated_size_compressed > 0);
-    }
-
-    #[test]
-    fn test_analyze_multizoom_returns_positive_tiles() {
-        // End-to-end: analyze() must report a positive tile count and archive
-        // size aggregated across the recommended zoom range.
-        let data = make_grid_data(15); // 225 points
         let spatial = crate::analysis::spatial::analyze(&data).unwrap();
-        let density = analyze(&data, &spatial).unwrap();
+        let temporal = crate::analysis::temporal::analyze(&data).unwrap();
+        let density = analyze(&data, &spatial, &temporal, None).unwrap();
 
-        assert!(
-            density.estimated_tile_count > 0,
-            "estimated_tile_count should be > 0"
+        let expected_zooms =
+            (spatial.recommended_min_zoom..=spatial.recommended_max_zoom).count();
+        assert_eq!(density.per_zoom.len(), expected_zooms);
+        assert_eq!(
+            density.estimated_tile_count,
+            density.per_zoom.iter().map(|z| z.tile_count).sum::<usize>()
         );
-        assert!(
-            density.estimated_archive_size > 0,
-            "estimated_archive_size should be > 0"
-        );
-        // Every chunk-size simulation should have produced tiles across zooms.
-        assert!(density
-            .chunk_simulations
-            .iter()
-            .all(|s| s.tile_count > 0));
+        assert!(density.estimated_archive_size > 0);
+        assert!(density.per_zoom.iter().all(|z| z.tile_count > 0));
+        // Point data: a deeper zoom can only split (x, y, t) tiles, never merge
+        // them, so tile counts are non-decreasing across the range.
+        for pair in density.per_zoom.windows(2) {
+            assert!(
+                pair[1].tile_count >= pair[0].tile_count,
+                "z{} tile_count {} < z{} tile_count {}",
+                pair[1].zoom,
+                pair[1].tile_count,
+                pair[0].zoom,
+                pair[0].tile_count
+            );
+        }
     }
 
     #[test]
-    fn test_find_optimal_chunk_size() {
-        let simulations = vec![
-            ChunkSimulation {
-                chunk_size: 128_000,
-                tile_count: 5000,
-                avg_features_per_tile: 50.0,
-                median_features_per_tile: 45,
-                max_features_per_tile: 500,
-                oversized_tiles: 0,
-                undersized_tiles: 100,
-                estimated_size_uncompressed: 10_000_000,
-                estimated_size_compressed: 3_000_000,
-            },
-            ChunkSimulation {
-                chunk_size: 256_000,
-                tile_count: 3000,
-                avg_features_per_tile: 80.0,
-                median_features_per_tile: 75,
-                max_features_per_tile: 800,
-                oversized_tiles: 0,
-                undersized_tiles: 50,
-                estimated_size_uncompressed: 10_000_000,
-                estimated_size_compressed: 3_000_000,
-            },
-        ];
+    fn test_oversized_issue_names_real_build_flags() {
+        // >10k features in one (x, y, t) tile must yield an oversized warning
+        // whose suggestion names real stt-build flags.
+        let features: Vec<_> = (0..10_001).map(|_| feature(-100.0, 40.0, 0)).collect();
+        let data = LoadedData {
+            features,
+            bounds: BoundingBox::new(-100.0, 40.0, -100.0, 40.0),
+            time_range: TimeRange::new(0, 0),
+            sample: Vec::new(),
+        };
+        let spatial = crate::analysis::spatial::analyze(&data).unwrap();
+        let temporal = crate::analysis::temporal::analyze(&data).unwrap();
+        let density = analyze(&data, &spatial, &temporal, None).unwrap();
 
-        let (chunk_size, _) = find_optimal_chunk_size(&simulations);
-        assert_eq!(chunk_size, 256_000);
+        let oversized: usize = density.per_zoom.iter().map(|z| z.oversized_tiles).sum();
+        assert!(oversized > 0, "expected oversized tiles");
+        let issue = density
+            .issues
+            .iter()
+            .find(|i| i.description.contains("10,000"))
+            .expect("oversized issue present");
+        assert!(issue.suggestion.contains("--maximum-tile-bytes"));
+        assert!(issue.suggestion.contains("--maximum-tile-features"));
+        assert!(issue.suggestion.contains("--temporal-bucket"));
     }
 }
-

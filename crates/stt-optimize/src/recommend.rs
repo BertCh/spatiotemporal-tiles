@@ -2,6 +2,7 @@
 //!
 //! Combines analysis results to generate optimal stt-build parameters.
 
+use crate::advisors::Advice;
 use crate::analysis::AnalysisResult;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -9,8 +10,9 @@ use std::path::Path;
 /// Recommended parameters for stt-build.
 ///
 /// `stt-build --auto` folds `min_zoom`, `max_zoom`, and `temporal_bucket_ms`
-/// into its own args and logs `confidence`/`explanations`; all fields also
-/// appear in the standalone `analyze`/`recommend` reports.
+/// into its own args and logs `confidence`/`explanations` (`--auto encode`
+/// additionally applies the non-lossy byte-level entries of `advice`); all
+/// fields also appear in the standalone `analyze`/`recommend` reports.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recommendations {
     /// Minimum zoom level
@@ -25,10 +27,17 @@ pub struct Recommendations {
     pub confidence: u8,
     /// Explanation of key decisions
     pub explanations: Vec<String>,
+    /// Evidence-based advisor suggestions ([`crate::advisors::run_all`]),
+    /// in advisor order (quantize, temporal, layout, budget). Entries with
+    /// `lossy: true` are surfaced only — they never join [`to_command`] and
+    /// are never auto-applied by `stt-build --auto`.
+    #[serde(default)]
+    pub advice: Vec<Advice>,
 }
 
-/// Generate recommendations from analysis results
-pub fn generate_recommendations(result: &AnalysisResult) -> Recommendations {
+/// Generate recommendations from analysis results, attaching the advisor
+/// suggestions (pass an empty `Vec` when the advisors were not run).
+pub fn generate_recommendations(result: &AnalysisResult, advice: Vec<Advice>) -> Recommendations {
     let mut explanations = Vec::new();
 
     // Zoom levels from spatial analysis
@@ -59,6 +68,7 @@ pub fn generate_recommendations(result: &AnalysisResult) -> Recommendations {
         temporal_bucket_human,
         confidence,
         explanations,
+        advice,
     }
 }
 
@@ -110,7 +120,12 @@ pub fn to_build_config(
     })
 }
 
-/// Convert recommendations to an stt-build command line
+/// Convert recommendations to an stt-build command line.
+///
+/// NON-LOSSY advisor advice is appended (flag + value, in advisor order) so
+/// the pasteable command carries the reversible byte-level/semantic levers.
+/// LOSSY advice (quantization, budgets) NEVER joins the command — it degrades
+/// data and stays a per-dataset opt-in the user must add by hand.
 pub fn to_command(
     recommendations: &Recommendations,
     input: &Path,
@@ -127,34 +142,188 @@ pub fn to_command(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "input.parquet".to_string());
 
-    format!(
+    let mut cmd = format!(
         "stt-build --input {} --output {} \\\n  --time-field {} --min-zoom {} --max-zoom {}",
         input_str,
         output_str,
         time_field,
         recommendations.min_zoom,
         recommendations.max_zoom,
-    )
+    );
+    // Stable order: exactly the advisor emit order (quantize, temporal,
+    // layout, budget), filtered to the non-lossy entries.
+    for advice in recommendations.advice.iter().filter(|a| !a.lossy) {
+        cmd.push_str(" \\\n  ");
+        cmd.push_str(&advice.flag);
+        if let Some(value) = &advice.value {
+            cmd.push(' ');
+            cmd.push_str(value);
+        }
+    }
+    cmd
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::advisors::AdviceConfidence;
+    use crate::analysis::density::DensityAnalysis;
+    use crate::analysis::geometry::{
+        GeometryAnalysis, GeometryComplexity, PropertyStats, SizeStats, VertexStats,
+    };
+    use crate::analysis::spatial::{SpatialAnalysis, SpatialDistribution};
+    use crate::analysis::temporal::{EventsPerDayStats, TemporalAnalysis, TemporalDistribution};
+    use std::collections::HashMap;
+    use stt_core::types::BoundingBox;
 
-    #[test]
-    fn test_to_command() {
-        let rec = Recommendations {
+    /// Minimal synthetic analysis result — just enough populated fields for
+    /// `generate_recommendations`/`calculate_confidence` to run.
+    fn synthetic_result() -> AnalysisResult {
+        AnalysisResult {
+            source: "synthetic.parquet".to_string(),
+            feature_count: 10_000,
+            bounds: BoundingBox::new(-74.0, 45.0, -73.0, 46.0),
+            spatial: SpatialAnalysis {
+                zoom_coverage: Vec::new(),
+                hotspots: Vec::new(),
+                recommended_min_zoom: 0,
+                recommended_max_zoom: 10,
+                distribution: SpatialDistribution::Regional,
+            },
+            temporal: TemporalAnalysis {
+                time_start: 0,
+                time_end: 86_400_000,
+                duration_ms: 86_400_000,
+                duration_human: "1 day".to_string(),
+                unique_timestamps: 1_000,
+                distribution: TemporalDistribution::Uniform,
+                recommended_bucket_ms: 3_600_000,
+                recommended_bucket_human: "1 hour".to_string(),
+                hourly_distribution: vec![0; 24],
+                daily_distribution: vec![0; 7],
+                monthly_distribution: vec![0; 12],
+                events_per_day: EventsPerDayStats {
+                    min: 0.0,
+                    max: 0.0,
+                    avg: 0.0,
+                    median: 0.0,
+                    std_dev: 0.0,
+                },
+            },
+            geometry: GeometryAnalysis {
+                type_distribution: HashMap::new(),
+                dominant_type: "Point".to_string(),
+                vertex_stats: VertexStats {
+                    min: 1,
+                    max: 1,
+                    avg: 1.0,
+                    median: 1,
+                    p95: 1,
+                    p99: 1,
+                    total: 10_000,
+                },
+                size_stats: SizeStats {
+                    min: 100,
+                    max: 100,
+                    avg: 100.0,
+                    median: 100,
+                    p95: 100,
+                    p99: 100,
+                    total: 1_000_000,
+                },
+                property_stats: PropertyStats {
+                    min: 2,
+                    max: 2,
+                    avg: 2.0,
+                },
+                complexity: GeometryComplexity::Simple,
+            },
+            density: DensityAnalysis {
+                per_zoom: Vec::new(),
+                estimated_tile_count: 100,
+                estimated_archive_size: 1 << 20,
+                issues: Vec::new(),
+            },
+            measured: None,
+        }
+    }
+
+    fn advice(flag: &str, value: Option<&str>, lossy: bool) -> Advice {
+        Advice {
+            flag: flag.to_string(),
+            value: value.map(str::to_string),
+            why: format!("{flag}: synthetic rationale"),
+            projected: None,
+            lossy,
+            confidence: AdviceConfidence::Medium,
+        }
+    }
+
+    fn rec_with_advice(advice: Vec<Advice>) -> Recommendations {
+        Recommendations {
             min_zoom: 0,
             max_zoom: 10,
             temporal_bucket_ms: 3_600_000,
             temporal_bucket_human: "1 hour".to_string(),
             confidence: 85,
             explanations: vec![],
-        };
+            advice,
+        }
+    }
 
+    #[test]
+    fn test_to_command() {
+        let rec = rec_with_advice(vec![]);
         let cmd = to_command(&rec, Path::new("data.parquet"), "timestamp");
         assert!(cmd.contains("--min-zoom 0"));
         assert!(cmd.contains("--max-zoom 10"));
+    }
+
+    #[test]
+    fn generate_recommendations_attaches_advice() {
+        let result = synthetic_result();
+        let rec = generate_recommendations(
+            &result,
+            vec![advice("--publish", None, false), advice("--quantize-coords", Some("1"), true)],
+        );
+        assert_eq!(rec.advice.len(), 2);
+        assert_eq!(rec.advice[0].flag, "--publish");
+        assert_eq!(rec.advice[1].flag, "--quantize-coords");
+        // The advisor layer must not disturb the basic recommendations.
+        assert_eq!(rec.min_zoom, 0);
+        assert_eq!(rec.max_zoom, 10);
+        assert_eq!(rec.temporal_bucket_ms, 3_600_000);
+    }
+
+    #[test]
+    fn to_command_appends_only_non_lossy_advice_in_stable_order() {
+        let rec = rec_with_advice(vec![
+            advice("--quantize-coords", Some("1"), true), // lossy: excluded
+            advice("--temporal-lod", Some("1d,30d"), false),
+            advice("--publish", None, false),
+            advice("--blob-ordering", Some("spatial"), false),
+            advice("--maximum-tile-features", Some("10000"), true), // lossy: excluded
+        ]);
+        let cmd = to_command(&rec, Path::new("data.parquet"), "timestamp");
+
+        // Non-lossy advice present, with values, in advisor (input) order.
+        let lod = cmd.find("--temporal-lod 1d,30d").expect("temporal-lod in command");
+        let publish = cmd.find("--publish").expect("publish in command");
+        let ordering = cmd.find("--blob-ordering spatial").expect("blob-ordering in command");
+        assert!(lod < publish && publish < ordering, "advisor order preserved: {cmd}");
+    }
+
+    #[test]
+    fn lossy_advice_never_joins_to_command() {
+        let rec = rec_with_advice(vec![
+            advice("--quantize-coords", Some("1"), true),
+            advice("--quantize-attrs-auto", None, true),
+            advice("--maximum-tile-features", Some("10000"), true),
+        ]);
+        let cmd = to_command(&rec, Path::new("data.parquet"), "timestamp");
+        assert!(!cmd.contains("--quantize-coords"), "lossy flag leaked: {cmd}");
+        assert!(!cmd.contains("--quantize-attrs-auto"), "lossy flag leaked: {cmd}");
+        assert!(!cmd.contains("--maximum-tile-features"), "lossy flag leaked: {cmd}");
     }
 }
 

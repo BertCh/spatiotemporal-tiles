@@ -22,10 +22,10 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
     output.push_str(&format!("  Time Range:      {}\n", result.temporal.time_range_description()));
     output.push_str(&format!(
         "  Spatial Bounds:  [{:.2}, {:.2}] to [{:.2}, {:.2}]\n",
-        result.spatial.zoom_coverage.first().map(|_| -180.0).unwrap_or(0.0),
-        -90.0,
-        180.0,
-        90.0
+        result.bounds.min_lon,
+        result.bounds.min_lat,
+        result.bounds.max_lon,
+        result.bounds.max_lat
     ));
     output.push_str(&format!("  Geometry Type:   {} ({})\n", 
         result.geometry.dominant_type,
@@ -38,7 +38,7 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
     output.push_str(&format!("  Distribution:    {}\n", result.spatial.distribution));
     
     // Show coverage at key zoom levels
-    for z in [4, 6, 8, 10, 12].iter() {
+    for z in [4, 6, 8, 10, 12, 14, 16].iter() {
         if let Some(cov) = result.spatial.zoom_coverage.iter().find(|c| c.zoom == *z) {
             output.push_str(&format!(
                 "  Coverage at z{}:  {:.2}% ({} tiles)\n",
@@ -116,6 +116,34 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
     ));
     output.push('\n');
 
+    // Measured encoding (sampled) — present when the loader retained a large
+    // enough sample to push through the real encoder.
+    if let Some(m) = &result.measured {
+        output.push_str("🔬 Measured Encoding (sampled)\n");
+        output.push_str(&format!(
+            "  Sample:          {} features ({})\n",
+            format_number(m.features),
+            m.geometry_kind
+        ));
+        output.push_str(&format!(
+            "  Bytes/feature:   {:.1} compressed\n",
+            m.bytes_per_feature
+        ));
+        output.push_str(&format!("  Zstd ratio:      {:.2}x\n", m.zstd_ratio));
+        if !m.per_column.is_empty() {
+            output.push_str("  Top columns:\n");
+            for c in m.per_column.iter().take(5) {
+                output.push_str(&format!(
+                    "    {:<18} {:>5.1}%  ({})\n",
+                    c.name,
+                    c.share * 100.0,
+                    format_bytes(c.compressed_bytes)
+                ));
+            }
+        }
+        output.push('\n');
+    }
+
     // Issues
     if !result.density.issues.is_empty() {
         output.push_str("⚠️  Issues\n");
@@ -150,6 +178,30 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
     ));
     output.push('\n');
 
+    // Advisor suggestions — evidence-based flag advice beyond the zoom/bucket
+    // basics. Lossy levers are marked: they are opt-in and never auto-applied.
+    if !recommendations.advice.is_empty() {
+        output.push_str("🧭 Advisor\n");
+        for advice in &recommendations.advice {
+            let mut line = format!("  {}", advice.flag);
+            if let Some(value) = &advice.value {
+                line.push(' ');
+                line.push_str(value);
+            }
+            if let Some(projected) = &advice.projected {
+                line.push_str(&format!("  [{}]", projected));
+            }
+            line.push_str(&format!("  ({} confidence)", advice.confidence));
+            if advice.lossy {
+                line.push_str("  [LOSSY - opt-in]");
+            }
+            output.push_str(&line);
+            output.push('\n');
+            output.push_str(&format!("     → {}\n", advice.why));
+        }
+        output.push('\n');
+    }
+
     // Suggested Command
     output.push_str("📋 Suggested Command:\n");
     // The suggested --output is the packed dataset DIRECTORY (the input's
@@ -176,6 +228,12 @@ pub fn generate_json(result: &AnalysisResult, recommendations: &Recommendations)
     let report = serde_json::json!({
         "source": result.source,
         "feature_count": result.feature_count,
+        "bounds": {
+            "min_lon": result.bounds.min_lon,
+            "min_lat": result.bounds.min_lat,
+            "max_lon": result.bounds.max_lon,
+            "max_lat": result.bounds.max_lat,
+        },
         "spatial": {
             "distribution": format!("{}", result.spatial.distribution),
             "recommended_min_zoom": result.spatial.recommended_min_zoom,
@@ -231,7 +289,19 @@ pub fn generate_json(result: &AnalysisResult, recommendations: &Recommendations)
             },
         },
         "density": {
-            "recommended_chunk_size": result.density.recommended_chunk_size,
+            "per_zoom": result.density.per_zoom.iter().map(|z| {
+                serde_json::json!({
+                    "zoom": z.zoom,
+                    "tile_count": z.tile_count,
+                    "avg_features_per_tile": z.avg_features_per_tile,
+                    "median_features_per_tile": z.median_features_per_tile,
+                    "max_features_per_tile": z.max_features_per_tile,
+                    "oversized_tiles": z.oversized_tiles,
+                    "undersized_tiles": z.undersized_tiles,
+                    "estimated_size_uncompressed": z.estimated_size_uncompressed,
+                    "estimated_size_compressed": z.estimated_size_compressed,
+                })
+            }).collect::<Vec<_>>(),
             "estimated_tile_count": result.density.estimated_tile_count,
             "estimated_archive_size": result.density.estimated_archive_size,
             "issues": result.density.issues.iter().map(|i| {
@@ -242,6 +312,8 @@ pub fn generate_json(result: &AnalysisResult, recommendations: &Recommendations)
                 })
             }).collect::<Vec<_>>(),
         },
+        // Measured sample encoding (null when the sample was too small).
+        "measured": result.measured,
         "recommendations": {
             "min_zoom": recommendations.min_zoom,
             "max_zoom": recommendations.max_zoom,
@@ -249,6 +321,9 @@ pub fn generate_json(result: &AnalysisResult, recommendations: &Recommendations)
             "confidence": recommendations.confidence,
             "explanations": recommendations.explanations,
         },
+        // Advisor suggestions, verbatim (each entry: flag/value/why/projected/
+        // lossy/confidence — lossy ones are opt-in, never auto-applied).
+        "advice": recommendations.advice,
     });
 
     Ok(serde_json::to_string_pretty(&report)?)

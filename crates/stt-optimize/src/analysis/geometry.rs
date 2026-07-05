@@ -1,7 +1,7 @@
 //! Geometry complexity and size analysis
 //!
 //! Analyzes geometry types, vertex counts, and estimated sizes
-//! to inform complexity classification and chunk sizing decisions.
+//! to inform complexity classification.
 
 use crate::loader::LoadedData;
 use anyhow::Result;

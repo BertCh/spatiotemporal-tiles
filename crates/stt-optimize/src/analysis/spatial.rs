@@ -86,7 +86,7 @@ impl std::fmt::Display for SpatialDistribution {
 pub fn analyze(data: &LoadedData) -> Result<SpatialAnalysis> {
     use indicatif::{ProgressBar, ProgressStyle};
 
-    let pb = ProgressBar::new(15); // We analyze z0-z14
+    let pb = ProgressBar::new(MAX_SUPPORTED_ZOOM as u64 + 1); // We analyze z0-z18
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{msg} [{bar:30.cyan/blue}] {pos}/{len}")
@@ -98,7 +98,7 @@ pub fn analyze(data: &LoadedData) -> Result<SpatialAnalysis> {
     let mut zoom_coverage = Vec::new();
 
     // Analyze each zoom level
-    for zoom in 0..=14u8 {
+    for zoom in 0..=MAX_SUPPORTED_ZOOM {
         let coverage = analyze_zoom_level(data, zoom);
         zoom_coverage.push(coverage);
         pb.inc(1);
@@ -172,9 +172,10 @@ fn analyze_zoom_level(data: &LoadedData, zoom: u8) -> ZoomCoverage {
     }
 }
 
-/// Hard cap on the recommended max zoom. The STT pipeline analyzes z0-z14, so
-/// the recommendation is bounded by the same window.
-const MAX_SUPPORTED_ZOOM: u8 = 14;
+/// Hard cap on the recommended max zoom. The shipped fleet builds tiles up to
+/// z18 (e.g. AV LiDAR), so the analysis scans and the recommendation is
+/// bounded by the same z0-z18 window.
+const MAX_SUPPORTED_ZOOM: u8 = 18;
 
 /// Web Mercator world circumference in meters at the equator (EPSG:3857 extent
 /// width = 2·π·a where a = 6_378_137 m). One full map at zoom 0 spans this many
@@ -494,6 +495,7 @@ mod tests {
             features,
             bounds: BoundingBox::new(min_lon, min_lat, max_lon, max_lat),
             time_range: TimeRange::new(0, 0),
+            sample: Vec::new(),
         }
     }
 
@@ -509,7 +511,8 @@ mod tests {
     fn test_density_max_zoom_dense_cluster_is_high() {
         // 2500 points packed into a ~0.01° x 0.01° box near San Francisco
         // (~1.1 km across). Inter-feature spacing is a few tens of meters, so the
-        // formula should land near the deepest supported zoom.
+        // formula should land near the deepest supported zoom — past the old z14
+        // cap now that the window extends to z18.
         let mut pts = Vec::new();
         let n = 50;
         for i in 0..n {
@@ -521,7 +524,8 @@ mod tests {
         }
         let data = make_data(&pts);
         let z = density_based_max_zoom(&data, data.features.len());
-        assert!(z >= 12, "dense cluster should yield a high zoom, got {}", z);
+        assert!(z >= 15, "dense cluster should yield a high zoom, got {}", z);
+        assert!(z <= MAX_SUPPORTED_ZOOM, "zoom must be clamped, got {}", z);
     }
 
     #[test]

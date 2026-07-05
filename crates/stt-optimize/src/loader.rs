@@ -77,12 +77,45 @@ impl std::fmt::Display for GeometryType {
     }
 }
 
+/// Sample cap for [`LoadedData::sample`]. Enough features for the measured
+/// sample encoding (`crate::measure`) to be representative while keeping the
+/// retained geometries/properties memory-bounded.
+const MAX_SAMPLE_FEATURES: usize = 5000;
+
+/// A sampled property value retained for sample-encode measurement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropValue {
+    /// A numeric Arrow column value, widened to f64.
+    Number(f64),
+    /// A utf8 / dictionary-encoded string value.
+    Text(String),
+}
+
+/// One deterministically-sampled source feature, retaining the full geometry
+/// and property values so `crate::measure` can push it through the real
+/// stt-core encoder. Only sampled rows pay this retention cost; the bulk
+/// [`AnalyzableFeature`] path keeps its compact summary shape.
+#[derive(Debug, Clone)]
+pub struct SampledFeature {
+    /// Full parsed geometry (WGS84 lon/lat).
+    pub geometry: geo_types::Geometry<f64>,
+    /// Timestamp in Unix milliseconds.
+    pub timestamp_ms: u64,
+    /// Property `(name, value)` pairs; columns with unsupported Arrow types
+    /// and null values are omitted.
+    pub properties: Vec<(String, PropValue)>,
+}
+
 /// Loaded dataset for analysis
 #[derive(Debug)]
 pub struct LoadedData {
     pub features: Vec<AnalyzableFeature>,
     pub bounds: BoundingBox,
     pub time_range: TimeRange,
+    /// Deterministic stride sample (never random — the same file always yields
+    /// the same sample) of at most [`MAX_SAMPLE_FEATURES`] features, retained
+    /// in full for measured sample encoding.
+    pub sample: Vec<SampledFeature>,
 }
 
 /// Load data from a data source
@@ -114,6 +147,13 @@ fn load_geoparquet(path: &Path, time_field: &str, time_format: &str) -> Result<L
     let geom_col_name = find_geometry_column(&schema)?;
     let time_col_idx = schema.fields().iter().position(|f| f.name() == time_field)
         .ok_or_else(|| anyhow::anyhow!("Time field '{}' not found", time_field))?;
+
+    // Deterministic stride sample: every Nth row (first row included), sized
+    // so at most MAX_SAMPLE_FEATURES rows are retained across the whole file.
+    let total_rows = builder.metadata().file_metadata().num_rows().max(0) as usize;
+    let sample_stride = ((total_rows + MAX_SAMPLE_FEATURES - 1) / MAX_SAMPLE_FEATURES).max(1);
+    let mut sample: Vec<SampledFeature> = Vec::new();
+    let mut row_index: usize = 0;
 
     let reader = builder.build()?;
 
@@ -160,6 +200,20 @@ fn load_geoparquet(path: &Path, time_field: &str, time_format: &str) -> Result<L
                 estimated_size,
                 property_count,
             });
+
+            // Sample retention: rows on the stride keep their full geometry
+            // and property values (rows whose geometry fails to parse are
+            // skipped, matching the (Unknown, 0, ...) summary above).
+            if row_index % sample_stride == 0 && sample.len() < MAX_SAMPLE_FEATURES {
+                if let Some(geometry) = sample_geometry_at(&batch, &geom_col_name, i) {
+                    sample.push(SampledFeature {
+                        geometry,
+                        timestamp_ms: timestamp,
+                        properties: sample_properties_at(&batch, i, &geom_col_name, time_field),
+                    });
+                }
+            }
+            row_index += 1;
         }
 
         if features.len() % 100_000 == 0 {
@@ -173,10 +227,10 @@ fn load_geoparquet(path: &Path, time_field: &str, time_format: &str) -> Result<L
         features,
         bounds: BoundingBox::new(min_lon, min_lat, max_lon, max_lat),
         time_range: TimeRange::new(min_time, max_time),
+        sample,
     })
 }
 
-/// Load features from an STT archive
 // =============================================================================
 // Helper Functions
 // =============================================================================
@@ -327,6 +381,162 @@ fn extract_geometries_from_batch(
     anyhow::bail!("Could not extract geometries from column '{}'", geom_col_name)
 }
 
+// =============================================================================
+// Sample retention (full geometry + property values for measured encoding)
+// =============================================================================
+
+/// Column names that can serve as a bare lon/lat geometry pair (see
+/// `find_geometry_column`); excluded from sampled properties for `__lon_lat__`
+/// sources so the coordinates aren't double-counted as numeric columns.
+const LONLAT_COLUMN_NAMES: &[&str] = &["lon", "longitude", "lat", "latitude", "x", "y"];
+
+/// Full geometry for one sampled row, mirroring `extract_geometries_from_batch`'s
+/// column resolution: WKB parses through [`parse_wkb_geometry`]; GeoArrow
+/// structs and bare lon/lat column pairs become Points.
+fn sample_geometry_at(
+    batch: &arrow::record_batch::RecordBatch,
+    geom_col_name: &str,
+    row: usize,
+) -> Option<geo_types::Geometry<f64>> {
+    if geom_col_name != "__lon_lat__" {
+        if let Some(col) = batch.column_by_name(geom_col_name) {
+            if let Some(binary) = col.as_any().downcast_ref::<arrow::array::BinaryArray>() {
+                if !binary.is_valid(row) {
+                    return None;
+                }
+                return parse_wkb_geometry(binary.value(row));
+            }
+            if let Some(struct_array) = col.as_any().downcast_ref::<arrow::array::StructArray>() {
+                if let Some(point) = struct_point_at(struct_array, row) {
+                    return Some(point);
+                }
+                // Struct without readable x/y falls through to the lon/lat
+                // fallback, like the summary extractor.
+            }
+        }
+    }
+    lonlat_point_at(batch, row)
+}
+
+/// Point geometry from a GeoArrow-style struct column's x/y children.
+fn struct_point_at(
+    struct_array: &arrow::array::StructArray,
+    row: usize,
+) -> Option<geo_types::Geometry<f64>> {
+    let x = struct_array
+        .column_by_name("x")
+        .or_else(|| struct_array.column_by_name("longitude"))
+        .or_else(|| struct_array.column_by_name("lon"))?;
+    let y = struct_array
+        .column_by_name("y")
+        .or_else(|| struct_array.column_by_name("latitude"))
+        .or_else(|| struct_array.column_by_name("lat"))?;
+    let x_arr = x.as_any().downcast_ref::<Float64Array>()?;
+    let y_arr = y.as_any().downcast_ref::<Float64Array>()?;
+    (x_arr.is_valid(row) && y_arr.is_valid(row)).then(|| {
+        geo_types::Geometry::Point(geo_types::Point::new(x_arr.value(row), y_arr.value(row)))
+    })
+}
+
+/// Point geometry from bare lon/lat columns.
+fn lonlat_point_at(
+    batch: &arrow::record_batch::RecordBatch,
+    row: usize,
+) -> Option<geo_types::Geometry<f64>> {
+    let lon = batch
+        .column_by_name("lon")
+        .or_else(|| batch.column_by_name("longitude"))
+        .or_else(|| batch.column_by_name("x"))?;
+    let lat = batch
+        .column_by_name("lat")
+        .or_else(|| batch.column_by_name("latitude"))
+        .or_else(|| batch.column_by_name("y"))?;
+    let lon_arr = lon.as_any().downcast_ref::<Float64Array>()?;
+    let lat_arr = lat.as_any().downcast_ref::<Float64Array>()?;
+    (lon_arr.is_valid(row) && lat_arr.is_valid(row)).then(|| {
+        geo_types::Geometry::Point(geo_types::Point::new(lon_arr.value(row), lat_arr.value(row)))
+    })
+}
+
+/// Property values for one sampled row: every column except the geometry, the
+/// time field, and (for `__lon_lat__` sources) the coordinate pair itself.
+/// Columns with unsupported Arrow types are omitted.
+fn sample_properties_at(
+    batch: &arrow::record_batch::RecordBatch,
+    row: usize,
+    geom_col_name: &str,
+    time_field: &str,
+) -> Vec<(String, PropValue)> {
+    let schema = batch.schema();
+    let mut properties = Vec::new();
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let name = field.name();
+        if name == geom_col_name || name == time_field {
+            continue;
+        }
+        if geom_col_name == "__lon_lat__" && LONLAT_COLUMN_NAMES.contains(&name.as_str()) {
+            continue;
+        }
+        if let Some(value) = prop_value_at(batch.column(idx).as_ref(), row) {
+            properties.push((name.clone(), value));
+        }
+    }
+    properties
+}
+
+/// One property value as a [`PropValue`]: numeric Arrow types widen to f64,
+/// utf8/dictionary strings copy out. Nulls and unsupported types yield `None`.
+fn prop_value_at(col: &dyn Array, row: usize) -> Option<PropValue> {
+    use arrow::array::{
+        Float32Array, Int16Array, Int32Array, Int8Array, LargeStringArray, UInt16Array,
+        UInt32Array, UInt64Array, UInt8Array,
+    };
+
+    if col.is_null(row) {
+        return None;
+    }
+    macro_rules! num {
+        ($t:ty) => {
+            col.as_any()
+                .downcast_ref::<$t>()
+                .map(|a| PropValue::Number(a.value(row) as f64))
+        };
+    }
+    match col.data_type() {
+        DataType::Float64 => num!(Float64Array),
+        DataType::Float32 => num!(Float32Array),
+        DataType::Int64 => num!(Int64Array),
+        DataType::Int32 => num!(Int32Array),
+        DataType::Int16 => num!(Int16Array),
+        DataType::Int8 => num!(Int8Array),
+        DataType::UInt64 => num!(UInt64Array),
+        DataType::UInt32 => num!(UInt32Array),
+        DataType::UInt16 => num!(UInt16Array),
+        DataType::UInt8 => num!(UInt8Array),
+        DataType::Utf8 => col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| PropValue::Text(a.value(row).to_string())),
+        DataType::LargeUtf8 => col
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .map(|a| PropValue::Text(a.value(row).to_string())),
+        // Dictionary<*, Utf8>: cast the single sampled row rather than
+        // matching every possible key width.
+        DataType::Dictionary(_, values)
+            if matches!(values.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            let one = col.slice(row, 1);
+            let casted = arrow::compute::cast(one.as_ref(), &DataType::Utf8).ok()?;
+            let strings = casted.as_any().downcast_ref::<StringArray>()?;
+            strings
+                .is_valid(0)
+                .then(|| PropValue::Text(strings.value(0).to_string()))
+        }
+        _ => None,
+    }
+}
+
 /// Extract timestamps from a column
 fn extract_timestamps_from_batch(
     batch: &arrow::record_batch::RecordBatch,
@@ -425,215 +635,253 @@ fn parse_iso8601(s: &str) -> Result<u64> {
 // WKB Parsing
 // =============================================================================
 
-const WKB_POINT: u32 = 1;
-const WKB_LINESTRING: u32 = 2;
-const WKB_POLYGON: u32 = 3;
-const WKB_MULTIPOINT: u32 = 4;
-const WKB_MULTILINESTRING: u32 = 5;
-const WKB_MULTIPOLYGON: u32 = 6;
+/// Parse a WKB/EWKB blob into a `geo_types` geometry.
+///
+/// Delegates to `geozero` (the same reader stt-build uses), which correctly
+/// handles 2D, 3D (WKB Z/M), and SRID-prefixed EWKB inputs. Returns `None`
+/// for malformed bytes.
+pub fn parse_wkb_geometry(bytes: &[u8]) -> Option<geo_types::Geometry<f64>> {
+    use geozero::ToGeo;
+    // `Ewkb` parses both plain ISO WKB and SRID-prefixed EWKB.
+    geozero::wkb::Ewkb(bytes.to_vec()).to_geo().ok()
+}
 
+/// Derive the analysis summary (type, total vertex count, centroid) from WKB.
 fn parse_wkb_info(wkb: &[u8]) -> Option<(GeometryType, usize, f64, f64)> {
-    if wkb.len() < 5 {
-        return None;
-    }
+    let geom = parse_wkb_geometry(wkb)?;
+    let (lon, lat) = geometry_centroid(&geom)?;
+    Some((classify_geometry(&geom), count_vertices(&geom), lon, lat))
+}
 
-    let little_endian = wkb[0] == 1;
-    let geom_type = if little_endian {
-        u32::from_le_bytes([wkb[1], wkb[2], wkb[3], wkb[4]]) % 1000
-    } else {
-        u32::from_be_bytes([wkb[1], wkb[2], wkb[3], wkb[4]]) % 1000
-    };
-
-    match geom_type {
-        WKB_POINT => parse_wkb_point_info(wkb, little_endian),
-        WKB_LINESTRING => parse_wkb_linestring_info(wkb, little_endian),
-        WKB_POLYGON => parse_wkb_polygon_info(wkb, little_endian),
-        WKB_MULTIPOINT => parse_wkb_multipoint_info(wkb, little_endian),
-        WKB_MULTILINESTRING => parse_wkb_multilinestring_info(wkb, little_endian),
-        WKB_MULTIPOLYGON => parse_wkb_multipolygon_info(wkb, little_endian),
-        _ => None,
+/// Map a parsed geometry onto the analysis `GeometryType` enum.
+fn classify_geometry(geom: &geo_types::Geometry<f64>) -> GeometryType {
+    use geo_types::Geometry as G;
+    match geom {
+        G::Point(_) => GeometryType::Point,
+        G::Line(_) | G::LineString(_) => GeometryType::LineString,
+        G::Polygon(_) | G::Rect(_) | G::Triangle(_) => GeometryType::Polygon,
+        G::MultiPoint(_) => GeometryType::MultiPoint,
+        G::MultiLineString(_) => GeometryType::MultiLineString,
+        G::MultiPolygon(_) => GeometryType::MultiPolygon,
+        G::GeometryCollection(_) => GeometryType::Unknown,
     }
 }
 
-fn read_f64(wkb: &[u8], offset: usize, little_endian: bool) -> Option<f64> {
-    if offset + 8 > wkb.len() {
-        return None;
+fn polygon_vertex_count(polygon: &geo_types::Polygon<f64>) -> usize {
+    polygon.exterior().0.len()
+        + polygon.interiors().iter().map(|ring| ring.0.len()).sum::<usize>()
+}
+
+/// Total vertex count across ALL rings and parts (the hand-rolled parser this
+/// replaced only counted the first ring / first member geometry).
+fn count_vertices(geom: &geo_types::Geometry<f64>) -> usize {
+    use geo_types::Geometry as G;
+    match geom {
+        G::Point(_) => 1,
+        G::Line(_) => 2,
+        G::LineString(ls) => ls.0.len(),
+        G::Polygon(polygon) => polygon_vertex_count(polygon),
+        G::MultiPoint(mp) => mp.0.len(),
+        G::MultiLineString(mls) => mls.0.iter().map(|ls| ls.0.len()).sum(),
+        G::MultiPolygon(mp) => mp.0.iter().map(polygon_vertex_count).sum(),
+        G::GeometryCollection(gc) => gc.0.iter().map(count_vertices).sum(),
+        G::Rect(_) => 4,
+        G::Triangle(_) => 3,
     }
-    let bytes: [u8; 8] = wkb[offset..offset+8].try_into().ok()?;
-    Some(if little_endian {
-        f64::from_le_bytes(bytes)
-    } else {
-        f64::from_be_bytes(bytes)
+}
+
+/// Geometric centroid as `(lon, lat)`, falling back to the bounding-rect
+/// center when the centroid is undefined (e.g. empty geometries).
+fn geometry_centroid(geom: &geo_types::Geometry<f64>) -> Option<(f64, f64)> {
+    use geo::algorithm::bounding_rect::BoundingRect;
+    use geo::algorithm::centroid::Centroid;
+
+    if let Some(c) = geom.centroid() {
+        return Some((c.x(), c.y()));
+    }
+    geom.bounding_rect().map(|rect| {
+        let c = rect.center();
+        (c.x, c.y)
     })
 }
 
-fn read_u32(wkb: &[u8], offset: usize, little_endian: bool) -> Option<u32> {
-    if offset + 4 > wkb.len() {
-        return None;
-    }
-    let bytes: [u8; 4] = wkb[offset..offset+4].try_into().ok()?;
-    Some(if little_endian {
-        u32::from_le_bytes(bytes)
-    } else {
-        u32::from_be_bytes(bytes)
-    })
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use geo_types::{Geometry, LineString, MultiPolygon, Point, Polygon};
+    use geozero::{CoordDimensions, ToWkb};
 
-fn parse_wkb_point_info(wkb: &[u8], little_endian: bool) -> Option<(GeometryType, usize, f64, f64)> {
-    let x = read_f64(wkb, 5, little_endian)?;
-    let y = read_f64(wkb, 13, little_endian)?;
-    Some((GeometryType::Point, 1, x, y))
-}
-
-fn parse_wkb_linestring_info(wkb: &[u8], little_endian: bool) -> Option<(GeometryType, usize, f64, f64)> {
-    let num_points = read_u32(wkb, 5, little_endian)? as usize;
-    if num_points == 0 {
-        return None;
+    /// Encode a geo-types geometry as ISO WKB via geozero's writer.
+    fn wkb(geom: &Geometry<f64>) -> Vec<u8> {
+        geom.to_wkb(CoordDimensions::xy()).expect("encode WKB fixture")
     }
 
-    let mut sum_x = 0.0;
-    let mut sum_y = 0.0;
-    let mut offset = 9;
-
-    for _ in 0..num_points {
-        let x = read_f64(wkb, offset, little_endian)?;
-        let y = read_f64(wkb, offset + 8, little_endian)?;
-        sum_x += x;
-        sum_y += y;
-        offset += 16;
+    fn closed_ring(coords: &[(f64, f64)]) -> LineString<f64> {
+        LineString::from(coords.to_vec())
     }
 
-    Some((GeometryType::LineString, num_points, sum_x / num_points as f64, sum_y / num_points as f64))
-}
-
-fn parse_wkb_polygon_info(wkb: &[u8], little_endian: bool) -> Option<(GeometryType, usize, f64, f64)> {
-    let num_rings = read_u32(wkb, 5, little_endian)? as usize;
-    if num_rings == 0 {
-        return None;
+    #[test]
+    fn parses_point() {
+        let bytes = wkb(&Geometry::Point(Point::new(1.5, -2.5)));
+        let (geom_type, vertices, lon, lat) = parse_wkb_info(&bytes).unwrap();
+        assert_eq!(geom_type, GeometryType::Point);
+        assert_eq!(vertices, 1);
+        assert_eq!((lon, lat), (1.5, -2.5));
     }
 
-    let mut total_points = 0usize;
-    let mut sum_x = 0.0;
-    let mut sum_y = 0.0;
-    let mut offset = 9;
-
-    for ring_idx in 0..num_rings {
-        let num_points = read_u32(wkb, offset, little_endian)? as usize;
-        offset += 4;
-
-        for _ in 0..num_points {
-            let x = read_f64(wkb, offset, little_endian)?;
-            let y = read_f64(wkb, offset + 8, little_endian)?;
-            
-            if ring_idx == 0 {
-                sum_x += x;
-                sum_y += y;
-                total_points += 1;
-            }
-            
-            offset += 16;
-        }
+    #[test]
+    fn parses_linestring() {
+        // Evenly spaced straight line so geo's length-weighted centroid
+        // lands on the middle vertex.
+        let line = LineString::from(vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)]);
+        let bytes = wkb(&Geometry::LineString(line));
+        let (geom_type, vertices, lon, lat) = parse_wkb_info(&bytes).unwrap();
+        assert_eq!(geom_type, GeometryType::LineString);
+        assert_eq!(vertices, 3);
+        assert!((lon - 1.0).abs() < 1e-9);
+        assert!(lat.abs() < 1e-9);
     }
 
-    let vertex_count: usize = total_points;
-    let centroid_x = if total_points > 0 { sum_x / total_points as f64 } else { 0.0 };
-    let centroid_y = if total_points > 0 { sum_y / total_points as f64 } else { 0.0 };
-
-    Some((GeometryType::Polygon, vertex_count, centroid_x, centroid_y))
-}
-
-fn parse_wkb_multipoint_info(wkb: &[u8], little_endian: bool) -> Option<(GeometryType, usize, f64, f64)> {
-    let num_geoms = read_u32(wkb, 5, little_endian)? as usize;
-    if num_geoms == 0 {
-        return None;
+    #[test]
+    fn polygon_vertex_count_includes_interior_rings() {
+        let exterior = closed_ring(&[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0), (0.0, 0.0)]);
+        let interior = closed_ring(&[(1.0, 1.0), (2.0, 1.0), (2.0, 2.0), (1.0, 2.0), (1.0, 1.0)]);
+        let bytes = wkb(&Geometry::Polygon(Polygon::new(exterior, vec![interior])));
+        let (geom_type, vertices, _, _) = parse_wkb_info(&bytes).unwrap();
+        assert_eq!(geom_type, GeometryType::Polygon);
+        // 5 exterior + 5 interior vertices (the old parser reported 5).
+        assert_eq!(vertices, 10);
     }
 
-    let mut sum_x = 0.0;
-    let mut sum_y = 0.0;
-    let mut offset = 9;
-
-    for _ in 0..num_geoms {
-        offset += 5; // Skip WKB header
-        let x = read_f64(wkb, offset, little_endian)?;
-        let y = read_f64(wkb, offset + 8, little_endian)?;
-        sum_x += x;
-        sum_y += y;
-        offset += 16;
+    #[test]
+    fn multipolygon_counts_all_parts() {
+        let tri_a = Polygon::new(
+            closed_ring(&[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)]),
+            vec![],
+        );
+        let tri_b = Polygon::new(
+            closed_ring(&[(10.0, 10.0), (11.0, 10.0), (10.0, 11.0), (10.0, 10.0)]),
+            vec![],
+        );
+        let bytes = wkb(&Geometry::MultiPolygon(MultiPolygon(vec![tri_a, tri_b])));
+        let (geom_type, vertices, _, _) = parse_wkb_info(&bytes).unwrap();
+        assert_eq!(geom_type, GeometryType::MultiPolygon);
+        // 4 + 4 vertices (the old parser reported the first ring only = 4).
+        assert_eq!(vertices, 8);
     }
 
-    Some((GeometryType::MultiPoint, num_geoms, sum_x / num_geoms as f64, sum_y / num_geoms as f64))
-}
-
-fn parse_wkb_multilinestring_info(wkb: &[u8], little_endian: bool) -> Option<(GeometryType, usize, f64, f64)> {
-    let num_geoms = read_u32(wkb, 5, little_endian)? as usize;
-    if num_geoms == 0 {
-        return None;
+    #[test]
+    fn unit_square_centroid() {
+        let square = Polygon::new(
+            closed_ring(&[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]),
+            vec![],
+        );
+        let bytes = wkb(&Geometry::Polygon(square));
+        let (_, _, lon, lat) = parse_wkb_info(&bytes).unwrap();
+        assert!((lon - 0.5).abs() < 1e-9);
+        assert!((lat - 0.5).abs() < 1e-9);
     }
 
-    let mut total_points = 0usize;
-    let mut sum_x = 0.0;
-    let mut sum_y = 0.0;
-    let mut offset = 9;
-
-    for _ in 0..num_geoms {
-        offset += 5; // Skip WKB header
-        let num_points = read_u32(wkb, offset, little_endian)? as usize;
-        offset += 4;
-
-        for _ in 0..num_points {
-            let x = read_f64(wkb, offset, little_endian)?;
-            let y = read_f64(wkb, offset + 8, little_endian)?;
-            sum_x += x;
-            sum_y += y;
-            total_points += 1;
-            offset += 16;
-        }
+    #[test]
+    fn malformed_bytes_return_none() {
+        assert!(parse_wkb_geometry(&[]).is_none());
+        assert!(parse_wkb_geometry(&[0x01, 0x02, 0x03]).is_none());
+        // Valid header claiming a point, but truncated coordinates.
+        assert!(parse_wkb_geometry(&[0x01, 0x01, 0x00, 0x00, 0x00, 0x00]).is_none());
+        assert!(parse_wkb_info(&[0xff; 16]).is_none());
     }
 
-    let centroid_x = if total_points > 0 { sum_x / total_points as f64 } else { 0.0 };
-    let centroid_y = if total_points > 0 { sum_y / total_points as f64 } else { 0.0 };
+    #[test]
+    fn load_geoparquet_retains_deterministic_sample() {
+        use arrow::array::{BinaryArray, Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
 
-    Some((GeometryType::MultiLineString, total_points, centroid_x, centroid_y))
-}
+        let n = 120usize;
+        let wkbs: Vec<Vec<u8>> = (0..n)
+            .map(|i| wkb(&Geometry::Point(Point::new(-73.0 + i as f64 * 0.01, 45.0))))
+            .collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(wkbs.iter().map(|v| v.as_slice()))),
+                Arc::new(Int64Array::from(
+                    (0..n as i64).map(|i| 1_600_000_000_000 + i * 1_000).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    (0..n).map(|i| i as f64 * 0.5).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    (0..n).map(|i| format!("cat-{}", i % 3)).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
 
-fn parse_wkb_multipolygon_info(wkb: &[u8], little_endian: bool) -> Option<(GeometryType, usize, f64, f64)> {
-    let num_geoms = read_u32(wkb, 5, little_endian)? as usize;
-    if num_geoms == 0 {
-        return None;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.parquet");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let data = load_data(&DataSource::GeoParquet {
+            path,
+            time_field: "timestamp".to_string(),
+            time_format: "unix-ms".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(data.features.len(), n);
+        // Below the cap the stride is 1: every row is retained.
+        assert_eq!(data.sample.len(), n);
+        let s = &data.sample[3];
+        assert!(matches!(s.geometry, Geometry::Point(_)));
+        assert_eq!(s.timestamp_ms, 1_600_000_000_000 + 3 * 1_000);
+        assert_eq!(
+            s.properties,
+            vec![
+                ("value".to_string(), PropValue::Number(1.5)),
+                ("name".to_string(), PropValue::Text("cat-0".to_string())),
+            ]
+        );
+
+        // The retained sample is measurable end-to-end.
+        let measured =
+            crate::measure::measure_sample(&data.sample, &crate::measure::MeasureSettings::default())
+                .unwrap()
+                .expect("sample is large enough to measure");
+        assert_eq!(measured.features, n);
+        assert_eq!(measured.geometry_kind, "point");
     }
 
-    let mut total_points = 0usize;
-    let mut sum_x = 0.0;
-    let mut sum_y = 0.0;
-    let mut offset = 9;
+    #[test]
+    fn prop_value_at_widens_numerics_and_copies_strings() {
+        use arrow::array::{DictionaryArray, Float64Array, Int32Array, StringArray};
+        use arrow::datatypes::Int32Type;
 
-    for poly_idx in 0..num_geoms {
-        offset += 5; // Skip WKB header
-        let num_rings = read_u32(wkb, offset, little_endian)? as usize;
-        offset += 4;
+        let floats = Float64Array::from(vec![Some(1.5), None]);
+        assert_eq!(prop_value_at(&floats, 0), Some(PropValue::Number(1.5)));
+        assert_eq!(prop_value_at(&floats, 1), None);
 
-        for ring_idx in 0..num_rings {
-            let num_points = read_u32(wkb, offset, little_endian)? as usize;
-            offset += 4;
+        let ints = Int32Array::from(vec![7]);
+        assert_eq!(prop_value_at(&ints, 0), Some(PropValue::Number(7.0)));
 
-            for _ in 0..num_points {
-                let x = read_f64(wkb, offset, little_endian)?;
-                let y = read_f64(wkb, offset + 8, little_endian)?;
-                
-                if poly_idx == 0 && ring_idx == 0 {
-                    sum_x += x;
-                    sum_y += y;
-                    total_points += 1;
-                }
-                
-                offset += 16;
-            }
-        }
+        let strings = StringArray::from(vec!["storm"]);
+        assert_eq!(
+            prop_value_at(&strings, 0),
+            Some(PropValue::Text("storm".to_string()))
+        );
+
+        let dict: DictionaryArray<Int32Type> = vec!["a", "b", "a"].into_iter().collect();
+        assert_eq!(prop_value_at(&dict, 2), Some(PropValue::Text("a".to_string())));
     }
-
-    let centroid_x = if total_points > 0 { sum_x / total_points as f64 } else { 0.0 };
-    let centroid_y = if total_points > 0 { sum_y / total_points as f64 } else { 0.0 };
-
-    Some((GeometryType::MultiPolygon, total_points, centroid_x, centroid_y))
 }
 
