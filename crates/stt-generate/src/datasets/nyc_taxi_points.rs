@@ -1,28 +1,33 @@
-//! Derive a NYC taxi POINT dataset from an existing LineString .stt archive.
+//! Derive a NYC taxi POINT dataset from an existing LineString packed dataset.
 //!
-//! Reads the already-built `nyc-taxi-paths.stt` (500K OSRM-routed trips),
-//! interpolates each trip's polyline at a fixed time interval, and emits a
-//! Point dataset suitable for animated rendering. This avoids re-running
-//! the OSRM pipeline — the route geometries already baked into the .stt are
-//! reused as-is.
+//! Reads the already-built `nyc-taxi-paths` packed dataset (500K OSRM-routed
+//! trips), interpolates each trip's polyline at a fixed time interval, and
+//! emits a Point dataset suitable for animated rendering. This avoids
+//! re-running the OSRM pipeline — the route geometries already baked into the
+//! packed tiles are reused as-is.
 
 use crate::common::{
     self, PointRecord, PropertyColumn, PropertyKind, StreamingParquetWriter,
 };
 use anyhow::{anyhow, Context, Result};
-use arrow::array::{Array, FixedSizeListArray, Float64Array, Int64Array, ListArray, UInt16Array, UInt64Array};
+use arrow::array::{
+    Array, FixedSizeListArray, Float64Array, Int32Array, Int64Array, ListArray, UInt16Array,
+    UInt64Array,
+};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::{json, Map};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use stt_core::ArchiveReader;
+use stt_core::arrow_tile::{QuantAffine, STT_QUANT_META_KEY};
+use stt_core::PackedReader;
 
 #[derive(Parser, Debug)]
 #[command(about = "Derive a NYC taxi point dataset by interpolating an existing path .stt")]
 pub struct Args {
-    /// Input LineString .stt archive (the existing taxi-paths build).
-    #[arg(long, default_value = "examples/showcase/public/data/nyc-taxi-paths.stt")]
+    /// Input LineString packed dataset (the existing taxi-paths build) — the
+    /// dataset directory or its `manifest.json`.
+    #[arg(long, default_value = "examples/showcase/public/data/nyc-taxi-paths")]
     pub input: PathBuf,
 
     /// Output .stt (or .parquet for intermediate only).
@@ -65,9 +70,16 @@ pub fn run(args: Args) -> Result<()> {
     println!("║      🚕 NYC Taxi Points (derived from existing .stt paths)    ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
-    if !args.input.exists() {
+    // Resolve the packed-dataset manifest: accept either the dataset directory
+    // (append manifest.json) or a direct manifest.json path.
+    let manifest_path = if args.input.is_dir() {
+        args.input.join("manifest.json")
+    } else {
+        args.input.clone()
+    };
+    if !manifest_path.exists() {
         return Err(anyhow!(
-            "Input .stt not found: {}",
+            "Input packed dataset not found: {} (expected a dataset dir or its manifest.json)",
             args.input.display()
         ));
     }
@@ -89,11 +101,11 @@ pub fn run(args: Args) -> Result<()> {
     println!();
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("📝 STEP 1: Read .stt and interpolate points");
+    println!("📝 STEP 1: Read packed dataset and interpolate points");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let reader = ArchiveReader::open(&args.input)
-        .with_context(|| format!("opening archive {}", args.input.display()))?;
+    let reader = PackedReader::open(&manifest_path)
+        .with_context(|| format!("opening packed dataset {}", args.input.display()))?;
     let entries = reader.entries();
     if entries.is_empty() {
         return Err(anyhow!("Archive contains no tiles"));
@@ -171,13 +183,22 @@ pub fn run(args: Args) -> Result<()> {
             let vertex_time_col = batch
                 .column_by_name("vertex_time")
                 .and_then(|c| c.as_any().downcast_ref::<ListArray>());
-            let schema_meta = batch.schema().metadata().clone();
+            let schema = batch.schema();
+            let schema_meta = schema.metadata();
             let vt_origin: Option<i64> = schema_meta
                 .get("stt:vertex_time_origin_ms")
                 .and_then(|s| s.parse().ok());
             let vt_step: Option<u32> = schema_meta
                 .get("stt:vertex_time_step_ms")
                 .and_then(|s| s.parse().ok());
+            // Packed tiles built with --quantize-coords ship i32 grid coordinates
+            // plus a reconstruction affine in the geometry field metadata;
+            // un-quantized tiles carry neither and decode as Float64.
+            let quant: Option<QuantAffine> = schema
+                .field_with_name("geometry")
+                .ok()
+                .and_then(|f| f.metadata().get(STT_QUANT_META_KEY))
+                .and_then(|s| QuantAffine::from_json(s));
 
             for i in 0..batch.num_rows() {
                 let id = ids.value(i);
@@ -197,7 +218,7 @@ pub fn run(args: Args) -> Result<()> {
                     continue;
                 }
 
-                let coords = extract_coords(geom, i)?;
+                let coords = extract_coords(geom, i, quant.as_ref())?;
                 if coords.len() < 2 {
                     skipped_short += 1;
                     continue;
@@ -292,23 +313,46 @@ pub fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Pull a single feature's coord list out of a `List<FixedSizeList<Float64,2>>`.
-fn extract_coords(geom: &ListArray, feature_idx: usize) -> Result<Vec<[f64; 2]>> {
+/// Pull a single feature's coord list out of a `List<FixedSizeList<_,2>>`.
+///
+/// Packed tiles built with `--quantize-coords` store the leaf as `Int32` grid
+/// indices; the `quant` affine (from the geometry field metadata) reconstructs
+/// Float64 lon/lat. Un-quantized tiles carry a `Float64` leaf and no affine.
+fn extract_coords(
+    geom: &ListArray,
+    feature_idx: usize,
+    quant: Option<&QuantAffine>,
+) -> Result<Vec<[f64; 2]>> {
     let pairs_arr = geom.value(feature_idx);
     let pairs = pairs_arr
         .as_any()
         .downcast_ref::<FixedSizeListArray>()
-        .ok_or_else(|| anyhow!("LineString inner type is not FixedSizeList<f64,2>"))?;
-    let raw = pairs
-        .values()
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .ok_or_else(|| anyhow!("LineString coords are not Float64"))?;
+        .ok_or_else(|| anyhow!("LineString inner type is not FixedSizeList<_,2>"))?;
     let n = pairs.len();
     let mut out = Vec::with_capacity(n);
-    for j in 0..n {
-        let base = j * 2;
-        out.push([raw.value(base), raw.value(base + 1)]);
+    match quant {
+        Some(affine) => {
+            let raw = pairs
+                .values()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| anyhow!("quantized LineString coords are not Int32"))?;
+            for j in 0..n {
+                let base = j * 2;
+                out.push([affine.lon(raw.value(base)), affine.lat(raw.value(base + 1))]);
+            }
+        }
+        None => {
+            let raw = pairs
+                .values()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| anyhow!("LineString coords are not Float64"))?;
+            for j in 0..n {
+                let base = j * 2;
+                out.push([raw.value(base), raw.value(base + 1)]);
+            }
+        }
     }
     Ok(out)
 }

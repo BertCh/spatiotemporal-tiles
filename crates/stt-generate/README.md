@@ -4,7 +4,8 @@ Unified CLI for generating the project's bundled showcase datasets. Each
 subcommand fetches a real public data source (USGS earthquakes, NOAA
 IBTrACS hurricanes and AIS vessel tracks, OpenSky flights, NYC TLC trips,
 Montréal BIXI rides, CelesTrak satellites, GBIF animal tracking, OSM edit
-history, NEXRAD storm radar, …), normalises it into GeoParquet, and shells
+history, NEXRAD storm radar, static GTFS transit feeds, NOAA National Water
+Model river discharge, …), normalises it into GeoParquet, and shells
 out to `stt-build` — so every output is a packed STT dataset directory,
 built publish-quality.
 

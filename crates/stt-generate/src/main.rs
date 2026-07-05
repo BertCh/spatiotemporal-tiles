@@ -57,6 +57,12 @@ enum Commands {
     /// Generate a Montreal BIXI origin→destination flowmap from open-data trips
     Bixi(datasets::bixi::Args),
 
+    /// Generate a country-scale transit "ballet" from a static GTFS feed (one service date)
+    Gtfs(datasets::gtfs::Args),
+
+    /// Generate NWM river-discharge corridors on the NHDPlus CONUS network
+    Nwm(datasets::nwm::Args),
+
     /// Derive a NYC taxi POINT dataset by interpolating an existing path .stt
     NycTaxiPoints(datasets::nyc_taxi_points::Args),
 
@@ -96,6 +102,8 @@ fn main() -> Result<()> {
         Commands::Wildfires(args) => datasets::wildfires::run(args),
         Commands::NycRideshare(args) => datasets::nyc_rideshare::run(args),
         Commands::Bixi(args) => datasets::bixi::run(args),
+        Commands::Gtfs(args) => datasets::gtfs::run(args),
+        Commands::Nwm(args) => datasets::nwm::run(args),
         Commands::NycTaxiPoints(args) => datasets::nyc_taxi_points::run(args),
         Commands::Satellites(args) => datasets::satellites::run(args),
         Commands::Drifters(args) => datasets::drifters::run(args),

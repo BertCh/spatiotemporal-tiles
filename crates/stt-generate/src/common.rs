@@ -606,6 +606,30 @@ impl StreamingLineStringParquetWriter {
         output_path: &Path,
         property_columns: Vec<PropertyColumn>,
     ) -> Result<Self> {
+        Self::with_columns_impl(output_path, property_columns, 100_000, None)
+    }
+
+    /// Like [`Self::with_columns`], but with an explicit flush / row-group
+    /// granularity. Matrix-heavy datasets (rows carrying `verts × buckets`
+    /// f32 lists, tens of KB per row — e.g. `nwm`) must flush far more often
+    /// than the default 100k rows: the batch builders AND the ArrowWriter's
+    /// in-progress row group (default 1M rows) would otherwise buffer the
+    /// entire multi-GB output in RAM. `batch_rows` bounds both.
+    pub fn with_columns_and_batch_rows(
+        output_path: &Path,
+        property_columns: Vec<PropertyColumn>,
+        batch_rows: usize,
+    ) -> Result<Self> {
+        let rows = batch_rows.max(1);
+        Self::with_columns_impl(output_path, property_columns, rows, Some(rows))
+    }
+
+    fn with_columns_impl(
+        output_path: &Path,
+        property_columns: Vec<PropertyColumn>,
+        batch_rows: usize,
+        max_row_group_rows: Option<usize>,
+    ) -> Result<Self> {
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -655,13 +679,16 @@ impl StreamingLineStringParquetWriter {
         let schema = Arc::new(Schema::new(fields));
 
         let file = File::create(output_path)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(Default::default()))
-            .build();
+        let mut props_builder = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(Default::default()));
+        if let Some(rows) = max_row_group_rows {
+            props_builder = props_builder.set_max_row_group_row_count(Some(rows));
+        }
+        let props = props_builder.build();
 
         let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
-        let batch_size = 100_000;
+        let batch_size = batch_rows;
         let property_builders: Vec<PropertyBuilder> = property_columns
             .iter()
             .map(|c| PropertyBuilder::new(&c.kind, batch_size))

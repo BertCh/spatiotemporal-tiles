@@ -492,8 +492,9 @@ fn parse_date_utc_ms(s: &str) -> Result<i64> {
 /// the intermediate. stt-build only consumes GeoParquet: a `*.parquet`/
 /// `*.geojson` output means stop at the intermediate; a `.stt` or directory
 /// output (the showcase default) is built into a packed directory with the
-/// intermediate written to a sibling `.parquet`.
-fn resolve_intermediate(output: &Path) -> (PathBuf, bool) {
+/// intermediate written to a sibling `.parquet`. Shared with the other
+/// path-style generators (e.g. [`super::gtfs`]).
+pub(crate) fn resolve_intermediate(output: &Path) -> (PathBuf, bool) {
     let ext = output.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
     let is_intermediate =
         matches!(ext.as_deref(), Some("parquet") | Some("geoparquet") | Some("geojson"));

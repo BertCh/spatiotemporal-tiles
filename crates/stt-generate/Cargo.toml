@@ -39,15 +39,23 @@ flate2.workspace = true
 
 # Additional dependencies
 reqwest = { version = "0.11", features = ["blocking", "json"] }
+# Feed-local → absolute-Unix-ms anchoring for the GTFS generator (`gtfs`
+# subcommand): GTFS clock times are offsets on the service date in the agency
+# timezone. Already in the tree via arrow's `chrono-tz` feature, so this pins
+# no new build cost.
+chrono-tz = "0.10"
 # 2D Delaunay triangulation for the abstract flow-network proximity graph
 # (bixi --flow-graph edge-path bundling). Tiny, pure-Rust, no deps.
 delaunator = "1"
 sgp4 = "2.3"
 zip = "0.6"
 rand = "0.8"
-parquet = { version = "54", default-features = false, features = ["arrow", "flate2", "snap", "zstd"] }
-arrow = { version = "54", default-features = false, features = ["chrono-tz"] }
+parquet = { workspace = true }
+arrow = { workspace = true }
 urlencoding = "2.1"
+# NWM retrospective zarr chunks (`nwm` subcommand) are bare zstd frames —
+# decoded directly with the same zstd stt-core already links; no zarr crate.
+zstd = "0.13"
 
 # OSM editing-history generator (`osm-edits` subcommand)
 # osmpbf reads full-history `.osh.pbf` extracts (exposes per-version
