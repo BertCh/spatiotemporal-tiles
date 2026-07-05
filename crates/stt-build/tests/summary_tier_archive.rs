@@ -9,9 +9,8 @@ use stt_build::summary::{
     build_summary_tier, parse_summary_columns, SummaryConfig,
 };
 use stt_build::tiler::{generate_tiles_streaming, TileConfig};
-use stt_core::archive::{Archive, ArchiveReader};
 use stt_core::metadata::{Metadata, SummaryScheme};
-use stt_core::types::Compression;
+use stt_core::{BlobOrdering, PackWriter, PackedReader};
 
 fn point(lon: f64, lat: f64, ts: u64, mag: f64) -> ParsedFeature {
     let props = serde_json::json!({ "magnitude": mag })
@@ -59,8 +58,8 @@ fn raw_plus_summary_tier_roundtrips_through_archive() {
         ));
     }
 
-    let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
 
     // Raw tier across zooms 8..=10 — coarse enough to keep the test fast but
     // wide enough that "raw" is unambiguously distinct from "summary".
@@ -95,7 +94,7 @@ fn raw_plus_summary_tier_roundtrips_through_archive() {
     writer.finalize(&metadata).unwrap();
 
     // -------- read side --------
-    let reader = ArchiveReader::open(&path).unwrap();
+    let reader = PackedReader::open(dir.path().join("manifest.json")).unwrap();
     let m = reader.metadata().clone();
     let tier = m
         .summary_tier

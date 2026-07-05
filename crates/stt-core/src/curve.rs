@@ -1,12 +1,11 @@
-//! Space-time blob ordering for the v4 writer.
+//! Space-time blob ordering for the packed writer.
 //!
 //! The on-disk *byte order* of tile blobs (independent of the directory index,
 //! which must stay `(zoom, hilbert, time_start)` for the lookup codec) decides
 //! how few HTTP range requests a client makes: a query box coalesces into one
 //! request only when its tiles are byte-contiguous. The best order depends on
 //! the dataset's space-vs-time aspect ratio, so the writer takes a
-//! [`BlobOrdering`] knob. See `crates/stt-core/examples/simulate_layout.rs` for
-//! the measurements that motivate the default ([`BlobOrdering::Hilbert3`]).
+//! [`BlobOrdering`] knob; the default is [`BlobOrdering::Hilbert3`].
 //!
 //! All five orderings keep **zoom as the primary key** — the directory codec
 //! requires zoom-major, and a reorder pass only permutes blobs *within* a zoom.

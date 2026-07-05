@@ -48,7 +48,7 @@ installs the four binaries (prebuilt binaries and a shell installer are on the
 | binary | role |
 |---|---|
 | `stt-build` | build packed STT archives from GeoParquet / PostGIS / DuckDB |
-| `stt-optimize` | analyze a dataset and recommend encoder settings |
+| `stt-optimize` | analyze a dataset and recommend encoder settings; inspect/diff/doctor built tilesets |
 | `stt-validate` | validate archives: header, content hashes, Arrow IPC decode, schema |
 | `stt-serve` | dynamic per-request tile server over live PostGIS/DuckDB (the `ST_AsMVT` analog) |
 
@@ -62,8 +62,10 @@ this crate — run `cargo uninstall stt-build stt-optimize stt-validate` once
 
 New to STT? `docs/guides/csv-quickstart.md` in the repository walks the
 whole path — CSV → GeoParquet (one DuckDB command) → `stt-build --auto` →
-animated deck.gl map. See `docs/api/cli-reference.md` for every flag, and
-`docs/spec/stt-packed-format.md` for the format specification.
+animated deck.gl map; `docs/guides/tuning-tiles.md` then covers the
+measure → interpret → decide tuning loop. See `docs/api/cli-reference.md`
+for every flag, and `docs/spec/stt-packed-format.md` for the format
+specification.
 
 ## License
 

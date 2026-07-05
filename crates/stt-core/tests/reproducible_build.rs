@@ -3,16 +3,17 @@
 //!
 //! Background: `arrow_tile::encode_layer_cfg` assembles schema- and field-level
 //! metadata from **sorted** `BTreeMap`s so the encoder itself contributes no
-//! ordering non-determinism. Arrow (v54) then stores that metadata in a
-//! `std::collections::HashMap` and serializes it in per-process HashMap
-//! iteration order, so the *raw IPC bytes* of two identical tiles can still
-//! differ in the metadata region (a documented arrow-level gap — see
-//! `docs/spec/stt-packed-format.md` §7-D6). These tests therefore guard the
-//! reproducibility that is actually under this crate's control — the encoder is
-//! a deterministic function of its inputs at the *logical* (decoded) level, and
-//! all cross-run wire differences are confined to Arrow metadata KeyValue
-//! ordering — plus the strict byte-identity target as an `#[ignore]`d canary
-//! that passes on any order-preserving Arrow metadata implementation.
+//! ordering non-determinism, and the pinned Arrow (v59) IPC writer serializes
+//! that metadata in stable (sorted) key order. So the *raw IPC bytes* of two
+//! identical tiles are byte-identical, including the metadata region — the
+//! cross-process reproducibility that content-addressed pack dedup, edge
+//! caching, and incremental deploys rely on (see
+//! `docs/spec/stt-packed-format.md` §7-D6). These tests guard both the
+//! logical-level determinism (`same_tile_is_logically_reproducible`) and the
+//! strict byte-identity target (`same_tile_encodes_byte_identically`), now an
+//! active test. (Under Arrow 54 the writer stored metadata in a per-process
+//! `HashMap` and emitted it in iteration order, so the strict test was an
+//! `#[ignore]`d canary; the Arrow ≥59 upgrade closed that gap.)
 
 use stt_core::arrow_tile::*;
 
@@ -214,14 +215,14 @@ fn baked_time_offset_reconstructs_absolute_starts() {
     assert_eq!(reconstructed, fixture.start_times);
 }
 
-/// STRICT byte-identity target. Ignored because Arrow v54 serializes schema
-/// metadata in per-process `HashMap` iteration order, so the raw IPC bytes of
-/// two identical tiles differ in the metadata region even though the encoder
-/// feeds arrow sorted `BTreeMap`s. Passes on any Arrow build whose metadata
-/// serialization preserves order (the forward-compatible target of the
-/// `BTreeMap` change). Tracked: `docs/spec/stt-packed-format.md` §7-D6.
+/// STRICT byte-identity target — ACTIVE on Arrow ≥59, whose IPC writer
+/// serializes schema metadata in stable (sorted) order. Two encodes of the same
+/// tile are byte-identical, which is what makes content-addressed pack dedup,
+/// edge caching, and incremental deploys reproducible. (Was `#[ignore]`d under
+/// Arrow 54, which serialized metadata in per-process `HashMap` order — the
+/// encoder always fed sorted `BTreeMap`s; only the writer's ordering lagged.)
+/// Tracked: `docs/spec/stt-packed-format.md` §7-D6.
 #[test]
-#[ignore = "blocked by arrow-54 HashMap metadata ordering; see docs/spec/stt-packed-format.md §7-D6"]
 fn same_tile_encodes_byte_identically() {
     for fixture in [point_fixture(), line_fixture()] {
         let layers = std::slice::from_ref(&fixture);

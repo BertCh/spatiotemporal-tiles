@@ -88,7 +88,7 @@ fn duckdb_matches_file_archive() {
     for (i, cfg) in configs.iter().enumerate() {
         let a = common::build_archive(&file, cfg);
         let b = common::build_archive(&duck, cfg);
-        common::assert_archives_equal(&a, &b, &format!("duckdb cfg#{i}"));
+        common::assert_archives_equal(a.path(), b.path(), &format!("duckdb cfg#{i}"));
     }
 }
 
@@ -138,5 +138,5 @@ fn postgres_matches_file_archive() {
     };
     let a = common::build_archive(&file, &cfg);
     let b = common::build_archive(&pg, &cfg);
-    common::assert_archives_equal(&a, &b, "postgres");
+    common::assert_archives_equal(a.path(), b.path(), "postgres");
 }

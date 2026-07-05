@@ -46,8 +46,62 @@
 //! before the offset sentinel. Per-entry key columns and the trailing
 //! `COVER_SECTION_TMIN` section are byte-identical to v4.
 
-use crate::archive::TileEntry;
 use crate::error::{Error, Result};
+use crate::tile::TileId;
+
+/// One directory entry: where a tile lives and what it covers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TileEntry {
+    /// Zoom level.
+    pub zoom: u8,
+    /// Tile X coordinate.
+    pub x: u32,
+    /// Tile Y coordinate.
+    pub y: u32,
+    /// Inclusive temporal start (Unix ms).
+    pub time_start: i64,
+    /// Inclusive temporal end (Unix ms).
+    pub time_end: i64,
+    /// Index of the pack object holding this tile's blob (packed format).
+    ///
+    /// This selects `manifest.packs[pack_id]` and [`offset`](Self::offset) is
+    /// **pack-relative**. A per-blob (per-run) property, not a per-entry key —
+    /// entries RLE-collapse only within one pack.
+    pub pack_id: u32,
+    /// Byte offset of the compressed blob, relative to `packs[pack_id]`.
+    pub offset: u64,
+    /// Compressed blob length in bytes.
+    pub length: u32,
+    /// Uncompressed payload length in bytes.
+    pub uncompressed_size: u32,
+    /// Total feature count across the tile's layers.
+    pub feature_count: u32,
+    /// Hilbert index of `(zoom, x, y)` — directory sort key.
+    pub hilbert: u64,
+    /// CRC32C integrity tag of the compressed blob.
+    pub crc32c: u32,
+    /// Temporal bucket size in milliseconds this tile occupies.
+    ///
+    /// Base tiles record the archive's base bucket size; temporal-LOD tiles
+    /// record their coarser bucket. `None` when the archive carries no LOD
+    /// pyramid (readers fall back to `Metadata::temporal_bucket_ms`).
+    pub temporal_bucket_ms: Option<u64>,
+    /// **Tight lower covering bound** — the minimum feature *start* time actually
+    /// present in the tile. `time_start` is the addressable *bucket boundary*
+    /// (kept loose so `(z,x,y,bucket)` lookup works); `cover_t_min` is the real
+    /// earliest data, which a client uses to prune a tile whose features all lie
+    /// after a query window (`time_end` already gives the tight upper bound).
+    /// `None` when not computed (pre-covering builds), in which case clients
+    /// fall back to `time_start`.
+    pub cover_t_min: Option<i64>,
+}
+
+impl TileEntry {
+    /// The tile's identity.
+    pub fn tile_id(&self) -> TileId {
+        TileId::new(self.zoom, self.x, self.y, self.time_start.max(0) as u64)
+    }
+}
 
 /// Directory format tag (first byte of the buffer). Bumped independently of the
 /// archive `FORMAT_VERSION` so the directory codec can evolve on its own.

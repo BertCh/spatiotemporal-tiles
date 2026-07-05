@@ -42,7 +42,7 @@
 //! round-trip tests. The HTTP reader (TS) decodes the root and fetches leaves on
 //! demand — that is where the cold-start win is realized.
 
-use crate::archive::TileEntry;
+use crate::directory::TileEntry;
 use crate::compression;
 use crate::directory::{decode_directory, encode_directory};
 use crate::error::{Error, Result};

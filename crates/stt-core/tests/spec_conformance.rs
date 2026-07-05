@@ -542,7 +542,7 @@ fn paged_directory_encode_decode_roundtrips() {
     // reproduce the entry list in directory order `(zoom, hilbert, time_start,
     // temporal_bucket_ms)` for any page size and both framings, and the
     // structural validator must find a clean encode clean.
-    use stt_core::archive::TileEntry;
+    use stt_core::TileEntry;
     use stt_core::tile::TileId;
     use stt_core::{decode_paged_directory, encode_paged_directory, verify_paged_structure};
 

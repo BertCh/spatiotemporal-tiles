@@ -39,7 +39,7 @@ use serde::Serialize;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use stt_core::archive::TileEntry;
+use stt_core::TileEntry;
 use stt_core::metadata::Metadata;
 use stt_core::{Manifest, PackedReader};
 

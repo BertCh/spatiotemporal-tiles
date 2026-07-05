@@ -1318,11 +1318,10 @@ fn encode_layer_cfg(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8
         build_geometry_array_q(&layer.geometry, quant.as_ref(), point_elev.as_deref());
     // Assemble field metadata in a BTreeMap so the key set is emitted in a
     // deterministic (lexicographic) order regardless of insertion order. Arrow
-    // stores field metadata in a HashMap and serializes it in HashMap-iteration
-    // order (see the quantization note below), so building from a sorted source
-    // removes this encoder's own contribution to non-reproducible pack bytes;
-    // the residual arrow-ipc-v54 byte-order gap is tracked in
-    // docs/spec/stt-packed-format.md §7-D6.
+    // ≥59 serializes IPC schema metadata in sorted order, so building from a
+    // sorted source makes the raw metadata-region bytes byte-reproducible across
+    // runs (guarded by `same_tile_encodes_byte_identically` in
+    // reproducible_build.rs) — closing the old arrow-54 HashMap-iteration gap.
     let mut geom_meta = BTreeMap::new();
     geom_meta.insert(
         GEOARROW_EXT_KEY.to_string(),
@@ -1333,11 +1332,9 @@ fn encode_layer_cfg(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8
         // so the GeoArrow CRS doesn't apply — swap it for the reconstruction
         // affine (whose presence is the reader's quantization signal). Field
         // metadata is assembled in a BTreeMap (deterministic key order); Arrow
-        // (v54) still serializes it in per-process HashMap-iteration order
-        // (arrow-ipc `convert::metadata_to_fb` iterates the HashMap without
-        // sorting), so the raw metadata-region bytes remain non-reproducible
-        // across runs — the tracked gap in docs/spec/stt-packed-format.md §7-D6
-        // and docs/spec/conformance.md §3.
+        // ≥59 serializes IPC schema metadata in sorted order, so the raw
+        // metadata-region bytes are byte-reproducible across runs (guarded by
+        // the `same_tile_encodes_byte_identically` test in reproducible_build.rs).
         Some(q) => {
             geom_meta.insert(STT_QUANT_META_KEY.to_string(), q.to_json());
         }
@@ -1553,12 +1550,10 @@ fn encode_layer_cfg(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8
     //
     // Built in a BTreeMap so the key set is assembled in deterministic
     // (lexicographic) order — this encoder contributes no ordering
-    // non-determinism, and the tile is byte-reproducible on any Arrow whose
-    // metadata serialization preserves order. NOTE: Arrow (v54) still stores
-    // this in a HashMap and serializes it in per-process HashMap-iteration
-    // order, so the *raw* metadata-region bytes of two identical tiles can
-    // differ across runs; that residual gap (which caps content-addressed pack
-    // dedup) is tracked in docs/spec/stt-packed-format.md §7-D6.
+    // non-determinism. Arrow ≥59 serializes IPC schema metadata in sorted order,
+    // so the raw metadata-region bytes of two identical tiles are now identical
+    // across runs (unblocking content-addressed pack dedup) — closing the old
+    // arrow-54 HashMap-iteration gap.
     let mut schema_meta: BTreeMap<String, String> = BTreeMap::new();
     schema_meta.insert("stt:layer".to_string(), layer.name.clone());
     schema_meta.insert(
@@ -2093,11 +2088,6 @@ mod tests {
         // `--vector-group` fuses named scalar columns into one interleaved
         // FixedSizeList and drops the scalars; ungrouped columns are untouched.
         use arrow::array::Float32Array;
-        set_vector_groups(vec![VectorGroup {
-            name: "surfel_quat".to_string(),
-            components: vec!["qx".into(), "qy".into(), "qz".into(), "qw".into()],
-            elem: VectorElem::F32,
-        }]);
         let layer = ColumnarLayer {
             name: "surfels".to_string(),
             feature_ids: vec![1, 2],
@@ -2116,8 +2106,18 @@ mod tests {
                 ("z".into(), PropertyColumn::Numeric(vec![Some(3.0), Some(4.0)])),
             ],
         };
-        let ipc = encode_layer(&layer).unwrap();
-        set_vector_groups(Vec::new()); // reset the build-global before asserting
+        // Explicit config (not the process-global setter) so this test can't
+        // leak a non-default vector-group into a concurrently-running test that
+        // reads the encoder globals via bare `encode_layer`.
+        let cfg = EncoderConfig {
+            vector_groups: vec![VectorGroup {
+                name: "surfel_quat".to_string(),
+                components: vec!["qx".into(), "qy".into(), "qz".into(), "qw".into()],
+                elem: VectorElem::F32,
+            }],
+            ..EncoderConfig::default()
+        };
+        let ipc = encode_layer_with(&layer, &cfg).unwrap();
         let batch = decode_layer(&ipc).unwrap();
 
         // Scalars fused away; the grouped vector + the ungrouped `z` remain.
@@ -2156,9 +2156,11 @@ mod tests {
                 ("speed".into(), PropertyColumn::Numeric(vec![Some(1.0), Some(2.0)])),
             ],
         };
-        set_point_elevation_column("z");
-        let ipc = encode_layer(&layer).unwrap();
-        set_point_elevation_column("");
+        let cfg = EncoderConfig {
+            point_elevation_column: "z".to_string(),
+            ..EncoderConfig::default()
+        };
+        let ipc = encode_layer_with(&layer, &cfg).unwrap();
         let batch = decode_layer(&ipc).unwrap();
 
         // Geometry is now a 3-wide list with z folded in; `z` is gone as a property.
@@ -2191,9 +2193,12 @@ mod tests {
             vertex_value_matrix: None,
             properties: vec![("z".into(), PropertyColumn::Numeric(vec![Some(5.0)]))],
         };
-        set_point_elevation_column("z");
-        let ipc = encode_layer_quantized(&layer, Some(0.05)).unwrap();
-        set_point_elevation_column("");
+        let cfg = EncoderConfig {
+            quantize_coords_m: Some(0.05),
+            point_elevation_column: "z".to_string(),
+            ..EncoderConfig::default()
+        };
+        let ipc = encode_layer_with(&layer, &cfg).unwrap();
         let batch = decode_layer(&ipc).unwrap();
 
         let field = batch.schema().field_with_name("geometry").unwrap().clone();
@@ -2275,17 +2280,23 @@ mod tests {
         };
 
         // Default (no attr-quant configured): `z` stays Float64, byte-identical
-        // to the historical encoder.
-        set_quantize_attrs(HashMap::new());
-        let plain = decode_layer(&encode_layer(&make()).unwrap()).unwrap();
+        // to the historical encoder. Explicit config (not the global setter) so
+        // this test stays hermetic under the parallel test runner.
+        let plain =
+            decode_layer(&encode_layer_with(&make(), &EncoderConfig::default()).unwrap()).unwrap();
         let zf = plain.schema().field_with_name("z").unwrap().clone();
         assert_eq!(zf.data_type(), &DataType::Float64);
         assert!(zf.metadata().get(STT_QUANT_ATTR_META_KEY).is_none());
 
         // Opt the `z` column in at 0.05-unit precision.
-        set_quantize_attrs(HashMap::from([("z".to_string(), 0.05f64)]));
-        let q = encode_layer(&make()).unwrap();
-        set_quantize_attrs(HashMap::new()); // reset so other tests are unaffected
+        let q = encode_layer_with(
+            &make(),
+            &EncoderConfig {
+                quantize_attrs: HashMap::from([("z".to_string(), 0.05f64)]),
+                ..EncoderConfig::default()
+            },
+        )
+        .unwrap();
 
         let batch = decode_layer(&q).unwrap();
         let field = batch.schema().field_with_name("z").unwrap().clone();
@@ -2336,18 +2347,28 @@ mod tests {
             properties: vec![("depth".into(), PropertyColumn::Numeric(depth.clone()))],
         };
 
-        // Default: auto off → Float64.
-        set_quantize_attrs_auto(false);
-        let plain = decode_layer(&encode_layer(&make()).unwrap()).unwrap();
+        // Default: auto off → Float64. Explicit config (not the global setter)
+        // so this test can't flip `quantize_attrs_auto` under a concurrently
+        // running test that reads the encoder globals via bare `encode_layer`.
+        let plain =
+            decode_layer(&encode_layer_with(&make(), &EncoderConfig::default()).unwrap()).unwrap();
         assert_eq!(
             plain.schema().field_with_name("depth").unwrap().data_type(),
             &DataType::Float64
         );
 
         // Auto on → range-adaptive UInt16 + affine.
-        set_quantize_attrs_auto(true);
-        let batch = decode_layer(&encode_layer(&make()).unwrap()).unwrap();
-        set_quantize_attrs_auto(false); // reset for other tests
+        let batch = decode_layer(
+            &encode_layer_with(
+                &make(),
+                &EncoderConfig {
+                    quantize_attrs_auto: true,
+                    ..EncoderConfig::default()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
 
         let field = batch.schema().field_with_name("depth").unwrap().clone();
         assert_eq!(field.data_type(), &DataType::UInt16);

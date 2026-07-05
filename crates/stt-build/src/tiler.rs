@@ -28,7 +28,7 @@ pub struct GeneratedTile {
     /// Tight lower covering bound: the earliest feature *start* time actually
     /// present in the tile (≤ `time_end`, and may be ≥ or < `time_start`).
     /// Stored in the directory so a client can prune a tile whose data lies
-    /// entirely after a query window. See [`stt_core::archive::TileEntry::cover_t_min`].
+    /// entirely after a query window. See `TileEntry::cover_t_min`.
     pub cover_t_min: i64,
     /// One or more Arrow layers (grouped by geometry kind / clip status).
     pub layers: Vec<ColumnarLayer>,
@@ -944,26 +944,9 @@ fn apply_tile_budget(
     keep
 }
 
-/// Stream generated tiles straight into an [`stt_core::archive::ArchiveWriter`].
-impl TileWriter for stt_core::archive::ArchiveWriter {
-    fn write_tile(&mut self, tile: &GeneratedTile) -> Result<()> {
-        let payload = encode_tile(&tile.layers)?;
-        self.add_tile_full(
-            &tile.id,
-            tile.time_start,
-            tile.time_end,
-            Some(tile.cover_t_min),
-            tile.feature_count(),
-            None,
-            &payload,
-        )?;
-        Ok(())
-    }
-}
-
 /// Stream generated tiles straight into a packed-format [`stt_core::PackWriter`].
 ///
-/// Identical mapping to the [`stt_core::archive::ArchiveWriter`] impl above —
+/// Identical mapping to the `ArchiveWriter` impl above —
 /// `PackWriter` shares the same `add_tile_full` contract; it just buffers the
 /// tiles and cuts them into content-addressed packs at finalize.
 impl TileWriter for stt_core::PackWriter {
@@ -990,26 +973,6 @@ pub trait LodTileWriter {
         tile: &GeneratedTile,
         temporal_bucket_ms: Option<u64>,
     ) -> Result<()>;
-}
-
-impl LodTileWriter for stt_core::archive::ArchiveWriter {
-    fn write_lod_tile(
-        &mut self,
-        tile: &GeneratedTile,
-        temporal_bucket_ms: Option<u64>,
-    ) -> Result<()> {
-        let payload = encode_tile(&tile.layers)?;
-        self.add_tile_full(
-            &tile.id,
-            tile.time_start,
-            tile.time_end,
-            Some(tile.cover_t_min),
-            tile.feature_count(),
-            temporal_bucket_ms,
-            &payload,
-        )?;
-        Ok(())
-    }
 }
 
 impl LodTileWriter for stt_core::PackWriter {
@@ -1115,10 +1078,12 @@ struct TileBucket {
 /// accumulators), capped per-accumulator at `spill_bytes`. There is no
 /// `Vec<GeneratedTile>` held in RAM — tiles go straight to the writer.
 ///
-/// `external_sort` controls whether the writer's directory is left sorted by
-/// (zoom, hilbert) at finalize time (the default `ArchiveWriter` behaviour)
-/// or whether this function pre-flushes per-zoom so the writer's stream is
-/// already sorted and no global tile-set sort happens.
+/// **Retained but currently unused by any binary.** Its sole production caller
+/// was the removed `--streaming-arrow` path; it is kept as the writer-generic
+/// streaming core for a future spill-to-disk streaming `PackWriter` (roadmap
+/// `docs/roadmap/stt-packed.md` §2). The live `--streaming` CLI path uses
+/// [`generate_tiles_streaming`] instead. Correctness is exercised by the unit
+/// tests below.
 pub fn build_streaming_from_batches<W, I>(
     batches: I,
     config: &TileConfig,
@@ -1367,9 +1332,8 @@ fn flush_bucket<W: TileWriter>(
 mod tests {
     use super::*;
     use geojson::{Feature, Geometry, Value as GeomValue};
-    use stt_core::archive::{Archive, ArchiveReader};
+    use stt_core::{BlobOrdering, PackWriter, PackedReader};
     use stt_core::metadata::Metadata;
-    use stt_core::types::Compression;
 
     fn point(lon: f64, lat: f64, ts: u64) -> ParsedFeature {
         let props = serde_json::json!({ "v": ts as f64 })
@@ -1615,14 +1579,14 @@ mod tests {
             "expected a tile whose earliest feature is after the bucket edge"
         );
 
-        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
         for tile in &tiles {
             writer.write_tile(tile).unwrap();
         }
         writer.finalize(&Metadata::new("cover")).unwrap();
 
-        let reader = ArchiveReader::open(&path).unwrap();
+        let reader = PackedReader::open(dir.path().join("manifest.json")).unwrap();
         // The covering section round-trips: every entry carries a bound and at
         // least one is tighter than its bucket edge.
         assert!(reader.entries().iter().all(|e| e.cover_t_min.is_some()));
@@ -1657,8 +1621,8 @@ mod tests {
         let tiles = generate_tiles(&features, &config, 2).unwrap();
         assert!(!tiles.is_empty(), "expected tiles to be generated");
 
-        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
         for tile in &tiles {
             writer.write_tile(tile).unwrap();
         }
@@ -1666,7 +1630,7 @@ mod tests {
             tiles.iter().map(|t| t.feature_count() as usize).sum();
         writer.finalize(&Metadata::new("e2e-points")).unwrap();
 
-        let mut reader = ArchiveReader::open(&path).unwrap();
+        let reader = PackedReader::open(dir.path().join("manifest.json")).unwrap();
         assert_eq!(reader.entries().len(), tiles.len());
 
         // Every feature is represented somewhere (summed over all tiles).
@@ -1705,14 +1669,14 @@ mod tests {
             tiles.len()
         );
 
-        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
         for tile in &tiles {
             writer.write_tile(tile).unwrap();
         }
         writer.finalize(&Metadata::new("e2e-tracks")).unwrap();
 
-        let mut reader = ArchiveReader::open(&path).unwrap();
+        let reader = PackedReader::open(dir.path().join("manifest.json")).unwrap();
         let entry = reader.entries()[0].clone();
         let layers = reader.read_layers(&entry).unwrap();
         // Clipped segments are linestrings carrying a vertex_time column.
@@ -1721,10 +1685,8 @@ mod tests {
     }
 
     /// Streaming pipeline emits the same tiles as the in-memory pipeline
-    /// when fed identical features in chunks. This is the unit-level
-    /// correctness check for `build_streaming_from_batches`; a larger
-    /// peak-RSS test lives at `tests/streaming_peak_rss.rs` (uses
-    /// platform `getrusage`).
+    /// when fed identical features in chunks — the unit-level correctness
+    /// check for `build_streaming_from_batches`.
     #[test]
     fn streaming_matches_in_memory_for_points() {
         let hour = 3_600_000u64;
@@ -1753,14 +1715,14 @@ mod tests {
         for chunk in features.chunks(50) {
             batches.push(Ok(chunk.to_vec()));
         }
-        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
         let stats =
             build_streaming_from_batches(batches.into_iter(), &config, &mut writer, 2, 1024 * 1024)
                 .unwrap();
         writer.finalize(&Metadata::new("streaming")).unwrap();
 
-        let reader = ArchiveReader::open(&path).unwrap();
+        let reader = PackedReader::open(dir.path().join("manifest.json")).unwrap();
         let archived: usize = reader.entries().iter().map(|e| e.feature_count as usize).sum();
 
         // Stream and in-mem totals must match exactly (no features dropped,
@@ -1796,8 +1758,8 @@ mod tests {
             ..TileConfig::default()
         };
 
-        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
         let stats = build_streaming_from_batches(
             std::iter::once(Ok(features)),
             &config,
@@ -1809,7 +1771,7 @@ mod tests {
         writer.finalize(&Metadata::new("stream-tracks")).unwrap();
         assert!(stats.total_tiles > 1, "trajectory should cover multiple tiles");
 
-        let reader = ArchiveReader::open(&path).unwrap();
+        let reader = PackedReader::open(dir.path().join("manifest.json")).unwrap();
         let entry = reader.entries()[0].clone();
         let layers = reader.read_layers(&entry).unwrap();
         assert!(layers[0].batch.column_by_name("vertex_time").is_some());
@@ -1952,8 +1914,8 @@ mod tests {
         };
         let tagged = generate_tiles_with_lod(&features, &config, 1).unwrap();
 
-        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-        let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
         for t in &tagged {
             writer.write_lod_tile(&t.tile, t.temporal_bucket_ms).unwrap();
         }
@@ -1963,7 +1925,7 @@ mod tests {
             .unwrap();
         writer.finalize(&metadata).unwrap();
 
-        let reader = ArchiveReader::open(&path).unwrap();
+        let reader = PackedReader::open(dir.path().join("manifest.json")).unwrap();
         let buckets: std::collections::BTreeSet<Option<u64>> =
             reader.entries().iter().map(|e| e.temporal_bucket_ms).collect();
         // The on-disk index distinguishes base + LOD bucket sizes.

@@ -1,11 +1,10 @@
 //! End-to-end tests for the `stt-validate` binary.
 //!
-//! Each test builds a tiny packed dataset in a temp dir (via the `stt_core`
-//! writers + the single-file → packed transcode, the same pipeline
-//! `stt-build --streaming-arrow` uses), then runs the compiled binary
-//! (`CARGO_BIN_EXE_*`) over it with `--json` and asserts on the parsed report.
-//! This exercises the real decode path, the schema checks, and the `--sample`
-//! accounting end to end.
+//! Each test builds a tiny packed dataset in a temp dir via `stt_core`'s
+//! `PackWriter` (the same writer the offline `stt-build` uses), then runs the
+//! compiled binary (`CARGO_BIN_EXE_*`) over it with `--json` and asserts on the
+//! parsed report. This exercises the real decode path, the schema checks, and
+//! the `--sample` accounting end to end.
 
 // The stt-validate binary (and CARGO_BIN_EXE_stt-validate) only exists when
 // the `validate-cli` feature is on; compile the suite out otherwise.
@@ -16,8 +15,8 @@ use std::process::Command;
 
 use stt_core::arrow_tile::{encode_tile, ColumnarLayer, GeometryColumn, PropertyColumn};
 use stt_core::metadata::Metadata;
-use stt_core::types::{Compression, TimeRange};
-use stt_core::{transcode_archive_to_packs, Archive, BlobOrdering, TileId};
+use stt_core::types::TimeRange;
+use stt_core::{BlobOrdering, PackWriter, TileId};
 
 /// Build a point layer of `n` features whose times fall inside [start, end].
 fn point_layer(name: &str, base_id: u64, n: usize, start: i64, end: i64) -> ColumnarLayer {
@@ -39,13 +38,11 @@ fn point_layer(name: &str, base_id: u64, n: usize, start: i64, end: i64) -> Colu
 }
 
 /// Write a valid packed dataset of `tile_count` tiles, each holding `per_tile`
-/// point features, into the directory `out_dir`. Builds a temp single-file
-/// archive and transcodes it to packs — the same staging pipeline
-/// `stt-build --streaming-arrow` uses. Returns the total feature count so
-/// callers can assert the metadata grand total matches.
+/// point features, into the directory `out_dir` — straight through `PackWriter`,
+/// the same writer the offline `stt-build` uses. Returns the total feature count
+/// so callers can assert the metadata grand total matches.
 fn write_dataset(out_dir: &Path, tile_count: u32, per_tile: usize) -> u64 {
-    let staging = tempfile::Builder::new().suffix(".stt").tempfile().unwrap();
-    let mut writer = Archive::create(staging.path(), Compression::Zstd).unwrap();
+    let mut writer = PackWriter::create(out_dir, BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
     let t_start = 1_000i64;
     let t_end = 2_000i64;
     let mut features = 0u64;
@@ -54,20 +51,16 @@ fn write_dataset(out_dir: &Path, tile_count: u32, per_tile: usize) -> u64 {
         let layer = point_layer("default", x as u64 * 1000, per_tile, t_start, t_end);
         let payload = encode_tile(&[layer]).unwrap();
         writer
-            .add_tile(&id, t_start, t_end, per_tile as u32, &payload)
+            .add_tile_full(&id, t_start, t_end, None, per_tile as u32, None, &payload)
             .unwrap();
         features += per_tile as u64;
     }
-    let meta = Metadata::new("test")
+    let mut meta = Metadata::new("test")
         .with_time_range(TimeRange::new(t_start as u64, t_end as u64))
         .with_zoom_levels(8, 8);
-    let mut meta = meta;
     meta.feature_count = features;
     meta.tile_count = tile_count as u64;
     writer.finalize(&meta).unwrap();
-
-    transcode_archive_to_packs(staging.path(), out_dir, BlobOrdering::Auto, 64 * 1024 * 1024)
-        .unwrap();
     features
 }
 

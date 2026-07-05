@@ -1,6 +1,6 @@
 //! STT **packed format** — a multi-object, edge-cacheable container.
 //!
-//! Replaces the single-file v4 archive ([`crate::archive::ArchiveWriter`]) as
+//! Replaces the single-file v4 archive (`ArchiveWriter`) as
 //! the canonical write path. A single-file archive cannot be edge-cached once it
 //! exceeds the CDN per-object limit (Cloudflare = 512 MB): every range request
 //! hits origin forever. The packed format makes the *cacheable unit a small
@@ -29,10 +29,10 @@
 //! [`PackWriter`] reuses the dedup / per-blob-zstd / curve-ordering logic of
 //! `ArchiveWriter::finalize_buffered`, then cuts the ordered, deduped blob stream
 //! into packs. [`PackedReader`] is the local-file reader (the TS reader handles
-//! remote/HTTP); it mirrors [`crate::archive::ArchiveReader`] semantics.
+//! remote/HTTP); it mirrors `ArchiveReader` semantics.
 
-use crate::archive::{ArchiveReader, TileEntry};
 use crate::compression;
+use crate::directory::TileEntry;
 use crate::curve::BlobOrdering;
 use crate::error::{Error, Result};
 use crate::metadata::Metadata;
@@ -198,7 +198,7 @@ struct PendingTile {
 
 /// Writer for the multi-object packed format.
 ///
-/// Consumes an `(id, payload)` stream like [`crate::archive::ArchiveWriter`],
+/// Consumes an `(id, payload)` stream like `ArchiveWriter`,
 /// buffering every tile until [`finalize`](Self::finalize). At finalize it
 /// reuses the buffered-writer pipeline — resolve [`BlobOrdering::Auto`], sort by
 /// the space-time curve key, per-blob zstd (NO shared dictionary, so the fzstd
@@ -268,7 +268,7 @@ impl PackWriter {
     }
 
     /// Add a tile carrying the full directory metadata. Same shape as
-    /// [`crate::archive::ArchiveWriter::add_tile_full`]: `cover_t_min` is the
+    /// `ArchiveWriter::add_tile_full`: `cover_t_min` is the
     /// tight lower covering bound (`None` to omit), `temporal_bucket_ms` tags the
     /// directory entry with the temporal bucket size the tile represents. The
     /// `payload` is the uncompressed tile frame.
@@ -637,229 +637,6 @@ fn write_atomic(dir: &Path, final_path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 // ----------------------------------------------------------------------------
-// Transcode (single-file v4 archive -> packed dir)
-// ----------------------------------------------------------------------------
-
-/// Losslessly re-wrap a single-file v4 `.stt` archive into the packed format.
-///
-/// Reads every tile payload via [`ArchiveReader`] and streams it into a fresh
-/// [`PackWriter`], preserving the tight covering bound (`cover_t_min`) and the
-/// per-tile `temporal_bucket_ms` exactly (no thinning), then finalizes with the
-/// source archive's metadata. Writes `manifest.json`, `index/<hash>.sttd`, and
-/// one or more `packs/<hash>.sttp` objects under `out_dir`.
-///
-/// Shared by the `pack-transcode` example and `stt-build`'s `--streaming-arrow`
-/// path (which builds a temp single-file archive under bounded RAM, then
-/// transcodes it to packs).
-pub fn transcode_archive_to_packs<I: AsRef<Path>, O: AsRef<Path>>(
-    in_archive: I,
-    out_dir: O,
-    ordering: BlobOrdering,
-    pack_target_bytes: u64,
-) -> Result<Manifest> {
-    transcode_archive_to_packs_paged(in_archive, out_dir, ordering, pack_target_bytes, None)
-}
-
-/// [`transcode_archive_to_packs`] with an explicit paging choice.
-///
-/// `page_entries`: `Some(k)` emits a paged directory (root + leaf pages of ≤ `k`
-/// entries — Wave 2); `None` emits the single whole-load v5 directory. The tile
-/// payloads, packs, dedup and ordering are identical either way — only the
-/// `.sttd` directory shape changes — so a paged transcode of an existing dataset
-/// re-ships only `index/*.sttd` + `manifest.json` (the packs are unchanged
-/// content addresses).
-pub fn transcode_archive_to_packs_paged<I: AsRef<Path>, O: AsRef<Path>>(
-    in_archive: I,
-    out_dir: O,
-    ordering: BlobOrdering,
-    pack_target_bytes: u64,
-    page_entries: Option<usize>,
-) -> Result<Manifest> {
-    transcode_archive_to_packs_paged_level(
-        in_archive,
-        out_dir,
-        ordering,
-        pack_target_bytes,
-        page_entries,
-        compression::ZSTD_LEVEL,
-    )
-}
-
-/// [`transcode_archive_to_packs_paged`] at an explicit zstd `level` (see
-/// [`PackWriter::with_zstd_level`]). Re-compresses every blob at `level`, so —
-/// unlike [`repack_directory`] — it rewrites the packs, not just the directory.
-pub fn transcode_archive_to_packs_paged_level<I: AsRef<Path>, O: AsRef<Path>>(
-    in_archive: I,
-    out_dir: O,
-    ordering: BlobOrdering,
-    pack_target_bytes: u64,
-    page_entries: Option<usize>,
-    zstd_level: i32,
-) -> Result<Manifest> {
-    let reader = ArchiveReader::open(in_archive)?;
-    let meta = reader.metadata().clone();
-    let entries = reader.entries().to_vec();
-
-    let mut writer = PackWriter::create(out_dir, ordering, pack_target_bytes)?
-        .with_paging(page_entries)
-        .with_zstd_level(zstd_level);
-    for e in &entries {
-        let payload = reader.read_payload(e)?;
-        writer.add_tile_full(
-            &TileId::new(e.zoom, e.x, e.y, e.time_start.max(0) as u64),
-            e.time_start,
-            e.time_end,
-            e.cover_t_min,
-            e.feature_count,
-            e.temporal_bucket_ms,
-            &payload,
-        )?;
-    }
-    writer.finalize(&meta)
-}
-
-/// Re-transcode an existing **packed** dataset into a fresh packed dataset at an
-/// explicit zstd `level` and (optionally) a paged directory — the publish-build
-/// migration. Unlike [`repack_directory`] (directory-only) this re-reads and
-/// **re-compresses every tile payload**, so it picks up a higher `--zstd-level`
-/// (−10..19% on the wire) and re-pages the directory in one pass.
-///
-/// The input packed dir is the source of truth — important because several
-/// showcase datasets were rebuilt later than their legacy single-file `.stt`,
-/// so transcoding from the packs (not the stale `.stt`) preserves those fixes.
-/// Tile content is byte-for-byte preserved (lossless); only the compression
-/// level and directory shape change. `out_dir` MUST differ from the input dir.
-pub fn transcode_packs_to_packs_paged_level<I: AsRef<Path>, O: AsRef<Path>>(
-    in_manifest: I,
-    out_dir: O,
-    ordering: BlobOrdering,
-    pack_target_bytes: u64,
-    page_entries: Option<usize>,
-    zstd_level: i32,
-) -> Result<Manifest> {
-    let reader = PackedReader::open(in_manifest)?;
-    let meta = reader.metadata().clone();
-    let entries = reader.entries().to_vec();
-
-    let mut writer = PackWriter::create(out_dir, ordering, pack_target_bytes)?
-        .with_paging(page_entries)
-        .with_zstd_level(zstd_level);
-    for e in &entries {
-        let payload = reader.read_payload(e)?;
-        writer.add_tile_full(
-            &TileId::new(e.zoom, e.x, e.y, e.time_start.max(0) as u64),
-            e.time_start,
-            e.time_end,
-            e.cover_t_min,
-            e.feature_count,
-            e.temporal_bucket_ms,
-            &payload,
-        )?;
-    }
-    writer.finalize(&meta)
-}
-
-/// Re-encode **only the directory** of an existing packed dataset, optionally
-/// switching it to (or from) the paged container — without re-reading or
-/// re-compressing a single tile payload.
-///
-/// This is the cheap Wave-2 re-transcode: the directory entries already carry
-/// every blob's `(pack_id, offset, length, crc32c)`, and the packs are
-/// content-addressed and immutable, so a directory shape change re-ships only
-/// `index/<hash>.sttd` + `manifest.json` — the packs keep their exact bytes and
-/// names. `page_entries`: `Some(k)` → paged directory (leaf pages of ≤ `k`),
-/// `None` → single whole-load directory.
-///
-/// When `out_dir` differs from the input dataset's directory, the (unchanged)
-/// pack objects are copied across so `out_dir` is a complete dataset; an
-/// in-place re-pack (`out_dir` == the input dir) leaves the packs untouched and
-/// just adds the new index object + overwrites the manifest.
-pub fn repack_directory<P: AsRef<Path>, Q: AsRef<Path>>(
-    in_manifest: P,
-    out_dir: Q,
-    page_entries: Option<usize>,
-) -> Result<Manifest> {
-    let in_manifest = in_manifest.as_ref();
-    let in_dir = in_manifest
-        .parent()
-        .ok_or_else(|| Error::InvalidArchive("manifest path has no parent dir".into()))?;
-    let out_dir = out_dir.as_ref();
-
-    let reader = PackedReader::open(in_manifest)?;
-    let entries = reader.entries().to_vec();
-    let metadata = reader.metadata().clone();
-    let src = Manifest::from_json_bytes(&fs::read(in_manifest)?)?;
-
-    fs::create_dir_all(out_dir.join("index"))?;
-    fs::create_dir_all(out_dir.join("packs"))?;
-
-    // Copy the (unchanged, content-addressed) packs only when writing elsewhere.
-    let same_dir = fs::canonicalize(in_dir).ok() == fs::canonicalize(out_dir).ok();
-    if !same_dir {
-        for p in &src.packs {
-            let dst = out_dir.join(&p.key);
-            if !dst.exists() {
-                fs::copy(in_dir.join(&p.key), &dst)?;
-            }
-        }
-    }
-
-    // Re-encode the directory from the existing entries (no payload re-read).
-    let (index_bytes, layout, root_length, page_count, page_entries_field): (
-        Vec<u8>,
-        Option<String>,
-        Option<u64>,
-        Option<u64>,
-        Option<u64>,
-    ) = if let Some(k) = page_entries {
-        let paged = crate::directory_page::encode_paged_directory(&entries, k, true)?;
-        (
-            paged.bytes,
-            Some(DIRECTORY_LAYOUT_PAGED.to_string()),
-            Some(paged.root_length),
-            Some(paged.page_count as u64),
-            Some(paged.page_entries as u64),
-        )
-    } else {
-        let plain = crate::directory::encode_directory(&entries);
-        (
-            compression::compress_zstd_with_dict(&plain, None)?,
-            None,
-            None,
-            None,
-            None,
-        )
-    };
-
-    let index_hex = blake3_128_hex(&index_bytes);
-    let index_rel = format!("index/{index_hex}.sttd");
-    write_atomic(&out_dir.join("index"), &out_dir.join(&index_rel), &index_bytes)?;
-
-    let manifest = Manifest {
-        format: PACKED_FORMAT.to_string(),
-        format_version: PACKED_FORMAT_VERSION,
-        compression: src.compression.clone(),
-        directory: DirectoryRef {
-            key: index_rel,
-            length: index_bytes.len() as u64,
-            directory_version: crate::directory::DIRECTORY_VERSION,
-            encoding: Some(DIRECTORY_ENCODING_ZSTD.to_string()),
-            layout,
-            root_length,
-            page_count,
-            page_entries: page_entries_field,
-        },
-        packs: src.packs.clone(),
-        metadata,
-    };
-    let manifest_bytes = manifest.to_json_bytes()?;
-    let mut f = File::create(out_dir.join("manifest.json"))?;
-    f.write_all(&manifest_bytes)?;
-    f.flush()?;
-    Ok(manifest)
-}
-
-// ----------------------------------------------------------------------------
 // Integrity
 // ----------------------------------------------------------------------------
 
@@ -1003,7 +780,7 @@ struct LoadedPack {
 /// Reader for a **local** packed dataset. Remote/HTTP reads are the TS reader's
 /// job; this opens objects from the filesystem.
 ///
-/// Mirrors [`crate::archive::ArchiveReader`]: [`entries`](Self::entries) returns
+/// Mirrors `ArchiveReader`: [`entries`](Self::entries) returns
 /// the decoded v5 directory, [`metadata`](Self::metadata) the folded metadata,
 /// and [`read_payload`](Self::read_payload) selects the entry's pack, slices
 /// `[offset..offset+length]`, verifies CRC32C and decompresses the per-blob
@@ -1087,7 +864,7 @@ impl PackedReader {
     ///
     /// Selects the pack by `entry.pack_id`, slices `[offset..offset+length]`
     /// within it, checks the CRC, then decompresses the per-blob zstd. Mirrors
-    /// [`crate::archive::ArchiveReader::read_payload`].
+    /// `ArchiveReader::read_payload`.
     pub fn read_payload(&self, entry: &TileEntry) -> Result<Vec<u8>> {
         let cell = self.packs.get(entry.pack_id as usize).ok_or_else(|| {
             Error::InvalidArchive(format!(
@@ -1442,49 +1219,6 @@ mod tests {
         assert!(issues.is_empty(), "paged verify issues: {issues:?}");
     }
 
-    /// `repack_directory` switches a built dataset's directory to paged WITHOUT
-    /// re-reading payloads: the packs keep their exact content addresses, the
-    /// re-opened entries are identical, and the result verifies clean.
-    #[test]
-    fn repack_directory_to_paged_preserves_packs_and_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src");
-        let out = dir.path().join("out");
-
-        // A small single-directory dataset.
-        let mut w = PackWriter::create(&src, BlobOrdering::Auto, 16 * 1024).unwrap();
-        for k in 0..80u64 {
-            let zoom = [8u8, 11][(k % 2) as usize];
-            let t = (k % 3) as i64 * 3_600_000;
-            let id = TileId::new(zoom, (k % 9) as u32, (k / 9) as u32, t as u64);
-            w.add_tile_full(&id, t, t + 3_599_999, Some(t), 4, Some(3_600_000), &distinct_tile(k))
-                .unwrap();
-        }
-        let src_manifest = w.finalize(&Metadata::new("repack-src")).unwrap();
-        assert!(src_manifest.directory.layout.is_none());
-
-        // Directory-only re-pack into a fresh dir, paged.
-        let out_manifest = repack_directory(src.join("manifest.json"), &out, Some(8)).unwrap();
-        assert_eq!(out_manifest.directory.layout.as_deref(), Some(DIRECTORY_LAYOUT_PAGED));
-        assert!(out_manifest.directory.page_count.unwrap() >= 2);
-
-        // Packs are byte-identical content addresses (only the directory changed).
-        let src_keys: std::collections::BTreeSet<&str> =
-            src_manifest.packs.iter().map(|p| p.key.as_str()).collect();
-        let out_keys: std::collections::BTreeSet<&str> =
-            out_manifest.packs.iter().map(|p| p.key.as_str()).collect();
-        assert_eq!(src_keys, out_keys);
-
-        // Re-opened entries are identical, and integrity verifies clean.
-        let r_src = PackedReader::open(src.join("manifest.json")).unwrap();
-        let r_out = PackedReader::open(out.join("manifest.json")).unwrap();
-        assert_eq!(r_src.entries(), r_out.entries());
-        // A payload reads back identically through the re-packed (paged) dataset.
-        let e = &r_out.entries()[0];
-        assert_eq!(r_out.read_payload(e).unwrap(), r_src.read_payload(e).unwrap());
-        assert!(verify_packed_objects(out.join("manifest.json")).unwrap().is_empty());
-    }
-
     /// A single blob larger than the pack target gets its own pack (never split).
     #[test]
     fn oversized_blob_gets_its_own_pack() {
@@ -1525,6 +1259,43 @@ mod tests {
         let reader = PackedReader::open(out.join("manifest.json")).unwrap();
         let big_entry = reader.entries().iter().find(|e| e.x == 0).unwrap();
         assert_eq!(reader.read_payload(big_entry).unwrap(), big);
+    }
+
+    /// Read-path integrity: flipping a byte inside a pack object makes
+    /// [`PackedReader::read_payload`] fail the per-blob CRC32C check instead of
+    /// returning silently-wrong bytes. Guards the integrity check in
+    /// `read_payload` (replaces the archive-era `corrupt_blob_is_detected`).
+    #[test]
+    fn corrupt_pack_blob_is_detected_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+
+        let mut w = PackWriter::create(&out, BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
+        for k in 0..4u64 {
+            let p = distinct_tile(k);
+            w.add_tile_full(&TileId::new(10, k as u32, 0, 0), 0, 100, None, 6, None, &p).unwrap();
+        }
+        let manifest = w.finalize(&Metadata::new("crc")).unwrap();
+
+        // Clean read before corruption.
+        let entry = PackedReader::open(out.join("manifest.json")).unwrap().entries()[0].clone();
+        assert!(PackedReader::open(out.join("manifest.json"))
+            .unwrap()
+            .read_payload(&entry)
+            .is_ok());
+
+        // Flip the first byte of that tile's compressed blob inside its pack.
+        let pack_path = out.join(&manifest.packs[entry.pack_id as usize].key);
+        let mut bytes = fs::read(&pack_path).unwrap();
+        bytes[entry.offset as usize] ^= 0xff;
+        fs::write(&pack_path, &bytes).unwrap();
+
+        // A fresh reader must now reject that tile's payload (CRC32C mismatch).
+        let reader = PackedReader::open(out.join("manifest.json")).unwrap();
+        assert!(
+            reader.read_payload(&entry).is_err(),
+            "corrupt pack blob must fail the read-path CRC32C check"
+        );
     }
 
     /// Two builds of the same input — added in different orders, including

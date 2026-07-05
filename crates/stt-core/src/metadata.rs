@@ -122,6 +122,80 @@ pub struct HeatmapDomain {
     pub classes: Vec<HeatmapClassDomain>,
 }
 
+/// Build-time statistics + rendering defaults for ONE property column,
+/// carried inside [`StyleHints`].
+///
+/// Two shapes share this struct:
+/// * **numeric** properties carry `min`/`p50`/`p90`/`p95`/`p97`/`p99`/`max`
+///   and `suggested_domain` (`cardinality` absent);
+/// * **categorical** (string) properties carry ONLY `name` + `cardinality`
+///   (the numeric fields are absent from the JSON, not null-filled).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PropertyStyleHint {
+    /// Property (tile column) name.
+    pub name: String,
+    /// Minimum observed value (numeric only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    /// 50th percentile (numeric only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50: Option<f64>,
+    /// 90th percentile (numeric only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p90: Option<f64>,
+    /// 95th percentile (numeric only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95: Option<f64>,
+    /// 97th percentile (numeric only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p97: Option<f64>,
+    /// 99th percentile (numeric only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p99: Option<f64>,
+    /// Maximum observed value (numeric only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    /// Suggested render domain `[min, p97]`, each endpoint rounded OUTWARD to
+    /// 2 significant figures. p97 (not max) encodes the project's manual
+    /// "domain clamps at ~p97" tuning convention — a single outlier must not
+    /// dim the whole ramp (numeric only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_domain: Option<[f64; 2]>,
+    /// Distinct-value count (categorical only; the profiler caps it at
+    /// 10 000 — "at least 10k" is already actionable for palette sizing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cardinality: Option<u32>,
+}
+
+/// Optional build-time "style hints" block: per-property statistics plus
+/// archive-level rendering defaults, computed by the opt-in
+/// `stt-build --style-hints` profiler so a fresh dataset renders sensibly
+/// without hand-tuning.
+///
+/// Hints are DEFAULTS — a renderer or user can always override them. The
+/// whole block is additive: archives without it (and readers that don't know
+/// it) are unaffected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StyleHints {
+    /// Style-hints block schema version. Currently `1`.
+    pub version: u32,
+    /// Per-property statistics (numeric percentiles or categorical
+    /// cardinality — see [`PropertyStyleHint`]).
+    pub properties: Vec<PropertyStyleHint>,
+    /// Suggested playback duration in seconds:
+    /// `clamp(round(sqrt(bucket_count)), 20, 90)` where `bucket_count` is the
+    /// time-range duration divided by `temporal_bucket_ms`. Absent when the
+    /// bucket size is unknown/zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_playback_seconds: Option<u32>,
+    /// Dominant produced layer kind: one of `"points"`, `"paths"`, `"trips"`,
+    /// or `"polygons"` (absent when no kind could be derived). Kept as a
+    /// string (not an enum) so a newer writer's vocabulary can't fail an
+    /// older reader's decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_hint: Option<String>,
+}
+
 /// One level of a temporal LOD pyramid (orthogonal to the summary tier above).
 ///
 /// At any tile-zoom-level `z` such that `z <= max_zoom_level`, a client that
@@ -192,6 +266,12 @@ pub struct Metadata {
     /// (earthquake magnitudes, AIS speed, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heatmap_domain: Option<HeatmapDomain>,
+
+    /// Optional build-time style hints (per-property statistics + suggested
+    /// rendering defaults). Baked by `stt-build --style-hints`; always
+    /// overridable by the renderer/user, ignored by older readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_hints: Option<StyleHints>,
 }
 
 impl Default for Metadata {
@@ -217,6 +297,7 @@ impl Default for Metadata {
             summary_tier: None,
             temporal_lod: None,
             heatmap_domain: None,
+            style_hints: None,
         }
     }
 }
@@ -306,6 +387,12 @@ impl Metadata {
     /// Attach a bake-time HeatmapLayer intensity-domain block.
     pub fn with_heatmap_domain(mut self, domain: HeatmapDomain) -> Self {
         self.heatmap_domain = Some(domain);
+        self
+    }
+
+    /// Attach a build-time style-hints block.
+    pub fn with_style_hints(mut self, hints: StyleHints) -> Self {
+        self.style_hints = Some(hints);
         self
     }
 
@@ -563,6 +650,65 @@ mod tests {
         let metadata = Metadata::new("no-heat");
         let s = String::from_utf8(metadata.to_json_bytes().unwrap()).unwrap();
         assert!(!s.contains("heatmap_domain"), "got: {s}");
+    }
+
+    #[test]
+    fn test_style_hints_roundtrip() {
+        let hints = StyleHints {
+            version: 1,
+            properties: vec![
+                PropertyStyleHint {
+                    name: "magnitude".to_string(),
+                    min: Some(0.1),
+                    p50: Some(2.0),
+                    p90: Some(4.1),
+                    p95: Some(4.9),
+                    p97: Some(5.3),
+                    p99: Some(6.2),
+                    max: Some(9.1),
+                    suggested_domain: Some([0.1, 5.3]),
+                    cardinality: None,
+                },
+                // Categorical: ONLY name + cardinality.
+                PropertyStyleHint {
+                    name: "category".to_string(),
+                    cardinality: Some(7),
+                    ..Default::default()
+                },
+            ],
+            suggested_playback_seconds: Some(45),
+            layer_hint: Some("points".to_string()),
+        };
+        let metadata = Metadata::new("hints-test").with_style_hints(hints.clone());
+        let bytes = metadata.to_json_bytes().unwrap();
+
+        // Wire shape: the categorical entry must carry NO numeric keys (absent,
+        // not null-filled) — pinned cross-language contract with the TS reader.
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let cat = &v["style_hints"]["properties"][1];
+        assert_eq!(cat["name"], "category");
+        assert_eq!(cat["cardinality"], 7);
+        let cat_keys: Vec<&String> = cat.as_object().unwrap().keys().collect();
+        assert_eq!(cat_keys.len(), 2, "categorical carries only name+cardinality: {cat_keys:?}");
+        // Numeric entry: no cardinality key.
+        assert!(v["style_hints"]["properties"][0].get("cardinality").is_none());
+        assert_eq!(v["style_hints"]["suggested_playback_seconds"], 45);
+        assert_eq!(v["style_hints"]["layer_hint"], "points");
+
+        let decoded = Metadata::from_json_bytes(&bytes).unwrap();
+        assert_eq!(decoded.style_hints, Some(hints));
+    }
+
+    #[test]
+    fn test_style_hints_field_omitted_when_unset() {
+        // Old readers must be unaffected: an archive built without
+        // --style-hints carries no `style_hints` key at all, and a legacy
+        // metadata JSON without the key decodes to None (see the
+        // `test_metadata_without_summary_tier_decodes` fixture, which also
+        // lacks style_hints).
+        let metadata = Metadata::new("no-hints");
+        let s = String::from_utf8(metadata.to_json_bytes().unwrap()).unwrap();
+        assert!(!s.contains("style_hints"), "got: {s}");
     }
 
     #[test]

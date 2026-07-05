@@ -30,6 +30,10 @@ pub mod input;
 pub mod postgres_input;
 pub mod quadbin;
 pub mod simplify;
+/// Build-time `style_hints` collection (`--style-hints`): bounded per-property
+/// value sampling + layer-kind counting over the loaded features, feeding the
+/// generic profiler in `stt_optimize::analysis::properties`.
+pub mod style_hints;
 pub mod summary;
 pub mod tiler;
 

@@ -54,10 +54,6 @@ indicatif = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
-# stt-build CLI (feature `build-cli`): temp staging for the
-# --streaming-arrow -> packed transcode path.
-tempfile = { version = "3.10", optional = true }
-
 # stt-validate (feature `validate-cli`): Arrow IPC decode checks.
 arrow = { workspace = true, optional = true }
 
@@ -103,7 +99,7 @@ cli-core = [
   "dep:tracing",
   "dep:tracing-subscriber",
 ]
-build-cli = ["build", "cli-core", "dep:tempfile"]
+build-cli = ["build", "cli-core"]
 optimize-cli = ["optimize", "cli-core"]
 validate-cli = ["cli-core", "dep:arrow"]
 # stt-serve plumbing (HTTP server + runtime), backend-less. Internal: enabling

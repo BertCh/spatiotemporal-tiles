@@ -37,9 +37,8 @@ use parquet::arrow::ArrowWriter;
 
 use stt_build::input::{self, InputStrictness, ParsedFeature, TimeFormat};
 use stt_build::tiler::{generate_tiles_streaming, TileConfig};
-use stt_core::archive::{Archive, ArchiveReader};
 use stt_core::metadata::Metadata;
-use stt_core::types::Compression;
+use stt_core::{BlobOrdering, PackWriter, PackedReader};
 
 /// One fixture row. `wkb == None` is a null geometry (skip-parity case). `vts` /
 /// `vvs` are the per-vertex arrays (None = no per-vertex column for this row);
@@ -395,12 +394,12 @@ pub fn assert_features_equal(file: &[ParsedFeature], other: &[ParsedFeature], la
     }
 }
 
-/// Build a single-file archive from a feature set with the given tile config,
-/// returning the temp path. Bounds/time-range derive from the features exactly
+/// Build a packed dataset from a feature set with the given tile config,
+/// returning the temp dir. Bounds/time-range derive from the features exactly
 /// as the CLI does.
-pub fn build_archive(features: &[ParsedFeature], config: &TileConfig) -> tempfile::TempPath {
-    let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let mut writer = Archive::create(&path, Compression::Zstd).unwrap();
+pub fn build_archive(features: &[ParsedFeature], config: &TileConfig) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
     generate_tiles_streaming(features, config, &mut writer, 2).unwrap();
     let (bounds, time_range) = input::calculate_bounds(features).unwrap();
     let metadata = Metadata::new("parity")
@@ -409,14 +408,14 @@ pub fn build_archive(features: &[ParsedFeature], config: &TileConfig) -> tempfil
         .with_zoom_levels(config.min_zoom, config.max_zoom)
         .with_temporal_bucket_ms(config.temporal_bucket_ms);
     writer.finalize(&metadata).unwrap();
-    path
+    dir
 }
 
 /// The per-tile identity key-set of an archive: `(zoom, x, y, time_start,
 /// time_end, feature_count)` for every tile — order-independent and robust to
 /// within-tile feature ordering (which legitimately differs by source).
-pub fn archive_tile_keys(path: &std::path::Path) -> std::collections::BTreeSet<(u8, u32, u32, i64, i64, u32)> {
-    let reader = ArchiveReader::open(path).unwrap();
+pub fn archive_tile_keys(dir: &std::path::Path) -> std::collections::BTreeSet<(u8, u32, u32, i64, i64, u32)> {
+    let reader = PackedReader::open(dir.join("manifest.json")).unwrap();
     reader
         .entries()
         .iter()

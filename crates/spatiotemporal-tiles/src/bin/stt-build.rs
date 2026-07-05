@@ -107,9 +107,8 @@ struct Args {
     /// `auto` (default; pick from the dataset's space-vs-time cardinality:
     /// wide-time → spatial-major, else the 3D-Hilbert generalist), or an explicit
     /// `spatial`, `time-major`, `hilbert3`, or `morton3`. Locality means fewer
-    /// packs touched per viewport (fewer client range requests). The in-memory
-    /// pipeline holds all tile payloads in RAM until finalize. With
-    /// --streaming-arrow this controls the ordering of the transcode pass.
+    /// packs touched per viewport (fewer client range requests). The pipeline
+    /// holds all tile payloads in RAM until finalize.
     #[arg(long, default_value = "auto")]
     blob_ordering: String,
 
@@ -213,13 +212,6 @@ struct Args {
     #[arg(long)]
     streaming: bool,
 
-    /// Enable the new Arrow-native streaming pipeline. Reads Parquet record
-    /// batches lazily, partitions into per-tile accumulators, and emits
-    /// tiles directly to the archive — peak RSS bounded by one batch plus
-    /// the active tile-spill budget. Required for >10 GB inputs.
-    #[arg(long)]
-    streaming_arrow: bool,
-
     /// Enable line simplification for lower zoom levels (reduces memory and improves performance)
     #[arg(long)]
     simplify: bool,
@@ -256,12 +248,23 @@ struct Args {
     #[arg(long)]
     strict_geometry: bool,
 
-    /// Auto-tune zoom range, temporal bucket size, and compression by
-    /// running stt-optimize's analyzer over the input before building.
-    /// Any flag the user passes explicitly still wins; only unset/default
-    /// values are filled in from the recommendation.
-    #[arg(long)]
-    auto: bool,
+    /// Auto-tune build flags by running stt-optimize's analyzer over the
+    /// input before building. Bare `--auto` (= `--auto basic`) fills in the
+    /// zoom range and temporal bucket only; `--auto encode` additionally
+    /// applies the advisors' NON-LOSSY byte-level levers (zstd level via the
+    /// `--publish` advice, `--blob-ordering`, `--pack-size`). Any flag the
+    /// user passes explicitly still wins, and LOSSY advice (quantization,
+    /// per-tile budgets) is never auto-applied in either mode — it is logged
+    /// loudly as "suggested, not applied".
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        num_args(0..=1),
+        require_equals = false,
+        default_missing_value = "basic"
+    )]
+    auto: Option<AutoMode>,
 
     // --- Summary-tier options (server-aggregated low-zoom tier) ---
     /// Emit a pre-aggregated summary tier alongside the raw tier.
@@ -365,6 +368,18 @@ struct Args {
     /// [0, 1] (sufficient for the un-weighted gaussian-peak case).
     #[arg(long)]
     heatmap_class: Option<String>,
+
+    /// Bake per-property "style hints" into the archive metadata
+    /// (`style_hints`): numeric percentiles (p50/p90/p95/p97/p99) plus a
+    /// suggested color domain [min, p97] (each endpoint rounded outward to 2
+    /// significant figures), categorical distinct-value counts, a suggested
+    /// playback duration, and a layer-kind hint. Hints are DEFAULTS — the
+    /// renderer/user can always override them. Values are sampled at a
+    /// deterministic stride capped at ~250k values per property (memory
+    /// guard). In-memory pipeline only: skipped with a warning under
+    /// --streaming.
+    #[arg(long)]
+    style_hints: bool,
 
     /// Ceiling (ms) on the per-vertex time quantization step. Vertex
     /// timestamps ride a compact u16-delta encoding whose step is derived
@@ -482,6 +497,17 @@ struct Args {
 enum SummaryTierScheme {
     H3,
     Quadbin,
+}
+
+/// `--auto` tiers. `basic` (the bare-`--auto` default) fills in the zoom
+/// range + temporal bucket only — exactly the pre-tier behaviour. `encode`
+/// additionally applies the advisors' non-lossy byte-level encoding levers
+/// for flags the user did not set explicitly. Lossy and semantic advice is
+/// never auto-applied in either mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum AutoMode {
+    Basic,
+    Encode,
 }
 
 /// Where features come from: a GeoParquet file, a live PostGIS query, or a
@@ -618,60 +644,6 @@ impl InputSource {
                     time_format,
                     time_strictness,
                     geometry_strictness,
-                )
-            }
-        }
-    }
-
-    /// Streaming load — invoke `on_batch` per bounded batch (bounded RAM).
-    fn stream<F>(
-        &self,
-        time_field: &str,
-        end_time_field: Option<&str>,
-        time_format: input::TimeFormat,
-        time_strictness: input::InputStrictness,
-        geometry_strictness: input::InputStrictness,
-        on_batch: F,
-    ) -> Result<()>
-    where
-        F: FnMut(Vec<input::ParsedFeature>) -> Result<()>,
-    {
-        match self {
-            InputSource::File(path) => input::stream_features(
-                path,
-                time_field,
-                end_time_field,
-                time_format,
-                time_strictness,
-                geometry_strictness,
-                on_batch,
-            ),
-            #[cfg(feature = "postgres")]
-            InputSource::Postgres { conn, spec } => {
-                stt_build::postgres_input::stream_features_postgres(
-                    conn,
-                    spec,
-                    time_field,
-                    end_time_field,
-                    time_format,
-                    time_strictness,
-                    geometry_strictness,
-                    stt_build::postgres_input::DEFAULT_BATCH_SIZE,
-                    on_batch,
-                )
-            }
-            #[cfg(feature = "duckdb")]
-            InputSource::DuckDb { db_path, spec } => {
-                stt_build::duckdb_input::stream_features_duckdb(
-                    db_path,
-                    spec,
-                    time_field,
-                    end_time_field,
-                    time_format,
-                    time_strictness,
-                    geometry_strictness,
-                    stt_build::duckdb_input::DEFAULT_BATCH_SIZE,
-                    on_batch,
                 )
             }
         }
@@ -835,8 +807,8 @@ fn main() -> Result<()> {
     // rebuilt at the tiling stage; this call is purely for early validation.
     build_attribute_filter(&args)?;
 
-    if args.auto {
-        apply_auto_recommendations(&matches, &mut args)?;
+    if let Some(mode) = args.auto {
+        apply_auto_recommendations(&matches, &mut args, mode)?;
     }
 
     // --publish bundles the lossless deploy wins into the core build path so a
@@ -871,8 +843,10 @@ fn main() -> Result<()> {
         info!("Encoder settings ENABLED: {}", enabled.join(", "));
     }
 
-    // Parse compression
-    let compression = parse_compression(&args.compression)?;
+    // Validate the --compression flag (packed output is zstd-only; the legacy
+    // gzip/none choices now error). The parsed value is otherwise unused —
+    // PackWriter is always per-blob zstd.
+    parse_compression(&args.compression)?;
 
     // Parse the pack ordering (the packed format always buffers + reorders
     // before cutting packs). `eager` is accepted for backward-compat and maps
@@ -902,239 +876,6 @@ fn main() -> Result<()> {
     } else {
         input::InputStrictness::Warn
     };
-
-    // --streaming-arrow: the new Arrow-native streaming pipeline. Reads
-    // record batches lazily, builds per-tile accumulators, and writes
-    // tiles directly without ever holding the full feature set in RAM.
-    // The legacy path below keeps the small-dataset behaviour identical
-    // to v2.
-    if args.streaming_arrow {
-        // The streaming pipeline finalizes the archive before the in-memory
-        // path's summary-tier / heatmap-domain / raster / metadata-output
-        // passes run, so silently honouring those flags here would drop them.
-        // Refuse the combination with a clear error rather than producing an
-        // archive that's quietly missing the requested features. (Wiring these
-        // passes into the streaming finalize is tracked as a follow-up; until
-        // then use the in-memory pipeline for these features.)
-        let mut unsupported: Vec<&str> = Vec::new();
-        if args.summary_tier.is_some() {
-            unsupported.push("--summary-tier");
-        }
-        if args.heatmap_weight.is_some() {
-            unsupported.push("--heatmap-weight");
-        }
-        if args.heatmap_class.is_some() {
-            unsupported.push("--heatmap-class");
-        }
-        if args.metadata_output.is_some() {
-            unsupported.push("--metadata-output");
-        }
-        // Per-tile budgets + attribute control hook into the in-memory
-        // build_tile path only (the streaming-arrow path finalizes a temp
-        // single-file archive through a different tile builder). Mirror the
-        // existing gate rather than silently honour them.
-        if args.maximum_tile_bytes.is_some() {
-            unsupported.push("--maximum-tile-bytes");
-        }
-        if args.maximum_tile_features.is_some() {
-            unsupported.push("--maximum-tile-features");
-        }
-        if args.drop_densest_as_needed {
-            unsupported.push("--drop-densest-as-needed");
-        }
-        if !args.exclude.is_empty() {
-            unsupported.push("--exclude");
-        }
-        if !args.include.is_empty() {
-            unsupported.push("--include");
-        }
-        if args.exclude_all {
-            unsupported.push("--exclude-all");
-        }
-        if !unsupported.is_empty() {
-            anyhow::bail!(
-                "--streaming-arrow does not yet support {} (the streaming pipeline \
-                 finalizes before those passes run). Re-run without --streaming-arrow \
-                 to use {}, or drop the flag(s) to stream.",
-                unsupported.join(", "),
-                unsupported.join(", "),
-            );
-        }
-        info!("Using streaming-Arrow pipeline (bounded RAM)...");
-        let temporal_bucket_ms = parse_duration(&args.temporal_bucket)?;
-        let temporal_lod = match args.temporal_lod.as_deref() {
-            Some(s) => parse_temporal_lod(s, args.max_zoom)?,
-            None => Vec::new(),
-        };
-        if !temporal_lod.is_empty() {
-            warn!(
-                "--temporal-lod ignored in --streaming-arrow mode: LOD aggregation \
-                 requires the in-memory pipeline (will be lifted to streaming in a \
-                 follow-up)."
-            );
-        }
-        let tile_config = tiler::TileConfig {
-            min_zoom: args.min_zoom,
-            max_zoom: args.max_zoom,
-            layer_name: args.layer.clone(),
-            temporal_bucket_ms,
-            clip_trajectories: !args.no_clip,
-            clip_min_vertices: args.clip_min_vertices,
-            simplify: args.simplify,
-            simplify_max_zoom: args.simplify_max_zoom,
-            pre_tessellate: args.pre_tessellate,
-            // Temporal LOD only wired in the non-streaming branch below.
-            temporal_lod: Vec::new(),
-            min_features_per_tile: args.min_features_per_tile,
-            time_aware_simplify: args.time_aware_simplify,
-            // Adaptive temporal chunking is an in-memory-only feature; the
-            // streaming path keeps fixed buckets, so this is ignored here.
-            adaptive_target_features: None,
-            min_zoom_field: args.min_zoom_field.clone(),
-            max_zoom_field: args.max_zoom_field.clone(),
-            // Per-tile budgets + attribute control are in-memory-only; the
-            // streaming-arrow combination is rejected above, so these stay at
-            // their inert defaults here.
-            tile_budget: None,
-            attribute_filter: stt_build::columnar::AttributeFilter::KeepAll,
-            property_types: source
-                .property_kinds(&args.time_field, args.end_time_field.as_deref()),
-        };
-        // --streaming-arrow stays bounded-RAM: it streams tiles into a TEMP
-        // single-file archive (the only writer that doesn't buffer all
-        // payloads), then transcodes that temp file into the packed dir. The
-        // pack ordering is applied during the transcode pass.
-        info!(
-            "Streaming to a temp single-file archive, then transcoding to packs \
-             (ordering {pack_ordering}, pack target {} MiB)",
-            args.pack_size
-        );
-        let temp_archive = tempfile::Builder::new()
-            .prefix("stt-build-streaming-")
-            .suffix(".stt")
-            .tempfile()
-            .context("failed to create temp archive for --streaming-arrow")?;
-        let temp_archive_path = temp_archive.path().to_path_buf();
-        let mut writer = stt_core::Archive::create(&temp_archive_path, compression)?;
-        let mut bounds_lon = (f64::MAX, f64::MIN);
-        let mut bounds_lat = (f64::MAX, f64::MIN);
-        let mut time_range = (u64::MAX, 0u64);
-        let mut feature_count: u64 = 0;
-
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<input::ParsedFeature>>>(2);
-        // Producer: stream the source (GeoParquet file or PostGIS) -> channel.
-        let producer_source = source.clone();
-        let time_field = args.time_field.clone();
-        let end_time_field = args.end_time_field.clone();
-        let time_format = args.time_format;
-        let handle = std::thread::spawn(move || {
-            let tx_clone = tx.clone();
-            let res = producer_source.stream(
-                &time_field,
-                end_time_field.as_deref(),
-                time_format,
-                time_strictness,
-                geometry_strictness,
-                |batch| {
-                    tx_clone
-                        .send(Ok(batch))
-                        .map_err(|e| anyhow::anyhow!("channel closed: {e}"))?;
-                    Ok(())
-                },
-            );
-            if let Err(e) = res {
-                let _ = tx.send(Err(e));
-            }
-        });
-
-        // Consumer: drive the streaming tiler and update bounds inline.
-        let iter = std::iter::from_fn(|| rx.recv().ok()).map(|res| {
-            res.map(|batch| {
-                feature_count += batch.len() as u64;
-                for f in &batch {
-                    bounds_lon.0 = bounds_lon.0.min(f.lon);
-                    bounds_lon.1 = bounds_lon.1.max(f.lon);
-                    bounds_lat.0 = bounds_lat.0.min(f.lat);
-                    bounds_lat.1 = bounds_lat.1.max(f.lat);
-                    time_range.0 = time_range.0.min(f.timestamp);
-                    time_range.1 = time_range
-                        .1
-                        .max(f.end_timestamp.unwrap_or(f.timestamp));
-                }
-                batch
-            })
-        });
-
-        let stats = tiler::build_streaming_from_batches(
-            iter,
-            &tile_config,
-            &mut writer,
-            args.workers,
-            // 64 MB per-tile spill budget by default. Bigger = fewer flushes
-            // (better compression ratio) but more RAM in flight.
-            64 * 1024 * 1024,
-        )?;
-        handle.join().ok();
-
-        info!(
-            "streaming: {} tiles ({} clipped, {} originals) from {} features",
-            stats.total_tiles, stats.clipped_segments, stats.original_features, feature_count
-        );
-
-        let bounds = if feature_count == 0 {
-            stt_core::types::BoundingBox::new(-180.0, -90.0, 180.0, 90.0)
-        } else {
-            stt_core::types::BoundingBox::new(
-                bounds_lon.0,
-                bounds_lat.0,
-                bounds_lon.1,
-                bounds_lat.1,
-            )
-        };
-        let trange = if feature_count == 0 {
-            stt_core::types::TimeRange::new(0, 0)
-        } else {
-            aligned_time_range(
-                stt_core::types::TimeRange::new(time_range.0, time_range.1),
-                temporal_bucket_ms,
-                &[],
-                false,
-            )
-        };
-        let metadata = stt_core::metadata::Metadata::new(
-            args.name.clone().unwrap_or_else(|| source.default_name()),
-        )
-        .with_description(args.description.unwrap_or_default())
-        .with_attribution(args.attribution.unwrap_or_default())
-        .with_bounds(bounds)
-        .with_time_range(trange)
-        .with_zoom_levels(args.min_zoom, args.max_zoom)
-        .with_temporal_bucket_ms(temporal_bucket_ms);
-        writer.finalize(&metadata)?;
-
-        // Transcode the bounded-RAM temp archive into the packed dataset dir,
-        // then drop the temp file. Shared with the pack-transcode example.
-        info!("Transcoding temp archive -> packed dir {}", out_dir.display());
-        let manifest = stt_core::transcode_archive_to_packs_paged_level(
-            &temp_archive_path,
-            &out_dir,
-            pack_ordering,
-            pack_target_bytes,
-            (!args.single_directory).then_some(args.page_entries),
-            args.zstd_level,
-        )?;
-        drop(temp_archive); // delete the temp .stt
-        let total_pack_bytes: u64 = manifest.packs.iter().map(|p| p.length).sum();
-        info!(
-            "Packed dataset written to {} ({} tiles, {} features, {} packs, {} pack bytes)",
-            out_dir.display(),
-            stats.total_tiles,
-            feature_count,
-            manifest.packs.len(),
-            total_pack_bytes,
-        );
-        return Ok(());
-    }
 
     // Step 1: Load all features into memory
     info!("Loading input data...");
@@ -1478,6 +1219,31 @@ fn main() -> Result<()> {
         );
         metadata = metadata.with_heatmap_domain(domain);
     }
+    if args.style_hints {
+        // Mirrors --temporal-lod's pipeline gate: hints need the loaded
+        // feature slice, so only the in-memory path computes them.
+        if args.streaming {
+            warn!(
+                "--style-hints ignored with --streaming: the style-hints profiler \
+                 needs the in-memory pipeline. Re-run without --streaming to bake hints."
+            );
+        } else if let Some(hints) = stt_build::style_hints::compute_style_hints(
+            &features,
+            &time_range,
+            temporal_bucket_ms,
+        ) {
+            info!(
+                "Style hints: {} properties profiled, layer hint {}, suggested playback {}",
+                hints.properties.len(),
+                hints.layer_hint.as_deref().unwrap_or("(none)"),
+                hints
+                    .suggested_playback_seconds
+                    .map(|s| format!("{s}s"))
+                    .unwrap_or_else(|| "(none)".to_string()),
+            );
+            metadata = metadata.with_style_hints(hints);
+        }
+    }
 
     let manifest = writer.finalize(&metadata)?;
 
@@ -1654,8 +1420,16 @@ fn compute_heatmap_domain(
 
 /// Run stt-optimize over the input and fold its recommendations into `args`
 /// for any flag the user did NOT pass explicitly.
-fn apply_auto_recommendations(matches: &ArgMatches, args: &mut Args) -> Result<()> {
-    info!("--auto: analyzing input for build recommendations...");
+///
+/// `basic` (bare `--auto`) fills in the zoom range + temporal bucket only.
+/// `encode` additionally applies the advisors' NON-LOSSY byte-level levers
+/// (`--publish`-equivalent zstd level, `--blob-ordering`, `--pack-size`).
+/// LOSSY advice (quantization, budgets) is never applied in either mode —
+/// it is warn-logged as "suggested, not applied" — and semantic levers
+/// (`--temporal-lod`, `--adaptive-temporal`, `--summary-tier`,
+/// `--min-zoom-field`, …) stay suggestion-only too.
+fn apply_auto_recommendations(matches: &ArgMatches, args: &mut Args, mode: AutoMode) -> Result<()> {
+    info!("--auto ({mode:?}): analyzing input for build recommendations...");
     let path = args.input.clone().ok_or_else(|| {
         anyhow::anyhow!("--auto is not supported with --postgres/--duckdb (the analyzer reads a GeoParquet file)")
     })?;
@@ -1682,9 +1456,13 @@ fn apply_auto_recommendations(matches: &ArgMatches, args: &mut Args) -> Result<(
     // rec.compression is NOT folded in: the packed format is zstd-only, so
     // an analyzer recommendation of gzip/none would just fail validation.
     if !user_set("temporal_bucket") && rec.temporal_bucket_ms > 0 {
-        let human = rec.temporal_bucket_human.clone();
-        info!("  temporal-bucket: {} (auto)", human);
-        args.temporal_bucket = human;
+        info!(
+            "  temporal-bucket: {} (auto)",
+            rec.temporal_bucket_human
+        );
+        // Fold in the ms form: the human string ("30 days") is for logs only
+        // and is not always `parse_duration`-compatible.
+        args.temporal_bucket = format!("{}ms", rec.temporal_bucket_ms);
     }
 
     info!(
@@ -1694,6 +1472,75 @@ fn apply_auto_recommendations(matches: &ArgMatches, args: &mut Args) -> Result<(
     );
     for line in &rec.explanations {
         info!("    - {}", line);
+    }
+
+    // Advisor suggestions. Only `--auto encode` applies anything, and ONLY
+    // the non-lossy byte-level levers, and only for flags the user did not
+    // set explicitly. Everything else is surfaced as a suggestion.
+    let mut applied: Vec<String> = Vec::new();
+    for advice in &rec.advice {
+        let suggestion = match &advice.value {
+            Some(v) => format!("{} {}", advice.flag, v),
+            None => advice.flag.clone(),
+        };
+        if advice.lossy {
+            // Lossy levers (quantization, budgets) discard or degrade data —
+            // NEVER auto-applied (no-thinning principle). Loud by design.
+            warn!("suggested, not applied: {suggestion} — {}", advice.why);
+            continue;
+        }
+        if mode != AutoMode::Encode {
+            info!("  suggested, not applied (--auto encode applies byte-level levers): {suggestion}");
+            continue;
+        }
+        match advice.flag.as_str() {
+            // --publish bundles zstd 19 over the already-paged-by-default
+            // directory; apply the equivalent directly (set the level, leave
+            // the paging default) rather than flipping the publish bool.
+            "--publish" => {
+                if user_set("zstd_level") || user_set("publish") {
+                    info!("  --publish advice skipped (explicit --zstd-level/--publish wins)");
+                } else {
+                    args.zstd_level = 19;
+                    applied.push("zstd-level 19 (--publish advice)".to_string());
+                }
+            }
+            "--zstd-level" => match advice.value.as_deref().map(str::parse::<i32>) {
+                Some(Ok(level)) if !user_set("zstd_level") => {
+                    args.zstd_level = level;
+                    applied.push(format!("zstd-level {level}"));
+                }
+                Some(Ok(_)) => info!("  --zstd-level advice skipped (explicit flag wins)"),
+                _ => warn!("  --zstd-level advice has no usable value; skipped"),
+            },
+            "--blob-ordering" => match &advice.value {
+                Some(ordering) if !user_set("blob_ordering") => {
+                    args.blob_ordering = ordering.clone();
+                    applied.push(format!("blob-ordering {ordering}"));
+                }
+                Some(_) => info!("  --blob-ordering advice skipped (explicit flag wins)"),
+                None => warn!("  --blob-ordering advice has no value; skipped"),
+            },
+            "--pack-size" => match advice.value.as_deref().map(str::parse::<u64>) {
+                Some(Ok(mib)) if !user_set("pack_size") => {
+                    args.pack_size = mib;
+                    applied.push(format!("pack-size {mib}"));
+                }
+                Some(Ok(_)) => info!("  --pack-size advice skipped (explicit flag wins)"),
+                _ => warn!("  --pack-size advice has no usable value; skipped"),
+            },
+            // Semantic levers (--temporal-lod, --adaptive-temporal,
+            // --summary-tier, --min-zoom-field, …) change what the archive
+            // MEANS, not just its bytes — never auto-applied.
+            _ => info!("  suggested, not applied (semantic lever): {suggestion} — {}", advice.why),
+        }
+    }
+    if mode == AutoMode::Encode {
+        if applied.is_empty() {
+            info!("--auto encode: no byte-level levers auto-applied (explicit flags win, or no applicable advice)");
+        } else {
+            info!("--auto encode applied: {}", applied.join(", "));
+        }
     }
     Ok(())
 }
@@ -1940,6 +1787,44 @@ mod tests {
             .expect("no source should error")
             .to_string();
         assert!(err.contains("no input"), "got: {err}");
+    }
+
+    #[test]
+    fn auto_absent_parses_to_none() {
+        assert_eq!(args_from(&[]).auto, None);
+    }
+
+    #[test]
+    fn bare_auto_parses_to_basic() {
+        // Plain `--auto` must keep its pre-tier meaning: basic (zoom + bucket).
+        assert_eq!(args_from(&["--auto"]).auto, Some(AutoMode::Basic));
+        assert_eq!(args_from(&["--auto", "basic"]).auto, Some(AutoMode::Basic));
+    }
+
+    #[test]
+    fn auto_encode_parses_to_encode() {
+        assert_eq!(args_from(&["--auto", "encode"]).auto, Some(AutoMode::Encode));
+        // `--auto=encode` (require_equals is false, but `=` still works).
+        assert_eq!(args_from(&["--auto=encode"]).auto, Some(AutoMode::Encode));
+    }
+
+    #[test]
+    fn bare_auto_does_not_swallow_the_next_flag() {
+        let args = args_from(&["--auto", "--simplify"]);
+        assert_eq!(args.auto, Some(AutoMode::Basic));
+        assert!(args.simplify);
+    }
+
+    #[test]
+    fn style_hints_flag_defaults_off_and_parses() {
+        assert!(!args_from(&[]).style_hints);
+        assert!(args_from(&["--style-hints"]).style_hints);
+    }
+
+    #[test]
+    fn auto_rejects_unknown_mode() {
+        let argv = vec!["stt-build", "-i", "in.parquet", "-o", "out", "--auto", "bogus"];
+        assert!(Args::try_parse_from(argv).is_err());
     }
 
     /// Doc gate (naming-types-consistency F9): every visible long flag must

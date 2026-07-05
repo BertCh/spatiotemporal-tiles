@@ -34,15 +34,14 @@ geo-traits = "0.2"
 # Polygon tessellation (pre-baked triangle indices, MLT-style)
 earcutr = "0.5"
 
-# GeoArrow/GeoParquet ecosystem
-geoarrow = { version = "0.6", default-features = false }
-arrow = { version = "54", default-features = false, features = ["chrono-tz", "ipc"] }
-parquet = { version = "54", default-features = false, features = ["arrow", "flate2", "snap", "zstd"] }
+# Arrow / GeoParquet ecosystem
+arrow = { version = "59", default-features = false, features = ["chrono-tz", "ipc"] }
+parquet = { version = "59", default-features = false, features = ["arrow", "flate2", "flate2-rust_backened", "snap", "zstd"] }
 
 # WKB / geometry decoding for input parsing
 geozero = { version = "0.14", default-features = false, features = ["with-wkb", "with-geo"] }
-arrow-schema = "54"
-arrow-array = "54"
+arrow-schema = "59"
+arrow-array = "59"
 
 # Data I/O
 csv = "1.3"
