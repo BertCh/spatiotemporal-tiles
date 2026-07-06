@@ -25,10 +25,16 @@
 //!
 //! Beyond column shapes, the self-description metadata every reader depends on
 //! is enforced too: an `Int32`-leaf (quantized) geometry must carry a parseable
-//! `stt:quant` affine, unquantized geometry the CRS84
-//! `ARROW:extension:metadata`, a `List<UInt16>` (delta) `vertex_time` its
-//! `stt:vertex_time_origin_ms`/`step_ms` keys, and `stt:vertex_value_buckets`
-//! must be a positive integer consistent with the matrix column's row widths.
+//! `stt:quant` affine (and a `Float64`-leaf one must NOT), unquantized geometry
+//! the CRS84 `ARROW:extension:metadata`, a `List<UInt16>` (delta) `vertex_time`
+//! its `stt:vertex_time_origin_ms`/`step_ms` keys (which a `List<Int64>` one
+//! must NOT carry), and `stt:vertex_value_buckets` must be a positive integer
+//! consistent with the matrix column's row widths.
+//!
+//! Findings are split by severity ([`SchemaFindings`]): everything is an
+//! error except a *missing* CRS84 metadata on unquantized geometry, which is
+//! a warning — the writer MUST is newer than many deployed archives, and
+//! rebuilding re-emits it.
 //!
 //! ## Where the expected types/names come from
 //!
@@ -77,19 +83,28 @@ const REQUIRED_SCALARS: &[(&str, DataType)] = &[
 /// The geometry column name `encode_layer` always uses.
 const GEOMETRY_COLUMN: &str = "geometry";
 
-/// Check every layer of a decoded tile against the STT schema contract,
-/// returning a (possibly empty) list of human-readable issues. Never panics:
-/// callers collect these into the validator's error mechanism and continue
-/// (or stop, under `--fail-fast`).
-pub fn check_tile_schema(layers: &[DecodedLayer]) -> Vec<String> {
-    let mut issues = Vec::new();
-    for layer in layers {
-        check_layer_schema(layer, &mut issues);
-    }
-    issues
+/// Schema findings split by severity. `errors` fail validation; `warnings`
+/// flag tolerated legacy gaps (today only the missing-CRS84 case — see the
+/// module docs).
+#[derive(Default)]
+pub struct SchemaFindings {
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
-fn check_layer_schema(layer: &DecodedLayer, issues: &mut Vec<String>) {
+/// Check every layer of a decoded tile against the STT schema contract,
+/// returning (possibly empty) lists of human-readable findings. Never panics:
+/// callers collect these into the validator's error mechanism and continue
+/// (or stop, under `--fail-fast`).
+pub fn check_tile_schema(layers: &[DecodedLayer]) -> SchemaFindings {
+    let mut findings = SchemaFindings::default();
+    for layer in layers {
+        check_layer_schema(layer, &mut findings);
+    }
+    findings
+}
+
+fn check_layer_schema(layer: &DecodedLayer, findings: &mut SchemaFindings) {
     let schema = layer.batch.schema();
     let name = &layer.name;
 
@@ -98,13 +113,15 @@ fn check_layer_schema(layer: &DecodedLayer, issues: &mut Vec<String>) {
         match schema.field_with_name(col) {
             Ok(field) => {
                 if field.data_type() != want {
-                    issues.push(format!(
+                    findings.errors.push(format!(
                         "layer '{name}': column '{col}' has type {:?}, expected {want:?}",
                         field.data_type()
                     ));
                 }
             }
-            Err(_) => issues.push(format!("layer '{name}': missing required column '{col}'")),
+            Err(_) => findings
+                .errors
+                .push(format!("layer '{name}': missing required column '{col}'")),
         }
     }
 
@@ -114,20 +131,22 @@ fn check_layer_schema(layer: &DecodedLayer, issues: &mut Vec<String>) {
     // already proved it's a valid Arrow array — only that it's geometry.
     match schema.field_with_name(GEOMETRY_COLUMN) {
         Ok(field) => {
-            check_geometry_extension(name, field, issues);
+            check_geometry_extension(name, field, &mut findings.errors);
             if is_list_like(field.data_type()) {
-                check_geometry_self_description(name, field, issues);
+                check_geometry_self_description(name, field, findings);
             } else {
-                issues.push(format!(
+                findings.errors.push(format!(
                     "layer '{name}': geometry column is {:?}, expected a (FixedSize)List of coordinates",
                     field.data_type()
                 ));
             }
         }
-        Err(_) => issues.push(format!(
+        Err(_) => findings.errors.push(format!(
             "layer '{name}': missing required '{GEOMETRY_COLUMN}' column"
         )),
     }
+
+    let issues = &mut findings.errors;
 
     // (c) optional per-vertex columns, when present, must carry the expected
     // List<inner> types.
@@ -183,34 +202,46 @@ fn check_geometry_extension(layer: &str, field: &Field, issues: &mut Vec<String>
 /// - an `Int32` (fixed-point) leaf MUST carry a parseable `stt:quant`
 ///   reconstruction affine — without it a reader renders raw grid indices as
 ///   lon/lat (mirrors the `stt:qa` gate on quantized property columns);
-/// - an unquantized `Float64` leaf MUST carry the CRS84
-///   `ARROW:extension:metadata` (a writer MUST, `docs/spec/conformance.md` §3);
+/// - an unquantized `Float64` leaf must NOT carry `stt:quant` (a reader would
+///   re-type real degrees as grid indices) and MUST carry the CRS84
+///   `ARROW:extension:metadata` (a writer MUST, `docs/spec/conformance.md` §3)
+///   — a *missing* CRS is only a warning, since archives written before that
+///   MUST landed carry none and remain readable;
 /// - any other leaf is producer drift.
-fn check_geometry_self_description(layer: &str, field: &Field, issues: &mut Vec<String>) {
+fn check_geometry_self_description(layer: &str, field: &Field, findings: &mut SchemaFindings) {
     match geometry_leaf_type(field.data_type()) {
         DataType::Int32 => match field.metadata().get(STT_QUANT_META_KEY) {
             Some(json) if QuantAffine::from_json(json).is_some() => {}
-            Some(json) => issues.push(format!(
+            Some(json) => findings.errors.push(format!(
                 "layer '{layer}': geometry '{STT_QUANT_META_KEY}' metadata is not a valid \
                  quantization affine JSON: {json}"
             )),
-            None => issues.push(format!(
+            None => findings.errors.push(format!(
                 "layer '{layer}': quantized (Int32-leaf) geometry is missing the \
                  '{STT_QUANT_META_KEY}' reconstruction affine"
             )),
         },
-        DataType::Float64 => match field.metadata().get(GEOARROW_EXT_META_KEY) {
-            Some(json) if crs_is_crs84(json) => {}
-            Some(json) => issues.push(format!(
-                "layer '{layer}': geometry '{GEOARROW_EXT_META_KEY}' does not pin the CRS \
-                 to {CRS84}: {json}"
-            )),
-            None => issues.push(format!(
-                "layer '{layer}': unquantized geometry is missing the {CRS84} \
-                 '{GEOARROW_EXT_META_KEY}' (writer MUST, docs/spec/conformance.md §3)"
-            )),
-        },
-        other => issues.push(format!(
+        DataType::Float64 => {
+            if field.metadata().contains_key(STT_QUANT_META_KEY) {
+                findings.errors.push(format!(
+                    "layer '{layer}': unquantized (Float64-leaf) geometry must not carry \
+                     '{STT_QUANT_META_KEY}' (the affine re-types coordinates as grid indices)"
+                ));
+            }
+            match field.metadata().get(GEOARROW_EXT_META_KEY) {
+                Some(json) if crs_is_crs84(json) => {}
+                Some(json) => findings.errors.push(format!(
+                    "layer '{layer}': geometry '{GEOARROW_EXT_META_KEY}' does not pin the CRS \
+                     to {CRS84}: {json}"
+                )),
+                None => findings.warnings.push(format!(
+                    "layer '{layer}': unquantized geometry is missing the {CRS84} \
+                     '{GEOARROW_EXT_META_KEY}' (writer MUST, docs/spec/conformance.md §3; \
+                     pre-MUST archives lack it — rebuilding re-emits it)"
+                )),
+            }
+        }
+        other => findings.errors.push(format!(
             "layer '{layer}': geometry leaf type is {other:?}, expected Float64 (unquantized) \
              or Int32 (quantized, with '{STT_QUANT_META_KEY}')"
         )),
@@ -244,7 +275,9 @@ fn crs_is_crs84(json: &str) -> bool {
 /// `(origin, step)` schema metadata — the TS reader would otherwise silently
 /// reconstruct with `origin=0, step=1` (wrong timestamps, no error on either
 /// side). Whenever the column is `List<UInt16>`, both keys must be present
-/// with sane values (an integer Unix-ms origin and a positive integer step).
+/// with sane values (an integer Unix-ms origin and a positive integer step);
+/// an absolute `List<Int64>` column must NOT carry either key (a reader
+/// keying the encoding off the metadata would misdecode).
 fn check_vertex_time_metadata(layer: &DecodedLayer, issues: &mut Vec<String>) {
     let schema = layer.batch.schema();
     let name = &layer.name;
@@ -258,6 +291,14 @@ fn check_vertex_time_metadata(layer: &DecodedLayer, issues: &mut Vec<String>) {
         _ => false,
     };
     if !is_u16_delta {
+        for key in [VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY] {
+            if schema.metadata().contains_key(key) {
+                issues.push(format!(
+                    "layer '{name}': absolute (List<Int64>) vertex_time must not carry \
+                     '{key}' (the key describes the u16-delta encoding)"
+                ));
+            }
+        }
         return;
     }
     let meta = schema.metadata();
@@ -498,10 +539,17 @@ mod tests {
         decode_tile(&encode_tile(layers).unwrap()).unwrap()
     }
 
+    /// Errors and warnings flattened together — for the "this passes clean"
+    /// assertions where neither severity is expected.
+    fn all_findings(layers: &[DecodedLayer]) -> Vec<String> {
+        let f = check_tile_schema(layers);
+        f.errors.into_iter().chain(f.warnings).collect()
+    }
+
     #[test]
     fn well_formed_tile_passes_schema_check() {
         let decoded = decode(&[good_point_layer()]);
-        let issues = check_tile_schema(&decoded);
+        let issues = all_findings(&decoded);
         assert!(issues.is_empty(), "unexpected schema issues: {issues:?}");
     }
 
@@ -521,7 +569,7 @@ mod tests {
             vertex_value_matrix: None,
             properties: vec![],
         };
-        let issues = check_tile_schema(&decode(&[layer]));
+        let issues = all_findings(&decode(&[layer]));
         assert!(issues.is_empty(), "unexpected schema issues: {issues:?}");
     }
 
@@ -542,7 +590,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![id, end]).unwrap();
         let layers = vec![DecodedLayer { name: "broken".into(), batch }];
 
-        let issues = check_tile_schema(&layers);
+        let issues = check_tile_schema(&layers).errors;
         assert!(
             issues.iter().any(|i| i.contains("missing required column 'start_time'")),
             "issues were: {issues:?}"
@@ -580,7 +628,7 @@ mod tests {
         ]));
         let batch =
             RecordBatch::try_new(schema, vec![id, start, end, geom]).unwrap();
-        let issues = check_tile_schema(&[DecodedLayer { name: "drift".into(), batch }]);
+        let issues = check_tile_schema(&[DecodedLayer { name: "drift".into(), batch }]).errors;
         assert!(
             issues.iter().any(|i| i.contains("column 'id'") && i.contains("expected UInt64")),
             "issues were: {issues:?}"
@@ -611,7 +659,7 @@ mod tests {
             Field::new("geometry", geom.data_type().clone(), false),
         ]));
         let batch = RecordBatch::try_new(schema, vec![id, start, end, geom]).unwrap();
-        let issues = check_tile_schema(&[DecodedLayer { name: "nogeo".into(), batch }]);
+        let issues = check_tile_schema(&[DecodedLayer { name: "nogeo".into(), batch }]).errors;
         assert!(
             issues.iter().any(|i| i.contains("extension name")),
             "issues were: {issues:?}"
@@ -641,7 +689,7 @@ mod tests {
         use stt_core::arrow_tile::encode_tile_quantized;
         let payload = encode_tile_quantized(&[good_point_layer()], Some(1.0)).unwrap();
         let decoded = decode_tile(&payload).unwrap();
-        let issues = check_tile_schema(&decoded);
+        let issues = all_findings(&decoded);
         assert!(issues.is_empty(), "unexpected schema issues: {issues:?}");
     }
 
@@ -678,7 +726,7 @@ mod tests {
                 vec![id.clone(), start.clone(), end.clone(), geom.clone()],
             )
             .unwrap();
-            check_tile_schema(&[DecodedLayer { name: "q".into(), batch }])
+            check_tile_schema(&[DecodedLayer { name: "q".into(), batch }]).errors
         };
 
         // Missing affine entirely.
@@ -698,15 +746,15 @@ mod tests {
         assert!(issues.is_empty(), "unexpected schema issues: {issues:?}");
     }
 
-    #[test]
-    fn unquantized_geometry_without_crs84_metadata_is_reported() {
-        // Strip the geometry field's CRS metadata from a real encoded tile,
-        // keeping the extension NAME — the conformance writer-MUST is the CRS.
+    /// Rebuild a decoded layer's batch with the geometry FIELD metadata
+    /// transformed, keeping every other field and column intact.
+    fn with_geometry_metadata(
+        layer: &DecodedLayer,
+        edit: impl Fn(&mut HashMap<String, String>),
+    ) -> DecodedLayer {
         use arrow::datatypes::Schema;
         use arrow::record_batch::RecordBatch;
-        let decoded = decode(&[good_point_layer()]);
-        let src = &decoded[0];
-        let fields: Vec<Arc<Field>> = src
+        let fields: Vec<Arc<Field>> = layer
             .batch
             .schema()
             .fields()
@@ -714,18 +762,58 @@ mod tests {
             .map(|f| {
                 if f.name() == "geometry" {
                     let mut meta = f.metadata().clone();
-                    meta.remove(GEOARROW_EXT_META_KEY);
+                    edit(&mut meta);
                     Arc::new(f.as_ref().clone().with_metadata(meta))
                 } else {
                     f.clone()
                 }
             })
             .collect();
-        let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema, src.batch.columns().to_vec()).unwrap();
-        let issues = check_tile_schema(&[DecodedLayer { name: src.name.clone(), batch }]);
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            layer.batch.schema().metadata().clone(),
+        ));
+        let batch = RecordBatch::try_new(schema, layer.batch.columns().to_vec()).unwrap();
+        DecodedLayer { name: layer.name.clone(), batch }
+    }
+
+    #[test]
+    fn unquantized_geometry_without_crs84_metadata_is_warned() {
+        // Strip the geometry field's CRS metadata from a real encoded tile,
+        // keeping the extension NAME — the conformance writer-MUST is the CRS.
+        // Older archives lack it, so the finding is warn-level, not an error.
+        let decoded = decode(&[good_point_layer()]);
+        let stripped = with_geometry_metadata(&decoded[0], |meta| {
+            meta.remove(GEOARROW_EXT_META_KEY);
+        });
+        let findings = check_tile_schema(&[stripped]);
+        assert!(findings.errors.is_empty(), "errors were: {:?}", findings.errors);
         assert!(
-            issues.iter().any(|i| i.contains(CRS84) && i.contains("missing")),
+            findings
+                .warnings
+                .iter()
+                .any(|i| i.contains(CRS84) && i.contains("missing")),
+            "warnings were: {:?}",
+            findings.warnings
+        );
+    }
+
+    #[test]
+    fn float64_geometry_carrying_quant_affine_is_reported() {
+        // The inverse of the Int32 gate: a real-degrees geometry that ALSO
+        // claims a quantization affine would re-type readers' coordinates.
+        let decoded = decode(&[good_point_layer()]);
+        let tampered = with_geometry_metadata(&decoded[0], |meta| {
+            meta.insert(
+                STT_QUANT_META_KEY.to_string(),
+                r#"{"x0":-180.0,"y0":-90.0,"sx":1e-5,"sy":1e-5}"#.to_string(),
+            );
+        });
+        let issues = check_tile_schema(&[tampered]).errors;
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains(STT_QUANT_META_KEY) && i.contains("must not carry")),
             "issues were: {issues:?}"
         );
     }
@@ -747,10 +835,10 @@ mod tests {
             properties: vec![],
         };
         let decoded = decode(&[layer]);
-        assert!(check_tile_schema(&decoded).is_empty());
+        assert!(all_findings(&decoded).is_empty());
 
         let stripped = with_schema_metadata(&decoded[0], HashMap::new());
-        let issues = check_tile_schema(&[stripped]);
+        let issues = check_tile_schema(&[stripped]).errors;
         assert!(
             issues.iter().any(|i| i.contains(VERTEX_TIME_ORIGIN_KEY) && i.contains("missing")),
             "issues were: {issues:?}"
@@ -764,7 +852,7 @@ mod tests {
         let mut bad = HashMap::new();
         bad.insert(VERTEX_TIME_ORIGIN_KEY.to_string(), "not-a-number".to_string());
         bad.insert(VERTEX_TIME_STEP_KEY.to_string(), "0".to_string());
-        let issues = check_tile_schema(&[with_schema_metadata(&decoded[0], bad)]);
+        let issues = check_tile_schema(&[with_schema_metadata(&decoded[0], bad)]).errors;
         assert!(
             issues.iter().any(|i| i.contains(VERTEX_TIME_ORIGIN_KEY) && i.contains("not an integer")),
             "issues were: {issues:?}"
@@ -773,6 +861,50 @@ mod tests {
             issues.iter().any(|i| i.contains(VERTEX_TIME_STEP_KEY) && i.contains("positive")),
             "issues were: {issues:?}"
         );
+    }
+
+    #[test]
+    fn absolute_vertex_time_must_not_carry_delta_keys() {
+        // A span far beyond the u16-delta step ceiling forces the absolute
+        // List<Int64> encoding, which legitimately carries no origin/step.
+        let span_ms: i64 = 100_000_000_000;
+        let layer = ColumnarLayer {
+            name: "tracks".into(),
+            feature_ids: vec![1],
+            start_times: vec![0],
+            end_times: vec![span_ms],
+            geometry: GeometryColumn::LineString(vec![vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]]),
+            vertex_times: Some(vec![vec![0, span_ms / 2, span_ms]]),
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![],
+        };
+        let decoded = decode(&[layer]);
+        let vt = decoded[0]
+            .batch
+            .schema()
+            .field_with_name("vertex_time")
+            .unwrap()
+            .data_type()
+            .clone();
+        assert!(
+            matches!(&vt, DataType::List(inner) if inner.data_type() == &DataType::Int64),
+            "expected the absolute Int64 fallback, got {vt:?}"
+        );
+        assert!(all_findings(&decoded).is_empty());
+
+        // Sneaking the delta keys onto an absolute column is producer drift.
+        let mut meta = decoded[0].batch.schema().metadata().clone();
+        meta.insert(VERTEX_TIME_ORIGIN_KEY.to_string(), "0".to_string());
+        meta.insert(VERTEX_TIME_STEP_KEY.to_string(), "1000".to_string());
+        let issues = check_tile_schema(&[with_schema_metadata(&decoded[0], meta)]).errors;
+        for key in [VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY] {
+            assert!(
+                issues.iter().any(|i| i.contains(key) && i.contains("must not carry")),
+                "no 'must not carry' issue for {key}; issues were: {issues:?}"
+            );
+        }
     }
 
     #[test]
@@ -801,12 +933,12 @@ mod tests {
             decoded[0].batch.schema().metadata().get(VERTEX_VALUE_BUCKETS_KEY).map(String::as_str),
             Some("2")
         );
-        assert!(check_tile_schema(&decoded).is_empty());
+        assert!(all_findings(&decoded).is_empty());
 
         let tamper = |value: &str| {
             let mut meta = decoded[0].batch.schema().metadata().clone();
             meta.insert(VERTEX_VALUE_BUCKETS_KEY.to_string(), value.to_string());
-            check_tile_schema(&[with_schema_metadata(&decoded[0], meta)])
+            check_tile_schema(&[with_schema_metadata(&decoded[0], meta)]).errors
         };
         // Positive but inconsistent with the row widths.
         let issues = tamper("4");
@@ -857,7 +989,7 @@ mod tests {
         ]));
         let depth = Arc::new(UInt16Array::from(vec![7u16]));
         let batch = RecordBatch::try_new(schema, vec![id, start, end, geom, depth]).unwrap();
-        let issues = check_tile_schema(&[DecodedLayer { name: "qa".into(), batch }]);
+        let issues = check_tile_schema(&[DecodedLayer { name: "qa".into(), batch }]).errors;
         assert!(
             issues.iter().any(|i| i.contains("'depth'") && i.contains(STT_QUANT_ATTR_META_KEY)),
             "issues were: {issues:?}"

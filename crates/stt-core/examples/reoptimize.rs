@@ -28,9 +28,9 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, UInt16Type};
 use stt_core::arrow_tile::{
-    decode_tile, encode_tile, set_quantize_attrs, set_quantize_attrs_auto, set_quantize_coords_m,
-    AttrQuant, ColumnarLayer, Coord, GeometryColumn, PropertyColumn, QuantAffine,
-    STT_QUANT_ATTR_META_KEY,
+    decode_tile, decode_tile_with_templates, encode_tile_with, set_quantize_attrs,
+    set_quantize_attrs_auto, set_quantize_coords_m, AttrQuant, ColumnarLayer, Coord,
+    EncoderConfig, GeometryColumn, PropertyColumn, QuantAffine, STT_QUANT_ATTR_META_KEY,
 };
 use stt_core::pack::{PackWriter, PackedReader};
 use stt_core::tile::TileId;
@@ -305,7 +305,7 @@ fn batch_to_columnar(batch: &RecordBatch, name: String) -> ColumnarLayer {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
-        eprintln!("usage: reoptimize <src/manifest.json> <out_dir> [--quantize-coords M] [--quantize-attr n=p]... [--drop col]... [--no-seq-ids] [--zstd N]");
+        eprintln!("usage: reoptimize <src/manifest.json> <out_dir> [--format-version N] [--quantize-coords M] [--quantize-attr n=p]... [--drop col]... [--no-seq-ids] [--zstd N]");
         std::process::exit(2);
     }
     let src = &args[0];
@@ -316,9 +316,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seq_ids = true;
     let mut auto = false;
     let mut zstd = 19;
+    // None = preserve the source's formatVersion (data-preserving default);
+    // Some(2) = migrate v1 packed data to the v2 container without re-fetching.
+    let mut format_version: Option<u32> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
+            "--format-version" => { format_version = Some(args[i + 1].parse()?); i += 2; }
             "--quantize-coords" => { coord_m = args[i + 1].parse()?; i += 2; }
             "--quantize-attr" => {
                 let (n, p) = args[i + 1].split_once('=').expect("name=prec");
@@ -334,16 +338,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Process-global encoder config (the encoder reads these on encode_tile).
-    set_quantize_coords_m(coord_m);
+    set_quantize_coords_m(coord_m)?;
     set_quantize_attrs(attrs.clone());
     set_quantize_attrs_auto(auto);
 
     let reader = PackedReader::open(src)?;
     let meta = reader.metadata().clone();
     let entries = reader.entries().to_vec();
+    // Tiles are fully re-encoded, so the output's capability declarations
+    // (spec §3.1) come from THIS run's settings, not the source manifest.
+    // The elevation fold survives decode→re-encode as a 3-wide leaf, so that
+    // one is carried forward from the source.
+    let mut capabilities: Vec<String> = Vec::new();
+    if coord_m > 0.0 {
+        capabilities.push(stt_core::pack::CAPABILITY_COORD_QUANT.to_string());
+    }
+    if auto || !attrs.is_empty() {
+        capabilities.push(stt_core::pack::CAPABILITY_ATTR_QUANT.to_string());
+    }
+    if reader
+        .capabilities()
+        .iter()
+        .any(|c| c == stt_core::pack::CAPABILITY_ELEVATION_FOLD)
+    {
+        capabilities.push(stt_core::pack::CAPABILITY_ELEVATION_FOLD.to_string());
+    }
     let mut writer = PackWriter::create(out, BlobOrdering::Auto, 64 * 1024 * 1024)?
         .with_paging(Some(4096))
-        .with_zstd_level(zstd);
+        .with_zstd_level(zstd)
+        .with_format_version(format_version.unwrap_or_else(|| reader.format_version()))
+        .with_capabilities(capabilities);
+    // Explicit encoder config, mirroring stt-build's `pack_encoder_config`:
+    // the frame version + template sink come FROM THE WRITER (which carries
+    // the source's formatVersion), layered over the process-wide quant
+    // globals set above — re-encoded frames and the output manifest can
+    // never disagree, and a v2 build's templates land in `manifest.schemas`.
+    let encoder_cfg = EncoderConfig {
+        format_version: writer.format_version(),
+        template_collector: (writer.format_version()
+            == stt_core::pack::PACKED_FORMAT_VERSION_V2)
+            .then(|| writer.template_collector()),
+        ..EncoderConfig::from_globals()
+    };
+    // v2 sources resolve frame template hashes through the manifest registry.
+    let templates = reader.templates().cloned();
 
     for e in entries.chunks(2048) {
         // Read payloads sequentially (the reader's lazy mmap is RefCell, not
@@ -357,7 +395,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let encoded: Vec<Vec<u8>> = payloads
             .par_iter()
             .map(|payload| -> std::result::Result<Vec<u8>, String> {
-                let layers = decode_tile(payload).map_err(|e| e.to_string())?;
+                let layers = match &templates {
+                    Some(t) => decode_tile_with_templates(payload, t),
+                    None => decode_tile(payload),
+                }
+                .map_err(|e| e.to_string())?;
                 let cols: Vec<ColumnarLayer> = layers
                     .iter()
                     .map(|dl| {
@@ -374,7 +416,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cl
                     })
                     .collect();
-                encode_tile(&cols).map_err(|e| e.to_string())
+                encode_tile_with(&cols, &encoder_cfg).map_err(|e| e.to_string())
             })
             .collect::<std::result::Result<Vec<_>, String>>()?;
         for (en, new_payload) in e.iter().zip(&encoded) {

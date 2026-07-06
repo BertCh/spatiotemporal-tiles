@@ -3,7 +3,6 @@
 //! This tool converts GeoParquet files into optimized STT archives for web visualization.
 
 use stt_build::build_options::{self, parse_duration, parse_temporal_lod, EncoderSettings};
-use stt_build::tiler::TileWriter;
 use stt_build::{input, summary, tiler};
 
 use anyhow::{Context, Result};
@@ -104,11 +103,14 @@ struct Args {
     compression: String,
 
     /// Pack ordering — how tile blobs are laid out before being cut into packs:
-    /// `auto` (default; pick from the dataset's space-vs-time cardinality:
-    /// wide-time → spatial-major, else the 3D-Hilbert generalist), or an explicit
-    /// `spatial`, `time-major`, `hilbert3`, or `morton3`. Locality means fewer
-    /// packs touched per viewport (fewer client range requests). The pipeline
-    /// holds all tile payloads in RAM until finalize.
+    /// `auto` (default; pick from the dataset's OCCUPIED space-vs-time extent:
+    /// shallow/wide-time → spatial-major, else the 3D-Hilbert generalist),
+    /// `measured` (opt-in; pick the order that simulates the fewest range reads
+    /// for this dataset), or an explicit `spatial`, `time-major`, `hilbert3`, or
+    /// `morton3` (morton3 is research-only — empirically never the measured
+    /// winner). Locality means fewer packs touched per viewport (fewer client
+    /// range requests). Tile payloads buffer until finalize, in RAM up to
+    /// `--pack-memory-budget` and spilled to disk beyond it.
     #[arg(long, default_value = "auto")]
     blob_ordering: String,
 
@@ -119,6 +121,16 @@ struct Args {
     /// fewer, coarser objects. Stay well under the CDN per-object cap (512 MB).
     #[arg(long, default_value = "64")]
     pack_size: u64,
+
+    /// In-memory budget (MiB) for tile payloads buffered by the pack writer
+    /// between encode and finalize. Beyond the budget, payloads spill to a
+    /// temp file inside the output directory (removed on success and failure
+    /// alike) and are read back during finalize — per-tile directory metadata
+    /// stays in RAM. Purely a memory-behaviour lever: output bytes are
+    /// IDENTICAL at any budget. `0` = unlimited (hold every payload in RAM,
+    /// the legacy behaviour).
+    #[arg(long, default_value = "512", value_name = "MIB")]
+    pack_memory_budget: u64,
 
     /// Opt OUT of the paged directory and emit a single whole-load `.sttd`
     /// instead. The directory is **paged by default**: a tiny root page + leaf
@@ -132,6 +144,17 @@ struct Args {
     /// spot). Ignored with `--single-directory`.
     #[arg(long, default_value = "4096")]
     page_entries: usize,
+
+    /// Packed format version to emit: 2 (default — schema templates in the
+    /// manifest, sectioned layer frames, STTP/STTD object magic) or 1 (the
+    /// frozen 0.3.x layout). `--format-version 1` is the transitional KILL
+    /// SWITCH for the v2 byte break: it reproduces the 0.3.x writer
+    /// byte-for-byte (golden-pinned) so a v2 regression can be rolled back by
+    /// rebuilding, and it is what `stt-serve` byte-parity checks build
+    /// against (serve emits v1 frames). v1 emission is kept for one release
+    /// and then removed.
+    #[arg(long, default_value = "2", value_parser = clap::value_parser!(u32).range(1..=2))]
+    format_version: u32,
 
     /// zstd level for tile blobs + directory (1..=22). Default 3 is zstd's
     /// "fast" tier; a **publish** build should pass 19 — the format is
@@ -201,6 +224,14 @@ struct Args {
     /// By default, LineStrings with duration are clipped at tile boundaries
     #[arg(long)]
     no_clip: bool,
+
+    /// Restore legacy whole-feature placement for NON-trajectory geometry
+    /// (polygons, MultiPolygons, timeless LineStrings/MultiLineStrings,
+    /// MultiPoints): the entire feature lands only in the single tile
+    /// containing its representative point, so neighbouring tiles it spans
+    /// render a hole. Kill switch for the default coverage-clipping behaviour.
+    #[arg(long)]
+    whole_feature_placement: bool,
 
     /// Minimum vertices required to clip a trajectory (skip short paths)
     #[arg(long, default_value = "2")]
@@ -441,6 +472,16 @@ struct Args {
     #[arg(long = "point-elevation-column", value_name = "NAME")]
     point_elevation_column: Option<String>,
 
+    /// Escape hatch: do NOT declare required-to-understand features in
+    /// `manifest.capabilities` (restores the pre-capabilities manifest bytes
+    /// for a quantized / elevation-fold build). Only for byte-compat with
+    /// tooling that predates the capability check — a reader that lacks a
+    /// declared feature would then silently misdecode the re-typed columns
+    /// instead of refusing at open. Builds using none of those features are
+    /// unaffected (the key is omitted either way).
+    #[arg(long = "no-manifest-capabilities", default_value_t = false)]
+    no_manifest_capabilities: bool,
+
     // --- Per-tile budgets (OPT-IN; default OFF) ----------------------------
     // The project follows a documented "no thinning / comprehensive data by
     // default" principle. These caps are inert unless explicitly set, and when
@@ -574,33 +615,54 @@ impl InputSource {
     /// `TileConfig::property_types` — pins every schema column's tile kind so
     /// a column that is all-null within one tile still gets its (all-null)
     /// column there instead of drifting the layer schema. GeoParquet derives
-    /// this from the Arrow schema. The DB adaptors return an empty map for
-    /// now (their row decode knows the types but doesn't thread them here
-    /// yet), which keeps their pre-0.1.1 per-tile sniffing behaviour.
+    /// this from the Arrow schema; the DB adaptors probe their result schema
+    /// (DuckDB: `LIMIT 0` execution; PostGIS: statement prepare) so all three
+    /// sources pin the same way. Any probe failure falls back to per-tile
+    /// sniffing — the real load will surface the underlying error with full
+    /// context, so the build is never failed from here.
     fn property_kinds(
         &self,
         time_field: &str,
         end_time_field: Option<&str>,
     ) -> Arc<stt_build::columnar::PropertyTypes> {
+        let fall_back = |source: &str, e: anyhow::Error| {
+            warn!(
+                "could not derive property kinds from the {source} schema ({e}); \
+                 falling back to per-tile type sniffing"
+            );
+            Arc::default()
+        };
         match self {
             InputSource::File(path) => {
                 match input::property_kinds(path, time_field, end_time_field) {
                     Ok(kinds) => Arc::new(kinds),
-                    Err(e) => {
-                        // The real load will surface the underlying error with
-                        // full context; don't fail the build from here.
-                        warn!(
-                            "could not derive property kinds from the input schema ({e}); \
-                             falling back to per-tile type sniffing"
-                        );
-                        Arc::default()
-                    }
+                    Err(e) => fall_back("input", e),
                 }
             }
             #[cfg(feature = "postgres")]
-            InputSource::Postgres { .. } => Arc::default(),
+            InputSource::Postgres { conn, spec } => {
+                match stt_build::postgres_input::property_kinds(
+                    conn,
+                    spec,
+                    time_field,
+                    end_time_field,
+                ) {
+                    Ok(kinds) => Arc::new(kinds),
+                    Err(e) => fall_back("PostGIS result", e),
+                }
+            }
             #[cfg(feature = "duckdb")]
-            InputSource::DuckDb { .. } => Arc::default(),
+            InputSource::DuckDb { db_path, spec } => {
+                match stt_build::duckdb_input::property_kinds(
+                    db_path,
+                    spec,
+                    time_field,
+                    end_time_field,
+                ) {
+                    Ok(kinds) => Arc::new(kinds),
+                    Err(e) => fall_back("DuckDB result", e),
+                }
+            }
         }
     }
 
@@ -830,15 +892,15 @@ fn main() -> Result<()> {
     // in-memory and streaming builders. Parsed + installed via the shared
     // `build_options` module so a live `stt-serve` configures the encoder
     // byte-identically. Set once, before any tile is encoded.
-    let enabled = EncoderSettings {
+    let encoder_settings = EncoderSettings {
         vertex_time_precision: Some(args.vertex_time_precision),
         quantize_coords_m: args.quantize_coords,
         quantize_attr: args.quantize_attr.clone(),
         quantize_attrs_auto: args.quantize_attrs_auto,
         vector_group: args.vector_group.clone(),
         point_elevation_column: args.point_elevation_column.clone(),
-    }
-    .apply()?;
+    };
+    let enabled = encoder_settings.apply()?;
     if !enabled.is_empty() {
         info!("Encoder settings ENABLED: {}", enabled.join(", "));
     }
@@ -849,15 +911,16 @@ fn main() -> Result<()> {
     parse_compression(&args.compression)?;
 
     // Parse the pack ordering (the packed format always buffers + reorders
-    // before cutting packs). `eager` is accepted for backward-compat and maps
-    // to `auto`.
+    // before cutting packs). `eager` is a legacy alias for `auto`; `measured`
+    // is the opt-in per-dataset picker resolved by simulating range-read cost at
+    // finalize (it uses the Auto slot as its placeholder ordering).
+    let blob_arg = args.blob_ordering.trim();
+    let measured_ordering = blob_arg.eq_ignore_ascii_case("measured");
     let pack_ordering: stt_core::BlobOrdering =
-        if args.blob_ordering.trim().eq_ignore_ascii_case("eager") {
+        if measured_ordering || blob_arg.eq_ignore_ascii_case("eager") {
             stt_core::BlobOrdering::Auto
         } else {
-            args.blob_ordering
-                .parse()
-                .map_err(|e: String| anyhow::anyhow!(e))?
+            blob_arg.parse().map_err(|e: String| anyhow::anyhow!(e))?
         };
 
     // Pack target size (MiB -> bytes). Never 0.
@@ -981,6 +1044,7 @@ fn main() -> Result<()> {
         layer_name: args.layer.clone(),
         temporal_bucket_ms,
         clip_trajectories: !args.no_clip,
+        clip_non_trajectory: !args.whole_feature_placement,
         clip_min_vertices: args.clip_min_vertices,
         simplify: args.simplify,
         simplify_max_zoom: args.simplify_max_zoom,
@@ -1002,13 +1066,55 @@ fn main() -> Result<()> {
 
     info!(
         "Pack ordering: {pack_ordering} (buffered — space-time blob layout + \
-         byte-identical dedup, then cut into packs of ≤{} MiB; holds payloads \
-         in RAM until finalize)",
+         byte-identical dedup, then cut into packs of ≤{} MiB; payloads buffer \
+         until finalize, spilling to disk beyond --pack-memory-budget)",
         args.pack_size
     );
+    // Required-to-understand capability declarations (manifest.capabilities,
+    // packed spec §3.1): derived from the encoder settings actually enabled,
+    // so an older reader that lacks e.g. coord-quant refuses this dataset at
+    // open instead of silently misdecoding its re-typed columns. Additive
+    // features (vector groups, triangles) are never declared.
+    let manifest_capabilities = if args.no_manifest_capabilities {
+        warn!(
+            "manifest.capabilities SUPPRESSED (--no-manifest-capabilities): a reader \
+             that does not implement the encoder features used here will silently \
+             misdecode instead of refusing at open"
+        );
+        Vec::new()
+    } else {
+        let caps = encoder_settings.required_capabilities();
+        if !caps.is_empty() {
+            info!("Manifest capabilities (required-to-understand): {}", caps.join(", "));
+        }
+        caps
+    };
     let mut writer = stt_core::PackWriter::create(&out_dir, pack_ordering, pack_target_bytes)?
+        .with_format_version(args.format_version)
         .with_paging((!args.single_directory).then_some(args.page_entries))
-        .with_zstd_level(args.zstd_level);
+        .with_zstd_level(args.zstd_level)
+        .with_capabilities(manifest_capabilities)
+        .with_measured_ordering(measured_ordering)
+        .with_memory_budget(args.pack_memory_budget.saturating_mul(1024 * 1024));
+    if args.pack_memory_budget > 0 {
+        info!(
+            "Pack-writer memory budget: {} MiB (payloads beyond it spill to a temp \
+             file in the output dir; output bytes are identical at any budget)",
+            args.pack_memory_budget
+        );
+    } else {
+        info!("Pack-writer memory budget: unlimited (--pack-memory-budget 0; all payloads in RAM)");
+    }
+    // The frame version rides the writer: the PackWriter tile sinks
+    // (`TileWriter`/`LodTileWriter`/`write_tiles_parallel` in stt_build::tiler)
+    // encode every payload with the writer's format_version + template
+    // collector, so frames and `manifest.formatVersion` can never diverge.
+    if args.format_version == stt_core::pack::PACKED_FORMAT_VERSION_V1 {
+        warn!(
+            "--format-version 1: emitting the frozen 0.3.x layout (kill switch; \
+             one-release transitional escape hatch — see the packed spec §9)"
+        );
+    }
     if args.zstd_level != stt_core::compression::ZSTD_LEVEL {
         info!(
             "zstd level {} (publish tuning; default {})",
@@ -1028,14 +1134,14 @@ fn main() -> Result<()> {
 
     let tile_count = if !temporal_lod.is_empty() {
         // --temporal-lod path: emit base tiles + per-level aggregate tiles.
-        // Streams through the LodTileWriter so each directory entry carries
-        // its temporal_bucket_ms. The streaming pipeline doesn't (yet) do
-        // LOD aggregation — that's a follow-up — so this path goes through
-        // the in-memory builder regardless of --streaming.
+        // Written via write_tiles_parallel with a per-tile bucket tag so each
+        // directory entry carries its temporal_bucket_ms. The streaming
+        // pipeline doesn't (yet) do LOD aggregation — that's a follow-up — so
+        // this path goes through the in-memory builder regardless of
+        // --streaming.
         if args.streaming {
             warn!("--streaming ignored when --temporal-lod is set (in-memory pipeline used)");
         }
-        use tiler::LodTileWriter;
         let tiles = tiler::generate_tiles_with_lod(&features, &tile_config, args.workers)?;
         info!(
             "Generated {} tiles (base + LOD aggregate tiers)",
@@ -1049,16 +1155,15 @@ fn main() -> Result<()> {
                 .progress_chars("##-"),
         );
         let min_features = args.min_features_per_tile.max(1);
-        let mut written = 0usize;
-        for tagged in &tiles {
-            if tagged.tile.feature_count() < min_features {
-                pb.inc(1);
-                continue;
-            }
-            writer.write_lod_tile(&tagged.tile, tagged.temporal_bucket_ms)?;
-            written += 1;
-            pb.inc(1);
-        }
+        // Parallel encode (bounded by --workers), deterministic ordered write.
+        let keep: Vec<(&tiler::GeneratedTile, Option<u64>)> = tiles
+            .iter()
+            .filter(|tagged| tagged.tile.feature_count() >= min_features)
+            .map(|tagged| (&tagged.tile, tagged.temporal_bucket_ms))
+            .collect();
+        pb.inc((tiles.len() - keep.len()) as u64);
+        tiler::write_tiles_parallel(&mut writer, &keep, args.workers, || pb.inc(1))?;
+        let written = keep.len();
         pb.finish_with_message("Tiles written");
         if written != tiles.len() {
             info!(
@@ -1099,16 +1204,15 @@ fn main() -> Result<()> {
         );
 
         let min_features = args.min_features_per_tile.max(1);
-        let mut written = 0usize;
-        for tile in &tiles {
-            if tile.feature_count() < min_features {
-                pb.inc(1);
-                continue;
-            }
-            writer.write_tile(tile)?;
-            written += 1;
-            pb.inc(1);
-        }
+        // Parallel encode (bounded by --workers), deterministic ordered write.
+        let keep: Vec<(&tiler::GeneratedTile, Option<u64>)> = tiles
+            .iter()
+            .filter(|t| t.feature_count() >= min_features)
+            .map(|t| (t, None))
+            .collect();
+        pb.inc((tiles.len() - keep.len()) as u64);
+        tiler::write_tiles_parallel(&mut writer, &keep, args.workers, || pb.inc(1))?;
+        let written = keep.len();
 
         pb.finish_with_message("Tiles written");
         if written != tiles.len() {

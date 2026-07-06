@@ -17,57 +17,8 @@
 
 use stt_core::arrow_tile::*;
 
-fn point_fixture() -> ColumnarLayer {
-    ColumnarLayer {
-        name: "points".to_string(),
-        // Out-of-order start times so the baked time_offset is the real min
-        // (1000), not simply the first value.
-        feature_ids: vec![1, 2, 3],
-        start_times: vec![3000, 1000, 2000],
-        end_times: vec![3500, 1500, 2500],
-        geometry: GeometryColumn::Point(vec![
-            [-122.4, 37.7],
-            [-122.5, 37.8],
-            [-122.6, 37.9],
-        ]),
-        vertex_times: None,
-        vertex_values: None,
-        triangles: None,
-        vertex_value_matrix: None,
-        properties: vec![
-            (
-                "speed".to_string(),
-                PropertyColumn::Numeric(vec![Some(10.0), None, Some(30.0)]),
-            ),
-            (
-                "kind".to_string(),
-                PropertyColumn::Categorical(vec![
-                    Some("car".to_string()),
-                    Some("bus".to_string()),
-                    None,
-                ]),
-            ),
-        ],
-    }
-}
-
-fn line_fixture() -> ColumnarLayer {
-    ColumnarLayer {
-        name: "tracks".to_string(),
-        feature_ids: vec![10, 11],
-        start_times: vec![100, 0],
-        end_times: vec![200, 50],
-        geometry: GeometryColumn::LineString(vec![
-            vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]],
-            vec![[5.0, 5.0], [6.0, 6.0]],
-        ]),
-        vertex_times: Some(vec![vec![0, 25, 50], vec![100, 200]]),
-        vertex_values: None,
-        triangles: None,
-        vertex_value_matrix: None,
-        properties: vec![],
-    }
-}
+mod common;
+use common::{line_fixture, point_fixture};
 
 /// A stable, order-independent fingerprint of a decoded tile: every layer's
 /// name, schema metadata (sorted), and, per column, the field name + sorted
@@ -236,4 +187,82 @@ fn same_tile_encodes_byte_identically() {
             );
         }
     }
+}
+
+/// The byte-identity contract extended to a whole **formatVersion-2 dataset**
+/// (packed-v2 design §1): two builds of the same input — with the tiles added
+/// in DIFFERENT orders, standing in for encode parallelism — produce a
+/// byte-identical manifest (including the sorted, deduped `schemas` table)
+/// and byte-identical directory + pack objects. Template hashes are
+/// content-addressed, so add order must never leak into any object.
+#[test]
+fn v2_dataset_rebuild_is_byte_identical_including_schemas() {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use stt_core::metadata::Metadata;
+    use stt_core::{BlobOrdering, PackWriter, TileId};
+
+    // Quantized config so `stt:qa`/`t0` vary per tile — the schema-template
+    // hoist must keep that variance OUT of `manifest.schemas`.
+    let tiles: Vec<ColumnarLayer> = (0..4)
+        .map(|k| {
+            let mut layer = point_fixture();
+            for t in layer.start_times.iter_mut() {
+                *t += k as i64 * 60_000;
+            }
+            for t in layer.end_times.iter_mut() {
+                *t += k as i64 * 60_000;
+            }
+            layer
+        })
+        .collect();
+
+    let build = |dir: &std::path::Path, reversed: bool| {
+        let mut writer = PackWriter::create(dir, BlobOrdering::Auto, 8 * 1024).unwrap();
+        assert_eq!(writer.format_version(), 2, "v2 is the writer default");
+        let cfg = EncoderConfig {
+            quantize_coords_m: Some(1.0),
+            quantize_attrs_auto: true,
+            format_version: FORMAT_VERSION_V2,
+            template_collector: Some(writer.template_collector()),
+            ..EncoderConfig::default()
+        };
+        let mut order: Vec<usize> = (0..tiles.len()).collect();
+        if reversed {
+            order.reverse();
+        }
+        for k in order {
+            let payload = encode_tile_with(std::slice::from_ref(&tiles[k]), &cfg).unwrap();
+            writer
+                .add_tile_full(&TileId::new(4, k as u32, 0, 0), 0, 100, None, 3, None, &payload)
+                .unwrap();
+        }
+        writer.finalize(&Metadata::new("v2-repro")).unwrap()
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+    let manifest_a = build(&a, false);
+    let manifest_b = build(&b, true);
+
+    assert!(!manifest_a.schemas.is_empty(), "v2 manifest must carry templates");
+    let hashes: Vec<&str> = manifest_a.schemas.iter().map(|s| s.hash.as_str()).collect();
+    assert!(hashes.windows(2).all(|w| w[0] < w[1]), "schemas sorted by hash");
+
+    assert_eq!(
+        fs::read(a.join("manifest.json")).unwrap(),
+        fs::read(b.join("manifest.json")).unwrap(),
+        "manifest bytes must not depend on tile add order"
+    );
+    let objects = |root: &std::path::Path, m: &stt_core::Manifest| -> BTreeMap<String, Vec<u8>> {
+        std::iter::once(&m.directory.key)
+            .chain(m.packs.iter().map(|p| &p.key))
+            .map(|key| (key.clone(), fs::read(root.join(key)).unwrap()))
+            .collect()
+    };
+    assert_eq!(
+        objects(&a, &manifest_a),
+        objects(&b, &manifest_b),
+        "every directory/pack object must be byte-identical across rebuilds"
+    );
 }

@@ -22,7 +22,8 @@ use postgres::{Client, NoTls, Row};
 use std::sync::Arc;
 
 use crate::db_input_common::{
-    apply_int_time_format, json_number_or_null, warn_dropped_columns, RowOutcome, VertexCoercions,
+    apply_int_time_format, decimal_string_to_json, json_number_or_null, warn_dropped_columns,
+    RowOutcome, VertexCoercions,
 };
 use crate::input::{
     parse_iso8601, parse_wkb_geometry, reject_negative_timestamp, InputStrictness, ParsedFeature,
@@ -66,7 +67,10 @@ impl QuerySpec {
 
     /// Build the wrapped query: project the geometry to an EWKB `bytea` column
     /// aliased [`WKB_ALIAS`], and pass every other column through as `q.*`.
-    fn wrapped_query(&self) -> String {
+    /// Public so an async caller (the serve path) can prepare the same
+    /// projection itself and feed the resolved columns to
+    /// [`property_kinds_from_columns`].
+    pub fn wrapped_query(&self) -> String {
         let inner = match &self.source {
             // A bare table name may be schema-qualified; trust the operator.
             QuerySource::Table(t) => format!("SELECT * FROM {t}"),
@@ -96,6 +100,13 @@ impl QuerySpec {
 /// so there is no request-controlled SQL. The time column must be a
 /// `timestamp`/`timestamptz` (compared via `to_timestamp`).
 ///
+/// `source_srid`: when the stored geometry is not EPSG:4326, it is
+/// `ST_Transform(ST_SetSRID(…))`-ed to 4326 *before* both the EWKB projection
+/// and the bbox test (the exact expression the `--source-srid` ingest uses) —
+/// the filter runs in tile space, still a strict superset. The per-row
+/// transform bypasses a plain GiST index on the raw column; add a functional
+/// index on the transform expression, or store 4326, if you need index speed.
+///
 /// Feed the result rows straight to [`decode_rows`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_tile_query(
@@ -106,8 +117,13 @@ pub fn build_tile_query(
     bbox: [f64; 4],
     t_start_ms: i64,
     t_end_ms: i64,
+    source_srid: Option<i32>,
 ) -> String {
-    let geom = format!("q.{}", QuerySpec::quote_ident(geom_column));
+    let geom_raw = format!("q.{}", QuerySpec::quote_ident(geom_column));
+    let geom = match source_srid {
+        Some(srid) => format!("ST_Transform(ST_SetSRID({geom_raw}, {srid}), 4326)"),
+        None => geom_raw,
+    };
     let time = format!("q.{}", QuerySpec::quote_ident(time_field));
     let time_where = pg_time_window(&time, time_format, t_start_ms, t_end_ms);
     format!(
@@ -124,8 +140,11 @@ pub fn build_tile_query(
 /// (the ingest path already honours `--time-format` for integer columns).
 /// `Iso8601` (the default) assumes a `timestamp`/`timestamptz` column and
 /// compares via `to_timestamp`; `UnixMs`/`UnixSec` assume an integer column and
-/// compare numerically (scaling seconds to ms so the ms-precision bucket bounds
-/// stay exact). Literals are server-formatted numbers — no request-controlled SQL.
+/// compare numerically. Seconds compare the RAW column against ceil-divided
+/// second bounds (`t*1000 >= a ⟺ t >= ⌈a/1000⌉` and `t*1000 < b ⟺ t <
+/// ⌈b/1000⌉` for integer `t`) — exactly equivalent to scaling the column, but
+/// sargable, so a b-tree index on the column still applies. Literals are
+/// server-formatted numbers — no request-controlled SQL.
 fn pg_time_window(time: &str, time_format: TimeFormat, t_start_ms: i64, t_end_ms: i64) -> String {
     match time_format {
         TimeFormat::Iso8601 => format!(
@@ -136,7 +155,9 @@ fn pg_time_window(time: &str, time_format: TimeFormat, t_start_ms: i64, t_end_ms
             format!("{time} >= {t_start_ms} AND {time} < {t_end_ms}")
         }
         TimeFormat::UnixSec => {
-            format!("{time} * 1000 >= {t_start_ms} AND {time} * 1000 < {t_end_ms}")
+            let start_s = crate::db_input_common::ceil_ms_to_seconds(t_start_ms);
+            let end_s = crate::db_input_common::ceil_ms_to_seconds(t_end_ms);
+            format!("{time} >= {start_s} AND {time} < {end_s}")
         }
     }
 }
@@ -311,11 +332,93 @@ where
             &seen_props,
             total_rows,
             "PostGIS",
-            "geometry/uuid/numeric/array",
+            "geometry/uuid/array",
         );
     }
     vertex_coercions.warn("PostGIS");
     Ok(())
+}
+
+/// Schema-level property-kind map for a PostGIS source — the DB analog of
+/// [`crate::input::property_kinds`] (GeoParquet): prepare the wrapped query
+/// (types every result column without executing it) and pin each property
+/// column's tile kind from its PG type, so `TileConfig::property_types` keeps
+/// the layer schema stable when a column is all-NULL within one tile (per-tile
+/// value sniffing drops it there and the layer schema drifts across tiles).
+/// Mirrors the DuckDB reader's `property_kinds` — the DB adaptors pin the same
+/// way. Opens a short-lived connection; the ingest read reconnects afterward.
+pub fn property_kinds(
+    conn: &str,
+    spec: &QuerySpec,
+    time_field: &str,
+    end_time_field: Option<&str>,
+) -> Result<crate::columnar::PropertyTypes> {
+    let mut client = Client::connect(conn, NoTls)
+        .with_context(|| "failed to connect to PostgreSQL (NoTls; localhost / non-TLS only)")?;
+    let stmt = client
+        .prepare(&spec.wrapped_query())
+        .context("prepare PostGIS schema probe — check --table/--sql and --geom-column")?;
+    Ok(property_kinds_from_columns(
+        stmt.columns(),
+        time_field,
+        end_time_field,
+        &spec.geom_column,
+    ))
+}
+
+/// As [`property_kinds`], from already-resolved result columns of any statement
+/// that projects the geometry to [`WKB_ALIAS`] (the same contract as
+/// [`decode_rows`]; the async serve path prepares its own statement). Excludes
+/// the system columns with the same predicates [`RowSchema::from_columns`]
+/// uses, so the pinned map and the row decode can't disagree about which
+/// columns are properties.
+pub fn property_kinds_from_columns(
+    columns: &[postgres::Column],
+    time_field: &str,
+    end_time_field: Option<&str>,
+    geom_column: &str,
+) -> crate::columnar::PropertyTypes {
+    let mut kinds = crate::columnar::PropertyTypes::new();
+    for col in columns {
+        let name = col.name();
+        if name == WKB_ALIAS
+            || name == time_field
+            || end_time_field == Some(name)
+            || name == geom_column
+            || crate::input::is_coordinate_column_name(name)
+            || crate::input::is_vertex_metadata_column(name)
+        {
+            continue;
+        }
+        if let Some(kind) = property_kind_for_pg(col.type_()) {
+            kinds.insert(name.to_string(), kind);
+        }
+    }
+    kinds
+}
+
+/// Schema-level mirror of [`decode_property`]: the tile kind a PG column of
+/// this type decodes to. `None` = unmappable (dropped at read time), or
+/// nested (`JSON`/`JSONB` decode to arbitrary JSON) — left to per-tile
+/// sniffing.
+fn property_kind_for_pg(ty: &Type) -> Option<crate::columnar::PropertyKind> {
+    use crate::columnar::PropertyKind;
+    match *ty {
+        // Timestamps/dates decode to epoch-ms numbers; NUMERIC to nearest-f64.
+        Type::INT2
+        | Type::INT4
+        | Type::INT8
+        | Type::FLOAT4
+        | Type::FLOAT8
+        | Type::NUMERIC
+        | Type::TIMESTAMP
+        | Type::TIMESTAMPTZ
+        | Type::DATE => Some(PropertyKind::Numeric),
+        Type::BOOL | Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
+            Some(PropertyKind::Categorical)
+        }
+        _ => None,
+    }
 }
 
 /// A time column resolved against the result set: its index and PG type.
@@ -682,16 +785,18 @@ fn decode_f32_array(row: &Row, col: &TimeCol, coerced: &mut usize) -> Option<Vec
 }
 
 /// Map one property column value to a JSON value. SQL NULL and unmappable PG
-/// types (geometry, numeric, uuid, arrays, …) return `None` and are dropped.
+/// types (geometry, uuid, arrays, …) return `None` and are dropped.
 ///
 /// This is a documented **superset** of `crate::input::extract_property_value`,
 /// not an exact mirror: it shares the six core types (bool / Int32 / Int64 /
 /// Float32 / Float64 / text) and the NaN→JSON-null rule, but additionally maps
-/// `INT2`, `TIMESTAMP`/`TIMESTAMPTZ`/`DATE` (→ epoch-ms numbers) and
-/// `JSON`/`JSONB` — types a GeoParquet file can't express the same way, so they
-/// only ever add properties a file build couldn't carry, never diverge on the
-/// common type set. The PostGIS and DuckDB readers stay in lockstep on that
-/// common set; `JSON`/`JSONB` parsed to *nested* JSON is PostGIS-only, because
+/// `INT2`, `NUMERIC` (→ nearest-f64 number via [`decimal_string_to_json`] — the
+/// file reader drops Parquet decimals), `TIMESTAMP`/`TIMESTAMPTZ`/`DATE`
+/// (→ epoch-ms numbers) and `JSON`/`JSONB` — types a GeoParquet file can't
+/// express the same way, so they only ever add properties a file build couldn't
+/// carry, never diverge on the common type set. The PostGIS and DuckDB readers
+/// stay in lockstep on that common set (NUMERIC/DECIMAL uses the one shared
+/// conversion); `JSON`/`JSONB` parsed to *nested* JSON is PostGIS-only, because
 /// duckdb-rs surfaces DuckDB's JSON logical type as plain `ValueRef::Text`
 /// (arrives as a string property there — see db-input-adaptors.md).
 fn decode_property(row: &Row, col: &PropCol) -> Option<serde_json::Value> {
@@ -727,6 +832,13 @@ fn decode_property(row: &Row, col: &PropCol) -> Option<serde_json::Value> {
             .ok()
             .flatten()
             .map(json_number_or_null),
+        // Fixed-point NUMERIC → nearest f64, via the conversion shared with the
+        // DuckDB reader's DECIMAL arm (identical value → identical number).
+        Type::NUMERIC => row
+            .try_get::<_, Option<rust_decimal::Decimal>>(col.idx)
+            .ok()
+            .flatten()
+            .map(|d| decimal_string_to_json(&d.to_string())),
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => row
             .try_get::<_, Option<String>>(col.idx)
             .ok()
@@ -749,7 +861,7 @@ fn decode_property(row: &Row, col: &PropCol) -> Option<serde_json::Value> {
             .and_then(|d| d.and_hms_opt(0, 0, 0))
             .map(|dt| Value::from(dt.and_utc().timestamp_millis())),
         Type::JSON | Type::JSONB => row.try_get::<_, Option<Value>>(col.idx).ok().flatten(),
-        // Unmappable (geometry, numeric, uuid, arrays, …) — drop silently.
+        // Unmappable (geometry, uuid, arrays, …) — drop silently.
         _ => None,
     }
 }
@@ -798,17 +910,126 @@ mod tests {
     fn tile_query_time_filter_honors_time_format() {
         let bbox = [-10.0, -5.0, 10.0, 5.0];
         // Default (Iso8601 → timestamp column): to_timestamp comparison.
-        let iso = build_tile_query("obs", "geom", "ts", TimeFormat::Iso8601, bbox, 1000, 2000);
+        let iso =
+            build_tile_query("obs", "geom", "ts", TimeFormat::Iso8601, bbox, 1000, 2000, None);
         assert!(iso.contains("to_timestamp(1000::double precision / 1000.0)"), "{iso}");
         assert!(iso.contains("to_timestamp(2000::double precision / 1000.0)"), "{iso}");
 
         // Integer-epoch-ms column: numeric comparison, no to_timestamp.
-        let ms = build_tile_query("obs", "geom", "ts", TimeFormat::UnixMs, bbox, 1000, 2000);
+        let ms = build_tile_query("obs", "geom", "ts", TimeFormat::UnixMs, bbox, 1000, 2000, None);
         assert!(ms.contains("q.\"ts\" >= 1000 AND q.\"ts\" < 2000"), "{ms}");
         assert!(!ms.contains("to_timestamp"), "{ms}");
 
-        // Seconds: scaled ×1000 so the ms bucket bounds stay exact.
-        let sec = build_tile_query("obs", "geom", "ts", TimeFormat::UnixSec, bbox, 1000, 2000);
-        assert!(sec.contains("q.\"ts\" * 1000 >= 1000 AND q.\"ts\" * 1000 < 2000"), "{sec}");
+        // Seconds: sargable — the RAW column against ceil-divided second
+        // bounds (t*1000 >= 1000 ⟺ t >= 1; t*1000 < 2000 ⟺ t < 2), never a
+        // scaled-column expression that would defeat a b-tree index.
+        let sec =
+            build_tile_query("obs", "geom", "ts", TimeFormat::UnixSec, bbox, 1000, 2000, None);
+        assert!(sec.contains("q.\"ts\" >= 1 AND q.\"ts\" < 2"), "{sec}");
+        assert!(!sec.contains("* 1000"), "{sec}");
+
+        // Non-multiple-of-1000 ms bounds round up on both ends (half-open).
+        let odd = pg_time_window("t", TimeFormat::UnixSec, 1500, 2001);
+        assert_eq!(odd, "t >= 2 AND t < 3");
+    }
+
+    #[test]
+    fn tile_query_reprojects_when_source_srid_given() {
+        let bbox = [-10.0, -5.0, 10.0, 5.0];
+        let q = build_tile_query(
+            "obs",
+            "geom",
+            "ts",
+            TimeFormat::Iso8601,
+            bbox,
+            1000,
+            2000,
+            Some(3857),
+        );
+        // The transformed geometry feeds BOTH the EWKB projection and the bbox
+        // test (the exact expression the --source-srid ingest uses), so the
+        // filter runs in tile (4326) space — a strict superset.
+        assert!(
+            q.contains("ST_AsEWKB(ST_Transform(ST_SetSRID(q.\"geom\", 3857), 4326))"),
+            "{q}"
+        );
+        assert!(
+            q.contains(
+                "ST_Transform(ST_SetSRID(q.\"geom\", 3857), 4326) && \
+                 ST_MakeEnvelope(-10, -5, 10, 5, 4326)"
+            ),
+            "{q}"
+        );
+    }
+
+    // ---- property_kind_for_pg: the schema-level Type → PropertyKind dispatch.
+    //
+    // The value-decode counterpart (`decode_property`) needs a live `Row`, so it
+    // is covered end-to-end by the gated `postgres_decodes_*` parity tests. These
+    // pin the pure classification for every arm — including NUMERIC and DATE,
+    // which no cross-source parity fixture can carry (the file reader drops
+    // Parquet decimals and can't express a DATE-as-property), so this is their
+    // only non-live guard against a mis-classification silently dropping a column.
+
+    #[test]
+    fn property_kind_pg_classifies_numeric_types() {
+        use crate::columnar::PropertyKind;
+        for ty in [
+            Type::INT2,
+            Type::INT4,
+            Type::INT8,
+            Type::FLOAT4,
+            Type::FLOAT8,
+            Type::NUMERIC,
+            Type::TIMESTAMP,
+            Type::TIMESTAMPTZ,
+            Type::DATE,
+        ] {
+            assert_eq!(
+                property_kind_for_pg(&ty),
+                Some(PropertyKind::Numeric),
+                "{ty} must classify as Numeric"
+            );
+        }
+    }
+
+    #[test]
+    fn property_kind_pg_classifies_categorical_types() {
+        use crate::columnar::PropertyKind;
+        for ty in [
+            Type::BOOL,
+            Type::TEXT,
+            Type::VARCHAR,
+            Type::BPCHAR,
+            Type::NAME,
+        ] {
+            assert_eq!(
+                property_kind_for_pg(&ty),
+                Some(PropertyKind::Categorical),
+                "{ty} must classify as Categorical"
+            );
+        }
+    }
+
+    #[test]
+    fn property_kind_pg_drops_unmappable_and_nested() {
+        // Arrays are vertex/time columns (handled by decode_u64_ms_array /
+        // decode_f32_array), never scalar properties; geometry/uuid/bytea are
+        // unmappable. JSON/JSONB are intentionally None at the SCHEMA layer even
+        // though `decode_property` maps them at value time — nested JSON is left
+        // to per-tile sniffing (see the `decode_property` doc-comment).
+        for ty in [
+            Type::JSON,
+            Type::JSONB,
+            Type::UUID,
+            Type::BYTEA,
+            Type::INT4_ARRAY,
+            Type::INT8_ARRAY,
+            Type::FLOAT8_ARRAY,
+            Type::TIMESTAMP_ARRAY,
+            Type::DATE_ARRAY,
+        ] {
+            assert_eq!(property_kind_for_pg(&ty), None, "{ty} must be dropped (None)");
+        }
     }
 }

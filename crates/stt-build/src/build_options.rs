@@ -175,7 +175,7 @@ impl EncoderSettings {
             }
         }
 
-        stt_core::arrow_tile::set_quantize_coords_m(self.quantize_coords_m);
+        stt_core::arrow_tile::set_quantize_coords_m(self.quantize_coords_m)?;
         if self.quantize_coords_m > 0.0 {
             enabled.push(format!("quantize-coords={}m", self.quantize_coords_m));
         }
@@ -213,6 +213,11 @@ impl EncoderSettings {
     /// via [`stt_core::arrow_tile::encode_tile_with`] with its own config, never
     /// mutating shared state). This is the non-global sibling of [`apply`].
     pub fn resolve(&self) -> Result<stt_core::arrow_tile::EncoderConfig> {
+        // Fail fast at config time, not per-request at encode time: without
+        // this, a server boots cleanly on an invalid precision and 500s
+        // every tile (the same floor is enforced again where the value is
+        // consumed, so this is UX, not the safety net).
+        stt_core::arrow_tile::validate_quantize_coords_m(self.quantize_coords_m)?;
         Ok(stt_core::arrow_tile::EncoderConfig {
             quantize_coords_m: (self.quantize_coords_m > 0.0).then_some(self.quantize_coords_m),
             quantize_attrs: parse_quantize_attrs(&self.quantize_attr)?,
@@ -222,7 +227,31 @@ impl EncoderSettings {
             vertex_time_max_step_ms: self
                 .vertex_time_precision
                 .unwrap_or(stt_core::arrow_tile::DEFAULT_VERTEX_TIME_MAX_STEP_MS),
+            // The concurrently-landed format-v2 fields (`format_version`,
+            // `template_collector`) default to v1 / no-collector so this
+            // no-globals server path stays byte-identical until it opts into v2.
+            ..stt_core::arrow_tile::EncoderConfig::default()
         })
+    }
+
+    /// The `manifest.capabilities` entries these settings imply
+    /// (required-to-understand declarations, packed spec §3.1): each names a
+    /// feature that RE-TYPES existing tile columns, so an older reader would
+    /// silently misdecode without it. Additive features (vector groups,
+    /// vertex-time precision) are deliberately NOT capabilities. Returned in
+    /// registry order (deterministic; the pack writer canonicalizes anyway).
+    pub fn required_capabilities(&self) -> Vec<String> {
+        let mut caps: Vec<String> = Vec::new();
+        if self.quantize_coords_m > 0.0 {
+            caps.push(stt_core::pack::CAPABILITY_COORD_QUANT.to_string());
+        }
+        if !self.quantize_attr.is_empty() || self.quantize_attrs_auto {
+            caps.push(stt_core::pack::CAPABILITY_ATTR_QUANT.to_string());
+        }
+        if self.point_elevation_column.as_deref().is_some_and(|c| !c.is_empty()) {
+            caps.push(stt_core::pack::CAPABILITY_ELEVATION_FOLD.to_string());
+        }
+        caps
     }
 }
 
@@ -340,6 +369,38 @@ mod tests {
         assert!(matches!(g[1].elem, VectorElem::F32));
         assert!(parse_vector_groups(&["bad".into()]).is_err());
         assert!(parse_vector_groups(&["x=a:f64".into()]).is_err());
+    }
+
+    #[test]
+    fn required_capabilities_from_settings() {
+        // No re-typing feature → no capabilities (the manifest key is omitted).
+        assert!(EncoderSettings::default().required_capabilities().is_empty());
+
+        // Each re-typing feature declares its registry entry.
+        let all = EncoderSettings {
+            quantize_coords_m: 1.0,
+            quantize_attr: vec!["z=0.05".into()],
+            point_elevation_column: Some("z".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            all.required_capabilities(),
+            ["coord-quant", "attr-quant", "elevation-fold"]
+        );
+
+        // Auto attr-quantization alone also re-types columns.
+        let auto = EncoderSettings { quantize_attrs_auto: true, ..Default::default() };
+        assert_eq!(auto.required_capabilities(), ["attr-quant"]);
+
+        // Additive features (vector groups, vertex-time precision) and an
+        // empty elevation column never need a capability.
+        let additive = EncoderSettings {
+            vector_group: vec!["rgba=r,g,b,a:u8".into()],
+            vertex_time_precision: Some(50),
+            point_elevation_column: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(additive.required_capabilities().is_empty());
     }
 
     #[test]

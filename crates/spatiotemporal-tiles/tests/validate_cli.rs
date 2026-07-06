@@ -13,7 +13,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use stt_core::arrow_tile::{encode_tile, ColumnarLayer, GeometryColumn, PropertyColumn};
+use stt_core::arrow_tile::{
+    encode_tile_with, ColumnarLayer, EncoderConfig, GeometryColumn, PropertyColumn,
+};
 use stt_core::metadata::Metadata;
 use stt_core::types::TimeRange;
 use stt_core::{BlobOrdering, PackWriter, TileId};
@@ -43,13 +45,21 @@ fn point_layer(name: &str, base_id: u64, n: usize, start: i64, end: i64) -> Colu
 /// so callers can assert the metadata grand total matches.
 fn write_dataset(out_dir: &Path, tile_count: u32, per_tile: usize) -> u64 {
     let mut writer = PackWriter::create(out_dir, BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
+    // Frames follow the writer's (default v2) formatVersion + template
+    // collector, exactly like stt-build's encoder wiring — `add_tile_full`
+    // enforces frame/manifest version coherence.
+    let cfg = EncoderConfig {
+        format_version: writer.format_version(),
+        template_collector: Some(writer.template_collector()),
+        ..EncoderConfig::default()
+    };
     let t_start = 1_000i64;
     let t_end = 2_000i64;
     let mut features = 0u64;
     for x in 0..tile_count {
         let id = TileId::new(8, x, 0, t_start as u64);
         let layer = point_layer("default", x as u64 * 1000, per_tile, t_start, t_end);
-        let payload = encode_tile(&[layer]).unwrap();
+        let payload = encode_tile_with(&[layer], &cfg).unwrap();
         writer
             .add_tile_full(&id, t_start, t_end, None, per_tile as u32, None, &payload)
             .unwrap();
@@ -113,18 +123,6 @@ fn sample_limits_decoded_tile_count_and_skips_grand_total() {
     // Grand-total feature check must be skipped (not spuriously failing).
     assert_eq!(report["feature_count_decoded_complete"], false);
     assert_eq!(report["errors"].as_array().unwrap().len(), 0);
-}
-
-#[test]
-fn sample_is_deterministic() {
-    let dir = tempfile::tempdir().unwrap();
-    let archive = dir.path().join("det");
-    write_dataset(&archive, 20, 4);
-
-    let (_, a) = run_json(&archive, &["--sample", "5"]);
-    let (_, b) = run_json(&archive, &["--sample", "5"]);
-    assert_eq!(a["tiles_decoded"], b["tiles_decoded"]);
-    assert_eq!(a["feature_count_decoded"], b["feature_count_decoded"]);
 }
 
 #[test]

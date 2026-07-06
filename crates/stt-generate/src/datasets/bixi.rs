@@ -2282,14 +2282,14 @@ mod tests {
         assert_eq!(ab[&0], 2);
         assert_eq!(ab[&2], 1);
 
-        let dir = std::env::temp_dir().join("bixi-test-out.parquet");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("bixi-test-out.parquet");
         let (features, buckets, bucket0, range_end) =
             agg.write_parquet(&dir, 1, None, 10, 13, None).unwrap();
         assert_eq!(features, 2);
         assert_eq!(buckets, 3); // bins 0,1,2
         assert_eq!(bucket0, 0);
         assert_eq!(range_end, 3 * h);
-        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -2301,10 +2301,10 @@ mod tests {
             agg.add_trip(ParsedTrip { ..clone_trip(&busy) });
         }
         agg.add_trip(ParsedTrip { origin_key: "C".into(), dest_key: "D".into(), origin_pos: [0.0, 0.0], dest_pos: [2.0, 2.0], start_ms: 0, end_ms: None });
-        let dir = std::env::temp_dir().join("bixi-test-thresh.parquet");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("bixi-test-thresh.parquet");
         let (features, _, _, _) = agg.write_parquet(&dir, 3, None, 10, 13, None).unwrap();
         assert_eq!(features, 1); // only A→B (5) clears min_trips=3
-        let _ = std::fs::remove_file(&dir);
     }
 
     fn clone_trip(t: &ParsedTrip) -> ParsedTrip {
@@ -2372,7 +2372,8 @@ mod tests {
     #[test]
     fn clustered_write_bands_each_zoom_and_aggregates() {
         let h = 3_600_000i64;
-        let dir = std::env::temp_dir().join("bixi-test-cluster.parquet");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("bixi-test-cluster.parquet");
         let (features, buckets, bucket0, range_end) =
             downtown_agg().write_parquet(&dir, 1, Some(40.0), 10, 13, None).unwrap();
         // z13+z12 keep both corridors (2+2); z11+z10 aggregate the two docks
@@ -2381,7 +2382,6 @@ mod tests {
         assert_eq!(buckets, 1);
         assert_eq!(bucket0, 0);
         assert_eq!(range_end, h);
-        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
@@ -2389,12 +2389,12 @@ mod tests {
         // Baking must not change WHICH corridors are emitted per zoom — only
         // their geometry (2 verts → P verts). Same banded count as the
         // unbundled clustered write above.
-        let dir = std::env::temp_dir().join("bixi-test-baked.parquet");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("bixi-test-baked.parquet");
         let bp = BundleParams { points: 12, ..Default::default() };
         let (features, buckets, _, _) =
             downtown_agg().write_parquet(&dir, 1, Some(40.0), 10, 13, Some(&bp)).unwrap();
         assert_eq!(features, 6, "baking preserves per-zoom feature banding");
         assert_eq!(buckets, 1);
-        let _ = std::fs::remove_file(&dir);
     }
 }

@@ -4,14 +4,16 @@
 //! temporal bucketing, feature count, and encoded payload — and `None` for any
 //! `(z, x, y, t)` the offline build left empty.
 //!
-//! Parity is asserted at the strongest level the encoder guarantees across two
-//! encode calls: equal byte LENGTH plus an identical logical fingerprint
-//! (layer names, sorted schema/field metadata, and raw column buffer bytes).
-//! Raw byte equality is not asserted because arrow-54 serializes schema/field
-//! metadata in per-process `HashMap` iteration order, so two encodes of the
-//! same tile can differ in the metadata region only (the tracked gap in
-//! `docs/spec/stt-packed-format.md` §7-D6; see
-//! `crates/stt-core/tests/reproducible_build.rs`).
+//! Parity is asserted at the strongest level the encoder guarantees: raw byte
+//! equality of the two encoded payloads. Arrow ≥59 serializes schema/field
+//! metadata in stable (sorted) key order and the encoder feeds it sorted
+//! `BTreeMap`s, so two encodes of the same tile are byte-identical — the same
+//! cross-process reproducibility content-addressed pack dedup relies on (see
+//! `docs/spec/stt-packed-format.md` §7-D6 and the determinism guard in
+//! `crates/stt-core/tests/reproducible_build.rs`). This makes the parity check
+//! independent of any decode step: if the single-tile path ever diverges from
+//! the offline pipeline in placement, clipping, bucketing, column order, or
+//! metadata, the byte comparison fails immediately.
 //!
 //! Written against the PUBLIC `stt-build` surface only (`generate_tiles`,
 //! `encode_single_tile_counted`, `TileConfig`) with the shared cross-source
@@ -20,53 +22,7 @@
 mod common;
 
 use stt_build::tiler::{encode_single_tile_counted, generate_tiles, TileConfig};
-use stt_core::arrow_tile::{decode_tile, encode_tile_with, EncoderConfig};
-
-/// A stable, order-independent fingerprint of a decoded tile payload: every
-/// layer's name, sorted schema metadata, and, per column, the field name +
-/// sorted field metadata + the column's raw Arrow value bytes. Mirrors the
-/// fingerprint `reproducible_build.rs` uses for the same arrow-54 reason.
-fn logical_fingerprint(payload: &[u8]) -> Vec<u8> {
-    let mut fp: Vec<u8> = Vec::new();
-    for layer in decode_tile(payload).unwrap() {
-        fp.extend_from_slice(layer.name.as_bytes());
-        fp.push(0);
-        let schema = layer.batch.schema();
-        let mut smeta: Vec<(String, String)> = schema
-            .metadata()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        smeta.sort();
-        for (k, v) in smeta {
-            fp.extend_from_slice(k.as_bytes());
-            fp.push(b'=');
-            fp.extend_from_slice(v.as_bytes());
-            fp.push(0);
-        }
-        for (i, field) in schema.fields().iter().enumerate() {
-            fp.extend_from_slice(field.name().as_bytes());
-            fp.push(0);
-            let mut fmeta: Vec<(String, String)> = field
-                .metadata()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            fmeta.sort();
-            for (k, v) in fmeta {
-                fp.extend_from_slice(k.as_bytes());
-                fp.push(b'=');
-                fp.extend_from_slice(v.as_bytes());
-                fp.push(0);
-            }
-            let data = layer.batch.column(i).to_data();
-            for buf in data.buffers() {
-                fp.extend_from_slice(buf.as_slice());
-            }
-        }
-    }
-    fp
-}
+use stt_core::arrow_tile::{encode_tile_with, EncoderConfig};
 
 #[test]
 fn single_tile_encoding_matches_offline_build() {
@@ -122,19 +78,13 @@ fn single_tile_encoding_matches_offline_build() {
             tile.id.y,
             tile.id.t
         );
+        // Strict byte-identity: the single-tile encoder must reproduce the
+        // offline pipeline's payload exactly (see module docs — Arrow ≥59 makes
+        // this deterministic). Any divergence in placement, clipping, temporal
+        // bucketing, column order, or baked metadata surfaces here.
         assert_eq!(
-            single_bytes.len(),
-            offline_bytes.len(),
-            "payload length diverges at z{}/{}/{} t{}",
-            tile.id.z,
-            tile.id.x,
-            tile.id.y,
-            tile.id.t
-        );
-        assert_eq!(
-            logical_fingerprint(&single_bytes),
-            logical_fingerprint(&offline_bytes),
-            "payload content diverges at z{}/{}/{} t{}",
+            single_bytes, offline_bytes,
+            "payload bytes diverge at z{}/{}/{} t{}",
             tile.id.z,
             tile.id.x,
             tile.id.y,

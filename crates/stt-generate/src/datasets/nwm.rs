@@ -34,15 +34,21 @@
 //!    default; a supplied matrix is dropped under `--simplify`).
 //!
 //! ## Value encodings (design §5, baked at generate time)
+//! - `self-scaled`: `round(clamp((log10 q − p2) / (p98 − p2), 0, 1), 2)` — each
+//!   reach's OWN annual [p2, p98] log-discharge mapped to [0, 1], so every reach
+//!   (creek or Mississippi) spans the full ramp across its own low→high and
+//!   colour reads seasonal *variation*, not absolute size (year/daily demo). A
+//!   `SELF_SCALE_MIN_LOG_SPAN` floor keeps near-constant reaches dim rather than
+//!   amplifying their noise to full contrast.
 //! - `log-q`:       `round(log10(max(q, 0.01)), 2)` ∈ [−2, 5] — absolute
-//!   discharge on a log axis (year/daily demo).
+//!   discharge on a log axis (big rivers dominate the scale; kept for reference).
 //! - `log-anomaly`: `round(clamp(log2(q / median_2019), 0, 6), 2)` — flood
 //!   anomaly vs the reach's 2019 daily median (March/hourly demo). Reaches
 //!   with median < 0.01 m³/s (intermittent) → `NaN` → renderer fallback color.
 //!
 //! ```bash
-//! # Demo 1 — full-year daily absolute discharge:
-//! stt-generate nwm --window 2019 --bin 1d --value log-q \
+//! # Demo 1 — full-year daily flow, each reach self-scaled to its own range:
+//! stt-generate nwm --window 2019 --bin 1d --value self-scaled \
 //!   --output examples/showcase/public/data/nwm-rivers-2019
 //! # Demo 2 — March hourly flood anomaly (needs the 2019 daily pass for medians):
 //! stt-generate nwm --window 2019-03 --bin 1h --value log-anomaly \
@@ -93,6 +99,11 @@ const METERS_PER_PIXEL_Z0: f64 = 123_357.0;
 const CONTINUITY_EPS_DEG: f64 = 1e-4;
 /// Anomaly baseline floor: reaches with 2019 median below this are masked NaN.
 const MEDIAN_FLOOR: f32 = 0.01;
+/// Self-scaled floor: a reach whose robust log10-discharge span (p98 − p2) is
+/// below this uses only a proportional fraction of the ramp, so near-constant
+/// (regulated / baseflow-only) reaches stay dim instead of amplifying noise to
+/// full contrast. 0.30 log10 units ≈ a 2× annual swing to saturate the ramp.
+const SELF_SCALE_MIN_LOG_SPAN: f32 = 0.30;
 /// Rows per writer flush / parquet row group: matrix rows are tens of KB, so
 /// the default 100k-row batches would buffer the whole archive in RAM.
 const WRITER_BATCH_ROWS: usize = 2_048;
@@ -129,10 +140,13 @@ pub struct Args {
     #[arg(long, default_value = "1d")]
     pub bin: String,
 
-    /// Value encoding: `log-q` = round(log10(max(q,0.01)),2) absolute
-    /// discharge; `log-anomaly` = round(clamp(log2(q/median2019),0,6),2)
-    /// flood anomaly (needs/triggers the window year's `1d` reduce).
-    #[arg(long, default_value = "log-q")]
+    /// Value encoding: `self-scaled` = round(clamp((log10 q−p2)/(p98−p2),0,1),2),
+    /// each reach normalised to its OWN annual [p2,p98] so colour reads seasonal
+    /// variation not absolute size (the year demo); `log-q` =
+    /// round(log10(max(q,0.01)),2) absolute discharge; `log-anomaly` =
+    /// round(clamp(log2(q/median2019),0,6),2) flood anomaly (needs/triggers the
+    /// window year's `1d` reduce).
+    #[arg(long, default_value = "self-scaled")]
     pub value: String,
 
     /// Output packed `.stt` directory (or `*.parquet` to stop at the
@@ -281,15 +295,19 @@ fn parse_bin(s: &str) -> Result<Bin> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValueEncoding {
+    SelfScaled,
     LogQ,
     LogAnomaly,
 }
 
 fn parse_value(s: &str) -> Result<ValueEncoding> {
     match s.trim() {
+        "self-scaled" => Ok(ValueEncoding::SelfScaled),
         "log-q" => Ok(ValueEncoding::LogQ),
         "log-anomaly" => Ok(ValueEncoding::LogAnomaly),
-        other => bail!("--value must be `log-q` or `log-anomaly` (got '{other}')"),
+        other => {
+            bail!("--value must be `self-scaled`, `log-q` or `log-anomaly` (got '{other}')")
+        }
     }
 }
 
@@ -591,6 +609,33 @@ pub(crate) fn median_non_nan(vals: &[f32]) -> f32 {
     } else {
         (v[m - 1] + v[m]) / 2.0
     }
+}
+
+/// Nearest-rank percentile of an ascending-sorted slice (`p` ∈ [0, 1]); clamps
+/// to the ends. NaN for an empty slice.
+pub(crate) fn percentile_sorted(sorted: &[f32], p: f32) -> f32 {
+    if sorted.is_empty() {
+        return f32::NAN;
+    }
+    let idx = ((p * (sorted.len() as f32 - 1.0)).round() as usize).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+/// `(p2, p98)` of a reach's finite `log10(max(q, 0.01))` series — the
+/// self-scaled normalization bounds. Percentiles (not raw min/max) so a single
+/// flood-day spike or dry-out can't compress the rest of the year against the
+/// ramp. Returns `(NaN, NaN)` when the reach has no finite sample.
+pub(crate) fn log_percentile_bounds(series: &[f32]) -> (f32, f32) {
+    let mut v: Vec<f32> = series
+        .iter()
+        .filter(|x| x.is_finite())
+        .map(|&x| x.max(0.01).log10())
+        .collect();
+    if v.is_empty() {
+        return (f32::NAN, f32::NAN);
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (percentile_sorted(&v, 0.02), percentile_sorted(&v, 0.98))
 }
 
 const STRIPE_MAGIC: &[u8; 8] = b"NWMRED2\0";
@@ -1375,6 +1420,20 @@ pub(crate) fn round2(v: f32) -> f32 {
     ((v as f64 * 100.0).round() / 100.0) as f32
 }
 
+/// `round(clamp((log10 q − lo) / max(hi − lo, MIN_SPAN), 0, 1), 2)` where
+/// `[lo, hi]` are the reach's own `log10`-discharge (p2, p98). Maps each reach's
+/// annual low→high onto the full [0, 1] ramp so colour reads seasonal variation,
+/// not absolute size; the span floor keeps near-constant reaches dim. Fill/NaN
+/// (or a reach with no finite bound) → NaN → renderer fallback color.
+pub(crate) fn encode_self_scaled(q: f32, lo: f32, hi: f32) -> f32 {
+    if q.is_nan() || lo.is_nan() || hi.is_nan() {
+        return f32::NAN;
+    }
+    let logq = q.max(0.01).log10();
+    let denom = (hi - lo).max(SELF_SCALE_MIN_LOG_SPAN);
+    round2(((logq - lo) / denom).clamp(0.0, 1.0))
+}
+
 /// `round(log10(max(q, 0.01)), 2)` ∈ [−2, 5]; fill/NaN passes through.
 pub(crate) fn encode_log_q(q: f32) -> f32 {
     if q.is_nan() {
@@ -1628,6 +1687,12 @@ pub fn run(args: Args) -> Result<()> {
             .map(|&c| {
                 let series = table.series(table.index[&c]);
                 match value {
+                    ValueEncoding::SelfScaled => {
+                        // Normalise each reach to its OWN annual [p2, p98] so
+                        // colour reads seasonal variation, not absolute size.
+                        let (lo, hi) = log_percentile_bounds(series);
+                        series.iter().map(|&q| encode_self_scaled(q, lo, hi)).collect()
+                    }
                     ValueEncoding::LogQ => series.iter().map(|&q| encode_log_q(q)).collect(),
                     ValueEncoding::LogAnomaly => {
                         let med = medians
@@ -1938,6 +2003,7 @@ mod tests {
         assert_eq!(parse_bin("1d").unwrap(), Bin::Daily);
         assert_eq!(parse_bin("1h").unwrap(), Bin::Hourly);
         assert!(parse_bin("6h").is_err());
+        assert_eq!(parse_value("self-scaled").unwrap(), ValueEncoding::SelfScaled);
         assert_eq!(parse_value("log-q").unwrap(), ValueEncoding::LogQ);
         assert_eq!(parse_value("log-anomaly").unwrap(), ValueEncoding::LogAnomaly);
         assert!(parse_value("linear").is_err());
@@ -2096,6 +2162,45 @@ mod tests {
         assert_eq!(round2(0.477_121_3), 0.48);
         assert_eq!(round2(-1.234), -1.23);
         assert_eq!(round2(2.0), 2.0);
+    }
+
+    #[test]
+    fn log_percentile_bounds_cases() {
+        // 0..=100 m³/s: p2 ≈ log10(2)=0.30, p98 ≈ log10(98)=1.99 (nearest-rank).
+        let series: Vec<f32> = (0..=100).map(|i| i as f32).collect();
+        let (lo, hi) = log_percentile_bounds(&series);
+        assert!((lo - 2.0f32.log10()).abs() < 1e-4, "lo={lo}");
+        assert!((hi - 98.0f32.log10()).abs() < 1e-4, "hi={hi}");
+        // Fills are ignored; a single finite sample gives lo == hi.
+        let (lo1, hi1) = log_percentile_bounds(&[f32::NAN, 50.0, f32::NAN]);
+        assert_eq!(lo1, 50.0f32.log10());
+        assert_eq!(hi1, 50.0f32.log10());
+        // All-fill reach → no bound.
+        let (lo0, hi0) = log_percentile_bounds(&[f32::NAN, f32::NAN]);
+        assert!(lo0.is_nan() && hi0.is_nan());
+    }
+
+    #[test]
+    fn encode_self_scaled_cases() {
+        // A reach whose own range is 1 → 1000 m³/s (log10 span 3.0, well above
+        // the floor): its low pins to 0, its high to 1, geometric mid to 0.5.
+        let (lo, hi) = (0.0f32, 3.0f32); // log10(1), log10(1000)
+        assert_eq!(encode_self_scaled(1.0, lo, hi), 0.0);
+        assert_eq!(encode_self_scaled(1000.0, lo, hi), 1.0);
+        assert_eq!(encode_self_scaled(31.62, lo, hi), 0.5); // 10^1.5
+        // Absolute size does NOT set the colour — a huge reach scaled to its own
+        // [10^4, 10^6] range reports the SAME 0.5 at its geometric midpoint.
+        let (blo, bhi) = (4.0f32, 6.0f32);
+        assert_eq!(encode_self_scaled(100_000.0, blo, bhi), 0.5); // 10^5
+        // Below-p2 / above-p98 samples clamp to the ends.
+        assert_eq!(encode_self_scaled(0.1, lo, hi), 0.0);
+        assert_eq!(encode_self_scaled(1e6, lo, hi), 1.0);
+        // Span floor: a near-constant reach (log span 0.1 < 0.30) only reaches a
+        // proportional fraction of the ramp, so it stays dim.
+        assert_eq!(encode_self_scaled(10.0f32.powf(0.1), 0.0, 0.1), round2(0.1 / 0.30));
+        // Undefined bounds / fill → NaN → renderer fallback.
+        assert!(encode_self_scaled(f32::NAN, lo, hi).is_nan());
+        assert!(encode_self_scaled(5.0, f32::NAN, f32::NAN).is_nan());
     }
 
     // -- mainstem merge -----------------------------------------------------

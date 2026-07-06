@@ -25,18 +25,39 @@
 //! The pack target is 4 KiB to cut the ~10 distinct blobs into 2-3 packs.
 //!
 //! Run: cargo run -p stt-core --example make-golden-fixture
+//!
+//! `--v2` emits the SAME source data as a version-coherent packed-v2 build
+//! (`formatVersion: 2` manifests + v2 frames) into sibling `*-v2/` dirs,
+//! leaving the committed v1 fixture bytes untouched — for future fixture
+//! needs; nothing consumes the v2 output yet, so it is not committed.
 
-use stt_core::arrow_tile::{encode_tile, ColumnarLayer, GeometryColumn};
+use stt_core::arrow_tile::{encode_tile_with, ColumnarLayer, EncoderConfig, GeometryColumn};
 use stt_core::metadata::Metadata;
+use stt_core::pack::{PACKED_FORMAT_VERSION_V1, PACKED_FORMAT_VERSION_V2};
 use stt_core::{BlobOrdering, PackWriter, TileId};
 use std::path::PathBuf;
 
+/// Frame-version-coherent encoder config: frames follow the writer's
+/// formatVersion (mirroring stt-build's `pack_encoder_config`) instead of the
+/// process-global encode default, so a dataset can never mix frame and
+/// manifest versions — readers hard-reject mixed datasets (packed-v2 design
+/// §1 ★F6). v2 emits SELF-CONTAINED frames (no template collector): the
+/// paged + single grid builds below use two writers, and inline schema
+/// sections keep their payload bytes byte-shareable without shared-collector
+/// plumbing.
+fn encoder_config(format_version: u32) -> EncoderConfig {
+    EncoderConfig {
+        format_version,
+        ..EncoderConfig::default()
+    }
+}
+
 /// Build the deterministic payload for tile index `k`. `id_seed` lets the
 /// deduped tiles (k=4, k=9) reuse k=0's identity bytes.
-fn payload_for(id_seed: u64) -> Vec<u8> {
+fn payload_for(id_seed: u64, cfg: &EncoderConfig) -> Vec<u8> {
     let ids: Vec<u64> = (0..3).map(|i| 100 * id_seed + i).collect();
     let n = ids.len();
-    encode_tile(&[ColumnarLayer {
+    encode_tile_with(&[ColumnarLayer {
         name: "default".to_string(),
         feature_ids: ids,
         start_times: vec![1000 * id_seed as i64; n],
@@ -47,11 +68,27 @@ fn payload_for(id_seed: u64) -> Vec<u8> {
         triangles: None,
         vertex_value_matrix: None,
         properties: vec![],
-    }])
+    }], cfg)
     .unwrap()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Version coherence: the committed fixtures are v1 (byte-frozen), so the
+    // writers are PINNED to v1 rather than inheriting `PackWriter`'s v2
+    // default — and the payload frames follow the same pin (see
+    // `encoder_config`). `--v2` writes a coherent v2 copy NEXT TO the v1
+    // outputs (`*-v2/` suffix), never over them.
+    let mut v2 = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--v2" => v2 = true,
+            other => return Err(format!("unknown argument {other:?} (only --v2)").into()),
+        }
+    }
+    let format_version = if v2 { PACKED_FORMAT_VERSION_V2 } else { PACKED_FORMAT_VERSION_V1 };
+    let suffix = if v2 { "-v2" } else { "" };
+    let cfg = encoder_config(format_version);
+
     // <crate>/../../packages/core/test/fixtures/packed-golden
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let out_dir = manifest_dir
@@ -61,7 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("core")
         .join("test")
         .join("fixtures")
-        .join("packed-golden");
+        .join(format!("packed-golden{suffix}"));
 
     // Start clean so re-running is deterministic (stale packs would linger
     // otherwise — content-addressed names mean old objects never get clobbered).
@@ -71,7 +108,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SpatialMajor keeps the order deterministic + independent of the Auto
     // heuristic, so the content hashes are stable across builds.
-    let mut w = PackWriter::create(&out_dir, BlobOrdering::SpatialMajor, 4 * 1024)?;
+    let mut w = PackWriter::create(&out_dir, BlobOrdering::SpatialMajor, 4 * 1024)?
+        .with_format_version(format_version);
 
     // `encode_tile` is NOT byte-deterministic across separate calls (Arrow IPC
     // framing), so build each distinct payload exactly ONCE and CLONE it for the
@@ -85,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let id_seed = if k == 4 || k == 9 { 0 } else { k };
         let payload = distinct
             .entry(id_seed)
-            .or_insert_with(|| payload_for(id_seed))
+            .or_insert_with(|| payload_for(id_seed, &cfg))
             .clone();
         let t = 1000 * k as i64;
         // Distinct spatial cell per tile so all 12 directory entries survive.
@@ -124,21 +162,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // query path returns byte-identical results to a whole-load directory while
     // fetching only a fraction of the leaf pages.
     let base = manifest_dir.join("..").join("..").join("packages").join("core").join("test").join("fixtures");
-    let grid = build_grid_tiles();
+    let grid = build_grid_tiles(&cfg);
     let grid_meta = Metadata::new("paged-golden")
         .with_description("Deterministic STT paged-directory cross-impl fixture")
         .with_zoom_levels(10, 12)
         .with_temporal_bucket_ms(3_600_000)
         .with_time_range(stt_core::types::TimeRange::new(0, 3 * 3_600_000));
-    for (sub, paging) in [("paged-golden", Some(8usize)), ("paged-golden-single", None)] {
-        let dir = base.join(sub);
+    for (sub, paging) in [
+        (format!("paged-golden{suffix}"), Some(8usize)),
+        (format!("paged-golden-single{suffix}"), None),
+    ] {
+        let dir = base.join(&sub);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
         // SpatialMajor → deterministic order + stable content hashes; identical
         // shared payload bytes → the two builds' packs are byte-identical and
         // only the directory container differs.
-        let mut gw = PackWriter::create(&dir, BlobOrdering::SpatialMajor, 8 * 1024)?.with_paging(paging);
+        let mut gw = PackWriter::create(&dir, BlobOrdering::SpatialMajor, 8 * 1024)?
+            .with_format_version(format_version)
+            .with_paging(paging);
         for (id, ts, te, payload) in &grid {
             gw.add_tile_full(id, *ts, *te, Some(*ts), 3, Some(3_600_000), payload)?;
         }
@@ -162,7 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// A spread-out grid of tiles across two zooms and three time buckets, with
 /// deterministic per-tile payloads built once (so paged + single builds share
 /// byte-identical blobs). ~250 entries → several leaf pages at page size 8.
-fn build_grid_tiles() -> Vec<(TileId, i64, i64, Vec<u8>)> {
+fn build_grid_tiles(cfg: &EncoderConfig) -> Vec<(TileId, i64, i64, Vec<u8>)> {
     let mut out = Vec::new();
     let mut seed = 1_000u64;
     let bucket = 3_600_000i64;
@@ -172,7 +215,7 @@ fn build_grid_tiles() -> Vec<(TileId, i64, i64, Vec<u8>)> {
             let (x, y) = (520 + gx, 384 + gy);
             let b = ((gx + gy) % 3) as i64;
             let t = b * bucket;
-            out.push((TileId::new(10, x, y, t.max(0) as u64), t, t + bucket - 1, payload_for(seed)));
+            out.push((TileId::new(10, x, y, t.max(0) as u64), t, t + bucket - 1, payload_for(seed, cfg)));
             seed += 1;
         }
     }
@@ -182,7 +225,7 @@ fn build_grid_tiles() -> Vec<(TileId, i64, i64, Vec<u8>)> {
             let (x, y) = (2084 + gx, 1536 + gy);
             let b = ((gx * 7 + gy) % 3) as i64;
             let t = b * bucket;
-            out.push((TileId::new(12, x, y, t.max(0) as u64), t, t + bucket - 1, payload_for(seed)));
+            out.push((TileId::new(12, x, y, t.max(0) as u64), t, t + bucket - 1, payload_for(seed, cfg)));
             seed += 1;
         }
     }

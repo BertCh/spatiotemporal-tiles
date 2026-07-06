@@ -203,10 +203,7 @@ fn round_nice(x: f64) -> u64 {
 mod tests {
     use super::*;
     use crate::analysis::density::{DensityAnalysis, ZoomDensity};
-    use crate::analysis::geometry::{
-        GeometryAnalysis, GeometryComplexity, PropertyStats, SizeStats, VertexStats,
-    };
-    use crate::analysis::spatial::{SpatialAnalysis, SpatialDistribution};
+    use crate::analysis::spatial::SpatialDistribution;
     use crate::analysis::temporal::{EventsPerDayStats, TemporalAnalysis, TemporalDistribution};
     use crate::analysis::AnalysisResult;
     use crate::loader::LoadedData;
@@ -270,13 +267,11 @@ mod tests {
             source: "synthetic.parquet".to_string(),
             feature_count: 100_000,
             bounds: BoundingBox::new(-74.0, 40.0, -73.0, 41.0),
-            spatial: SpatialAnalysis {
-                zoom_coverage: Vec::new(),
-                hotspots: Vec::new(),
-                recommended_min_zoom: 0,
-                recommended_max_zoom: max_zoom,
-                distribution: SpatialDistribution::Regional,
-            },
+            spatial: crate::test_support::sample_spatial(
+                0,
+                max_zoom,
+                SpatialDistribution::Regional,
+            ),
             temporal: TemporalAnalysis {
                 time_start: 0,
                 time_end: duration_ms,
@@ -291,34 +286,7 @@ mod tests {
                 monthly_distribution: vec![0; 12],
                 events_per_day,
             },
-            geometry: GeometryAnalysis {
-                type_distribution: std::collections::HashMap::new(),
-                dominant_type: "Point".to_string(),
-                vertex_stats: VertexStats {
-                    min: 1,
-                    max: 1,
-                    avg: 1.0,
-                    median: 1,
-                    p95: 1,
-                    p99: 1,
-                    total: 100_000,
-                },
-                size_stats: SizeStats {
-                    min: 100,
-                    max: 100,
-                    avg: 100.0,
-                    median: 100,
-                    p95: 100,
-                    p99: 100,
-                    total: 10_000_000,
-                },
-                property_stats: PropertyStats {
-                    min: 2,
-                    max: 2,
-                    avg: 2.0,
-                },
-                complexity: GeometryComplexity::Simple,
-            },
+            geometry: crate::test_support::point_geometry(100_000),
             density: DensityAnalysis {
                 estimated_tile_count: per_zoom.iter().map(|z| z.tile_count).sum(),
                 estimated_archive_size: 0,

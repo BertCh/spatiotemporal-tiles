@@ -135,9 +135,18 @@ struct Args {
     #[arg(long)]
     sql: Option<String>,
 
-    /// Geometry column (must be EPSG:4326 lon/lat).
+    /// Geometry column (EPSG:4326 lon/lat, unless --source-srid says otherwise).
     #[arg(long, default_value = "geom")]
     geom_column: String,
+
+    /// SRID of the stored geometry when it is NOT EPSG:4326 — every per-tile
+    /// query then reprojects it to 4326 before filtering and encoding (DuckDB:
+    /// `ST_Transform(geom, 'EPSG:<srid>', 'EPSG:4326')`; PostGIS:
+    /// `ST_Transform(ST_SetSRID(geom, <srid>), 4326)`), matching an offline
+    /// `stt-build --source-srid` ingest. Costs a per-row transform — store
+    /// 4326 for the cheap path.
+    #[arg(long)]
+    source_srid: Option<i32>,
 
     /// Timestamp column (a timestamp / timestamptz type, or an integer column
     /// interpreted per --time-format). Default matches `stt-build` /
@@ -181,6 +190,14 @@ struct Args {
     /// tile). No effect on point/polygon data.
     #[arg(long)]
     no_clip: bool,
+
+    /// Restore legacy whole-feature placement for non-trajectory geometry
+    /// (polygons, timeless lines, multipoints land only in their
+    /// representative tile). Parity with `stt-build --whole-feature-placement`
+    /// — a file archive built with that flag and a live serve of the same
+    /// source must set BOTH or their tiles diverge.
+    #[arg(long)]
+    whole_feature_placement: bool,
 
     /// Minimum vertices required before a trajectory is clipped.
     #[arg(long, default_value = "2")]
@@ -363,6 +380,9 @@ struct ServerState {
     /// `--sql` source. Interpolated into the per-tile + metadata queries.
     source: String,
     geom_column: String,
+    /// Reproject-from SRID for non-4326 sources (`--source-srid`), threaded
+    /// into every per-tile query; `None` = stored geometry is already lon/lat.
+    source_srid: Option<i32>,
     time_field: String,
     end_time_field: Option<String>,
     time_format: TimeFormat,
@@ -414,9 +434,21 @@ async fn tile_handler_multi(
     }
 }
 
+/// Whether `(z, x, y)` addresses a real slippy tile: `z ≤ 31` (beyond that the
+/// tile count overflows the `u32` x/y space — and `1u64 << z` itself overflows
+/// at z = 64) and `x`, `y` within the `2^z` grid. Guards [`tile_bbox`]'s shift
+/// against request-controlled input.
+fn tile_in_range(z: u8, x: u32, y: u32) -> bool {
+    z <= 31 && u64::from(x) < (1u64 << z) && u64::from(y) < (1u64 << z)
+}
+
 /// The shared tile-serving core: parse `t`, generate the tile, and build the
 /// HTTP response. Reused by the single- and multi-dataset routes.
 async fn serve_tile(st: &Arc<ServerState>, z: u8, x: u32, y: u32, t: String) -> Response {
+    if !tile_in_range(z, x, y) {
+        return (StatusCode::BAD_REQUEST, "tile out of range: need z <= 31 and x, y < 2^z")
+            .into_response();
+    }
     let t_ms = match t.trim_end_matches(".stt").parse::<i64>() {
         Ok(v) => v,
         Err(_) => {
@@ -474,6 +506,7 @@ async fn build_tile(
                 bbox,
                 t_start,
                 t_end,
+                st.source_srid,
             );
             let client = pool.get().await.context("get pooled PG connection")?;
             let rows = client.query(&sql, &[]).await.context("tile query")?;
@@ -507,6 +540,7 @@ async fn build_tile(
                 bbox,
                 t_start,
                 t_end,
+                st.source_srid,
             );
             // DuckDB is fully blocking: pool checkout, query, decode, encode all
             // run on one blocking worker.
@@ -661,7 +695,13 @@ async fn load_metadata_pg(
     bucket_ms: u64,
 ) -> Result<serde_json::Value> {
     let client = pool.get().await.context("get connection for metadata")?;
-    let geom = quote_ident(&args.geom_column);
+    let geom_raw = quote_ident(&args.geom_column);
+    // Reproject non-4326 sources so the advertised bounds are always lon/lat
+    // (matches the per-tile query's transform).
+    let geom = match args.source_srid {
+        Some(srid) => format!("ST_Transform(ST_SetSRID({geom_raw}, {srid}), 4326)"),
+        None => geom_raw,
+    };
     let time = quote_ident(&args.time_field);
     // Convert min/max time to epoch-ms per `--time-format` so an integer-epoch
     // column advertises the same extent it would when ingested.
@@ -808,8 +848,13 @@ fn load_metadata_duckdb(
     bucket_ms: u64,
 ) -> Result<serde_json::Value> {
     let conn = pool.get().context("get DuckDB connection for metadata")?;
-    let sql =
-        duckdb_input::build_metadata_query(source, &args.geom_column, &args.time_field, args.time_format);
+    let sql = duckdb_input::build_metadata_query(
+        source,
+        &args.geom_column,
+        &args.time_field,
+        args.time_format,
+        args.source_srid,
+    );
     let mut stmt = conn.prepare(&sql).context("prepare DuckDB metadata query")?;
     let mut rows = stmt.query([]).context("DuckDB metadata query")?;
     let row = rows
@@ -991,7 +1036,7 @@ fn build_config(
 
     // Resolve encoder settings into an EXPLICIT config (parses + validates the
     // specs) — no process-wide globals are touched.
-    let encoder = EncoderSettings {
+    let mut encoder = EncoderSettings {
         vertex_time_precision: Some(args.vertex_time_precision),
         quantize_coords_m: args.quantize_coords,
         quantize_attr: args.quantize_attr.clone(),
@@ -1000,6 +1045,14 @@ fn build_config(
         point_elevation_column: args.point_elevation_column.clone(),
     }
     .resolve()?;
+    // stt-serve STAYS on v1 layer frames (packed-v2 design §7): inline
+    // schemas are its only mode anyway (no manifest to carry templates) and
+    // responses are `no-store`, so template amortization buys nothing. The
+    // serve protocol has no version channel — a future serve-v2 must add
+    // `formatVersion` to `/metadata.json` FIRST. This also scopes the file≡DB
+    // byte-parity story: parity holds against a `--format-version 1` build.
+    encoder.format_version = stt_core::arrow_tile::FORMAT_VERSION_V1;
+    encoder.template_collector = None;
     let mut enc_enabled: Vec<String> = Vec::new();
     if let Some(m) = encoder.quantize_coords_m {
         enc_enabled.push(format!("quantize-coords={m}m"));
@@ -1084,6 +1137,9 @@ fn build_config(
     } else if args.clip_min_vertices != 2 {
         active.push(format!("clip-min-vertices={}", args.clip_min_vertices));
     }
+    if args.whole_feature_placement {
+        active.push("whole-feature-placement".into());
+    }
     if args.simplify {
         active.push(format!("simplify(max-zoom={})", args.simplify_max_zoom));
     }
@@ -1101,6 +1157,9 @@ fn build_config(
     }
     if args.min_features_per_tile != 1 {
         active.push(format!("min-features-per-tile={}", args.min_features_per_tile));
+    }
+    if let Some(srid) = args.source_srid {
+        active.push(format!("source-srid={srid}"));
     }
     if tile_budget.is_some() {
         active.push("tile-budget".into());
@@ -1128,6 +1187,7 @@ fn build_config(
         layer_name: args.layer.clone(),
         temporal_bucket_ms: bucket_ms,
         clip_trajectories: !args.no_clip,
+        clip_non_trajectory: !args.whole_feature_placement,
         clip_min_vertices: args.clip_min_vertices,
         simplify: args.simplify,
         simplify_max_zoom: args.simplify_max_zoom,
@@ -1142,9 +1202,9 @@ fn build_config(
         max_zoom_field: args.max_zoom_field.clone(),
         tile_budget,
         attribute_filter,
-        // DB-backed serving keeps per-tile type sniffing for now — the row
-        // decode knows the column types but doesn't thread them here yet
-        // (see ColumnarOptions::property_types).
+        // Pinned from the backend's result schema in `build_dataset_state`
+        // once the pool exists (build_config runs before the backend is
+        // resolved); empty until then (see ColumnarOptions::property_types).
         property_types: Default::default(),
     };
     Ok((config, encoder))
@@ -1162,7 +1222,7 @@ async fn build_dataset_state(args: &Args) -> Result<(String, ServerState)> {
     let bucket_ms = build_options::parse_duration(&args.temporal_bucket)?;
     let (source, derived_name) = resolve_source(args)?;
     let name = args.name.clone().unwrap_or(derived_name);
-    let (config, encoder) = build_config(args, bucket_ms)?;
+    let (mut config, encoder) = build_config(args, bucket_ms)?;
 
     // Resolve the backend: explicit per-dataset flags first, then env
     // fallbacks. DuckDB is tried first (but an explicit --postgres outranks the
@@ -1181,6 +1241,28 @@ async fn build_dataset_state(args: &Args) -> Result<(String, ServerState)> {
             let pool = build_duckdb_pool(&path, args.pool_size)?;
             let metadata = load_metadata_duckdb(&pool, args, &source, &name, bucket_ms)
                 .context("load DuckDB source metadata")?;
+            // Pin property kinds from the result schema (LIMIT 0 probe), so the
+            // layer schema can't drift across tiles when a column is all-NULL
+            // within one tile — same pinning the offline build does.
+            let probe_spec = duckdb_input::QuerySpec {
+                source: duckdb_input::QuerySource::Table(source.clone()),
+                geom_column: args.geom_column.clone(),
+                where_clause: None,
+                reproject_from_srid: args.source_srid,
+            };
+            let conn = pool.get().context("get DuckDB connection for schema probe")?;
+            match duckdb_input::property_kinds_on(
+                &conn,
+                &probe_spec,
+                &args.time_field,
+                args.end_time_field.as_deref(),
+            ) {
+                Ok(kinds) => config.property_types = Arc::new(kinds),
+                Err(e) => tracing::warn!(
+                    "could not pin property kinds from the DuckDB result schema ({e:#}); \
+                     per-tile type sniffing applies"
+                ),
+            }
             resolved = Some((Backend::DuckDb(pool), metadata));
         }
     }
@@ -1208,6 +1290,31 @@ async fn build_dataset_state(args: &Args) -> Result<(String, ServerState)> {
             let metadata = load_metadata_pg(&pool, args, &source, &name, bucket_ms)
                 .await
                 .context("load PostGIS source metadata")?;
+            // Pin property kinds from the prepared projection's result schema
+            // (prepare types the columns without executing) — same pinning the
+            // offline build does.
+            let probe = postgres_input::QuerySpec {
+                source: postgres_input::QuerySource::Table(source.clone()),
+                geom_column: args.geom_column.clone(),
+                where_clause: None,
+                reproject_from_srid: args.source_srid,
+            }
+            .wrapped_query();
+            let client = pool.get().await.context("get PG connection for schema probe")?;
+            match client.prepare(&probe).await {
+                Ok(stmt) => {
+                    config.property_types = Arc::new(postgres_input::property_kinds_from_columns(
+                        stmt.columns(),
+                        &args.time_field,
+                        args.end_time_field.as_deref(),
+                        &args.geom_column,
+                    ))
+                }
+                Err(e) => tracing::warn!(
+                    "could not pin property kinds from the PostGIS result schema ({e:#}); \
+                     per-tile type sniffing applies"
+                ),
+            }
             resolved = Some((Backend::Postgres(pool), metadata));
         }
     }
@@ -1243,6 +1350,7 @@ async fn build_dataset_state(args: &Args) -> Result<(String, ServerState)> {
             backend,
             source,
             geom_column: args.geom_column.clone(),
+            source_srid: args.source_srid,
             time_field: args.time_field.clone(),
             end_time_field: args.end_time_field.clone(),
             time_format: args.time_format,
@@ -1348,6 +1456,22 @@ mod tests {
         let b = tile_bbox(10, x, y);
         assert!(b[0] < b[2] && b[1] < b[3]);
         assert!(b[0] > -130.0 && b[2] < -110.0);
+    }
+
+    #[test]
+    fn tile_in_range_rejects_overflow_and_out_of_grid() {
+        assert!(tile_in_range(0, 0, 0));
+        // z = 31: the deepest grid — max index 2^31 - 1.
+        assert!(tile_in_range(31, (1u32 << 31) - 1, (1u32 << 31) - 1));
+        assert!(tile_in_range(10, 1023, 1023));
+        // Out of the 2^z grid (u32::MAX = 2^32 - 1 exceeds even the z=31 grid).
+        assert!(!tile_in_range(31, u32::MAX, u32::MAX));
+        assert!(!tile_in_range(10, 1024, 0));
+        assert!(!tile_in_range(0, 0, 1));
+        // z = 64 would overflow `1u64 << z`; z = 32 already exceeds the u32 grid.
+        assert!(!tile_in_range(32, 0, 0));
+        assert!(!tile_in_range(64, 0, 0));
+        assert!(!tile_in_range(255, 0, 0));
     }
 
     #[test]

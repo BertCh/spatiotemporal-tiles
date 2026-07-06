@@ -28,7 +28,8 @@ use geojson::Feature;
 use std::sync::Arc;
 
 use crate::db_input_common::{
-    apply_int_time_format, json_number_or_null, warn_dropped_columns, RowOutcome, VertexCoercions,
+    apply_int_time_format, decimal_string_to_json, json_number_or_null, warn_dropped_columns,
+    RowOutcome, VertexCoercions,
 };
 use crate::input::{
     parse_iso8601, parse_wkb_geometry, reject_negative_timestamp, InputStrictness, ParsedFeature,
@@ -101,16 +102,23 @@ impl QuerySpec {
 
 /// Build a per-tile query for a dynamic server: project geometry to a WKB
 /// `BLOB` aliased [`WKB_ALIAS`], pass every other column through, and filter by
-/// a WGS84 bounding box (envelope-overlap: `ST_Intersects` between the
-/// geometry's `ST_Envelope` and the tile envelope — a SUPERSET prefilter
-/// matching the PostGIS `&&` bbox semantics, so a feature the tiler places by
-/// centroid is never dropped by an exact-intersection test; the authoritative
-/// per-tile placement happens in `encode_single_tile`) and a half-open time
-/// window `[t_start_ms, t_end_ms)`. The
-/// geometry / time literals are server-formatted numbers (request `z/x/y/t` are
-/// parsed to integers upstream), so there is no request-controlled SQL. The
-/// time column must be a `TIMESTAMP`/`TIMESTAMP WITH TIME ZONE` (compared via
-/// `epoch_ms`, which yields a UTC `TIMESTAMP`; pin the session to UTC).
+/// a WGS84 bounding box (`ST_Intersects_Extent` — bounding-box overlap, the
+/// PostGIS `&&` analog: a pure MBR test with no per-row GEOS work, and a
+/// SUPERSET prefilter, so a feature the tiler places by centroid is never
+/// dropped by an exact-intersection test; the authoritative per-tile placement
+/// happens in `encode_single_tile`) and a half-open time window
+/// `[t_start_ms, t_end_ms)`. The geometry / time literals are server-formatted
+/// numbers (request `z/x/y/t` are parsed to integers upstream), so there is no
+/// request-controlled SQL. The time column must be a `TIMESTAMP`/`TIMESTAMP
+/// WITH TIME ZONE` (compared via `epoch_ms`, which yields a UTC `TIMESTAMP`;
+/// pin the session to UTC).
+///
+/// `source_srid`: when the stored geometry is not EPSG:4326, it is
+/// `ST_Transform`ed to 4326 *before* both the WKB projection and the bbox
+/// test — the filter runs in tile space (still a strict superset), and the
+/// output matches an offline `stt-build --source-srid` ingest exactly. The
+/// per-row transform makes this a full-scan predicate; store 4326 if you need
+/// the cheap path.
 ///
 /// Feed the result to [`decode_query`].
 #[allow(clippy::too_many_arguments)]
@@ -122,14 +130,19 @@ pub fn build_tile_query(
     bbox: [f64; 4],
     t_start_ms: i64,
     t_end_ms: i64,
+    source_srid: Option<i32>,
 ) -> String {
-    let geom = format!("q.{}", QuerySpec::quote_ident(geom_column));
+    let geom_raw = format!("q.{}", QuerySpec::quote_ident(geom_column));
+    let geom = match source_srid {
+        Some(srid) => format!("ST_Transform({geom_raw}, 'EPSG:{srid}', 'EPSG:4326', true)"),
+        None => geom_raw,
+    };
     let time = format!("q.{}", QuerySpec::quote_ident(time_field));
     let time_where = duckdb_time_window(&time, time_format, t_start_ms, t_end_ms);
     format!(
         "SELECT ST_AsWKB({geom}) AS {WKB_ALIAS}, q.* \
          FROM ( SELECT * FROM {table} ) AS q \
-         WHERE ST_Intersects(ST_Envelope({geom}), ST_MakeEnvelope({}, {}, {}, {})) \
+         WHERE ST_Intersects_Extent({geom}, ST_MakeEnvelope({}, {}, {}, {})) \
            AND {time_where}",
         bbox[0], bbox[1], bbox[2], bbox[3]
     )
@@ -138,8 +151,12 @@ pub fn build_tile_query(
 /// The half-open `[t_start_ms, t_end_ms)` predicate for the time column, chosen
 /// by `--time-format` (mirrors the PostGIS reader): `Iso8601` (default) assumes a
 /// `TIMESTAMP` column and compares via `epoch_ms`; `UnixMs`/`UnixSec` assume an
-/// integer column and compare numerically (scaling seconds to ms). Literals are
-/// server-formatted numbers — no request-controlled SQL.
+/// integer column and compare numerically. Seconds compare the RAW column
+/// against ceil-divided second bounds (`t*1000 >= a ⟺ t >= ⌈a/1000⌉` and
+/// `t*1000 < b ⟺ t < ⌈b/1000⌉` for integer `t`) — exactly equivalent to
+/// scaling the column, but sargable, so zone-map / index pruning on the column
+/// still applies. Literals are server-formatted numbers — no
+/// request-controlled SQL.
 fn duckdb_time_window(
     time: &str,
     time_format: TimeFormat,
@@ -154,7 +171,9 @@ fn duckdb_time_window(
             format!("{time} >= {t_start_ms} AND {time} < {t_end_ms}")
         }
         TimeFormat::UnixSec => {
-            format!("{time} * 1000 >= {t_start_ms} AND {time} * 1000 < {t_end_ms}")
+            let start_s = crate::db_input_common::ceil_ms_to_seconds(t_start_ms);
+            let end_s = crate::db_input_common::ceil_ms_to_seconds(t_end_ms);
+            format!("{time} >= {start_s} AND {time} < {end_s}")
         }
     }
 }
@@ -164,14 +183,21 @@ fn duckdb_time_window(
 /// `ST_Extent_Agg` (aggregate) yields a bbox GEOMETRY; the scalar `ST_Extent`
 /// turns it into a `BOX_2D` for `ST_XMin`/… `epoch_ms(TIMESTAMP)` yields BIGINT
 /// epoch-ms. The bounds + time values are NULL-safe (read as `Option`) for an
-/// empty table; `cnt` (`COUNT(*)`) is never NULL.
+/// empty table; `cnt` (`COUNT(*)`) is never NULL. `source_srid` reprojects the
+/// geometry to EPSG:4326 before aggregating, so the advertised bounds are
+/// always lon/lat (matches [`build_tile_query`]).
 pub fn build_metadata_query(
     table: &str,
     geom_column: &str,
     time_field: &str,
     time_format: TimeFormat,
+    source_srid: Option<i32>,
 ) -> String {
-    let geom = QuerySpec::quote_ident(geom_column);
+    let geom_raw = QuerySpec::quote_ident(geom_column);
+    let geom = match source_srid {
+        Some(srid) => format!("ST_Transform({geom_raw}, 'EPSG:{srid}', 'EPSG:4326', true)"),
+        None => geom_raw,
+    };
     let time = QuerySpec::quote_ident(time_field);
     // Convert the aggregated min/max time to epoch-ms per `--time-format`, so an
     // integer-epoch column advertises the same extent it would when ingested.
@@ -361,7 +387,7 @@ where
         &seen_props,
         total_rows,
         "DuckDB",
-        "GEOMETRY/DECIMAL/LIST",
+        "GEOMETRY/LIST/STRUCT",
     );
     vertex_coercions.warn("DuckDB");
     Ok(())
@@ -410,6 +436,112 @@ pub fn decode_query(
         i += 1;
     }
     Ok(out)
+}
+
+/// Schema-level property-kind map for a DuckDB source — the DB analog of
+/// [`crate::input::property_kinds`] (GeoParquet): probe the wrapped query's
+/// result schema (a `LIMIT 0` execution — plans and types every column, scans
+/// no rows) and pin each property column's tile kind from its result type, so
+/// `TileConfig::property_types` keeps the layer schema stable when a column is
+/// all-NULL within one tile (per-tile value sniffing drops it there and the
+/// layer schema drifts across tiles; the file reader has pinned kinds from the
+/// Parquet schema since 0.1.1 — this brings the DB path to parity).
+pub fn property_kinds(
+    db_path: &str,
+    spec: &QuerySpec,
+    time_field: &str,
+    end_time_field: Option<&str>,
+) -> Result<crate::columnar::PropertyTypes> {
+    let conn = open_connection(db_path)?;
+    property_kinds_on(&conn, spec, time_field, end_time_field)
+}
+
+/// As [`property_kinds`], on an already-open connection — the serve path
+/// probes through its pool at startup.
+pub fn property_kinds_on(
+    conn: &Connection,
+    spec: &QuerySpec,
+    time_field: &str,
+    end_time_field: Option<&str>,
+) -> Result<crate::columnar::PropertyTypes> {
+    property_kinds_for_query(
+        conn,
+        &spec.wrapped_query(),
+        time_field,
+        end_time_field,
+        &spec.geom_column,
+    )
+}
+
+/// As [`property_kinds`], for an arbitrary query that projects the geometry to
+/// [`WKB_ALIAS`] — the same contract as [`decode_query`]. Excludes the system
+/// columns with the same predicates [`RowSchema`] uses, so the pinned map and
+/// the row decode can't disagree about which columns are properties.
+pub fn property_kinds_for_query(
+    conn: &Connection,
+    sql: &str,
+    time_field: &str,
+    end_time_field: Option<&str>,
+    geom_column: &str,
+) -> Result<crate::columnar::PropertyTypes> {
+    let probe = format!("SELECT * FROM ( {sql} ) AS __stt_schema_probe LIMIT 0");
+    let mut stmt = conn.prepare(&probe).context("prepare DuckDB schema probe")?;
+    let rows = stmt.query([]).context("DuckDB schema probe failed")?;
+    let mut kinds = crate::columnar::PropertyTypes::new();
+    let Some(executed) = rows.as_ref() else {
+        return Ok(kinds);
+    };
+    let names = executed.column_names();
+    for (idx, name) in names.iter().enumerate() {
+        if name == WKB_ALIAS
+            || name == time_field
+            || end_time_field == Some(name.as_str())
+            || name == geom_column
+            || crate::input::is_coordinate_column_name(name)
+            || crate::input::is_vertex_metadata_column(name)
+        {
+            continue;
+        }
+        if let Some(kind) = property_kind_for_duck(&executed.column_type(idx)) {
+            kinds.insert(name.clone(), kind);
+        }
+    }
+    Ok(kinds)
+}
+
+/// Schema-level mirror of [`decode_property_value`]: the tile kind a DuckDB
+/// result column of this (vendored-Arrow) type decodes to. `None` = not
+/// pinned — unmappable at read time (blobs, intervals, nested types), or a
+/// `DECIMAL(p>18, 0)`/HUGEINT-shaped column whose out-of-i64-range values fall
+/// back to strings, where a pinned Numeric could lie; those stay on per-tile
+/// sniffing.
+fn property_kind_for_duck(
+    dt: &duckdb::arrow::datatypes::DataType,
+) -> Option<crate::columnar::PropertyKind> {
+    use crate::columnar::PropertyKind;
+    use duckdb::arrow::datatypes::DataType as T;
+    match dt {
+        T::Int8
+        | T::Int16
+        | T::Int32
+        | T::Int64
+        | T::UInt8
+        | T::UInt16
+        | T::UInt32
+        | T::UInt64
+        | T::Float32
+        | T::Float64
+        // Timestamps/dates decode to epoch-ms numbers.
+        | T::Timestamp(..)
+        | T::Date32 => Some(PropertyKind::Numeric),
+        // Scale-0 decimals surface as HugeInt (i128): DECIMAL(p ≤ 18, 0)
+        // always fits i64 → always a number; wider stays unpinned (see above).
+        T::Decimal128(p, 0) if *p <= 18 => Some(PropertyKind::Numeric),
+        // Scaled decimals surface as `ValueRef::Decimal` → nearest-f64 number.
+        T::Decimal128(_, s) if *s > 0 => Some(PropertyKind::Numeric),
+        T::Boolean | T::Utf8 | T::LargeUtf8 => Some(PropertyKind::Categorical),
+        _ => None,
+    }
 }
 
 /// A property column: index in the result, its output name, and (when the
@@ -742,16 +874,19 @@ fn decode_f32_list(row: &Row, idx: usize, coerced: &mut usize) -> Option<Vec<f32
 }
 
 /// Map one property cell to a JSON value. SQL NULL and unmappable types (raw
-/// GEOMETRY/other BLOBs, decimals, intervals, nested types, …) return `None` and
-/// are dropped.
+/// GEOMETRY/other BLOBs, intervals, nested types, …) return `None` and are
+/// dropped.
 ///
 /// This is a documented **superset** of `crate::input::extract_property_value`,
 /// not an exact mirror: it shares the six core types (bool / Int32 / Int64 /
 /// Float32 / Float64 / text) and the NaN→JSON-null rule, but additionally maps
-/// `TinyInt`/`SmallInt`, all unsigned ints, `HugeInt`, and `Timestamp`/`Date32`
-/// (→ epoch-ms numbers) — types a GeoParquet file can't express the same way, so
-/// they only ever add properties a file build couldn't carry, never diverge on
-/// the common type set. The DuckDB and PostGIS readers stay in lockstep here.
+/// `TinyInt`/`SmallInt`, all unsigned ints, `HugeInt`, `Decimal` (→ nearest-f64
+/// number via [`decimal_string_to_json`] — the file reader drops Parquet
+/// decimals), and `Timestamp`/`Date32` (→ epoch-ms numbers) — types a
+/// GeoParquet file can't express the same way, so they only ever add properties
+/// a file build couldn't carry, never diverge on the common type set. The
+/// DuckDB and PostGIS readers stay in lockstep here (NUMERIC/DECIMAL uses the
+/// one shared conversion).
 fn decode_property_value(v: ValueRef) -> Option<serde_json::Value> {
     use serde_json::Value;
     match v {
@@ -770,6 +905,9 @@ fn decode_property_value(v: ValueRef) -> Option<serde_json::Value> {
         ValueRef::UBigInt(n) => Some(Value::from(n)),
         ValueRef::Float(f) => Some(json_number_or_null(f as f64)),
         ValueRef::Double(f) => Some(json_number_or_null(f)),
+        // Fixed-point DECIMAL → nearest f64, via the conversion shared with the
+        // PostGIS reader's NUMERIC arm (identical value → identical number).
+        ValueRef::Decimal(d) => Some(decimal_string_to_json(&d.to_string())),
         ValueRef::Text(bytes) => {
             std::str::from_utf8(bytes).ok().map(|s| Value::String(s.to_string()))
         }
@@ -778,8 +916,8 @@ fn decode_property_value(v: ValueRef) -> Option<serde_json::Value> {
             timestamp_unit_to_ms(unit, value).ok().map(Value::from)
         }
         ValueRef::Date32(days) => Some(Value::from((days as i64) * 86_400_000)),
-        // NULL, Blob (incl. raw GEOMETRY/WKB), Decimal, Time64, Interval, and
-        // the nested List/Struct/Map/Enum/Array/Union types are dropped.
+        // NULL, Blob (incl. raw GEOMETRY/WKB), Time64, Interval, and the
+        // nested List/Struct/Map/Enum/Array/Union types are dropped.
         _ => None,
     }
 }
@@ -820,7 +958,8 @@ mod tests {
 
     #[test]
     fn tile_query_filters_bbox_and_time() {
-        // Default (Iso8601 → timestamp column): epoch_ms comparison.
+        // Default (Iso8601 → timestamp column): epoch_ms comparison; the bbox
+        // prefilter is the pure-MBR ST_Intersects_Extent (the `&&` analog).
         let q = build_tile_query(
             "obs",
             "geom",
@@ -829,10 +968,11 @@ mod tests {
             [-10.0, -5.0, 10.0, 5.0],
             1000,
             2000,
+            None,
         );
         assert!(q.contains("ST_AsWKB(q.\"geom\")"), "{q}");
         assert!(
-            q.contains("ST_Intersects(ST_Envelope(q.\"geom\"), ST_MakeEnvelope(-10, -5, 10, 5))"),
+            q.contains("ST_Intersects_Extent(q.\"geom\", ST_MakeEnvelope(-10, -5, 10, 5))"),
             "{q}"
         );
         assert!(q.contains("q.\"ts\" >= epoch_ms(1000::BIGINT)"), "{q}");
@@ -847,11 +987,14 @@ mod tests {
             [-10.0, -5.0, 10.0, 5.0],
             1000,
             2000,
+            None,
         );
         assert!(ms.contains("q.\"ts\" >= 1000 AND q.\"ts\" < 2000"), "{ms}");
         assert!(!ms.contains("epoch_ms"), "{ms}");
 
-        // Seconds: scaled ×1000 so the ms bucket bounds stay exact.
+        // Seconds: sargable — the RAW column against ceil-divided second
+        // bounds (t*1000 >= 1000 ⟺ t >= 1; t*1000 < 2000 ⟺ t < 2), never a
+        // scaled-column expression that would defeat zone-map pruning.
         let sec = build_tile_query(
             "obs",
             "geom",
@@ -860,8 +1003,47 @@ mod tests {
             [-10.0, -5.0, 10.0, 5.0],
             1000,
             2000,
+            None,
         );
-        assert!(sec.contains("q.\"ts\" * 1000 >= 1000 AND q.\"ts\" * 1000 < 2000"), "{sec}");
+        assert!(sec.contains("q.\"ts\" >= 1 AND q.\"ts\" < 2"), "{sec}");
+        assert!(!sec.contains("* 1000"), "{sec}");
+
+        // Non-multiple-of-1000 ms bounds round up on both ends (half-open).
+        let odd = duckdb_time_window("t", TimeFormat::UnixSec, 1500, 2001);
+        assert_eq!(odd, "t >= 2 AND t < 3");
+    }
+
+    #[test]
+    fn tile_query_reprojects_when_source_srid_given() {
+        let q = build_tile_query(
+            "obs",
+            "geom",
+            "ts",
+            TimeFormat::Iso8601,
+            [-10.0, -5.0, 10.0, 5.0],
+            1000,
+            2000,
+            Some(3857),
+        );
+        // The transformed geometry feeds BOTH the WKB projection and the bbox
+        // test, so the filter runs in tile (4326) space — a strict superset.
+        assert!(
+            q.contains("ST_AsWKB(ST_Transform(q.\"geom\", 'EPSG:3857', 'EPSG:4326', true))"),
+            "{q}"
+        );
+        assert!(
+            q.contains(
+                "ST_Intersects_Extent(ST_Transform(q.\"geom\", 'EPSG:3857', 'EPSG:4326', true), \
+                 ST_MakeEnvelope(-10, -5, 10, 5))"
+            ),
+            "{q}"
+        );
+
+        let mq = build_metadata_query("obs", "geom", "ts", TimeFormat::Iso8601, Some(3857));
+        assert!(
+            mq.contains("ST_Extent_Agg(ST_Transform(\"geom\", 'EPSG:3857', 'EPSG:4326', true))"),
+            "{mq}"
+        );
     }
 
     #[test]
@@ -878,19 +1060,21 @@ mod tests {
         assert_eq!(QuerySpec::quote_ident("we\"ird"), "\"we\"\"ird\"");
     }
 
+    /// WKB for POINT(1 2), little-endian — shared by the no-spatial decode tests
+    /// (the geometry rides as a pre-made `BLOB` aliased to [`WKB_ALIAS`]).
+    const POINT_WKB: &[u8] = &[
+        0x01, // little-endian
+        0x01, 0x00, 0x00, 0x00, // geometry type 1 = Point
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F, // x = 1.0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // y = 2.0
+    ];
+
     /// End-to-end decode against a real (bundled) in-memory DuckDB — no spatial
     /// extension / network needed: the geometry is supplied as a pre-made WKB
     /// `BLOB` aliased to [`WKB_ALIAS`], exercising the `ValueRef` decode path,
     /// column-name resolution, timestamp→ms, and property mapping.
     #[test]
     fn decodes_blob_geometry_time_and_props() {
-        // WKB for POINT(1 2), little-endian.
-        const POINT_WKB: &[u8] = &[
-            0x01, // little-endian
-            0x01, 0x00, 0x00, 0x00, // geometry type 1 = Point
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F, // x = 1.0
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // y = 2.0
-        ];
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE t (g BLOB, ts TIMESTAMP, n INTEGER, name VARCHAR);")
             .unwrap();
@@ -935,8 +1119,40 @@ mod tests {
         );
     }
 
+    /// `DECIMAL` property cells decode to nearest-f64 JSON numbers (they were
+    /// silently dropped before); a NULL decimal keeps dropping the key.
+    #[test]
+    fn decodes_decimal_properties() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (g BLOB, ts TIMESTAMP, price DECIMAL(10,2), fee DECIMAL(18,6));
+             INSERT INTO t VALUES (NULL, TIMESTAMP '2024-06-21 12:00:00', 12.34, NULL);",
+        )
+        .unwrap();
+        conn.execute("UPDATE t SET g = ?", duckdb::params![POINT_WKB]).unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT g AS __stt_wkb, ts AS \"timestamp\", price, fee FROM t")
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let names: Vec<String> = rows.as_ref().unwrap().column_names();
+        let schema =
+            RowSchema::resolve(&names, "timestamp", None, "g", TimeFormat::Iso8601).unwrap();
+        let row = rows.next().unwrap().unwrap();
+        let mut coercions = VertexCoercions::default();
+        let RowOutcome::Feature(f) = schema
+            .parse_row(row, InputStrictness::Warn, InputStrictness::Warn, 0, &mut coercions)
+            .unwrap()
+        else {
+            panic!("expected a decoded feature");
+        };
+        let props = f.shared_properties.expect("properties present");
+        assert_eq!(props.get("price"), Some(&serde_json::Value::from(12.34)));
+        assert_eq!(props.get("fee"), None, "NULL decimal drops the key");
+    }
+
     /// Live smoke test of the actual spatial SQL the server emits — exercises
-    /// `ST_Point`/`ST_AsWKB`/`ST_MakeEnvelope`/`ST_Intersects`/`epoch_ms` (tile
+    /// `ST_Point`/`ST_AsWKB`/`ST_MakeEnvelope`/`ST_Intersects_Extent`/`epoch_ms` (tile
     /// query) and `ST_Transform` (reprojection). Ignored by default because the
     /// first `INSTALL spatial` needs network (cached under `~/.duckdb` after).
     /// Run with: `cargo test -p stt-build --features duckdb -- --ignored`.
@@ -968,6 +1184,7 @@ mod tests {
             [-74.5, 40.0, -73.0, 41.0],
             t0,
             t1,
+            None,
         );
         let feats = decode_query(
             &conn,
@@ -1017,8 +1234,49 @@ mod tests {
         assert!((f2[0].lon - (-73.9)).abs() < 1e-4, "reprojected lon {}", f2[0].lon);
         assert!((f2[0].lat - 40.7).abs() < 1e-4, "reprojected lat {}", f2[0].lat);
 
+        // Serve-style reprojected tile query (the --source-srid serve path):
+        // the same NYC bbox against the Web-Mercator table must reproject,
+        // bbox-filter in 4326 space, and decode to lon/lat.
+        let srid_sql = build_tile_query(
+            "merc",
+            "geom",
+            "ts",
+            TimeFormat::Iso8601,
+            [-74.5, 40.0, -73.0, 41.0],
+            t0,
+            t1,
+            Some(3857),
+        );
+        let f3 = decode_query(
+            &conn,
+            &srid_sql,
+            "ts",
+            None,
+            "geom",
+            TimeFormat::Iso8601,
+            InputStrictness::Warn,
+            InputStrictness::Warn,
+        )
+        .unwrap();
+        assert_eq!(f3.len(), 1, "reprojected tile query finds the mercator point");
+        assert!((f3[0].lon - (-73.9)).abs() < 1e-4, "srid tile lon {}", f3[0].lon);
+        assert!((f3[0].lat - 40.7).abs() < 1e-4, "srid tile lat {}", f3[0].lat);
+
+        // Reprojected metadata bounds come back in lon/lat.
+        let mq_srid = build_metadata_query("merc", "geom", "ts", TimeFormat::Iso8601, Some(3857));
+        let mut stmt = conn.prepare(&mq_srid).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let row = rows.next().unwrap().unwrap();
+        let min_lon: Option<f64> = row.get(0).unwrap();
+        assert!(
+            (min_lon.unwrap() - (-73.9)).abs() < 1e-4,
+            "srid metadata min_lon {min_lon:?}"
+        );
+        drop(rows);
+        drop(stmt);
+
         // Metadata aggregate: bounds, [t_start, t_end] epoch-ms, count.
-        let mq = build_metadata_query("obs", "geom", "ts", TimeFormat::Iso8601);
+        let mq = build_metadata_query("obs", "geom", "ts", TimeFormat::Iso8601, None);
         let mut stmt = conn.prepare(&mq).unwrap();
         let mut rows = stmt.query([]).unwrap();
         let row = rows.next().unwrap().unwrap();

@@ -137,25 +137,37 @@ impl PackedTileset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stt_core::arrow_tile::{encode_tile, ColumnarLayer, GeometryColumn};
+    use stt_core::arrow_tile::{
+        encode_tile_with, ColumnarLayer, EncoderConfig, GeometryColumn,
+    };
     use stt_core::curve::BlobOrdering;
     use stt_core::pack::PackWriter;
     use stt_core::tile::TileId;
 
-    fn tiny_tile(seed: u64) -> Vec<u8> {
+    /// Frames must match the writer's (default v2) manifest declaration —
+    /// mixed-version datasets are a reader hard error.
+    fn tiny_tile(seed: u64, w: &PackWriter) -> Vec<u8> {
         let n = 4usize;
-        encode_tile(&[ColumnarLayer {
-            name: "default".to_string(),
-            feature_ids: (0..n as u64).map(|i| seed * 100 + i).collect(),
-            start_times: vec![0; n],
-            end_times: vec![100; n],
-            geometry: GeometryColumn::Point(vec![[-73.6, 45.5]; n]),
-            vertex_times: None,
-            vertex_values: None,
-            triangles: None,
-            vertex_value_matrix: None,
-            properties: vec![],
-        }])
+        let cfg = EncoderConfig {
+            format_version: w.format_version(),
+            template_collector: Some(w.template_collector()),
+            ..EncoderConfig::default()
+        };
+        encode_tile_with(
+            &[ColumnarLayer {
+                name: "default".to_string(),
+                feature_ids: (0..n as u64).map(|i| seed * 100 + i).collect(),
+                start_times: vec![0; n],
+                end_times: vec![100; n],
+                geometry: GeometryColumn::Point(vec![[-73.6, 45.5]; n]),
+                vertex_times: None,
+                vertex_values: None,
+                triangles: None,
+                vertex_value_matrix: None,
+                properties: vec![],
+            }],
+            &cfg,
+        )
         .unwrap()
     }
 
@@ -166,7 +178,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("dataset");
         let mut w = PackWriter::create(&out, BlobOrdering::Auto, 64 * 1024).unwrap();
-        let payloads: Vec<Vec<u8>> = (0..3).map(tiny_tile).collect();
+        let payloads: Vec<Vec<u8>> = (0..3).map(|k| tiny_tile(k, &w)).collect();
         for (k, p) in payloads.iter().enumerate() {
             let id = TileId::new(7, k as u32, 0, 0);
             w.add_tile_full(&id, 0, 3_599_999, Some(0), 4, Some(3_600_000), p)
@@ -208,7 +220,7 @@ mod tests {
             .unwrap()
             .with_paging(Some(2));
         for k in 0..6u64 {
-            let p = tiny_tile(k);
+            let p = tiny_tile(k, &w);
             let id = TileId::new(9, k as u32, 0, 0);
             w.add_tile_full(&id, 0, 100, None, 4, None, &p).unwrap();
         }

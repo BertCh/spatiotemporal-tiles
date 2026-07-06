@@ -16,11 +16,17 @@ exclude = ["/examples", "/tests"]
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `raw_value`: the bundle profile (`pack::write_bundle`) embeds manifest.json
+# VERBATIM in the `.sttb` header so unpack reproduces it byte-identically.
+serde_json = { workspace = true, features = ["raw_value"] }
 geo.workspace = true
 geo-types.workspace = true
 earcutr.workspace = true
 zstd = "0.13"
+# formatVersion-2 manifests embed each schema template as base64 in
+# `manifest.schemas` (packed spec §3.2 — templates ride the manifest, so no
+# new object class exists for r2-sync/CDN plumbing to learn).
+base64 = "0.22"
 hilbert_2d.workspace = true
 byteorder.workspace = true
 memmap2.workspace = true
@@ -44,6 +50,9 @@ projection = ["proj"]
 [dev-dependencies]
 criterion.workspace = true
 tempfile = "3.10"
+# Adversarial property tests (tests/adversarial_decode.rs): round-trip +
+# never-panic over the v5 directory, paged container, and tile layer frame.
+proptest = "1"
 
 [[bench]]
 name = "encoding"

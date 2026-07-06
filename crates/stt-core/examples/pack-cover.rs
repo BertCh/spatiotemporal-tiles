@@ -35,7 +35,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metadata = reader.metadata().clone();
     let entries = reader.entries().to_vec();
 
-    let mut writer = PackWriter::create(out_dir, ordering, pack_size_mb * 1024 * 1024)?;
+    // Payloads are repacked verbatim, so the source's capability
+    // declarations (spec §3.1) must be carried forward — dropping them would
+    // re-arm the silent-misdecode hazard on quantized/folded source data.
+    // The source's formatVersion is carried too (frames and manifest may not
+    // mix; readers hard-reject), and a v2 source's registry seeds the new
+    // manifest's schemas table — copied frames reference templates by hash
+    // but never re-encode, so nothing else would record them.
+    let mut writer = PackWriter::create(out_dir, ordering, pack_size_mb * 1024 * 1024)?
+        .with_format_version(reader.format_version())
+        .with_capabilities(reader.capabilities().to_vec());
+    if let Some(templates) = reader.templates() {
+        writer = writer.with_seeded_templates(templates);
+    }
     let (mut kept, mut computed, mut empty) = (0u64, 0u64, 0u64);
     for entry in &entries {
         let payload = reader.read_payload(entry)?;

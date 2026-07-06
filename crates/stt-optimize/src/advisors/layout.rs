@@ -185,15 +185,8 @@ fn pack_size_advice(result: &AnalysisResult) -> Option<Advice> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::density::DensityAnalysis;
-    use crate::analysis::geometry::{
-        GeometryAnalysis, GeometryComplexity, PropertyStats, SizeStats, VertexStats,
-    };
-    use crate::analysis::spatial::SpatialAnalysis;
-    use crate::analysis::temporal::{EventsPerDayStats, TemporalAnalysis, TemporalDistribution};
     use crate::loader::{PropValue, SampledFeature};
     use geo_types::{Geometry, Point};
-    use std::collections::HashMap;
     use stt_core::types::{BoundingBox, TimeRange};
 
     const DAY_MS: u64 = 86_400_000;
@@ -243,73 +236,16 @@ mod tests {
         estimated_archive_size: usize,
         measured: Option<MeasuredEncoding>,
     ) -> AnalysisResult {
-        AnalysisResult {
-            source: "synthetic.parquet".to_string(),
-            feature_count: 10_000,
-            bounds: BoundingBox::new(-74.0, 45.0, -73.0, 46.0),
-            spatial: SpatialAnalysis {
-                zoom_coverage: Vec::new(),
-                hotspots: Vec::new(),
-                recommended_min_zoom: 0,
-                recommended_max_zoom: 10,
-                distribution,
-            },
-            temporal: TemporalAnalysis {
-                time_start: 0,
-                time_end: duration_ms,
-                duration_ms,
-                duration_human: format!("{:.1} days", duration_ms as f64 / DAY_MS as f64),
-                unique_timestamps: 1_000,
-                distribution: TemporalDistribution::Uniform,
-                recommended_bucket_ms: 3_600_000,
-                recommended_bucket_human: "1 hour".to_string(),
-                hourly_distribution: vec![0; 24],
-                daily_distribution: vec![0; 7],
-                monthly_distribution: vec![0; 12],
-                events_per_day: EventsPerDayStats {
-                    min: 0.0,
-                    max: 0.0,
-                    avg: 0.0,
-                    median: 0.0,
-                    std_dev: 0.0,
-                },
-            },
-            geometry: GeometryAnalysis {
-                type_distribution: HashMap::new(),
-                dominant_type: "Point".to_string(),
-                vertex_stats: VertexStats {
-                    min: 1,
-                    max: 1,
-                    avg: 1.0,
-                    median: 1,
-                    p95: 1,
-                    p99: 1,
-                    total: 10_000,
-                },
-                size_stats: SizeStats {
-                    min: 100,
-                    max: 100,
-                    avg: 100.0,
-                    median: 100,
-                    p95: 100,
-                    p99: 100,
-                    total: 1_000_000,
-                },
-                property_stats: PropertyStats {
-                    min: 2,
-                    max: 2,
-                    avg: 2.0,
-                },
-                complexity: GeometryComplexity::Simple,
-            },
-            density: DensityAnalysis {
-                per_zoom: Vec::new(),
-                estimated_tile_count: 100,
-                estimated_archive_size,
-                issues: Vec::new(),
-            },
-            measured,
-        }
+        // The shared default (10 000 points, one uniform day, empty density),
+        // with only the fields the layout advisor reads overridden.
+        let mut r = crate::test_support::sample_analysis();
+        r.spatial.distribution = distribution;
+        r.temporal.time_end = duration_ms;
+        r.temporal.duration_ms = duration_ms;
+        r.temporal.duration_human = format!("{:.1} days", duration_ms as f64 / DAY_MS as f64);
+        r.density.estimated_archive_size = estimated_archive_size;
+        r.measured = measured;
+        r
     }
 
     fn find<'a>(advice: &'a [Advice], flag: &str) -> Option<&'a Advice> {

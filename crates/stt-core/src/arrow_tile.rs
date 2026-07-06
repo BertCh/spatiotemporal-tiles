@@ -19,7 +19,12 @@
 //! | `<property>`  | `Float64` or `Dictionary<UInt16,Utf8>`   | one column per property       |
 //!
 //! All layers in one tile are concatenated with a tiny frame so a tile can
-//! carry, say, a linestring layer and a point layer side by side:
+//! carry, say, a linestring layer and a point layer side by side. Two frame
+//! shapes exist, selected by [`EncoderConfig::format_version`] (the payload
+//! side of the packed format's `manifest.formatVersion` — the two are bumped
+//! in lockstep, see `docs/spec/stt-packed-format.md` §9):
+//!
+//! **v1** (`format_version: 1`, the 0.3.x wire shape — frozen, byte-identical):
 //!
 //! ```text
 //! [u16 layer_count | ALIGNED_FRAME_FLAG]
@@ -35,6 +40,42 @@
 //! `(8 - pos % 8) % 8` from the position after `ipc_len`. Frames without the
 //! flag (every archive written before the flag existed) carry no padding and
 //! decode exactly as before.
+//!
+//! **v2** (`format_version: 2`, default for new `stt-build` output): a
+//! sectioned frame that hoists each layer's Arrow IPC *schema message* into a
+//! per-dataset **template** (referenced by blake3-128 hash, resolved through
+//! the manifest's `schemas` table) so the per-tile schema tax disappears, and
+//! carries the per-tile-varying metadata in a compact [`TILE_META`
+//! section](TileMeta) instead of the schema:
+//!
+//! ```text
+//! u16  0xFFFF                    # v2 escape (see FRAME_V2_ESCAPE)
+//! u8   frame_version = 2
+//! u8   flags = 0                 # reserved, MUST be 0
+//! u16  layer_count
+//! per layer:
+//!   u16  name_len, [name utf8]
+//!   u8   ref_kind_core           # 0 = INLINE_SCHEMA_CORE section present;
+//!                                # 1 = the next 16 bytes are the template hash
+//!   [16] core template hash     # iff ref_kind_core == 1
+//!   u8   ref_kind_props          # 0/1 as above; 2 = NO props sections at all
+//!   [16] props template hash    # iff ref_kind_props == 1
+//!   u8   section_count
+//!   per section (TOC): u8 tag, u32 length     # at-rest bytes, pad excluded
+//!   [pad to 8, derived]
+//!   per section: [section bytes][pad to 8, derived]
+//! ```
+//!
+//! Reserved columns (`id`/times/geometry/vertex_*/`triangles`) form the CORE
+//! batch; property columns form the PROPS batch with its own schema/template
+//! (emitted only when properties exist). Each `*_BATCH` section is the IPC
+//! stream's **tail** — dictionary batch(es) + record batch + end-of-stream —
+//! and a reader materialises `concat(template, tail)` for a stock Arrow
+//! reader. Unknown section tags are skippable via the TOC. Rows are
+//! stable-sorted by `start_time` at encode (after id assignment), declared by
+//! `TILE_META.sorted`. The v2 escape is unreachable from the v1 writer: the
+//! v1 path caps `layer_count` below `0x7fff`, so an aligned v1 frame can
+//! never start with `0xFFFF`.
 
 use crate::error::{Error, Result};
 use crate::types::GeometryType;
@@ -47,9 +88,12 @@ use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, UInt16Type};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
+use arrow::ipc::{root_as_message, MessageHeader};
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 /// Top bit of the layer frame's leading u16: marks an *aligned* frame whose
 /// IPC streams are padded to 8-byte boundaries (see the module docs). The
@@ -59,6 +103,188 @@ pub const ALIGNED_FRAME_FLAG: u16 = 0x8000;
 
 /// Alignment (bytes) of each layer's Arrow IPC stream within an aligned frame.
 const FRAME_ALIGN: usize = 8;
+
+// ----------------------------------------------------------------------------
+// Layer frame v2 (packed formatVersion 2) — see the module docs.
+// ----------------------------------------------------------------------------
+
+/// Leading u16 of a **v2** layer frame. Deliberately unreachable from the v1
+/// writer: the v1 encoder rejects tiles whose `count | ALIGNED_FRAME_FLAG`
+/// would collide with this escape, so the two frame shapes are disjoint on
+/// their first two bytes. Manifest `formatVersion` remains the authoritative
+/// discriminator (design ★F6); this escape is defense-in-depth.
+pub const FRAME_V2_ESCAPE: u16 = 0xFFFF;
+
+/// `frame_version` byte of the v2 frame.
+const FRAME_V2_VERSION: u8 = 2;
+
+/// v2 section tag: full IPC schema prefix for the CORE batch (self-contained
+/// mode, `ref_kind == REF_KIND_INLINE`).
+pub const SECTION_INLINE_SCHEMA_CORE: u8 = 0x01;
+/// v2 section tag: the canonical [`TileMeta`] JSON.
+pub const SECTION_TILE_META: u8 = 0x02;
+/// v2 section tag: CORE batch IPC tail (dict batches + record batch + EOS).
+pub const SECTION_CORE_BATCH: u8 = 0x03;
+/// v2 section tag: full IPC schema prefix for the PROPS batch (as 0x01).
+pub const SECTION_INLINE_SCHEMA_PROPS: u8 = 0x04;
+/// v2 section tag: PROPS batch IPC tail (as 0x03, props schema).
+pub const SECTION_PROPS_BATCH: u8 = 0x05;
+
+/// v2 `ref_kind`: the schema rides inline in an `INLINE_SCHEMA_*` section
+/// (self-contained blob — no template registry needed to decode).
+const REF_KIND_INLINE: u8 = 0;
+/// v2 `ref_kind`: the next 16 bytes are the blake3-128 template hash,
+/// resolved against the dataset's [`TemplateRegistry`].
+const REF_KIND_TEMPLATE_HASH: u8 = 1;
+/// v2 `ref_kind_props`: the layer has no property columns — no props
+/// schema/template and no `PROPS_BATCH` section.
+const REF_KIND_NO_PROPS: u8 = 2;
+
+/// The frame format this encoder emits when nothing opts in explicitly —
+/// v1, the frozen 0.3.x wire shape. `stt-build` opts into v2 explicitly
+/// (its `--format-version` default is 2); `stt-serve` and every other
+/// existing caller stays v1 without changes (design §7).
+pub const FORMAT_VERSION_V1: u32 = 1;
+/// The sectioned template-referencing frame (packed formatVersion 2).
+pub const FORMAT_VERSION_V2: u32 = 2;
+
+/// blake3 content hash truncated to 128 bits — the v2 template reference
+/// (16 raw bytes in the frame; lowercase hex in `manifest.schemas`).
+pub(crate) fn blake3_128(bytes: &[u8]) -> [u8; 16] {
+    let hash = blake3::hash(bytes);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&hash.as_bytes()[..16]);
+    out
+}
+
+/// Thread-safe encode-side sink for the schema templates a v2 build produces.
+///
+/// The encoder [`record`](Self::record)s each layer's stripped schema prefix
+/// and embeds the returned hash in the frame; `PackWriter::finalize` snapshots
+/// the collector into the manifest's `schemas` table. Content-addressed keys
+/// make the result independent of encode parallelism/order (design ★F1/E1):
+/// two tiles sharing a schema record the same entry, and the snapshot is
+/// sorted by hash.
+#[derive(Debug, Default)]
+pub struct TemplateCollector {
+    templates: Mutex<BTreeMap<[u8; 16], Vec<u8>>>,
+}
+
+impl TemplateCollector {
+    /// New, empty collector.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a template's bytes (idempotent), returning its blake3-128 hash —
+    /// the 16-byte reference the v2 frame carries.
+    pub fn record(&self, template: &[u8]) -> [u8; 16] {
+        let hash = blake3_128(template);
+        self.templates
+            .lock()
+            .unwrap()
+            .entry(hash)
+            .or_insert_with(|| template.to_vec());
+        hash
+    }
+
+    /// Snapshot of every recorded `(hash, template bytes)`, sorted by hash
+    /// (deduped by construction) — the byte-reproducible manifest order.
+    pub fn snapshot(&self) -> Vec<([u8; 16], Vec<u8>)> {
+        self.templates
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(h, b)| (*h, b.clone()))
+            .collect()
+    }
+
+    /// Number of distinct templates recorded so far.
+    pub fn len(&self) -> usize {
+        self.templates.lock().unwrap().len()
+    }
+
+    /// Whether no template has been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Decode-side template lookup: blake3-128 hash → raw template bytes.
+///
+/// Built once per dataset from `manifest.schemas` (each entry hash-validated
+/// at open) and threaded into [`decode_tile_with_templates`].
+#[derive(Debug, Default, Clone)]
+pub struct TemplateRegistry {
+    templates: HashMap<[u8; 16], Arc<Vec<u8>>>,
+}
+
+impl TemplateRegistry {
+    /// New, empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a template, returning its blake3-128 hash.
+    pub fn insert(&mut self, template: Vec<u8>) -> [u8; 16] {
+        let hash = blake3_128(&template);
+        self.templates.insert(hash, Arc::new(template));
+        hash
+    }
+
+    /// Look a template up by its 16-byte hash.
+    pub fn get(&self, hash: &[u8; 16]) -> Option<&[u8]> {
+        self.templates.get(hash).map(|t| t.as_slice())
+    }
+
+    /// Iterate every `(hash, template bytes)` pair (arbitrary order). Lets a
+    /// verbatim-repack tool seed a [`TemplateCollector`] from a source
+    /// dataset's registry ([`crate::pack::PackWriter::with_seeded_templates`]).
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8; 16], &[u8])> {
+        self.templates.iter().map(|(h, t)| (h, t.as_slice()))
+    }
+
+    /// Number of templates registered.
+    pub fn len(&self) -> usize {
+        self.templates.len()
+    }
+
+    /// Whether the registry is empty.
+    pub fn is_empty(&self) -> bool {
+        self.templates.is_empty()
+    }
+}
+
+/// The per-tile-varying metadata a v2 frame carries in its `TILE_META`
+/// section instead of the (now dataset-constant, template-resident) Arrow
+/// schema metadata. Canonical serialization (design §4.3): JSON, keys sorted
+/// — field order below IS alphabetical and the `qa` map is a `BTreeMap` — no
+/// whitespace. Readers MUST ignore unknown keys (serde's default here), so
+/// the section can evolve additively. Presence rules: a key is present iff
+/// the corresponding feature is (`qa` omits non-quantized columns entirely;
+/// `t0` iff a start-time column exists; `vt` iff delta-encoded vertex_time;
+/// `vb` iff a value matrix).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct TileMeta {
+    /// Per-property attribute-quantization affines, `column → [o, s]`
+    /// (`value = o + q*s`) — the v1 `stt:qa` field metadata, hoisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qa: Option<BTreeMap<String, (f64, f64)>>,
+    /// Rows are stable-sorted by `start_time` (always `true` from this
+    /// writer; a flag so Stage III can demote the sort without a frame bump).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sorted: Option<bool>,
+    /// The v1 `stt:time_offset_ms` schema key: minimum feature start-time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t0: Option<i64>,
+    /// The v1 `stt:vertex_value_buckets` schema key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vb: Option<u32>,
+    /// The v1 `stt:vertex_time_origin_ms` / `stt:vertex_time_step_ms` pair,
+    /// as `[origin_ms, step_ms]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vt: Option<(i64, u32)>,
+}
 
 /// GeoArrow extension-name metadata key.
 const GEOARROW_EXT_KEY: &str = "ARROW:extension:name";
@@ -312,14 +538,28 @@ pub fn tessellate_polygon(rings: &[Vec<Coord>]) -> Vec<u32> {
 // ----------------------------------------------------------------------------
 
 /// Build an `i32` offset buffer from per-element counts.
-fn offsets_from_counts(counts: impl Iterator<Item = usize>) -> OffsetBuffer<i32> {
+///
+/// Errors when the accumulated count exceeds `i32::MAX`: Arrow list offsets
+/// are 32-bit, so a larger layer would wrap into corrupt offsets in release
+/// builds. No budget cap guarantees safety here (budgets are optional), so the
+/// overflow must be a hard, descriptive failure.
+fn offsets_from_counts(counts: impl Iterator<Item = usize>) -> Result<OffsetBuffer<i32>> {
     let mut acc = 0i32;
     let mut offsets = vec![0i32];
     for c in counts {
-        acc += c as i32;
+        acc = i32::try_from(c)
+            .ok()
+            .and_then(|c| acc.checked_add(c))
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "layer geometry exceeds {} total vertices/rings, which Arrow's \
+                     32-bit list offsets cannot address; split the layer",
+                    i32::MAX
+                ))
+            })?;
         offsets.push(acc);
     }
-    OffsetBuffer::new(offsets.into())
+    Ok(OffsetBuffer::new(offsets.into()))
 }
 
 /// Meters per degree of latitude (WGS84 mean) — the constant the coordinate
@@ -401,12 +641,48 @@ impl QuantAffine {
         (((lat - self.y0) / self.sy).round() as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32
     }
     /// Quantize a metre altitude to a grid index (3D affines only; `z0`/`sz` set).
+    ///
+    /// Altitude is unbounded input (unlike lon/lat), so an index outside i32 is
+    /// a hard error identifying the offending value — the old silent clamp
+    /// snapped such points to ±i32::MAX quanta without a trace.
     #[inline]
-    fn qz(&self, z: f64) -> i32 {
+    fn qz(&self, z: f64) -> Result<i32> {
         let z0 = self.z0.unwrap_or(0.0);
         let sz = self.sz.unwrap_or(1.0);
-        (((z - z0) / sz).round() as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+        let q = ((z - z0) / sz).round();
+        if !(q >= i32::MIN as f64 && q <= i32::MAX as f64) {
+            return Err(Error::Other(format!(
+                "altitude {z} does not fit the quantization grid (origin {z0}, step {sz}): \
+                 index {q} is outside i32; use a coarser --quantize-coords precision or drop \
+                 the point-elevation fold for this dataset"
+            )));
+        }
+        Ok(q as i32)
     }
+}
+
+/// Finest coordinate-quantization precision (meters) the world-anchored grid
+/// supports: the grid is anchored at `(-180, -90)` with a uniform step of
+/// `meters / M_PER_DEG_LAT` degrees, so the largest longitude index is
+/// `360 * M_PER_DEG_LAT / meters`. Below this floor (≈ 0.0187 m, ~19 mm) that
+/// index exceeds `i32::MAX` and quantization would silently snap far-east
+/// coordinates to wrong locations — so finer precisions are rejected.
+pub const MIN_QUANTIZE_COORDS_M: f64 = 360.0 * M_PER_DEG_LAT / (i32::MAX as f64);
+
+/// Validate a coordinate-quantization precision against the world grid's
+/// [`MIN_QUANTIZE_COORDS_M`] floor. `meters <= 0` (quantization off) passes.
+/// Public so config-building paths ([`EncoderConfig`] consumers like
+/// `stt-serve`) can fail fast at startup with the same error the global
+/// setter and the encode-time guard produce.
+pub fn validate_quantize_coords_m(meters: f64) -> Result<()> {
+    if meters > 0.0 && meters < MIN_QUANTIZE_COORDS_M {
+        return Err(Error::Other(format!(
+            "coordinate quantization precision {meters} m is finer than the minimum \
+             {MIN_QUANTIZE_COORDS_M} m (~19 mm): the world-anchored grid's ±180° longitude \
+             index would overflow i32 and snap points to wrong locations"
+        )));
+    }
+    Ok(())
 }
 
 /// The fixed, dataset-independent quantization grid for a target ground
@@ -464,7 +740,7 @@ fn build_geometry_array_q(
     geom: &GeometryColumn,
     quant: Option<&QuantAffine>,
     point_elev: Option<&[f64]>,
-) -> ArrayRef {
+) -> Result<ArrayRef> {
     // 3D POINT path: interleave [x,y,z] into a FixedSizeList<_,3> leaf.
     if let (GeometryColumn::Point(points), Some(elev)) = (geom, point_elev) {
         let list_size = 3;
@@ -476,7 +752,7 @@ fn build_geometry_array_q(
                 for (i, [x, y]) in points.iter().enumerate() {
                     iv.push(q.qx(*x));
                     iv.push(q.qy(*y));
-                    iv.push(q.qz(elev.get(i).copied().unwrap_or(0.0)));
+                    iv.push(q.qz(elev.get(i).copied().unwrap_or(0.0))?);
                 }
                 Arc::new(Int32Array::from(iv))
             }
@@ -490,7 +766,7 @@ fn build_geometry_array_q(
                 Arc::new(Float64Array::from(flat))
             }
         };
-        return Arc::new(FixedSizeListArray::new(field, list_size, child, None));
+        return Ok(Arc::new(FixedSizeListArray::new(field, list_size, child, None)));
     }
 
     let coord_field = || {
@@ -529,7 +805,7 @@ fn build_geometry_array_q(
         }
     };
 
-    match geom {
+    Ok(match geom {
         GeometryColumn::Point(points) => {
             let mut flat = Vec::with_capacity(points.len() * 2);
             for [x, y] in points {
@@ -547,7 +823,7 @@ fn build_geometry_array_q(
                 }
             }
             let coords = make_leaf(flat);
-            let offsets = offsets_from_counts(lines.iter().map(|l| l.len()));
+            let offsets = offsets_from_counts(lines.iter().map(|l| l.len()))?;
             let vertex_field = Arc::new(Field::new("vertices", coords.data_type().clone(), false));
             Arc::new(ListArray::new(vertex_field, offsets, coords, None))
         }
@@ -568,7 +844,7 @@ fn build_geometry_array_q(
             }
             let coords = make_leaf(flat);
             // Ring level: List<FixedSizeList>.
-            let ring_offsets = offsets_from_counts(ring_sizes.into_iter());
+            let ring_offsets = offsets_from_counts(ring_sizes.into_iter())?;
             let vertex_field = Arc::new(Field::new("vertices", coords.data_type().clone(), false));
             let rings: ArrayRef = Arc::new(ListArray::new(
                 vertex_field,
@@ -577,11 +853,11 @@ fn build_geometry_array_q(
                 None,
             ));
             // Feature level: List<List<FixedSizeList>>.
-            let feature_offsets = offsets_from_counts(rings_per_feature.into_iter());
+            let feature_offsets = offsets_from_counts(rings_per_feature.into_iter())?;
             let ring_field = Arc::new(Field::new("rings", rings.data_type().clone(), false));
             Arc::new(ListArray::new(ring_field, feature_offsets, rings, None))
         }
-    }
+    })
 }
 
 /// Schema metadata keys for the v3 per-vertex time encoding.
@@ -639,14 +915,18 @@ static QUANTIZE_COORDS_UM: AtomicU32 = AtomicU32::new(0);
 /// Set the build-global coordinate quantization precision in meters for every
 /// subsequent default [`encode_tile`] call. `<= 0` (the default) turns it off —
 /// coordinates stay Float64 GeoArrow. See [`encode_layer_quantized`] for the
-/// size/precision trade-off.
-pub fn set_quantize_coords_m(meters: f64) {
+/// size/precision trade-off. Errors (storing nothing) for a positive precision
+/// below [`MIN_QUANTIZE_COORDS_M`], which would overflow the world grid's
+/// longitude index.
+pub fn set_quantize_coords_m(meters: f64) -> Result<()> {
+    validate_quantize_coords_m(meters)?;
     let um = if meters > 0.0 {
         (meters * 1.0e6).round().clamp(1.0, u32::MAX as f64) as u32
     } else {
         0
     };
     QUANTIZE_COORDS_UM.store(um, Ordering::Relaxed);
+    Ok(())
 }
 
 /// The build-global quantization precision in meters, or `None` when off.
@@ -791,6 +1071,49 @@ pub fn point_elevation_column() -> String {
     point_elevation_column_cell().read().unwrap().clone()
 }
 
+/// Build-global layer-frame format version ([`FORMAT_VERSION_V1`] |
+/// [`FORMAT_VERSION_V2`]). Defaults to v1 so every existing globals-path
+/// caller (including `stt-serve`, which must stay v1 per the serve protocol)
+/// is byte-identical to the 0.3.x writer; `stt-build` opts the offline build
+/// into v2 explicitly.
+static FORMAT_VERSION: AtomicU32 = AtomicU32::new(FORMAT_VERSION_V1);
+
+/// Set the build-global frame format version for every subsequent default
+/// [`encode_tile`] call. Errors (storing nothing) on anything but 1 or 2.
+pub fn set_format_version(v: u32) -> Result<()> {
+    if v != FORMAT_VERSION_V1 && v != FORMAT_VERSION_V2 {
+        return Err(Error::Other(format!(
+            "unsupported format version {v} (this writer emits 1 or 2)"
+        )));
+    }
+    FORMAT_VERSION.store(v, Ordering::Relaxed);
+    Ok(())
+}
+
+/// The build-global frame format version.
+pub fn format_version() -> u32 {
+    FORMAT_VERSION.load(Ordering::Relaxed)
+}
+
+/// Build-global template collector for the v2 hash-referencing mode. `None`
+/// (the default) makes a v2 encode self-contained (inline schema sections);
+/// `stt-build` installs the `PackWriter`'s collector here so the offline
+/// globals-path encodes reference templates the manifest will carry.
+fn template_collector_cell() -> &'static RwLock<Option<Arc<TemplateCollector>>> {
+    static A: OnceLock<RwLock<Option<Arc<TemplateCollector>>>> = OnceLock::new();
+    A.get_or_init(|| RwLock::new(None))
+}
+
+/// Install (or clear, with `None`) the build-global [`TemplateCollector`].
+pub fn set_template_collector(collector: Option<Arc<TemplateCollector>>) {
+    *template_collector_cell().write().unwrap() = collector;
+}
+
+/// The current build-global template collector, if any.
+pub fn template_collector() -> Option<Arc<TemplateCollector>> {
+    template_collector_cell().read().unwrap().clone()
+}
+
 /// Resolved, explicit encoder settings — the values the tile encoder reads at
 /// encode time (coordinate + attribute quantization, vector grouping, the
 /// point-elevation fold, vertex-time precision).
@@ -819,6 +1142,18 @@ pub struct EncoderConfig {
     pub point_elevation_column: String,
     /// Ceiling (ms) on the per-vertex time u16-delta quantization step.
     pub vertex_time_max_step_ms: u32,
+    /// Layer-frame format version ([`FORMAT_VERSION_V1`] |
+    /// [`FORMAT_VERSION_V2`]). The SINGLE branch point between the frozen
+    /// 0.3.x v1 frame and the sectioned v2 frame (design §1 ★F3): everything
+    /// upstream of frame assembly + metadata placement is shared. Defaults to
+    /// v1 so every existing caller stays byte-identical; `stt-build` passes 2.
+    pub format_version: u32,
+    /// v2 only: when set, layer schemas are hoisted into this collector and
+    /// frames carry 16-byte template-hash references (the packed-dataset
+    /// mode — `PackWriter::finalize` publishes the collected templates in
+    /// `manifest.schemas`). `None` under v2 emits self-contained frames with
+    /// inline schema sections. Ignored under v1.
+    pub template_collector: Option<Arc<TemplateCollector>>,
 }
 
 impl Default for EncoderConfig {
@@ -830,6 +1165,8 @@ impl Default for EncoderConfig {
             vector_groups: Vec::new(),
             point_elevation_column: String::new(),
             vertex_time_max_step_ms: DEFAULT_VERTEX_TIME_MAX_STEP_MS,
+            format_version: FORMAT_VERSION_V1,
+            template_collector: None,
         }
     }
 }
@@ -845,6 +1182,8 @@ impl EncoderConfig {
             vector_groups: vector_groups(),
             point_elevation_column: point_elevation_column(),
             vertex_time_max_step_ms: vertex_time_max_step_ms(),
+            format_version: format_version(),
+            template_collector: template_collector(),
         }
     }
 }
@@ -966,9 +1305,19 @@ fn build_quantized_numeric_auto(values: &[Option<f64>]) -> Option<(ArrayRef, Str
 /// `Float64` column). Nulls and non-finite values become Arrow nulls. The
 /// offset is the per-column minimum: identical columns quantize identically, so
 /// the packed format's content-addressed dedup is preserved.
-fn build_quantized_numeric(values: &[Option<f64>], prec: f64) -> Option<(ArrayRef, String)> {
+///
+/// Errors when a value's quantized index exceeds `i32::MAX` — the widest leaf
+/// this encoding ships. Erroring is deliberate (mirrors the dictionary-overflow
+/// error in [`build_dictionary_indices`]): the previous behaviour silently
+/// clamped every overflowing value to `i32::MAX`, mislabeling features without
+/// a trace. A producer whose column genuinely spans more than `i32::MAX`
+/// quanta should pick a coarser precision or leave the column `Float64`.
+fn build_quantized_numeric(
+    values: &[Option<f64>],
+    prec: f64,
+) -> Result<Option<(ArrayRef, String)>> {
     if !(prec > 0.0) {
-        return None;
+        return Ok(None);
     }
     let mut min = f64::INFINITY;
     for v in values.iter().flatten() {
@@ -977,7 +1326,7 @@ fn build_quantized_numeric(values: &[Option<f64>], prec: f64) -> Option<(ArrayRe
         }
     }
     if !min.is_finite() {
-        return None; // no finite values — keep Float64
+        return Ok(None); // no finite values — keep Float64
     }
     let affine = AttrQuant { o: min, s: prec };
     let mut q: Vec<Option<i64>> = Vec::with_capacity(values.len());
@@ -986,6 +1335,15 @@ fn build_quantized_numeric(values: &[Option<f64>], prec: f64) -> Option<(ArrayRe
         match v {
             Some(x) if x.is_finite() => {
                 let qi = (((*x - affine.o) / affine.s).round() as i64).max(0);
+                if qi > i32::MAX as i64 {
+                    return Err(Error::Other(format!(
+                        "numeric property quantization overflows: value {x} at precision \
+                         {prec} quantizes to index {qi} (offset {min}), beyond the Int32 \
+                         leaf's {} ceiling; use a coarser --quantize-attr precision or \
+                         leave the column Float64",
+                        i32::MAX
+                    )));
+                }
                 if qi > max_q {
                     max_q = qi;
                 }
@@ -1007,13 +1365,13 @@ fn build_quantized_numeric(values: &[Option<f64>], prec: f64) -> Option<(ArrayRe
         let mut b = Int32Builder::with_capacity(q.len());
         for qi in &q {
             match qi {
-                Some(v) => b.append_value((*v).clamp(0, i32::MAX as i64) as i32),
+                Some(v) => b.append_value(*v as i32),
                 None => b.append_null(),
             }
         }
         Arc::new(b.finish())
     };
-    Some((array, affine.to_json()))
+    Ok(Some((array, affine.to_json())))
 }
 
 /// Build a (key_array, value_array) pair for a Dictionary<UInt16, Utf8>
@@ -1263,9 +1621,44 @@ pub fn encode_layer_with(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<V
     encode_layer_cfg(layer, cfg)
 }
 
-/// The single encode implementation, driven entirely by an explicit
+/// The single-layer encode implementation, driven entirely by an explicit
 /// [`EncoderConfig`]. Every public `encode_layer*` entry point funnels here.
+///
+/// Always emits the self-describing v1 shape — one Arrow IPC stream with ALL
+/// metadata inline. The v2 tile frame reuses the identical column/field build
+/// ([`build_layer_parts`]) and changes only metadata PLACEMENT at assembly
+/// ([`encode_layer_v2_parts`]) — the design's single v1/v2 branch point.
 fn encode_layer_cfg(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8>> {
+    let parts = build_layer_parts(layer, cfg)?;
+    assemble_layer_ipc_v1(parts)
+}
+
+/// Everything a frame assembler needs about one built layer: the Arrow fields
+/// + columns in canonical order (reserved columns first, then properties) and
+/// the per-tile schema-metadata values. Both frame versions build this
+/// identically; only where the metadata LANDS differs (v1: schema metadata;
+/// v2: `TILE_META` section + stripped, dataset-constant templates).
+struct LayerParts {
+    fields: Vec<Arc<Field>>,
+    columns: Vec<ArrayRef>,
+    /// `fields[..reserved_len]` are the reserved (CORE) columns; the rest are
+    /// property (PROPS) columns.
+    reserved_len: usize,
+    layer_name: String,
+    geometry_name: &'static str,
+    /// Minimum feature start-time (v1 `stt:time_offset_ms` / v2 `t0`).
+    min_start_time: Option<i64>,
+    /// `(origin_ms, step_ms)` of a u16-delta `vertex_time` column.
+    vertex_time_encoding: Option<(i64, u32)>,
+    /// v1 `stt:vertex_value_buckets` / v2 `vb`.
+    vertex_value_buckets: Option<u32>,
+    has_triangles: bool,
+}
+
+/// Build the Arrow fields + columns for one layer — the version-independent
+/// front of the encoder (validation, quantization, vector grouping, the
+/// point-elevation fold, vertex-time encoding).
+fn build_layer_parts(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<LayerParts> {
     layer.validate()?;
     let n = layer.feature_count();
 
@@ -1307,6 +1700,12 @@ fn encode_layer_cfg(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8
     let elev_consumed = point_elev.is_some();
 
     // Geometry column carries the GeoArrow extension name in field metadata.
+    // The precision floor is enforced HERE (where the meters value is
+    // consumed), so every entry point — globals, explicit EncoderConfig, a
+    // server's per-request config — hits the same guard.
+    if let Some(m) = cfg.quantize_coords_m {
+        validate_quantize_coords_m(m)?;
+    }
     let quant = cfg.quantize_coords_m.and_then(|m| {
         if point_elev.is_some() {
             world_grid_affine_3d(m)
@@ -1315,7 +1714,7 @@ fn encode_layer_cfg(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8
         }
     });
     let geom_array =
-        build_geometry_array_q(&layer.geometry, quant.as_ref(), point_elev.as_deref());
+        build_geometry_array_q(&layer.geometry, quant.as_ref(), point_elev.as_deref())?;
     // Assemble field metadata in a BTreeMap so the key set is emitted in a
     // deterministic (lexicographic) order regardless of insertion order. Arrow
     // ≥59 serializes IPC schema metadata in sorted order, so building from a
@@ -1443,6 +1842,10 @@ fn encode_layer_cfg(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8
         columns.push(array);
     }
 
+    // Every field pushed so far is a reserved column — the v2 CORE batch.
+    // Property columns (the v2 PROPS batch) follow.
+    let reserved_len = fields.len();
+
     // Fuse configured scalar columns into GPU-ready interleaved Vector columns
     // (e.g. qx/qy/qz/qw → one FixedSizeList<f32,4>). Runs BEFORE the quantize
     // loop so grouped components are written as the raw vector, not individually
@@ -1465,19 +1868,22 @@ fn encode_layer_cfg(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8
                 // For a LiDAR `z` column this is the single largest size lever
                 // after `id` — a raw Float64 elevation barely compresses, while
                 // the i16 grid is both smaller and far more compressible.
-                let quantized = cfg
+                let quantized = match cfg
                     .quantize_attrs
                     .get(name)
                     .copied()
                     .filter(|p| *p > 0.0)
-                    .and_then(|p| build_quantized_numeric(values, p))
-                    .or_else(|| {
-                        // No explicit precision — fall back to the configured
-                        // automatic range-adaptive quantization when enabled.
-                        cfg.quantize_attrs_auto
-                            .then(|| build_quantized_numeric_auto(values))
-                            .flatten()
-                    });
+                {
+                    Some(p) => build_quantized_numeric(values, p)?,
+                    None => None,
+                }
+                .or_else(|| {
+                    // No explicit precision — fall back to the configured
+                    // automatic range-adaptive quantization when enabled.
+                    cfg.quantize_attrs_auto
+                        .then(|| build_quantized_numeric_auto(values))
+                        .flatten()
+                });
                 match quantized {
                     Some((array, affine_json)) => {
                         let mut m = HashMap::new();
@@ -1531,7 +1937,13 @@ fn encode_layer_cfg(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8
                     }
                 };
                 let item_field = Arc::new(Field::new("item", child_dt, false));
-                let fsl = FixedSizeListArray::new(item_field, *width as i32, child, None);
+                let width_i32 = i32::try_from(*width).map_err(|_| {
+                    Error::Other(format!(
+                        "vector property '{name}' has width {width}, which exceeds the \
+                         FixedSizeList i32 size limit"
+                    ))
+                })?;
+                let fsl = FixedSizeListArray::new(item_field, width_i32, child, None);
                 fields.push(Arc::new(Field::new(
                     name,
                     fsl.data_type().clone(),
@@ -1542,6 +1954,47 @@ fn encode_layer_cfg(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8
         }
     }
 
+    Ok(LayerParts {
+        fields,
+        columns,
+        reserved_len,
+        layer_name: layer.name.clone(),
+        geometry_name: layer.geometry.geoarrow_name(),
+        // The layer's minimum feature start-time (integer Unix ms), so the TS
+        // decoder can skip its client-side min-scan over the whole start-time
+        // column and relativize times against this value directly. Mirrors
+        // exactly what the decoder computes (the min of the `start_time`
+        // column); only emitted when a start-time column is present. See
+        // packages/core/src/tile.ts.
+        min_start_time: layer.start_times.iter().copied().min(),
+        vertex_time_encoding,
+        vertex_value_buckets,
+        has_triangles,
+    })
+}
+
+/// Serialize one `(schema, columns)` batch as an Arrow IPC stream.
+fn write_ipc_stream(schema: Arc<Schema>, columns: Vec<ArrayRef>) -> Result<Vec<u8>> {
+    let batch = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| Error::Other(format!("failed to build tile RecordBatch: {e}")))?;
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &schema)
+            .map_err(|e| Error::Other(format!("Arrow IPC writer init failed: {e}")))?;
+        writer
+            .write(&batch)
+            .map_err(|e| Error::Other(format!("Arrow IPC write failed: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| Error::Other(format!("Arrow IPC finish failed: {e}")))?;
+    }
+    Ok(buf)
+}
+
+/// v1 assembly: one schema carrying EVERY metadata key (dataset-constant AND
+/// per-tile-varying), serialized as a single IPC stream — the frozen 0.3.x
+/// bytes, guarded by the `tests/v1_golden.rs` fixture.
+fn assemble_layer_ipc_v1(parts: LayerParts) -> Result<Vec<u8>> {
     // Schema-level metadata records the layer name and geometry kind so a
     // reader does not have to inspect the geometry column. When the
     // vertex_time column is u16-delta encoded we add `origin_ms` and
@@ -1555,46 +2008,244 @@ fn encode_layer_cfg(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8
     // across runs (unblocking content-addressed pack dedup) — closing the old
     // arrow-54 HashMap-iteration gap.
     let mut schema_meta: BTreeMap<String, String> = BTreeMap::new();
-    schema_meta.insert("stt:layer".to_string(), layer.name.clone());
-    schema_meta.insert(
-        "stt:geometry".to_string(),
-        layer.geometry.geoarrow_name().to_string(),
-    );
-    // Bake the layer's minimum feature start-time (integer Unix ms) so the TS
-    // decoder can skip its client-side min-scan over the whole start-time column
-    // and relativize times against this value directly. Mirrors exactly what the
-    // decoder computes (the min of the `start_time` column); only emitted when a
-    // start-time column is present. See packages/core/src/tile.ts.
-    if let Some(min_start) = layer.start_times.iter().copied().min() {
+    schema_meta.insert("stt:layer".to_string(), parts.layer_name.clone());
+    schema_meta.insert("stt:geometry".to_string(), parts.geometry_name.to_string());
+    if let Some(min_start) = parts.min_start_time {
         schema_meta.insert(TIME_OFFSET_MS_KEY.to_string(), min_start.to_string());
     }
-    if let Some((origin, step)) = vertex_time_encoding {
+    if let Some((origin, step)) = parts.vertex_time_encoding {
         schema_meta.insert(VERTEX_TIME_ORIGIN_KEY.to_string(), origin.to_string());
         schema_meta.insert(VERTEX_TIME_STEP_KEY.to_string(), step.to_string());
     }
-    if let Some(buckets) = vertex_value_buckets {
+    if let Some(buckets) = parts.vertex_value_buckets {
         schema_meta.insert(VERTEX_VALUE_BUCKETS_KEY.to_string(), buckets.to_string());
     }
-    if has_triangles {
+    if parts.has_triangles {
         schema_meta.insert(TRIANGLES_METADATA_KEY.to_string(), "true".to_string());
     }
-    let schema = Arc::new(Schema::new(fields).with_metadata(schema_meta.into_iter().collect()));
+    let schema = Arc::new(
+        Schema::new(parts.fields).with_metadata(schema_meta.into_iter().collect()),
+    );
+    write_ipc_stream(schema, parts.columns)
+}
 
-    let batch = RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| Error::Other(format!("failed to build tile RecordBatch: {e}")))?;
+// ----------------------------------------------------------------------------
+// v2 layer encoding (template extraction + TILE_META + core/props split)
+// ----------------------------------------------------------------------------
 
-    let mut buf = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut buf, &schema)
-            .map_err(|e| Error::Other(format!("Arrow IPC writer init failed: {e}")))?;
-        writer
-            .write(&batch)
-            .map_err(|e| Error::Other(format!("Arrow IPC write failed: {e}")))?;
-        writer
-            .finish()
-            .map_err(|e| Error::Other(format!("Arrow IPC finish failed: {e}")))?;
+/// One layer, encoded for the v2 frame: templates split off, tails verbatim,
+/// per-tile metadata canonicalized into the TILE_META JSON.
+struct EncodedLayerV2 {
+    core_template: Vec<u8>,
+    core_tail: Vec<u8>,
+    /// `(template, tail)` of the PROPS batch; `None` when the layer has no
+    /// property columns (`ref_kind_props = 2`).
+    props: Option<(Vec<u8>, Vec<u8>)>,
+    tile_meta_json: String,
+}
+
+/// Locate the end of the leading schema message by walking the Arrow IPC
+/// encapsulated framing: `[0xFFFFFFFF][i32 metadata_len][flatbuffer (padded)]`
+/// with the schema's `bodyLength == 0` (spike-proven boundary — deterministic,
+/// no re-serialization; `metadata_len` already includes the flatbuffer's
+/// padding). Everything before the boundary is the template, everything after
+/// is the tail (dictionary batches + record batch + EOS).
+fn split_ipc_at_schema(ipc: &[u8]) -> Result<usize> {
+    if ipc.len() < 8 || ipc[0..4] != [0xFF, 0xFF, 0xFF, 0xFF] {
+        return Err(Error::Other(
+            "layer IPC stream does not start with an encapsulated message".into(),
+        ));
     }
-    Ok(buf)
+    let meta_len = i32::from_le_bytes(ipc[4..8].try_into().expect("4 bytes"));
+    if meta_len <= 0 {
+        return Err(Error::Other(
+            "layer IPC stream starts with an end-of-stream marker".into(),
+        ));
+    }
+    let boundary = 8usize
+        .checked_add(meta_len as usize)
+        .filter(|b| *b <= ipc.len())
+        .ok_or_else(|| Error::Other("layer IPC schema message overruns the stream".into()))?;
+    let msg = root_as_message(&ipc[8..boundary])
+        .map_err(|e| Error::Other(format!("layer IPC schema flatbuffer parse failed: {e}")))?;
+    if msg.header_type() != MessageHeader::Schema {
+        return Err(Error::Other(format!(
+            "layer IPC stream must start with a Schema message, got {:?}",
+            msg.header_type()
+        )));
+    }
+    if msg.bodyLength() != 0 {
+        return Err(Error::Other(
+            "layer IPC schema message unexpectedly carries a body".into(),
+        ));
+    }
+    Ok(boundary)
+}
+
+/// v2 row order (design §4.2, ★F10): stable-sort rows by `start_time` at
+/// ENCODE time — after the tiler assigned feature ids — so ids stay
+/// order-independent. Returns the layer unchanged (borrowed) when its rows
+/// are already non-decreasing, which also makes the sort a no-op for
+/// pre-sorted producers.
+fn sort_rows_by_start_time(layer: &ColumnarLayer) -> Cow<'_, ColumnarLayer> {
+    if layer.start_times.windows(2).all(|w| w[0] <= w[1]) {
+        return Cow::Borrowed(layer);
+    }
+    let mut idx: Vec<usize> = (0..layer.feature_count()).collect();
+    idx.sort_by_key(|&i| layer.start_times[i]); // stable
+
+    // Per-feature Option<Vec<Vec<_>>> columns tolerate inner vecs shorter
+    // than the feature count at encode (`vt.get(i)` ⇒ null list); the
+    // permutation preserves that semantic via `.get(..).unwrap_or_default()`.
+    fn permute_nested<T: Clone>(v: &Option<Vec<Vec<T>>>, idx: &[usize]) -> Option<Vec<Vec<T>>> {
+        v.as_ref()
+            .map(|v| idx.iter().map(|&i| v.get(i).cloned().unwrap_or_default()).collect())
+    }
+
+    let geometry = match &layer.geometry {
+        GeometryColumn::Point(v) => {
+            GeometryColumn::Point(idx.iter().map(|&i| v[i]).collect())
+        }
+        GeometryColumn::LineString(v) => {
+            GeometryColumn::LineString(idx.iter().map(|&i| v[i].clone()).collect())
+        }
+        GeometryColumn::Polygon(v) => {
+            GeometryColumn::Polygon(idx.iter().map(|&i| v[i].clone()).collect())
+        }
+    };
+    let properties = layer
+        .properties
+        .iter()
+        .map(|(name, col)| {
+            let col = match col {
+                PropertyColumn::Numeric(v) => {
+                    PropertyColumn::Numeric(idx.iter().map(|&i| v[i]).collect())
+                }
+                PropertyColumn::Categorical(v) => {
+                    PropertyColumn::Categorical(idx.iter().map(|&i| v[i].clone()).collect())
+                }
+                PropertyColumn::Vector { width, elem, values } => PropertyColumn::Vector {
+                    width: *width,
+                    elem: *elem,
+                    values: idx
+                        .iter()
+                        .flat_map(|&i| values[i * width..(i + 1) * width].iter().copied())
+                        .collect(),
+                },
+            };
+            (name.clone(), col)
+        })
+        .collect();
+
+    Cow::Owned(ColumnarLayer {
+        name: layer.name.clone(),
+        feature_ids: idx.iter().map(|&i| layer.feature_ids[i]).collect(),
+        start_times: idx.iter().map(|&i| layer.start_times[i]).collect(),
+        end_times: idx.iter().map(|&i| layer.end_times[i]).collect(),
+        geometry,
+        vertex_times: permute_nested(&layer.vertex_times, &idx),
+        vertex_values: permute_nested(&layer.vertex_values, &idx),
+        vertex_value_matrix: permute_nested(&layer.vertex_value_matrix, &idx),
+        triangles: permute_nested(&layer.triangles, &idx),
+        properties,
+    })
+}
+
+/// Encode one layer for the v2 frame: sort rows, build the shared parts, move
+/// per-tile-varying metadata into TILE_META, split the CORE and PROPS IPC
+/// streams at their schema boundaries.
+///
+/// Metadata placement (design §3.1 audit): per-tile-varying and hoisted into
+/// TILE_META are exactly `stt:qa` (property fields) and the schema-level
+/// `stt:time_offset_ms` / `stt:vertex_time_origin_ms` / `stt:vertex_time_step_ms`
+/// / `stt:vertex_value_buckets`. Dataset-constant and template-resident:
+/// `ARROW:extension:name` / `ARROW:extension:metadata` (CRS), `stt:quant`
+/// (world-anchored), `stt:layer`, `stt:geometry`, `stt:has_triangles`.
+fn encode_layer_v2_parts(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<EncodedLayerV2> {
+    // Validate BEFORE the row sort: `sort_rows_by_start_time` indexes every
+    // column by the feature count, so a length-inconsistent layer would panic
+    // there instead of returning the v1 path's descriptive error.
+    // (`build_layer_parts` re-validates the sorted layer; the check is pure.)
+    layer.validate()?;
+    let sorted = sort_rows_by_start_time(layer);
+    let parts = build_layer_parts(&sorted, cfg)?;
+
+    // Strip `stt:qa` off the property fields into the TILE_META `qa` map —
+    // spike-proven to leave the batch tail bytes byte-identical (only the
+    // schema message changes). The affine JSON round-trips exactly
+    // (`AttrQuant::to_json` is a pure function of `(o, s)`), so decode
+    // re-injects byte-identical field metadata.
+    let mut qa: BTreeMap<String, (f64, f64)> = BTreeMap::new();
+    let mut props_fields: Vec<Arc<Field>> = Vec::with_capacity(
+        parts.fields.len() - parts.reserved_len,
+    );
+    for field in &parts.fields[parts.reserved_len..] {
+        let mut meta = field.metadata().clone();
+        if let Some(json) = meta.remove(STT_QUANT_ATTR_META_KEY) {
+            let affine = AttrQuant::from_json(&json).ok_or_else(|| {
+                Error::Other(format!(
+                    "property '{}' carries an unparseable {STT_QUANT_ATTR_META_KEY} affine",
+                    field.name()
+                ))
+            })?;
+            qa.insert(field.name().clone(), (affine.o, affine.s));
+            props_fields.push(Arc::new(field.as_ref().clone().with_metadata(meta)));
+        } else {
+            props_fields.push(field.clone());
+        }
+    }
+
+    let tile_meta = TileMeta {
+        qa: (!qa.is_empty()).then_some(qa),
+        sorted: Some(true),
+        t0: parts.min_start_time,
+        vb: parts.vertex_value_buckets,
+        vt: parts.vertex_time_encoding,
+    };
+    let tile_meta_json = serde_json::to_string(&tile_meta)
+        .map_err(|e| Error::Other(format!("TILE_META encode failed: {e}")))?;
+
+    // CORE schema: dataset-constant metadata ONLY (the per-tile keys live in
+    // TILE_META), so the template bytes are identical across every tile of
+    // the layer's shape — the whole point of the hoist.
+    let mut core_meta: BTreeMap<String, String> = BTreeMap::new();
+    core_meta.insert("stt:layer".to_string(), parts.layer_name.clone());
+    core_meta.insert("stt:geometry".to_string(), parts.geometry_name.to_string());
+    if parts.has_triangles {
+        core_meta.insert(TRIANGLES_METADATA_KEY.to_string(), "true".to_string());
+    }
+    let core_fields: Vec<Arc<Field>> = parts.fields[..parts.reserved_len].to_vec();
+    let core_columns: Vec<ArrayRef> = parts.columns[..parts.reserved_len].to_vec();
+    let core_schema = Arc::new(
+        Schema::new(core_fields).with_metadata(core_meta.into_iter().collect()),
+    );
+    let core_ipc = write_ipc_stream(core_schema, core_columns)?;
+    let core_boundary = split_ipc_at_schema(&core_ipc)?;
+    let core_tail = core_ipc[core_boundary..].to_vec();
+    let mut core_template = core_ipc;
+    core_template.truncate(core_boundary);
+
+    // PROPS schema: property fields only, no schema-level metadata (every
+    // dataset-constant key lives on the CORE template).
+    let props = if props_fields.is_empty() {
+        None
+    } else {
+        let props_columns: Vec<ArrayRef> = parts.columns[parts.reserved_len..].to_vec();
+        let props_schema = Arc::new(Schema::new(props_fields));
+        let props_ipc = write_ipc_stream(props_schema, props_columns)?;
+        let boundary = split_ipc_at_schema(&props_ipc)?;
+        let tail = props_ipc[boundary..].to_vec();
+        let mut template = props_ipc;
+        template.truncate(boundary);
+        Some((template, tail))
+    };
+
+    Ok(EncodedLayerV2 {
+        core_template,
+        core_tail,
+        props,
+        tile_meta_json,
+    })
 }
 
 /// Encode a full tile payload (one or more layers) with the layer frame.
@@ -1631,13 +2282,39 @@ pub fn encode_tile_with(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result
 }
 
 /// The single tile-encode implementation, driven entirely by an explicit
-/// [`EncoderConfig`]. Every public `encode_tile*` entry point funnels here.
+/// [`EncoderConfig`]. Every public `encode_tile*` entry point funnels here,
+/// then branches ONCE on [`EncoderConfig::format_version`] (design §1 ★F3):
+/// everything upstream (column/field build) is shared.
 fn encode_tile_cfg(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result<Vec<u8>> {
-    if layers.len() >= ALIGNED_FRAME_FLAG as usize {
+    match cfg.format_version {
+        FORMAT_VERSION_V1 => encode_tile_frame_v1(layers, cfg),
+        FORMAT_VERSION_V2 => encode_tile_frame_v2(layers, cfg),
+        other => Err(Error::Other(format!(
+            "unsupported format version {other} (this writer emits 1 or 2)"
+        ))),
+    }
+}
+
+/// v1 frame layer-count guard: the aligned frame's leading u16 spends bit 15
+/// on [`ALIGNED_FRAME_FLAG`], leaving 15 bits for the count — so 0x7FFE is the
+/// maximum representable count. 0x7FFF is additionally reserved (its OR with
+/// the flag collides with [`FRAME_V2_ESCAPE`]), and any count with bit 15 set
+/// (0x8000..) would OR into the flag as a silently-mangled smaller count.
+/// `>= 0x7FFF` rejects the collision AND the whole unrepresentable range.
+fn v1_layer_count_ok(count: usize) -> bool {
+    count < 0x7FFF
+}
+
+/// v1 frame assembly — the frozen 0.3.x bytes (`tests/v1_golden.rs`).
+fn encode_tile_frame_v1(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result<Vec<u8>> {
+    // Cap the count one below the historical 0x7fff limit (see
+    // [`v1_layer_count_ok`]). No real tile comes within orders of magnitude
+    // of the limit, so only the error bound moves.
+    if !v1_layer_count_ok(layers.len()) {
         return Err(Error::Other(format!(
             "tile has {} layers, exceeds the {} frame limit",
             layers.len(),
-            ALIGNED_FRAME_FLAG - 1
+            ALIGNED_FRAME_FLAG - 2
         )));
     }
     let mut out = Vec::new();
@@ -1648,12 +2325,108 @@ fn encode_tile_cfg(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result<Vec<
             return Err(Error::Other("layer name too long".into()));
         }
         let ipc = encode_layer_cfg(layer, cfg)?;
+        let ipc_len = u32::try_from(ipc.len()).map_err(|_| {
+            Error::Other(format!(
+                "layer '{}' IPC stream is {} bytes, exceeding the frame's u32 length field",
+                layer.name,
+                ipc.len()
+            ))
+        })?;
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name);
-        out.extend_from_slice(&(ipc.len() as u32).to_le_bytes());
+        out.extend_from_slice(&ipc_len.to_le_bytes());
         let pad = (FRAME_ALIGN - out.len() % FRAME_ALIGN) % FRAME_ALIGN;
         out.extend_from_slice(&[0u8; FRAME_ALIGN][..pad]);
         out.extend_from_slice(&ipc);
+    }
+    Ok(out)
+}
+
+/// Zero-pad `out` to the next [`FRAME_ALIGN`] boundary (v2 derived padding —
+/// like v1, the pad length is never stored).
+fn pad_to_frame_align(out: &mut Vec<u8>) {
+    let pad = (FRAME_ALIGN - out.len() % FRAME_ALIGN) % FRAME_ALIGN;
+    out.extend_from_slice(&[0u8; FRAME_ALIGN][..pad]);
+}
+
+/// v2 frame assembly (module docs / design §4). With a
+/// [`TemplateCollector`] configured, schemas are recorded there and frames
+/// carry 16-byte hash references (the packed-dataset mode); without one the
+/// frame is self-contained via `INLINE_SCHEMA_*` sections.
+fn encode_tile_frame_v2(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result<Vec<u8>> {
+    if layers.len() > u16::MAX as usize {
+        return Err(Error::Other(format!(
+            "tile has {} layers, exceeds the {} frame limit",
+            layers.len(),
+            u16::MAX
+        )));
+    }
+    let collector = cfg.template_collector.as_deref();
+    let mut out = Vec::new();
+    out.extend_from_slice(&FRAME_V2_ESCAPE.to_le_bytes());
+    out.push(FRAME_V2_VERSION);
+    out.push(0); // flags — reserved, MUST be 0
+    out.extend_from_slice(&(layers.len() as u16).to_le_bytes());
+    for layer in layers {
+        let name = layer.name.as_bytes();
+        if name.len() > u16::MAX as usize {
+            return Err(Error::Other("layer name too long".into()));
+        }
+        let enc = encode_layer_v2_parts(layer, cfg)?;
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(name);
+
+        // Schema references. Hash mode records the template with the
+        // collector (content-addressed, so parallel encode order is
+        // irrelevant); inline mode ships it as a section instead.
+        match collector {
+            Some(c) => {
+                out.push(REF_KIND_TEMPLATE_HASH);
+                out.extend_from_slice(&c.record(&enc.core_template));
+            }
+            None => out.push(REF_KIND_INLINE),
+        }
+        match (&enc.props, collector) {
+            (None, _) => out.push(REF_KIND_NO_PROPS),
+            (Some((template, _)), Some(c)) => {
+                out.push(REF_KIND_TEMPLATE_HASH);
+                out.extend_from_slice(&c.record(template));
+            }
+            (Some(_), None) => out.push(REF_KIND_INLINE),
+        }
+
+        // Sections in ascending tag order; TOC lengths are the exact at-rest
+        // byte counts (padding derived, never stored).
+        let mut sections: Vec<(u8, &[u8])> = Vec::new();
+        if collector.is_none() {
+            sections.push((SECTION_INLINE_SCHEMA_CORE, &enc.core_template));
+        }
+        sections.push((SECTION_TILE_META, enc.tile_meta_json.as_bytes()));
+        sections.push((SECTION_CORE_BATCH, &enc.core_tail));
+        if let Some((template, tail)) = &enc.props {
+            if collector.is_none() {
+                sections.push((SECTION_INLINE_SCHEMA_PROPS, template));
+            }
+            sections.push((SECTION_PROPS_BATCH, tail));
+        }
+        out.push(sections.len() as u8);
+        for (tag, bytes) in &sections {
+            out.push(*tag);
+            let len = u32::try_from(bytes.len()).map_err(|_| {
+                Error::Other(format!(
+                    "layer '{}' section 0x{tag:02x} is {} bytes, exceeding the TOC's u32 \
+                     length field",
+                    layer.name,
+                    bytes.len()
+                ))
+            })?;
+            out.extend_from_slice(&len.to_le_bytes());
+        }
+        pad_to_frame_align(&mut out);
+        for (_, bytes) in &sections {
+            out.extend_from_slice(bytes);
+            pad_to_frame_align(&mut out);
+        }
     }
     Ok(out)
 }
@@ -1689,12 +2462,43 @@ pub fn decode_layer(ipc: &[u8]) -> Result<RecordBatch> {
     }
 }
 
+/// Whether a tile payload carries the v2 sectioned frame (leading u16 is the
+/// [`FRAME_V2_ESCAPE`]). The manifest's `formatVersion` remains authoritative
+/// (★F6) — this sniff is defense-in-depth for the payload level.
+pub fn is_frame_v2(payload: &[u8]) -> bool {
+    payload.len() >= 2 && u16::from_le_bytes([payload[0], payload[1]]) == FRAME_V2_ESCAPE
+}
+
 /// Decode a full tile payload (the layer frame) into its layers.
 ///
-/// Accepts both frame shapes: the aligned frame ([`ALIGNED_FRAME_FLAG`] set,
-/// with derived padding before each IPC stream) and the legacy unpadded
-/// frame written by every archive that predates the flag.
+/// Accepts the v1 frame in both shapes — aligned ([`ALIGNED_FRAME_FLAG`] set,
+/// derived padding before each IPC stream) and the legacy unpadded frame
+/// written before the flag existed — plus **self-contained** v2 frames
+/// (inline schema sections). A v2 frame that references templates by hash
+/// needs the dataset's registry: use [`decode_tile_with_templates`] (a hash
+/// reference here is a descriptive error, not a panic).
 pub fn decode_tile(payload: &[u8]) -> Result<Vec<DecodedLayer>> {
+    if is_frame_v2(payload) {
+        return decode_tile_v2(payload, None);
+    }
+    decode_tile_v1(payload)
+}
+
+/// [`decode_tile`] with the dataset's [`TemplateRegistry`], so v2 frames can
+/// resolve their 16-byte template-hash references. v1 frames decode
+/// unchanged (the registry is simply unused).
+pub fn decode_tile_with_templates(
+    payload: &[u8],
+    templates: &TemplateRegistry,
+) -> Result<Vec<DecodedLayer>> {
+    if is_frame_v2(payload) {
+        return decode_tile_v2(payload, Some(templates));
+    }
+    decode_tile_v1(payload)
+}
+
+/// The v1 frame walk — UNCHANGED from the 0.3.x reader.
+fn decode_tile_v1(payload: &[u8]) -> Result<Vec<DecodedLayer>> {
     if payload.len() < 2 {
         return Err(Error::Other("tile payload too short for layer frame".into()));
     }
@@ -1718,6 +2522,312 @@ pub fn decode_tile(payload: &[u8]) -> Result<Vec<DecodedLayer>> {
         layers.push(DecodedLayer { name, batch });
     }
     Ok(layers)
+}
+
+/// Splice a template onto a section tail and decode the resulting stream.
+///
+/// Normative guards (design §3.4): the tail is EXACTLY the TOC-declared bytes
+/// (the caller sliced it that way) and MUST begin with the `0xFFFFFFFF`
+/// continuation marker — stray zero bytes make arrow-rs silently return an
+/// EMPTY tile (they parse as a legacy 4-byte end-of-stream), so a malformed
+/// section must error loudly instead. The template gets the same check
+/// (a corrupt manifest entry hashes consistently but still must not splice).
+fn splice_decode(template: &[u8], tail: &[u8], what: &str) -> Result<RecordBatch> {
+    if template.len() < 4 || template[0..4] != [0xFF, 0xFF, 0xFF, 0xFF] {
+        return Err(Error::Other(format!(
+            "{what}: schema template does not start with an encapsulated Arrow message"
+        )));
+    }
+    if tail.len() < 4 || tail[0..4] != [0xFF, 0xFF, 0xFF, 0xFF] {
+        return Err(Error::Other(format!(
+            "{what}: batch section does not start with the 0xFFFFFFFF continuation marker \
+             (corrupt or misaligned section)"
+        )));
+    }
+    let mut buf = Vec::with_capacity(template.len() + tail.len());
+    buf.extend_from_slice(template);
+    buf.extend_from_slice(tail);
+    decode_layer(&buf)
+}
+
+/// Resolve a v2 layer's schema template: inline section or registry lookup.
+fn resolve_template<'a>(
+    ref_kind: u8,
+    hash: Option<[u8; 16]>,
+    inline: Option<&'a [u8]>,
+    registry: Option<&'a TemplateRegistry>,
+    what: &str,
+) -> Result<&'a [u8]> {
+    match ref_kind {
+        REF_KIND_INLINE => inline.ok_or_else(|| {
+            Error::Other(format!("{what}: inline schema section missing from the frame"))
+        }),
+        REF_KIND_TEMPLATE_HASH => {
+            let hash = hash.expect("hash read for ref_kind 1");
+            let registry = registry.ok_or_else(|| {
+                Error::Other(format!(
+                    "{what}: frame references schema template {} but no template registry \
+                     was provided — open the dataset through its manifest (or use \
+                     decode_tile_with_templates)",
+                    hex_16(&hash)
+                ))
+            })?;
+            registry.get(&hash).ok_or_else(|| {
+                Error::Other(format!(
+                    "{what}: schema template {} is not in the dataset's registry \
+                     (manifest.schemas is incomplete or the frame is corrupt)",
+                    hex_16(&hash)
+                ))
+            })
+        }
+        other => Err(Error::Other(format!(
+            "{what}: unknown schema ref_kind {other} (this reader knows 0..=2)"
+        ))),
+    }
+}
+
+fn hex_16(hash: &[u8; 16]) -> String {
+    hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Merge a v2 layer's decoded CORE + PROPS batches back into the v1-shaped
+/// single batch, RE-INJECTING the TILE_META values into schema/field metadata
+/// with the exact v1 formatting — so every downstream consumer (validator,
+/// stt-optimize, tests, renderers) sees v1-equivalent decoded layers with
+/// zero changes.
+fn merge_v2_layer(
+    core: RecordBatch,
+    props: Option<RecordBatch>,
+    meta: &TileMeta,
+) -> Result<RecordBatch> {
+    let mut fields: Vec<Arc<Field>> = core.schema().fields().iter().cloned().collect();
+    let mut columns: Vec<ArrayRef> = core.columns().to_vec();
+    let mut schema_meta: HashMap<String, String> = core.schema().metadata().clone();
+
+    if let Some(props) = props {
+        if props.num_rows() != core.num_rows() {
+            return Err(Error::Other(format!(
+                "tile layer CORE/PROPS row counts disagree: {} vs {}",
+                core.num_rows(),
+                props.num_rows()
+            )));
+        }
+        for (field, column) in props.schema().fields().iter().zip(props.columns()) {
+            // Re-inject the hoisted attribute-quantization affine
+            // (byte-identical to the v1 field metadata: `to_json` is a pure
+            // function of the `[o, s]` pair TILE_META carries).
+            let field = match meta.qa.as_ref().and_then(|qa| qa.get(field.name())) {
+                Some(&(o, s)) => {
+                    let mut m = field.metadata().clone();
+                    m.insert(
+                        STT_QUANT_ATTR_META_KEY.to_string(),
+                        AttrQuant { o, s }.to_json(),
+                    );
+                    Arc::new(field.as_ref().clone().with_metadata(m))
+                }
+                None => field.clone(),
+            };
+            fields.push(field);
+            columns.push(column.clone());
+        }
+    }
+
+    // Schema-level re-injection, mirroring the v1 assembler's formatting.
+    if let Some(t0) = meta.t0 {
+        schema_meta.insert(TIME_OFFSET_MS_KEY.to_string(), t0.to_string());
+    }
+    if let Some((origin, step)) = meta.vt {
+        schema_meta.insert(VERTEX_TIME_ORIGIN_KEY.to_string(), origin.to_string());
+        schema_meta.insert(VERTEX_TIME_STEP_KEY.to_string(), step.to_string());
+    }
+    if let Some(buckets) = meta.vb {
+        schema_meta.insert(VERTEX_VALUE_BUCKETS_KEY.to_string(), buckets.to_string());
+    }
+
+    let schema = Arc::new(Schema::new_with_metadata(fields, schema_meta));
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| Error::Other(format!("failed to merge v2 CORE/PROPS batches: {e}")))
+}
+
+/// The v2 frame walk. Bounds-checked byte reads throughout (`read_slice`), so
+/// arbitrary/truncated input errors instead of panicking; unknown section
+/// tags are skipped via their TOC length (additive evolution).
+fn decode_tile_v2(
+    payload: &[u8],
+    registry: Option<&TemplateRegistry>,
+) -> Result<Vec<DecodedLayer>> {
+    let mut pos = 0usize;
+    let escape = read_u16(payload, &mut pos)?;
+    debug_assert_eq!(escape, FRAME_V2_ESCAPE, "caller dispatched on the escape");
+    let frame_version = read_slice(payload, &mut pos, 1)?[0];
+    if frame_version != FRAME_V2_VERSION {
+        return Err(Error::Other(format!(
+            "unsupported layer-frame version {frame_version} (this reader knows v2)"
+        )));
+    }
+    let flags = read_slice(payload, &mut pos, 1)?[0];
+    if flags != 0 {
+        return Err(Error::Other(format!(
+            "reserved v2 layer-frame flags must be 0, got {flags:#04x}"
+        )));
+    }
+    let count = read_u16(payload, &mut pos)? as usize;
+    let mut layers = Vec::with_capacity(count.min(64));
+    for _ in 0..count {
+        let name_len = read_u16(payload, &mut pos)? as usize;
+        let name = read_slice(payload, &mut pos, name_len)?;
+        let name = String::from_utf8(name.to_vec())
+            .map_err(|e| Error::Other(format!("layer name not utf8: {e}")))?;
+
+        let mut read_ref = |what: &str| -> Result<(u8, Option<[u8; 16]>)> {
+            let kind = read_slice(payload, &mut pos, 1)?[0];
+            let hash = if kind == REF_KIND_TEMPLATE_HASH {
+                let mut h = [0u8; 16];
+                h.copy_from_slice(read_slice(payload, &mut pos, 16)?);
+                Some(h)
+            } else if kind == REF_KIND_INLINE || kind == REF_KIND_NO_PROPS {
+                None
+            } else {
+                return Err(Error::Other(format!(
+                    "layer '{name}' {what}: unknown schema ref_kind {kind} \
+                     (this reader knows 0..=2)"
+                )));
+            };
+            Ok((kind, hash))
+        };
+        let (ref_core, core_hash) = read_ref("core")?;
+        if ref_core == REF_KIND_NO_PROPS {
+            return Err(Error::Other(format!(
+                "layer '{name}': ref_kind_core 2 is invalid (every layer has a CORE batch)"
+            )));
+        }
+        let (ref_props, props_hash) = read_ref("props")?;
+
+        let section_count = read_slice(payload, &mut pos, 1)?[0] as usize;
+        let mut toc: Vec<(u8, usize)> = Vec::with_capacity(section_count);
+        for _ in 0..section_count {
+            let tag = read_slice(payload, &mut pos, 1)?[0];
+            let len = read_u32(payload, &mut pos)? as usize;
+            toc.push((tag, len));
+        }
+        let pad = (FRAME_ALIGN - pos % FRAME_ALIGN) % FRAME_ALIGN;
+        read_slice(payload, &mut pos, pad)?;
+
+        let mut sections: BTreeMap<u8, &[u8]> = BTreeMap::new();
+        for (tag, len) in toc {
+            let bytes = read_slice(payload, &mut pos, len)?;
+            let pad = (FRAME_ALIGN - pos % FRAME_ALIGN) % FRAME_ALIGN;
+            read_slice(payload, &mut pos, pad)?;
+            if sections.insert(tag, bytes).is_some() {
+                return Err(Error::Other(format!(
+                    "layer '{name}': duplicate section tag 0x{tag:02x} in the TOC"
+                )));
+            }
+        }
+
+        // TILE_META: canonical JSON, unknown keys ignored (additive contract).
+        let tile_meta: TileMeta = match sections.get(&SECTION_TILE_META) {
+            Some(bytes) => serde_json::from_slice(bytes).map_err(|e| {
+                Error::Other(format!("layer '{name}': TILE_META JSON decode failed: {e}"))
+            })?,
+            None => TileMeta::default(),
+        };
+
+        let core_template = resolve_template(
+            ref_core,
+            core_hash,
+            sections.get(&SECTION_INLINE_SCHEMA_CORE).copied(),
+            registry,
+            &format!("layer '{name}' core"),
+        )?;
+        let core_tail = sections.get(&SECTION_CORE_BATCH).ok_or_else(|| {
+            Error::Other(format!("layer '{name}': CORE_BATCH section missing"))
+        })?;
+        let core = splice_decode(core_template, core_tail, &format!("layer '{name}' core"))?;
+
+        let props = if ref_props == REF_KIND_NO_PROPS {
+            if sections.contains_key(&SECTION_PROPS_BATCH) {
+                return Err(Error::Other(format!(
+                    "layer '{name}': PROPS_BATCH section present but ref_kind_props \
+                     declares no props"
+                )));
+            }
+            None
+        } else {
+            let template = resolve_template(
+                ref_props,
+                props_hash,
+                sections.get(&SECTION_INLINE_SCHEMA_PROPS).copied(),
+                registry,
+                &format!("layer '{name}' props"),
+            )?;
+            let tail = sections.get(&SECTION_PROPS_BATCH).ok_or_else(|| {
+                Error::Other(format!("layer '{name}': PROPS_BATCH section missing"))
+            })?;
+            Some(splice_decode(template, tail, &format!("layer '{name}' props"))?)
+        };
+
+        let batch = merge_v2_layer(core, props, &tile_meta)?;
+        layers.push(DecodedLayer { name, batch });
+    }
+    Ok(layers)
+}
+
+/// Walk ONLY a v2 frame's header structure — escape/version/flags/count,
+/// per-layer name + schema ref_kinds (+ their 16-byte hashes), TOC-driven
+/// section skips; **no Arrow decode, no section parse** — and return every
+/// template hash the frame references. The packed-format validators use this
+/// to prove each referenced hash resolves in `manifest.schemas` without
+/// decoding tiles. Errors (never panics) on truncated/malformed headers.
+pub fn frame_v2_template_refs(payload: &[u8]) -> Result<Vec<[u8; 16]>> {
+    if !is_frame_v2(payload) {
+        return Err(Error::Other("not a v2 layer frame (missing escape)".into()));
+    }
+    let mut pos = 2usize; // past the escape
+    let frame_version = read_slice(payload, &mut pos, 1)?[0];
+    if frame_version != FRAME_V2_VERSION {
+        return Err(Error::Other(format!(
+            "unsupported layer-frame version {frame_version} (this reader knows v2)"
+        )));
+    }
+    let flags = read_slice(payload, &mut pos, 1)?[0];
+    if flags != 0 {
+        return Err(Error::Other(format!(
+            "reserved v2 layer-frame flags must be 0, got {flags:#04x}"
+        )));
+    }
+    let count = read_u16(payload, &mut pos)? as usize;
+    let mut refs: Vec<[u8; 16]> = Vec::new();
+    for _ in 0..count {
+        let name_len = read_u16(payload, &mut pos)? as usize;
+        read_slice(payload, &mut pos, name_len)?;
+        for what in ["core", "props"] {
+            let kind = read_slice(payload, &mut pos, 1)?[0];
+            if kind == REF_KIND_TEMPLATE_HASH {
+                let mut h = [0u8; 16];
+                h.copy_from_slice(read_slice(payload, &mut pos, 16)?);
+                refs.push(h);
+            } else if kind != REF_KIND_INLINE && kind != REF_KIND_NO_PROPS {
+                return Err(Error::Other(format!(
+                    "{what}: unknown schema ref_kind {kind} (this reader knows 0..=2)"
+                )));
+            }
+        }
+        let section_count = read_slice(payload, &mut pos, 1)?[0] as usize;
+        let mut toc: Vec<usize> = Vec::with_capacity(section_count);
+        for _ in 0..section_count {
+            read_slice(payload, &mut pos, 1)?; // tag
+            toc.push(read_u32(payload, &mut pos)? as usize);
+        }
+        let pad = (FRAME_ALIGN - pos % FRAME_ALIGN) % FRAME_ALIGN;
+        read_slice(payload, &mut pos, pad)?;
+        for len in toc {
+            read_slice(payload, &mut pos, len)?;
+            let pad = (FRAME_ALIGN - pos % FRAME_ALIGN) % FRAME_ALIGN;
+            read_slice(payload, &mut pos, pad)?;
+        }
+    }
+    Ok(refs)
 }
 
 fn read_u16(buf: &[u8], pos: &mut usize) -> Result<u16> {
@@ -2942,5 +4052,677 @@ mod tests {
         let mut layer = sample_point_layer();
         layer.start_times.pop(); // now 2 entries vs 3 features
         assert!(encode_layer(&layer).is_err());
+    }
+
+    /// The v1 test's scenario through the V2 path: a length-inconsistent
+    /// layer must be the same descriptive Err, not an index-out-of-bounds
+    /// panic inside `sort_rows_by_start_time`'s column permutation. The
+    /// start times are UNSORTED so the pre-sort actually permutes (a sorted
+    /// layer short-circuits before touching the truncated column).
+    #[test]
+    fn length_mismatch_is_rejected_by_v2_frame_too() {
+        let mut layer = sample_point_layer();
+        layer.start_times = vec![3000, 1000, 2000];
+        layer.end_times.pop(); // now 2 entries vs 3 features
+        let err = encode_tile_with(
+            &[layer],
+            &EncoderConfig {
+                format_version: FORMAT_VERSION_V2,
+                ..EncoderConfig::default()
+            },
+        )
+        .expect_err("length-inconsistent layer must Err through the v2 path");
+        assert!(err.to_string().contains("end_times"), "got: {err}");
+    }
+
+    /// The v1 frame's leading u16 has only 15 bits for the layer count (bit
+    /// 15 is the aligned flag), so counts in [0x8000, 0xFFFE] would OR into
+    /// the flag as silently-mangled smaller counts, and 0x7FFF collides with
+    /// the v2 escape. The guard must reject the ENTIRE range, not just the
+    /// escape collision.
+    #[test]
+    fn v1_frame_rejects_unrepresentable_layer_counts() {
+        // Boundary on the extracted predicate (cheap — no encoding).
+        assert!(v1_layer_count_ok(0));
+        assert!(v1_layer_count_ok(0x7FFE), "max representable count");
+        assert!(!v1_layer_count_ok(0x7FFF), "v2-escape collision");
+        assert!(!v1_layer_count_ok(0x8000), "bit-15 OR is a no-op → count 0");
+        assert!(!v1_layer_count_ok(0xFFFE), "top of the mangled range");
+        assert!(!v1_layer_count_ok(0x10000));
+
+        // End-to-end: a 0x8000-layer tile previously ENCODED with a mangled
+        // count of 0; now a descriptive error. The guard runs before any
+        // per-layer encode, so 32Ki empty layers are cheap.
+        let empty = ColumnarLayer {
+            name: "l".to_string(),
+            feature_ids: vec![],
+            start_times: vec![],
+            end_times: vec![],
+            geometry: GeometryColumn::Point(vec![]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![],
+        };
+        let layers = vec![empty; 0x8000];
+        let err = encode_tile_with(&layers, &EncoderConfig::default())
+            .expect_err("0x8000 layers must be rejected");
+        assert!(err.to_string().contains("frame limit"), "got: {err}");
+    }
+
+    #[test]
+    fn offsets_from_counts_errors_on_i32_overflow() {
+        // Accumulating past i32::MAX must be a hard error, not a silent wrap
+        // (release builds would otherwise emit corrupt Arrow list offsets).
+        let ok = offsets_from_counts([3usize, 2, 0].into_iter()).unwrap();
+        assert_eq!(ok.len(), 4); // N+1 offsets
+
+        let at_limit = offsets_from_counts([i32::MAX as usize].into_iter());
+        assert!(at_limit.is_ok(), "exactly i32::MAX vertices still fits");
+
+        let over = offsets_from_counts([i32::MAX as usize, 1].into_iter())
+            .expect_err("i32::MAX + 1 total vertices must error");
+        assert!(over.to_string().contains("32-bit list offsets"), "got: {over}");
+
+        // A single count beyond i32::MAX errors too (the per-count try_from).
+        assert!(offsets_from_counts([usize::MAX].into_iter()).is_err());
+    }
+
+    #[test]
+    fn quantize_precision_below_floor_is_rejected() {
+        // 1 mm would put the ±180° longitude index past i32::MAX. Both the
+        // explicit-config path and the global setter must reject it with the
+        // minimum in the message; a precision at/above the floor encodes fine.
+        let layer = sample_point_layer();
+        let err = encode_layer_with(
+            &layer,
+            &EncoderConfig {
+                quantize_coords_m: Some(0.001),
+                ..EncoderConfig::default()
+            },
+        )
+        .expect_err("1 mm precision must be rejected");
+        assert!(
+            err.to_string().contains("minimum") && err.to_string().contains("overflow"),
+            "error must state the minimum: {err}"
+        );
+
+        assert!(0.0187 > MIN_QUANTIZE_COORDS_M);
+        assert!(encode_layer_with(
+            &layer,
+            &EncoderConfig {
+                quantize_coords_m: Some(0.0187),
+                ..EncoderConfig::default()
+            },
+        )
+        .is_ok());
+
+        // Global setter: rejects the same value WITHOUT storing it; <= 0
+        // (off) still passes. (No positive value is stored here so the test
+        // can't leak quantization into concurrently running global-path tests.)
+        assert!(set_quantize_coords_m(0.001).is_err());
+        assert!(set_quantize_coords_m(0.0).is_ok());
+    }
+
+    #[test]
+    fn quantized_altitude_outside_i32_errors_instead_of_clamping() {
+        // The z axis is unbounded input: a value whose grid index leaves i32
+        // must error (identifying the value), not clamp to ±i32::MAX quanta.
+        let make = |z: f64| ColumnarLayer {
+            name: "cloud".into(),
+            feature_ids: vec![1],
+            start_times: vec![0],
+            end_times: vec![0],
+            geometry: GeometryColumn::Point(vec![[-122.4, 37.7]]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![("z".into(), PropertyColumn::Numeric(vec![Some(z)]))],
+        };
+        let cfg = EncoderConfig {
+            quantize_coords_m: Some(0.05),
+            point_elevation_column: "z".to_string(),
+            ..EncoderConfig::default()
+        };
+        // Sane altitude still encodes.
+        assert!(encode_layer_with(&make(5.0), &cfg).is_ok());
+        // 1e18 m at a 0.05 m step → index 2e19, far outside i32.
+        let err = encode_layer_with(&make(1.0e18), &cfg)
+            .expect_err("overflowing altitude must error");
+        let msg = err.to_string();
+        // f64 Display renders 1.0e18 as its full integer form.
+        assert!(
+            msg.contains("altitude") && msg.contains("1000000000000000000"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn quantized_attr_index_beyond_i32_errors_instead_of_clamping() {
+        // An attribute whose quantized index exceeds i32::MAX must error
+        // (mirroring the dictionary-overflow error), not clamp to i32::MAX.
+        let layer = ColumnarLayer {
+            name: "wide".into(),
+            feature_ids: vec![1, 2],
+            start_times: vec![0; 2],
+            end_times: vec![1; 2],
+            geometry: GeometryColumn::Point(vec![[0.0, 0.0]; 2]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![(
+                "v".into(),
+                PropertyColumn::Numeric(vec![Some(0.0), Some(3.0e9)]),
+            )],
+        };
+        let err = encode_layer_with(
+            &layer,
+            &EncoderConfig {
+                quantize_attrs: HashMap::from([("v".to_string(), 1.0f64)]),
+                ..EncoderConfig::default()
+            },
+        )
+        .expect_err("index 3e9 > i32::MAX must error");
+        let msg = err.to_string();
+        assert!(msg.contains("overflows") && msg.contains("3000000000"), "got: {msg}");
+    }
+
+    // ------------------------------------------------------------------
+    // Layer frame v2 (packed formatVersion 2)
+    // ------------------------------------------------------------------
+
+    /// v2 config in SELF-CONTAINED mode (inline schema sections, no registry
+    /// needed to decode), layered over `base`.
+    fn v2_inline(base: &EncoderConfig) -> EncoderConfig {
+        EncoderConfig {
+            format_version: FORMAT_VERSION_V2,
+            template_collector: None,
+            ..base.clone()
+        }
+    }
+
+    /// v2 config in HASH-REFERENCING mode (templates recorded with
+    /// `collector`; frames carry 16-byte hashes), layered over `base`.
+    fn v2_hashed(base: &EncoderConfig, collector: &Arc<TemplateCollector>) -> EncoderConfig {
+        EncoderConfig {
+            format_version: FORMAT_VERSION_V2,
+            template_collector: Some(Arc::clone(collector)),
+            ..base.clone()
+        }
+    }
+
+    /// Decode-side registry over everything `collector` recorded.
+    fn registry_from(collector: &TemplateCollector) -> TemplateRegistry {
+        let mut registry = TemplateRegistry::new();
+        for (_, template) in collector.snapshot() {
+            registry.insert(template);
+        }
+        registry
+    }
+
+    /// The v1-equivalence contract (design §4.3 / merge_v2_layer): the SAME
+    /// layers encoded v1 and v2 (both v2 modes) decode to EQUAL
+    /// `DecodedLayer`s — batch equality covers columns AND schema/field
+    /// metadata, i.e. the TILE_META re-injection must reproduce the v1
+    /// metadata byte-for-byte.
+    fn assert_v2_decodes_like_v1(layers: &[ColumnarLayer], base: &EncoderConfig, what: &str) {
+        let v1 = decode_tile(&encode_tile_with(layers, base).unwrap()).unwrap();
+
+        let inline = decode_tile(&encode_tile_with(layers, &v2_inline(base)).unwrap()).unwrap();
+        assert_eq!(inline.len(), v1.len(), "{what}: inline layer count");
+        for (a, b) in inline.iter().zip(&v1) {
+            assert_eq!(a.name, b.name, "{what}: inline layer name");
+            assert_eq!(a.batch, b.batch, "{what}: inline v2 decode != v1 decode");
+        }
+
+        let collector = Arc::new(TemplateCollector::new());
+        let payload = encode_tile_with(layers, &v2_hashed(base, &collector)).unwrap();
+        let registry = registry_from(&collector);
+        let hashed = decode_tile_with_templates(&payload, &registry).unwrap();
+        assert_eq!(hashed.len(), v1.len(), "{what}: hashed layer count");
+        for (a, b) in hashed.iter().zip(&v1) {
+            assert_eq!(a.name, b.name, "{what}: hashed layer name");
+            assert_eq!(a.batch, b.batch, "{what}: hashed v2 decode != v1 decode");
+        }
+    }
+
+    /// Every payload shape the v2 break touches round-trips to EXACTLY the v1
+    /// decode: plain + quantized points, dictionary props (incl. TWO
+    /// dictionary columns), u16-delta AND exact-Int64 vertex_time, the
+    /// vertex-value matrix, pre-tessellated triangles, an empty-bucket tile
+    /// (zero rows, dictionary column intact), and a multi-layer tile.
+    #[test]
+    fn v2_roundtrip_equals_v1_decode_across_payload_shapes() {
+        let plain = EncoderConfig::default();
+        let quant = EncoderConfig {
+            quantize_coords_m: Some(1.0),
+            quantize_attrs_auto: true,
+            ..EncoderConfig::default()
+        };
+
+        let two_dicts = ColumnarLayer {
+            properties: vec![
+                (
+                    "kind".to_string(),
+                    PropertyColumn::Categorical(vec![
+                        Some("car".into()),
+                        Some("bus".into()),
+                        None,
+                    ]),
+                ),
+                (
+                    "color".to_string(),
+                    PropertyColumn::Categorical(vec![
+                        Some("red".into()),
+                        None,
+                        Some("blue".into()),
+                    ]),
+                ),
+            ],
+            ..sample_point_layer()
+        };
+
+        let wide_span_vt = ColumnarLayer {
+            vertex_times: Some(vec![vec![0, 100_000_000_000], vec![0, 1]]),
+            ..sample_line_layer()
+        };
+
+        let matrix = ColumnarLayer {
+            name: "flows".into(),
+            feature_ids: vec![1, 2],
+            start_times: vec![0, 0],
+            end_times: vec![1800, 1800],
+            geometry: GeometryColumn::LineString(vec![
+                vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]],
+                vec![[3.0, 3.0], [4.0, 4.0]],
+            ]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: Some(vec![
+                vec![10.0, 11.0, 20.0, 21.0, 30.0, 31.0],
+                vec![40.0, 41.0, 50.0, 51.0],
+            ]),
+            properties: vec![],
+        };
+
+        let exterior: Vec<Coord> =
+            vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]];
+        let triangles = ColumnarLayer {
+            triangles: Some(vec![tessellate_polygon(&[exterior.clone()])]),
+            geometry: GeometryColumn::Polygon(vec![vec![exterior]]),
+            ..sample_polygon_layer()
+        };
+
+        let empty = ColumnarLayer {
+            name: "points".into(),
+            feature_ids: vec![],
+            start_times: vec![],
+            end_times: vec![],
+            geometry: GeometryColumn::Point(vec![]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![
+                ("speed".into(), PropertyColumn::Numeric(vec![])),
+                ("kind".into(), PropertyColumn::Categorical(vec![])),
+            ],
+        };
+
+        assert_v2_decodes_like_v1(&[sample_point_layer()], &plain, "points");
+        assert_v2_decodes_like_v1(&[sample_point_layer()], &quant, "quantized points");
+        assert_v2_decodes_like_v1(&[two_dicts], &plain, "two dictionary columns");
+        assert_v2_decodes_like_v1(&[sample_line_layer()], &plain, "u16-delta vertex_time");
+        assert_v2_decodes_like_v1(&[wide_span_vt], &plain, "exact Int64 vertex_time");
+        assert_v2_decodes_like_v1(&[matrix], &plain, "vertex-value matrix");
+        assert_v2_decodes_like_v1(&[triangles], &plain, "pre-tessellated triangles");
+        assert_v2_decodes_like_v1(&[empty], &quant, "empty-bucket tile");
+        assert_v2_decodes_like_v1(
+            &[sample_line_layer(), sample_point_layer()],
+            &plain,
+            "multi-layer tile",
+        );
+    }
+
+    /// v2 row order (design §4.2 ★F10): rows come out stable-sorted by
+    /// `start_time`, ids travel WITH their rows (the sort runs after id
+    /// assignment), and the result equals the v1 decode of the pre-sorted
+    /// layer. v1 encoding of the same input stays in input order.
+    #[test]
+    fn v2_rows_stable_sorted_by_start_time_after_id_assignment() {
+        let unsorted = ColumnarLayer {
+            name: "points".into(),
+            feature_ids: vec![1, 2, 3, 4],
+            start_times: vec![3000, 1000, 2000, 1000],
+            end_times: vec![3500, 1500, 2500, 1600],
+            geometry: GeometryColumn::Point(vec![
+                [-122.4, 37.7],
+                [-122.5, 37.8],
+                [-122.6, 37.9],
+                [-122.7, 38.0],
+            ]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![(
+                "kind".into(),
+                PropertyColumn::Categorical(vec![
+                    Some("a".into()),
+                    Some("b".into()),
+                    Some("c".into()),
+                    Some("d".into()),
+                ]),
+            )],
+        };
+
+        let decoded =
+            decode_tile(&encode_tile_with(&[unsorted.clone()], &v2_inline(&EncoderConfig::default())).unwrap())
+                .unwrap();
+        let batch = &decoded[0].batch;
+        let starts = batch
+            .column_by_name("start_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        // Stable: the two 1000s keep input order (id 2 before id 4).
+        assert_eq!(starts, vec![1000, 1000, 2000, 3000]);
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(ids, vec![2, 4, 3, 1], "ids must travel with their rows");
+
+        // Equivalent to v1-encoding the manually pre-sorted layer.
+        let presorted = sort_rows_by_start_time(&unsorted).into_owned();
+        let v1 = decode_tile(&encode_tile_with(&[presorted], &EncoderConfig::default()).unwrap())
+            .unwrap();
+        assert_eq!(batch, &v1[0].batch);
+    }
+
+    /// Template constancy (design §3.1d): tiles differing ONLY per-tile —
+    /// qa affines, t0, dictionary categories, row counts — share ONE
+    /// CORE + ONE PROPS template. Type variants (u16-delta vs exact-Int64
+    /// vertex_time) legitimately mint DISTINCT templates (§2.2 cardinality),
+    /// and every recorded template resolves through the registry.
+    #[test]
+    fn v2_template_constancy_and_type_variant_cardinality() {
+        let quant = EncoderConfig {
+            quantize_coords_m: Some(1.0),
+            quantize_attrs_auto: true,
+            ..EncoderConfig::default()
+        };
+        let collector = Arc::new(TemplateCollector::new());
+        let cfg = v2_hashed(&quant, &collector);
+
+        let tile = |seed: i64, cats: [&str; 2], n: usize| ColumnarLayer {
+            name: "points".into(),
+            feature_ids: (0..n as u64).collect(),
+            start_times: (0..n as i64).map(|i| seed + i * 250).collect(),
+            end_times: (0..n as i64).map(|i| seed + i * 250 + 100).collect(),
+            geometry: GeometryColumn::Point(
+                (0..n).map(|i| [-122.0 + i as f64 * 1e-3, 37.0]).collect(),
+            ),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![
+                (
+                    "speed".into(),
+                    PropertyColumn::Numeric(
+                        (0..n).map(|i| Some(seed as f64 * 0.01 + i as f64)).collect(),
+                    ),
+                ),
+                (
+                    "kind".into(),
+                    PropertyColumn::Categorical(
+                        (0..n).map(|i| Some(cats[i % 2].to_string())).collect(),
+                    ),
+                ),
+            ],
+        };
+
+        let a = encode_tile_with(&[tile(1_000_000, ["car", "bus"], 3)], &cfg).unwrap();
+        let b = encode_tile_with(&[tile(9_000_000, ["tram", "ferry"], 5)], &cfg).unwrap();
+        assert_ne!(a, b, "per-tile content must still differ");
+        assert_eq!(
+            collector.len(),
+            2,
+            "qa/t0/category/row-count variance must NOT mint new templates (core+props)"
+        );
+
+        // Type variants: narrow-span (u16-delta) vs wide-span (Int64)
+        // vertex_time change the CORE schema → one new template each.
+        let narrow = sample_line_layer();
+        let wide = ColumnarLayer {
+            vertex_times: Some(vec![vec![0, 100_000_000_000], vec![0, 1]]),
+            ..sample_line_layer()
+        };
+        let c = encode_tile_with(&[narrow], &cfg).unwrap();
+        let d = encode_tile_with(&[wide], &cfg).unwrap();
+        assert_eq!(collector.len(), 4, "u16 vs Int64 vertex_time are distinct templates");
+
+        // Every frame resolves through a registry built from the collector.
+        let registry = registry_from(&collector);
+        for payload in [&a, &b, &c, &d] {
+            decode_tile_with_templates(payload, &registry).unwrap();
+        }
+    }
+
+    /// TILE_META canonical serialization (design §4.3): alphabetical keys, no
+    /// whitespace, and unknown keys are ignored on decode (additive contract).
+    #[test]
+    fn v2_tile_meta_is_canonical_json_and_ignores_unknown_keys() {
+        let meta = TileMeta {
+            qa: Some(BTreeMap::from([("speed".to_string(), (0.0, 0.15))])),
+            sorted: Some(true),
+            t0: Some(1_577_836_800_000),
+            vb: Some(24),
+            vt: Some((1_577_836_800_000, 1000)),
+        };
+        assert_eq!(
+            serde_json::to_string(&meta).unwrap(),
+            r#"{"qa":{"speed":[0.0,0.15]},"sorted":true,"t0":1577836800000,"vb":24,"vt":[1577836800000,1000]}"#
+        );
+        // Presence rules: absent features serialize NO key at all.
+        assert_eq!(serde_json::to_string(&TileMeta::default()).unwrap(), "{}");
+        // Unknown keys from a future writer must be ignored, not rejected.
+        let parsed: TileMeta =
+            serde_json::from_str(r#"{"sorted":true,"zz_future":{"x":1}}"#).unwrap();
+        assert_eq!(parsed.sorted, Some(true));
+    }
+
+    /// Walk a SINGLE-layer v2 frame's header and return each section's
+    /// `(tag, payload_offset, len)` — test-side mirror of the decoder's TOC
+    /// walk, so guard tests can doctor exact section bytes.
+    fn v2_section_spans(payload: &[u8]) -> Vec<(u8, usize, usize)> {
+        assert!(is_frame_v2(payload));
+        let mut pos = 6usize; // escape + frame_version + flags + layer_count
+        let name_len = u16::from_le_bytes([payload[pos], payload[pos + 1]]) as usize;
+        pos += 2 + name_len;
+        for _ in 0..2 {
+            let kind = payload[pos];
+            pos += 1;
+            if kind == REF_KIND_TEMPLATE_HASH {
+                pos += 16;
+            }
+        }
+        let section_count = payload[pos] as usize;
+        pos += 1;
+        let mut toc = Vec::with_capacity(section_count);
+        for _ in 0..section_count {
+            let tag = payload[pos];
+            let len = u32::from_le_bytes(payload[pos + 1..pos + 5].try_into().unwrap()) as usize;
+            toc.push((tag, len));
+            pos += 5;
+        }
+        pos += (FRAME_ALIGN - pos % FRAME_ALIGN) % FRAME_ALIGN;
+        let mut spans = Vec::with_capacity(section_count);
+        for (tag, len) in toc {
+            spans.push((tag, pos, len));
+            pos += len;
+            pos += (FRAME_ALIGN - pos % FRAME_ALIGN) % FRAME_ALIGN;
+        }
+        spans
+    }
+
+    /// Splice guards (design §3.4): stray zeros at a batch section's head
+    /// must ERROR LOUDLY — under arrow-rs they'd otherwise parse as a legacy
+    /// 4-byte end-of-stream and silently EMPTY the tile.
+    #[test]
+    fn v2_stray_zeros_in_batch_section_error_instead_of_empty_tile() {
+        let payload =
+            encode_tile_with(&[sample_point_layer()], &v2_inline(&EncoderConfig::default()))
+                .unwrap();
+        let (_, off, len) = *v2_section_spans(&payload)
+            .iter()
+            .find(|(tag, _, _)| *tag == SECTION_CORE_BATCH)
+            .expect("CORE_BATCH present");
+        assert!(len > 4);
+
+        let mut doctored = payload.clone();
+        doctored[off..off + 4].fill(0);
+        let err = decode_tile(&doctored).expect_err("zeroed continuation must error");
+        assert!(
+            err.to_string().contains("0xFFFFFFFF"),
+            "error must name the continuation guard: {err}"
+        );
+
+        // Direct splice guard: both halves are checked.
+        let template = &payload[..4]; // any bytes NOT starting with FFFFFFFF
+        assert!(splice_decode(&[0u8; 8], template, "guard").is_err());
+    }
+
+    /// Frame guards: truncations anywhere in the header error cleanly, and a
+    /// TOC length overrunning the payload is rejected before Arrow sees it.
+    #[test]
+    fn v2_truncated_header_and_lying_toc_length_error() {
+        let payload =
+            encode_tile_with(&[sample_point_layer()], &v2_inline(&EncoderConfig::default()))
+                .unwrap();
+        let first_section_off = v2_section_spans(&payload)[0].1;
+        for cut in 0..first_section_off {
+            assert!(decode_tile(&payload[..cut]).is_err(), "cut at {cut} must error");
+        }
+
+        // Inflate the first TOC length (u32 after the 1-byte tag): the
+        // decoder's bounds-checked read must reject it, not over-read.
+        let mut doctored = payload.clone();
+        let toc0 = first_toc_offset(&payload);
+        doctored[toc0 + 1..toc0 + 5].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = decode_tile(&doctored).expect_err("overrunning TOC length must error");
+        assert!(err.to_string().contains("truncated"), "got: {err}");
+    }
+
+    /// Byte offset of a single-layer v2 frame's FIRST TOC entry.
+    fn first_toc_offset(payload: &[u8]) -> usize {
+        let name_len = u16::from_le_bytes([payload[6], payload[7]]) as usize;
+        let mut pos = 8 + name_len;
+        for _ in 0..2 {
+            let kind = payload[pos];
+            pos += 1;
+            if kind == REF_KIND_TEMPLATE_HASH {
+                pos += 16;
+            }
+        }
+        pos + 1 // past section_count
+    }
+
+    /// Unknown section tags are SKIPPED via their TOC length (additive
+    /// evolution): re-tagging TILE_META to an unknown tag still decodes the
+    /// batch — only the re-injected per-tile metadata disappears.
+    #[test]
+    fn v2_unknown_section_tag_is_skipped() {
+        let payload =
+            encode_tile_with(&[sample_point_layer()], &v2_inline(&EncoderConfig::default()))
+                .unwrap();
+        let toc0 = first_toc_offset(&payload);
+        let mut doctored = payload.clone();
+        // TOC entries are (u8 tag, u32 len); find TILE_META's entry.
+        let section_count = doctored[toc0 - 1] as usize;
+        let mut retagged = false;
+        for i in 0..section_count {
+            let at = toc0 + i * 5;
+            if doctored[at] == SECTION_TILE_META {
+                doctored[at] = 0x6f; // unknown tag
+                retagged = true;
+            }
+        }
+        assert!(retagged);
+        let decoded = decode_tile(&doctored).unwrap();
+        assert_eq!(decoded[0].batch.num_rows(), 3);
+        assert!(
+            decoded[0].batch.schema().metadata().get(TIME_OFFSET_MS_KEY).is_none(),
+            "skipped TILE_META means no t0 re-injection"
+        );
+    }
+
+    /// A hash-referencing v2 frame decoded WITHOUT (or with an incomplete)
+    /// registry is a descriptive error naming the fix — never a panic.
+    #[test]
+    fn v2_hash_frame_without_registry_errors_descriptively() {
+        let collector = Arc::new(TemplateCollector::new());
+        let payload = encode_tile_with(
+            &[sample_point_layer()],
+            &v2_hashed(&EncoderConfig::default(), &collector),
+        )
+        .unwrap();
+
+        let err = decode_tile(&payload).expect_err("no registry must error");
+        assert!(
+            err.to_string().contains("decode_tile_with_templates"),
+            "error must point at the registry entry point: {err}"
+        );
+
+        let empty = TemplateRegistry::new();
+        let err = decode_tile_with_templates(&payload, &empty)
+            .expect_err("incomplete registry must error");
+        assert!(
+            err.to_string().contains("not in the dataset's registry"),
+            "got: {err}"
+        );
+    }
+
+    /// The strip is tail-invariant (design §3.6, spike-proven): hoisting the
+    /// per-tile metadata out of the schema changes ONLY the schema message —
+    /// two tiles differing in per-tile metadata alone share byte-identical
+    /// templates while their tails differ, which is exactly what makes
+    /// cross-tile template dedup sound.
+    #[test]
+    fn v2_metadata_strip_leaves_template_constant_and_tails_differing() {
+        let quant = EncoderConfig {
+            quantize_attrs_auto: true,
+            ..EncoderConfig::default()
+        };
+        let mut early = sample_point_layer();
+        // Different t0 + different qa affine (value range) per tile.
+        for t in early.start_times.iter_mut() {
+            *t += 7_000;
+        }
+        let late = sample_point_layer();
+
+        let a = encode_layer_v2_parts(&early, &quant).unwrap();
+        let b = encode_layer_v2_parts(&late, &quant).unwrap();
+        assert_eq!(a.core_template, b.core_template, "CORE template must be constant");
+        let (a_props_template, a_props_tail) = a.props.as_ref().unwrap();
+        let (b_props_template, b_props_tail) = b.props.as_ref().unwrap();
+        assert_eq!(a_props_template, b_props_template, "PROPS template must be constant");
+        assert_ne!(a.core_tail, b.core_tail, "t0 shift must land in the tail");
+        assert_ne!(a.tile_meta_json, b.tile_meta_json, "TILE_META varies per tile");
+        // Same qa affine + same categories here → identical props tails is
+        // fine; what matters is templates never absorb per-tile variance.
+        let _ = (a_props_tail, b_props_tail);
     }
 }

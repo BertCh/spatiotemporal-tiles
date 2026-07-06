@@ -784,19 +784,23 @@ mod tests {
     }
 
     /// Build a real packed dataset per the spec (PackWriter + encode_tile_with,
-    /// the exact pattern of the packed.rs/inspect.rs test fixtures).
+    /// the exact pattern of the packed.rs/inspect.rs test fixtures). Frames
+    /// ride the writer's (default v2) format version + template collector so
+    /// the fixture is version-coherent — what a default `stt-build` emits.
     fn build(out: &std::path::Path, spec: &FixtureSpec) {
+        let mut w = PackWriter::create(out, BlobOrdering::Auto, 64 * 1024)
+            .unwrap()
+            .with_paging(spec.paged);
         let cfg = EncoderConfig {
             quantize_attrs: if spec.quantize_magnitude {
                 [("magnitude".to_string(), 0.01)].into_iter().collect()
             } else {
                 Default::default()
             },
+            format_version: w.format_version(),
+            template_collector: Some(w.template_collector()),
             ..Default::default()
         };
-        let mut w = PackWriter::create(out, BlobOrdering::Auto, 64 * 1024)
-            .unwrap()
-            .with_paging(spec.paged);
         let bucket = 3_600_000i64;
         let shared = spec
             .identical_payloads

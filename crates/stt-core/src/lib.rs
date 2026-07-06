@@ -24,6 +24,7 @@ pub mod directory_page;
 pub mod error;
 pub mod geometry;
 pub mod metadata;
+pub mod ordering_sim;
 pub mod pack;
 pub mod projection;
 pub mod tile;
@@ -39,6 +40,10 @@ pub use directory_page::{
     PagedRoot, DEFAULT_PAGE_ENTRIES,
 };
 pub use curve::BlobOrdering;
+pub use ordering_sim::{
+    evaluate as evaluate_orderings, measured_ordering, OrderingCost, QueryCost, SimOptions,
+    TileSample, CANDIDATES, DEFAULT_COALESCE_GAP_BYTES,
+};
 pub use error::{Error, Result};
 pub use tile::TileId;
 pub use timestamp::{

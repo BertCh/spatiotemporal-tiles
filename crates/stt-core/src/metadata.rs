@@ -5,7 +5,7 @@
 use crate::error::{Error, Result};
 use crate::types::{BoundingBox, TimeRange};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Aggregation scheme for the optional pre-aggregated summary tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,8 +242,10 @@ pub struct Metadata {
     pub feature_count: u64,
     /// Layer names
     pub layers: Vec<String>,
-    /// Custom properties
-    pub properties: HashMap<String, String>,
+    /// Custom properties. A `BTreeMap` so the serialized JSON key order is
+    /// deterministic across processes — the packed manifest embeds this map,
+    /// and byte-reproducible builds must not depend on hash-map iteration order.
+    pub properties: BTreeMap<String, String>,
     /// Temporal bucket size in milliseconds for tile chunking
     /// Tiles are organized into fixed temporal intervals (e.g., 3600000 = 1 hour)
     pub temporal_bucket_ms: u64,
@@ -292,7 +294,7 @@ impl Default for Metadata {
             tile_count: 0,
             feature_count: 0,
             layers: vec!["default".to_string()],
-            properties: HashMap::new(),
+            properties: BTreeMap::new(),
             temporal_bucket_ms: 3600 * 1000, // 1 hour default
             summary_tier: None,
             temporal_lod: None,
@@ -600,6 +602,88 @@ mod tests {
         assert_eq!(dt.resolution_for_zoom(2), 2);
         // Out-of-range zooms clamp to the endpoints.
         assert_eq!(dt.resolution_for_zoom(10), 4);
+    }
+
+    #[test]
+    fn test_metadata_summary_tier_quadbin_and_sub_buckets_roundtrip() {
+        // The CARTO `quadbin` scheme and a non-default `sub_buckets` count must
+        // survive the manifest JSON round-trip, and the scheme must serialize
+        // with its documented lowercase spelling. (Moved here from
+        // tests/spec_conformance.rs, whose remit is the per-layer Arrow schema.)
+        let tier = SummaryTier {
+            scheme: SummaryScheme::Quadbin,
+            min_zoom: 0,
+            max_zoom: 6,
+            cell_resolution_per_zoom: vec![0, 1, 2, 3, 4, 5, 6],
+            columns: vec![SummaryColumn {
+                name: "magnitude".to_string(),
+                agg: SummaryAggregation::Mean,
+            }],
+            layer_name: "summary".to_string(),
+            sub_buckets: 24,
+        };
+        let bytes = Metadata::new("q")
+            .with_summary_tier(tier)
+            .to_json_bytes()
+            .expect("serialize metadata");
+        let decoded = Metadata::from_json_bytes(&bytes).expect("deserialize metadata");
+        let dt = decoded.summary_tier.expect("summary tier round-trips");
+        assert_eq!(dt.scheme, SummaryScheme::Quadbin, "quadbin scheme survives");
+        assert_eq!(dt.sub_buckets, 24, "sub_buckets survives the round-trip");
+        assert_eq!(dt.max_zoom, 6);
+
+        let json = String::from_utf8(bytes).unwrap();
+        assert!(json.contains("quadbin"), "scheme serializes lowercase: {json}");
+        assert!(json.contains("sub_buckets"), "sub_buckets is a manifest field: {json}");
+    }
+
+    #[test]
+    fn test_metadata_summary_tier_defaults_when_subfields_absent() {
+        // A pre-`sub_buckets` manifest (tier present, but the `sub_buckets` and
+        // `layer_name` fields absent) must decode to the legacy single-count
+        // behaviour via serde's documented defaults.
+        let json = br#"{
+            "name": "old-summary",
+            "description": "",
+            "attribution": "",
+            "bounds": {"min_lon":-180.0,"min_lat":-85.0,"max_lon":180.0,"max_lat":85.0},
+            "time_range": {"start":0,"end":1000},
+            "min_zoom": 0,
+            "max_zoom": 8,
+            "tile_count": 0,
+            "feature_count": 0,
+            "layers": ["default"],
+            "properties": {},
+            "temporal_bucket_ms": 3600000,
+            "summary_tier": {
+                "scheme": "h3",
+                "min_zoom": 0,
+                "max_zoom": 4,
+                "cell_resolution_per_zoom": [0,1,2,3,4],
+                "columns": [{"name":"magnitude","agg":"mean"}]
+            }
+        }"#;
+        let m = Metadata::from_json_bytes(json).expect("legacy summary tier decodes");
+        let dt = m.summary_tier.expect("summary tier present");
+        assert_eq!(dt.scheme, SummaryScheme::H3);
+        assert_eq!(dt.sub_buckets, 1, "absent sub_buckets defaults to 1");
+        assert_eq!(dt.layer_name, "summary", "absent layer_name defaults to 'summary'");
+    }
+
+    #[test]
+    fn test_properties_serialize_in_sorted_key_order() {
+        // `properties` is a BTreeMap so the manifest JSON key order is
+        // deterministic across processes (no HashMap iteration order in
+        // anything serialized) — insertion order must NOT leak through.
+        let metadata = Metadata::new("ord")
+            .with_property("zebra", "1")
+            .with_property("alpha", "2")
+            .with_property("mid", "3");
+        let s = String::from_utf8(metadata.to_json_bytes().unwrap()).unwrap();
+        let a = s.find("\"alpha\"").unwrap();
+        let m = s.find("\"mid\"").unwrap();
+        let z = s.find("\"zebra\"").unwrap();
+        assert!(a < m && m < z, "properties must serialize sorted: {s}");
     }
 
     #[test]

@@ -753,11 +753,38 @@ fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 // Feature ids
 // ----------------------------------------------------------------------------
 
+/// 64-bit FNV-1a over a byte slice — the synthetic-feature-id hash.
+///
+/// Deliberately NOT `std::collections::hash_map::DefaultHasher`: its algorithm
+/// is explicitly unspecified across Rust releases, so a toolchain bump could
+/// change every synthetic id, every tile byte and every content address,
+/// silently breaking the incremental-deploy economics. FNV-1a is fixed by
+/// spec: offset basis `0xcbf29ce484222325`, prime `0x100000001b3`
+/// (http://www.isthe.com/chongo/tech/comp/fnv/). Multi-field inputs are fed
+/// as the concatenation of each field's little-endian bytes.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// FNV-1a over a sequence of u64 fields (each folded in as little-endian).
+fn fnv1a_64_fields(fields: &[u64]) -> u64 {
+    let mut bytes = Vec::with_capacity(fields.len() * 8);
+    for f in fields {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    fnv1a_64(&bytes)
+}
+
 /// Resolve a stable u64 feature id (from the GeoJSON id, else a hash).
 fn determine_feature_id(feature: &ParsedFeature) -> u64 {
     use geojson::feature::Id;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
 
     if let Some(id) = &feature.geojson.id {
         match id {
@@ -770,24 +797,20 @@ fn determine_feature_id(feature: &ParsedFeature) -> u64 {
                 }
             }
             Id::String(s) => {
-                let mut h = DefaultHasher::new();
-                s.hash(&mut h);
-                return h.finish();
+                return fnv1a_64(s.as_bytes());
             }
         }
     }
-    let mut h = DefaultHasher::new();
-    h.write_u64(feature.timestamp);
-    h.write_u64(feature.lon.to_bits());
-    h.write_u64(feature.lat.to_bits());
-    h.finish()
+    fnv1a_64_fields(&[
+        feature.timestamp,
+        feature.lon.to_bits(),
+        feature.lat.to_bits(),
+    ])
 }
 
 /// Resolve a stable u64 id for a clipped segment.
 fn segment_feature_id(segment: &ClippedSegment) -> u64 {
     use geojson::feature::Id;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
 
     if let Some(id) = &segment.feature_id {
         match id {
@@ -800,19 +823,16 @@ fn segment_feature_id(segment: &ClippedSegment) -> u64 {
                 }
             }
             Id::String(s) => {
-                let mut h = DefaultHasher::new();
-                s.hash(&mut h);
-                return h.finish();
+                return fnv1a_64(s.as_bytes());
             }
         }
     }
-    let mut h = DefaultHasher::new();
-    h.write_u64(segment.start_time);
-    if let Some((lon, lat, _)) = segment.coordinates.first() {
-        h.write_u64(lon.to_bits());
-        h.write_u64(lat.to_bits());
+    match segment.coordinates.first() {
+        Some((lon, lat, _)) => {
+            fnv1a_64_fields(&[segment.start_time, lon.to_bits(), lat.to_bits()])
+        }
+        None => fnv1a_64_fields(&[segment.start_time]),
     }
-    h.finish()
 }
 
 #[cfg(test)]
@@ -1311,6 +1331,50 @@ mod tests {
         }
         // The simple square still earcuts to two triangles.
         assert_eq!(tri[1].len(), 6);
+    }
+
+    /// Synthetic ids MUST come from the documented FNV-1a 64 (never
+    /// `DefaultHasher`, whose algorithm may change between Rust releases and
+    /// would churn every content address). Pinned against the published FNV
+    /// test vectors plus the exact composition rules for both id paths, so
+    /// any accidental change to the hash breaks loudly here.
+    #[test]
+    fn synthetic_ids_use_stable_fnv1a() {
+        // Published FNV-1a 64 vectors: "" → offset basis, "a", "foobar".
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64(b"foobar"), 0x85944171f73967e8);
+
+        // String-id path: FNV-1a over the raw UTF-8 bytes.
+        let mut f = point_feature(-122.4, 37.7, json!({}));
+        f.geojson.id = Some(geojson::feature::Id::String("quake-42".to_string()));
+        assert_eq!(determine_feature_id(&f), fnv1a_64(b"quake-42"));
+
+        // Synthetic fallback: little-endian (timestamp, lon bits, lat bits).
+        let f2 = point_feature(-122.4, 37.7, json!({}));
+        assert_eq!(
+            determine_feature_id(&f2),
+            fnv1a_64_fields(&[1000, (-122.4f64).to_bits(), 37.7f64.to_bits()])
+        );
+
+        // Segment fallback: little-endian (start_time, first lon bits, first lat bits).
+        let seg = crate::clip::ClippedSegment {
+            tile_x: 0,
+            tile_y: 0,
+            zoom: 10,
+            coordinates: vec![(1.5, 2.5, 0.0)],
+            timestamps: vec![7],
+            vertex_values: vec![],
+            vertex_value_matrix: vec![],
+            start_time: 7,
+            end_time: 7,
+            properties: None,
+            feature_id: None,
+        };
+        assert_eq!(
+            segment_feature_id(&seg),
+            fnv1a_64_fields(&[7, 1.5f64.to_bits(), 2.5f64.to_bits()])
+        );
     }
 
     #[test]

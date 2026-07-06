@@ -34,13 +34,18 @@ pub enum BlobOrdering {
     /// 3D Hilbert curve over `(x, y, time_bucket)` at native per-axis
     /// resolution. The best generalist — no catastrophic query — and the
     /// measured winner on the widest range of datasets. This is the enum
-    /// `Default` (the chosen order when reordering is requested), but note the
-    /// `stt-build` CLI defaults to `eager` (no reorder); a non-eager
-    /// `--blob-ordering` opts into this.
+    /// `Default`. The `stt-build` CLI defaults to `--blob-ordering auto`
+    /// (resolved to a concrete order by [`choose`](BlobOrdering::choose)); there
+    /// is no no-reorder mode — the packed writer always reorders before cutting
+    /// packs (`eager` is a legacy alias for `auto`). An opt-in
+    /// `--blob-ordering measured` instead picks the concrete order by simulating
+    /// per-ordering range-read cost (see [`crate::ordering_sim`]).
     #[default]
     Hilbert3,
     /// 3D Morton / Z-order over `(x, y, time_bucket)`. Cheaper to compute than
-    /// Hilbert but its long jumps hurt locality; rarely the best choice.
+    /// Hilbert but its long jumps hurt locality; empirically **never** the
+    /// measured-optimal ordering on any tested dataset — kept for research /
+    /// comparison, not production use.
     Morton3,
     /// Resolve the concrete ordering at finalize time from the dataset's
     /// space-vs-time cardinality via [`BlobOrdering::choose`]. A "resolve
@@ -52,29 +57,41 @@ pub enum BlobOrdering {
 impl BlobOrdering {
     /// Pick a concrete ordering from the dataset's space-vs-time shape.
     ///
-    /// `zoom_bits` is the spatial side (≈ max zoom); `time_bits` is
-    /// `ceil(log2(#time_buckets))`. The rule is **measured, not from first
-    /// principles** (and is the opposite of the naive "prefix the dominant
-    /// axis"):
+    /// `space_bits` is the **occupied** spatial extent in bits
+    /// (`bits_for(max(x_span, y_span) + 1)` over the native tier) — NOT the raw
+    /// max zoom, which for sparse data massively overstates spatial cardinality.
+    /// `time_bits` is `ceil(log2(#occupied time buckets))`. Both axes are thus
+    /// measured the same way (occupied extent), so the comparison is symmetric.
+    /// The rule is **measured, not from first principles**:
     ///
+    /// - **shallow time** (`time_bits ≤ 1`, i.e. a snapshot / ≤2 buckets) →
+    ///   [`SpatialMajor`]. With no real temporal axis, the 3D curve's collapsed
+    ///   time dimension only hurts locality; a pure 2D spatial Hilbert wins.
     /// - **time dominates** by more than [`ORDERING_BALANCE_BITS`]
     ///   (e.g. drifters: 2⁴ cells × 2281 buckets) → [`SpatialMajor`]. The
     ///   dominant access on time-deep data is *playback* (scrub time at a fixed
     ///   viewport), which wants each cell's whole timeline byte-contiguous.
-    ///   Measured: spatial-major beats 3D-Hilbert ~3× and time-major ~5× there.
     /// - **balanced or space-dominant** (e.g. flights: 2¹⁰ × 24 buckets) →
     ///   [`Hilbert3`], the robust generalist with no catastrophic query.
     ///
-    /// This is the default a single-pass build uses for `--blob-ordering auto`;
-    /// the build-time simulator's empirical per-dataset pick (which tries all
-    /// orders and measures) is strictly better and overrides it when available.
+    /// This is the `--blob-ordering auto` path. For a per-dataset pick that
+    /// actually measures range-read cost across orderings, see the opt-in
+    /// `--blob-ordering measured` mode ([`crate::ordering_sim`]).
     ///
     /// [`SpatialMajor`]: BlobOrdering::SpatialMajor
     /// [`Hilbert3`]: BlobOrdering::Hilbert3
-    pub fn choose(zoom_bits: u32, time_bits: u32) -> BlobOrdering {
-        if time_bits > zoom_bits + ORDERING_BALANCE_BITS {
+    pub fn choose(space_bits: u32, time_bits: u32) -> BlobOrdering {
+        if time_bits <= 1 {
+            // Shallow time (≤2 buckets): no temporal axis worth interleaving —
+            // a pure 2D spatial Hilbert keeps space contiguous. (Previously this
+            // fell through to a degenerate Hilbert3 whose collapsed time axis
+            // only hurt locality.)
+            BlobOrdering::SpatialMajor
+        } else if time_bits > space_bits + ORDERING_BALANCE_BITS {
+            // Time dominates — keep each cell's whole timeline contiguous.
             BlobOrdering::SpatialMajor
         } else {
+            // Balanced or space-dominant — the 3D-Hilbert generalist.
             BlobOrdering::Hilbert3
         }
     }
@@ -385,6 +402,10 @@ mod tests {
             BlobOrdering::choose(10, 10 + ORDERING_BALANCE_BITS + 1),
             BlobOrdering::SpatialMajor
         );
+        // F2: shallow time (a snapshot — 1 or 2 buckets) → spatial-major, even
+        // when space is wide. (Previously these degenerated to hilbert3.)
+        assert_eq!(BlobOrdering::choose(10, 0), BlobOrdering::SpatialMajor);
+        assert_eq!(BlobOrdering::choose(10, 1), BlobOrdering::SpatialMajor);
     }
 
     #[test]

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::array::{Array, FixedSizeListArray, Float64Array, Int32Array, RecordBatch, UInt64Array};
 use arrow::ipc::writer::StreamWriter;
 use h3o::{LatLng, Resolution};
-use stt_core::arrow_tile::{decode_tile, DecodedLayer, QuantAffine, STT_QUANT_META_KEY};
+use stt_core::arrow_tile::{DecodedLayer, QuantAffine, STT_QUANT_META_KEY};
 use stt_core::metadata::SummaryScheme;
 use stt_core::{BlobOrdering, PackWriter, PackedReader, TileId};
 use stt_build::quadbin;
@@ -56,9 +56,24 @@ fn main() -> anyhow::Result<()> {
         out_dir
     );
 
+    // Non-summary tiles are repacked verbatim, so the source's capability
+    // declarations (spec §3.1) must be carried forward — dropping them would
+    // re-arm the silent-misdecode hazard on quantized/folded source data.
+    // The source's formatVersion is carried too (frames and manifest may not
+    // mix; readers hard-reject), and a v2 source's registry seeds the new
+    // manifest's schemas table so verbatim-copied v2 frames stay resolvable.
+    // NOTE: `encode_frame` below re-emits repaired SUMMARY tiles as v1
+    // frames, so repairing a v2 source's summary tier fails loudly at
+    // `add_tile_full` (version-coherence guard) instead of writing a
+    // mixed-version dataset that bricks on first read.
     let mut writer = PackWriter::create(out_dir, BlobOrdering::Auto, 64 * 1024 * 1024)?
         .with_paging(Some(4096))
-        .with_zstd_level(19);
+        .with_zstd_level(19)
+        .with_format_version(reader.format_version())
+        .with_capabilities(reader.capabilities().to_vec());
+    if let Some(templates) = reader.templates() {
+        writer = writer.with_seeded_templates(templates);
+    }
 
     let mut tiles_touched = 0usize;
     let mut cells_fixed = 0usize;
@@ -66,7 +81,9 @@ fn main() -> anyhow::Result<()> {
 
     for e in &entries {
         let payload = reader.read_payload(e)?;
-        let layers = decode_tile(&payload)?;
+        // Version-aware decode (v2 frames resolve their template hashes
+        // through the reader's registry; v1 decodes as before).
+        let layers = reader.decode_payload(&payload)?;
         let has_summary = layers.iter().any(|l| l.name == layer_name);
         if !has_summary {
             // No summary layer in this tile — copy the frame byte-for-byte.

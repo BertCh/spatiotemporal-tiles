@@ -109,6 +109,28 @@ pub(crate) fn json_number_or_null(v: f64) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
+/// Ceiling division of a millisecond bound by 1000 → whole seconds
+/// (`⌈ms/1000⌉`), for the sargable integer-seconds time window both DB tile
+/// queries emit (`t*1000 >= a ⟺ t >= ⌈a/1000⌉` and `t*1000 < b ⟺ t <
+/// ⌈b/1000⌉` for integer `t`). `div_euclid`-based (stable, unlike
+/// `i64::div_ceil` on this toolchain) so a negative bound still rounds toward
+/// +∞.
+#[allow(clippy::manual_div_ceil)] // i64::div_ceil is unstable on this toolchain
+pub(crate) fn ceil_ms_to_seconds(ms: i64) -> i64 {
+    ms.div_euclid(1000) + i64::from(ms.rem_euclid(1000) > 0)
+}
+
+/// A fixed-point decimal's canonical string (`rust_decimal::Decimal` Display —
+/// plain notation, no exponent) → nearest-f64 JSON number. Both DB readers
+/// funnel `DECIMAL`/`NUMERIC` property cells through this ONE conversion —
+/// DuckDB and PostGIS surface the same `rust_decimal::Decimal`, so identical
+/// logical values yield the identical f64 in either engine (the lockstep
+/// invariant). Precision beyond f64 is rounded, same as a `DOUBLE` column; an
+/// unparseable string (can't happen for a Decimal Display) → JSON `null`.
+pub(crate) fn decimal_string_to_json(s: &str) -> serde_json::Value {
+    s.parse::<f64>().map(json_number_or_null).unwrap_or(serde_json::Value::Null)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +154,32 @@ mod tests {
     fn nan_float_becomes_json_null() {
         assert_eq!(json_number_or_null(f64::NAN), serde_json::Value::Null);
         assert_eq!(json_number_or_null(1.5), serde_json::json!(1.5));
+    }
+
+    #[test]
+    fn ceil_ms_to_seconds_rounds_up() {
+        assert_eq!(ceil_ms_to_seconds(0), 0);
+        assert_eq!(ceil_ms_to_seconds(1000), 1);
+        assert_eq!(ceil_ms_to_seconds(1001), 2);
+        assert_eq!(ceil_ms_to_seconds(1500), 2);
+        assert_eq!(ceil_ms_to_seconds(1999), 2);
+        assert_eq!(ceil_ms_to_seconds(2000), 2);
+        // Negative bounds round toward +∞ (t*1000 < -500 ⟺ t < 0).
+        assert_eq!(ceil_ms_to_seconds(-500), 0);
+        assert_eq!(ceil_ms_to_seconds(-1000), -1);
+        assert_eq!(ceil_ms_to_seconds(-1001), -1);
+    }
+
+    #[test]
+    fn decimal_strings_become_json_numbers() {
+        assert_eq!(decimal_string_to_json("12.34"), serde_json::json!(12.34));
+        assert_eq!(decimal_string_to_json("-0.5"), serde_json::json!(-0.5));
+        assert_eq!(decimal_string_to_json("0"), serde_json::json!(0.0));
+        // Beyond-f64 precision rounds to the nearest double (like a DOUBLE column).
+        assert_eq!(
+            decimal_string_to_json("0.10000000000000000001"),
+            serde_json::json!(0.1)
+        );
+        assert_eq!(decimal_string_to_json("not-a-number"), serde_json::Value::Null);
     }
 }

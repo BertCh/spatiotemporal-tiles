@@ -616,18 +616,26 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "flaky: intermittently fails on CI runners (this single test was the reason the whole \
-                crate was excluded from the workspace gate); run locally with --ignored"]
     fn test_gmst_calculation() {
-        // J2000.0 epoch: 2000-01-01 12:00:00 UTC
-        // GMST should be approximately 18h 41m 50.55s = 280.46 degrees
+        // J2000.0 epoch: 2000-01-01 12:00:00 UTC. At J2000 the Julian centuries
+        // term (t_ut1) is exactly 0.0, so `calculate_gmst` reduces to the pinned
+        // 67310.54841 s coefficient with no accumulated round-off — the result is
+        // a deterministic function of the inputs, bit-stable across platforms
+        // (plain IEEE-754 f64, no fma), not "flaky". Expected GMST at J2000 is
+        // 18h 41m 50.55s = 280.4606°; this calc yields 280.46062°, ~0.0006° off.
         let j2000 = DateTime::parse_from_rfc3339("2000-01-01T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         let gmst = calculate_gmst(j2000);
         let gmst_deg = gmst.to_degrees();
-        // Allow some tolerance due to different calculation methods
-        assert!((gmst_deg - 280.46).abs() < 1.0 || (gmst_deg + 360.0 - 280.46).abs() < 1.0);
+        // 0.01° tolerance keeps a ~16× margin over the actual 0.0006° error while
+        // still catching any real regression in the Meeus/GMST formula. The
+        // second clause guards the 0°/360° wraparound (dead for 280.46°, but kept
+        // so the assertion stays correct if the target ever sits near the seam).
+        assert!(
+            (gmst_deg - 280.46).abs() < 0.01 || (gmst_deg + 360.0 - 280.46).abs() < 0.01,
+            "GMST at J2000 = {gmst_deg}°, expected ~280.4606°"
+        );
     }
 }
 

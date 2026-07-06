@@ -11,15 +11,20 @@ pub mod diff;
 pub mod doctor;
 pub mod loader;
 pub mod measure;
+pub mod order_audit;
 pub mod packed;
 pub mod recommend;
 pub mod report;
+
+#[cfg(test)]
+mod test_support;
 
 use anyhow::Result;
 
 pub use analysis::inspect::InspectReport;
 pub use diff::DiffReport;
 pub use doctor::DoctorReport;
+pub use order_audit::OrderAuditReport;
 pub use loader::DataSource;
 pub use packed::PackedTileset;
 pub use recommend::Recommendations;

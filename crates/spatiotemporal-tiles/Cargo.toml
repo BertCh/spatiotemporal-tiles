@@ -1,6 +1,6 @@
 [package]
 name = "spatiotemporal-tiles"
-description = "SpatioTemporal Tiles (STT): animated space-time tile archives — umbrella crate re-exporting the stt-* libraries and shipping the stt-build/stt-optimize/stt-validate/stt-serve CLIs"
+description = "SpatioTemporal Tiles (STT): animated space-time tile archives — umbrella crate re-exporting the stt-* libraries and shipping the stt-build/stt-optimize/stt-validate/stt-bundle/stt-serve CLIs"
 readme = "README.md"
 keywords = ["tiles", "spatiotemporal", "geospatial", "arrow", "gis"]
 categories = ["science::geo", "encoding", "command-line-utilities"]
@@ -35,15 +35,20 @@ path = "src/bin/stt-validate/main.rs"
 required-features = ["validate-cli"]
 
 [[bin]]
+name = "stt-bundle"
+path = "src/bin/stt-bundle.rs"
+required-features = ["bundle-cli"]
+
+[[bin]]
 name = "stt-serve"
 path = "src/bin/stt-serve.rs"
 required-features = ["serve-core"]
 
 [dependencies]
 # The reader/format core is always present (the facade is useless without it).
-stt-core = { path = "../stt-core", version = "0.3.0" }
-stt-build = { path = "../stt-build", version = "0.3.0", optional = true }
-stt-optimize = { path = "../stt-optimize", version = "0.3.0", optional = true }
+stt-core = { path = "../stt-core", version = "0.4.0" }
+stt-build = { path = "../stt-build", version = "0.4.0", optional = true }
+stt-optimize = { path = "../stt-optimize", version = "0.4.0", optional = true }
 
 # CLI support (feature `cli-core`).
 anyhow = { workspace = true, optional = true }
@@ -54,8 +59,11 @@ indicatif = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
-# stt-validate (feature `validate-cli`): Arrow IPC decode checks.
+# stt-validate (feature `validate-cli`): Arrow IPC decode checks, plus the
+# same H3 crate/version stt-build mints summary cells with — the summary
+# cell-id validity check must agree with the builder bit-for-bit.
 arrow = { workspace = true, optional = true }
+h3o = { version = "0.7", optional = true }
 
 # stt-serve (feature `serve`): HTTP server + runtime.
 axum = { version = "0.7", optional = true }
@@ -73,11 +81,11 @@ duckdb = { version = "1", features = ["bundled", "r2d2"], optional = true }
 r2d2 = { version = "0.8", optional = true }
 
 [features]
-# A bare `cargo install spatiotemporal-tiles` installs all four CLIs with the
+# A bare `cargo install spatiotemporal-tiles` installs all five CLIs with the
 # light pure-Rust dependency set (stt-serve gets the PostGIS backend; the
 # bundled-DuckDB backend is a heavy C++ build, opt in via `serve-duckdb` or
 # `cli`). Library consumers should depend with `default-features = false`.
-default = ["build-cli", "optimize-cli", "validate-cli", "serve-postgres"]
+default = ["build-cli", "optimize-cli", "validate-cli", "bundle-cli", "serve-postgres"]
 # Library re-exports: `spatiotemporal_tiles::build` / `::optimize`.
 build = ["dep:stt-build"]
 optimize = ["dep:stt-optimize"]
@@ -101,7 +109,9 @@ cli-core = [
 ]
 build-cli = ["build", "cli-core"]
 optimize-cli = ["optimize", "cli-core"]
-validate-cli = ["cli-core", "dep:arrow"]
+validate-cli = ["cli-core", "dep:arrow", "dep:h3o"]
+# stt-bundle (single-file .sttb interchange): pure stt-core + CLI plumbing.
+bundle-cli = ["cli-core"]
 # stt-serve plumbing (HTTP server + runtime), backend-less. Internal: enabling
 # it without a backend is a compile error (see the compile_error! guard in
 # src/bin/stt-serve.rs) — enable `serve` or a `serve-*` backend instead.
@@ -110,8 +120,8 @@ serve-postgres = ["serve-core", "postgres", "dep:tokio-postgres", "dep:deadpool-
 serve-duckdb = ["serve-core", "duckdb", "dep:duckdb", "dep:r2d2"]
 # The full stt-serve binary as documented: both backends.
 serve = ["serve-postgres", "serve-duckdb"]
-# Everything: all four binaries, both serve backends.
-cli = ["build-cli", "optimize-cli", "validate-cli", "serve"]
+# Everything: all five binaries, both serve backends.
+cli = ["build-cli", "optimize-cli", "validate-cli", "bundle-cli", "serve"]
 
 [dev-dependencies]
 tempfile = "3.10"

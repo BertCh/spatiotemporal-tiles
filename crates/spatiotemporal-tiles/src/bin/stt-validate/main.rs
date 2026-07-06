@@ -1,10 +1,12 @@
 //! stt-validate — inspect and verify an STT dataset.
 //!
-//! Accepts the **packed format** only (a dataset directory or its
-//! `manifest.json`) and verifies the content-addressing contract. The
-//! single-file `.stt` container is an internal streaming/transcode
-//! intermediate (spec D3), never a deployment artifact, so it is not
-//! accepted here.
+//! Accepts the **packed format** only — a dataset directory, its
+//! `manifest.json`, or a single-file `.sttb` **bundle** of one (spec §13;
+//! the integrity tier then verifies each in-bundle object's blake3 against
+//! its key exactly like the exploded case) — and verifies the
+//! content-addressing contract. The single-file `.stt` container is an
+//! internal streaming/transcode intermediate (spec D3), never a deployment
+//! artifact, so it is not accepted here.
 //!
 //! Checks performed:
 //! 1. (packed) Every pack and the directory object blake3-hash to the name the
@@ -19,24 +21,38 @@
 //!    column), and tiles agree on their schema (no producer drift).
 //! 6. Feature counts in tile entries match the decoded layer rows.
 //! 7. Tile temporal extents lie inside the dataset's metadata time range.
+//! 8. Every feature's interval is sane (`end_time >= start_time`); violations
+//!    are counted and the first offender named.
+//! 9. Every decoded entry's directory `time_end` is TIGHT: it equals the max
+//!    feature `end_time` across the tile's layers (readers prune interval
+//!    queries on it — a nominal bucket end silently hides interval features).
+//! 10. When the metadata declares a summary tier, every summary-layer `id` is
+//!    a valid H3/Quadbin cell index at the tier's resolution for the tile's
+//!    zoom (a sequential id column — the blank-render bug — fails).
+//! 11. Metadata totals (`tile_count`/`feature_count`) match the
+//!    directory-derived totals; zero totals from pre-0.1.1 writers warn
+//!    instead (rebuilding with current stt-build repopulates them).
 //!
-//! The integrity, header, content-address and per-entry temporal-bound checks
-//! (1–3, 7) are cheap and always run over **every** tile. The expensive
-//! Arrow-decode + schema + feature-count checks (4–6) can be restricted to a
+//! The integrity, header, content-address, per-entry temporal-bound and
+//! metadata-total checks (1–3, 7, 11) are cheap and always run over **every**
+//! tile. The expensive Arrow-decode checks (4–6, 8–10) can be restricted to a
 //! deterministic representative sample with `--sample N` for very large
 //! archives; the report then states clearly how many tiles were decoded.
 //!
-//! Exits non-zero on any failure. With `--json` emits a machine-readable
-//! report; without it emits a short human summary.
+//! Exits non-zero on any failure; warnings (tolerated legacy gaps) are
+//! reported but never affect the exit code. With `--json` emits a
+//! machine-readable report; without it emits a short human summary.
 
 mod schema;
+mod summary;
+mod temporal;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use schema::{check_tile_schema, schema_signature};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use stt_core::TileEntry;
@@ -44,9 +60,33 @@ use stt_core::metadata::Metadata;
 use stt_core::{Manifest, PackedReader};
 
 #[derive(Parser)]
-#[command(name = "stt-validate", version, about = "Validate an STT dataset")]
+#[command(
+    name = "stt-validate",
+    version,
+    about = "Validate an STT dataset",
+    after_help = "\
+CHEAP TIER (always runs over every tile): content addressing (blake3 names, \
+declared lengths, pack_id ranges), paged-directory structure, per-tile CRC + \
+uncompressed size, per-entry temporal bounds vs the metadata time range, and \
+metadata tile/feature totals vs the directory-derived totals (zero totals \
+from pre-0.1.1 writers warn instead of failing).
+
+DECODE TIER (every tile unless --sample N restricts or --skip-decode skips): \
+Arrow layer-frame decode; schema/column contract incl. stt:quant on \
+Int32-leaf geometry (and its absence on Float64-leaf), u16-delta vertex_time \
+origin/step metadata (and its absence on absolute Int64 vertex_time), and \
+CRS84 extension metadata on unquantized geometry (warns when absent — older \
+archives predate the writer MUST); per-tile feature counts; schema drift \
+across tiles; interval sanity (end_time >= start_time, counted with the \
+first offender); directory time_end tightness (must equal the max feature \
+end_time — interval queries prune on it); and summary-tier cell-id validity \
+(H3/Quadbin cells at the tier's resolution for the tile zoom).
+
+Warnings never affect the exit code."
+)]
 struct Args {
-    /// Dataset to validate: a packed dataset directory or its `manifest.json`.
+    /// Dataset to validate: a packed dataset directory, its `manifest.json`,
+    /// or a single-file `.sttb` bundle.
     archive: PathBuf,
 
     /// Emit a JSON report instead of a human summary.
@@ -98,6 +138,9 @@ struct Report {
     payload_bytes_uncompressed: u64,
     elapsed_ms: u128,
     errors: Vec<String>,
+    /// Non-fatal findings (tolerated legacy gaps, e.g. missing CRS84 metadata
+    /// or zeroed pre-0.1.1 manifest totals). Never affect the exit code.
+    warnings: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -109,16 +152,20 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let Some(manifest_path) = packed_manifest_path(&args.archive) else {
+    let metadata = if let Some(bundle) = bundle_input_path(&args.archive) {
+        validate_bundle(&bundle, &args, &mut report)?
+    } else if let Some(manifest_path) = packed_manifest_path(&args.archive) {
+        validate_packed(&manifest_path, &args, &mut report)?
+    } else {
         anyhow::bail!(
             "{} is not a packed STT dataset (expected a directory containing \
-             manifest.json, or the manifest.json itself). Single-file `.stt` \
-             archives are an internal build intermediate and are not \
-             validated — rebuild with `stt-build` (packed output is the default)",
+             manifest.json, the manifest.json itself, or a single-file .sttb \
+             bundle). Single-file `.stt` archives are an internal build \
+             intermediate and are not validated — rebuild with `stt-build` \
+             (packed output is the default)",
             args.archive.display()
         );
     };
-    let metadata = validate_packed(&manifest_path, &args, &mut report)?;
 
     report.elapsed_ms = start.elapsed().as_millis();
 
@@ -136,6 +183,24 @@ fn main() -> Result<()> {
     } else {
         std::process::exit(1);
     }
+}
+
+/// If `input` denotes a single-file `.sttb` bundle, return its path.
+/// Detected by extension or by the 4-byte `STTB` magic, so a renamed bundle
+/// still validates; a `manifest.json` input never matches (its first bytes
+/// are JSON, not magic) and falls through to the packed-directory path.
+fn bundle_input_path(input: &Path) -> Option<PathBuf> {
+    if !input.is_file() {
+        return None;
+    }
+    if input.extension().map(|e| e == "sttb").unwrap_or(false) {
+        return Some(input.to_path_buf());
+    }
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    let mut f = std::fs::File::open(input).ok()?;
+    f.read_exact(&mut magic).ok()?;
+    (magic == stt_core::pack::BUNDLE_MAGIC).then(|| input.to_path_buf())
 }
 
 /// If `input` denotes a packed dataset, return its `manifest.json` path.
@@ -171,6 +236,34 @@ fn validate_packed(manifest_path: &Path, args: &Args, report: &mut Report) -> Re
 
     verify_paged_directly(manifest_path, &manifest, args, report)?;
 
+    validate_with_reader(&reader, args, report)
+}
+
+/// Validate a single-file `.sttb` bundle: the bundle-integrity tier first
+/// (every in-bundle object's blake3 against its key, in-bundle vs declared
+/// lengths, directory decode + `pack_id` range, paged structure — exactly
+/// the exploded checks, sourced from bundle windows), then the same
+/// decode-tier checks through the bundle-backed reader.
+fn validate_bundle(bundle_path: &Path, args: &Args, report: &mut Report) -> Result<Metadata> {
+    let integrity = stt_core::pack::verify_bundle_objects(bundle_path)
+        .with_context(|| format!("failed to read bundle {}", bundle_path.display()))?;
+    for issue in integrity {
+        push_err(report, args.fail_fast, format!("integrity: {issue}"))?;
+    }
+
+    let reader = PackedReader::open_bundle(bundle_path)
+        .with_context(|| format!("failed to open bundle {}", bundle_path.display()))?;
+    let manifest = stt_core::pack::read_bundle_manifest(bundle_path)?;
+    report.version = manifest.directory.directory_version;
+    report.compression = manifest.compression.clone();
+
+    validate_with_reader(&reader, args, report)
+}
+
+/// Decode-tier validation shared by the exploded and bundle inputs: every
+/// entry through `read_payload` + the per-tile checks, then the
+/// metadata-total reconciliation.
+fn validate_with_reader(reader: &PackedReader, args: &Args, report: &mut Report) -> Result<Metadata> {
     let metadata = reader.metadata().clone();
     let entries = reader.entries().to_vec();
     report.tile_count = entries.len();
@@ -180,6 +273,7 @@ fn validate_packed(manifest_path: &Path, args: &Args, report: &mut Report) -> Re
         &entries,
         &metadata,
         |e| reader.read_payload(e).map_err(|err| err.to_string()),
+        reader.templates(),
         args,
         report,
         pb.as_ref(),
@@ -227,7 +321,15 @@ fn verify_paged_directly(
     };
     let zstd = manifest.directory.encoding.as_deref()
         == Some(stt_core::pack::DIRECTORY_ENCODING_ZSTD);
-    match stt_core::verify_paged_structure(&dir_bytes, root_length, zstd) {
+    // formatVersion 2 prefixes the object with the 8-byte STTD magic; the
+    // codec bytes (and rootLength math) start after it. Malformed magic is
+    // already reported by the integrity pass — skip the re-check here.
+    let Ok(codec_bytes) =
+        stt_core::pack::directory_codec_bytes(&dir_bytes, manifest.format_version)
+    else {
+        return Ok(());
+    };
+    match stt_core::verify_paged_structure(codec_bytes, root_length, zstd) {
         Ok(issues) => {
             for issue in issues {
                 push_unique(report, format!("integrity: {issue}"))?;
@@ -267,6 +369,7 @@ fn validate_entries(
     entries: &[TileEntry],
     metadata: &Metadata,
     mut read_payload: impl FnMut(&TileEntry) -> std::result::Result<Vec<u8>, String>,
+    templates: Option<&stt_core::arrow_tile::TemplateRegistry>,
     args: &Args,
     report: &mut Report,
     pb: Option<&ProgressBar>,
@@ -282,6 +385,16 @@ fn validate_entries(
     // error can name a concrete disagreeing pair.
     let mut schemas: BTreeSet<String> = BTreeSet::new();
     let mut first_schema_example: Option<(String, String)> = None;
+
+    // Interval-sanity tally across every decoded tile: one aggregate error
+    // (count + first offender) instead of one error per bad feature.
+    let mut interval_violations = 0u64;
+    let mut interval_first: Option<String> = None;
+
+    // Schema warnings aggregated per distinct message body — an old archive
+    // missing CRS84 metadata would otherwise warn once per tile. BTreeMap
+    // keeps the emitted order deterministic.
+    let mut warning_tally: BTreeMap<String, (u64, String)> = BTreeMap::new();
 
     for (idx, entry) in entries.iter().enumerate() {
         report.payload_bytes_compressed += entry.length as u64;
@@ -326,7 +439,16 @@ fn validate_entries(
         };
 
         if decode_this {
-            match stt_core::arrow_tile::decode_tile(&payload) {
+            // formatVersion-2 frames reference schema templates by hash;
+            // resolve them through the manifest's registry (v1 datasets have
+            // none and take the plain path).
+            let decoded = match templates {
+                Some(registry) => {
+                    stt_core::arrow_tile::decode_tile_with_templates(&payload, registry)
+                }
+                None => stt_core::arrow_tile::decode_tile(&payload),
+            };
+            match decoded {
                 Ok(layers) => {
                     report.tiles_decoded += 1;
                     let row_total: u64 = layers.iter().map(|l| l.batch.num_rows() as u64).sum();
@@ -345,12 +467,70 @@ fn validate_entries(
                     }
 
                     // Schema / column-type contract per layer.
-                    for issue in check_tile_schema(&layers) {
+                    let findings = check_tile_schema(&layers);
+                    for issue in findings.errors {
                         push_err(
                             report,
                             args.fail_fast,
                             format!("tile {:?} schema: {issue}", entry.tile_id()),
                         )?;
+                    }
+                    for warning in findings.warnings {
+                        let slot = warning_tally
+                            .entry(warning)
+                            .or_insert_with(|| (0, format!("tile {:?}", entry.tile_id())));
+                        slot.0 += 1;
+                    }
+
+                    // Interval sanity (check 8): end_time >= start_time.
+                    let (violations, first) = temporal::check_interval_sanity(&layers);
+                    if violations > 0 {
+                        interval_violations += violations;
+                        if interval_first.is_none() {
+                            let o = first.expect("violations > 0 implies an offender");
+                            interval_first = Some(format!(
+                                "tile {:?} layer '{}' feature {} (start_time={}, end_time={})",
+                                entry.tile_id(),
+                                o.layer,
+                                o.feature_index,
+                                o.start_time,
+                                o.end_time
+                            ));
+                        }
+                    }
+
+                    // time_end tightness (check 9, review T1.5): the entry's
+                    // time_end must equal the max feature end_time — interval
+                    // features are findable past their start bucket ONLY via
+                    // this widening, so a nominal bucket end breaks interval
+                    // queries with no other symptom.
+                    if let Some(max_end) = temporal::max_feature_end(&layers) {
+                        if max_end != entry.time_end {
+                            push_err(
+                                report,
+                                args.fail_fast,
+                                format!(
+                                    "tile {:?}: directory time_end {} is not tight: max feature \
+                                     end_time is {max_end} (readers prune interval queries on \
+                                     time_end; the writer must widen it to the max feature end)",
+                                    entry.tile_id(),
+                                    entry.time_end
+                                ),
+                            )?;
+                        }
+                    }
+
+                    // Summary cell-id validity (check 10): summary-layer ids
+                    // ARE the aggregation cell indices; anything else renders
+                    // blank client-side with no error anywhere.
+                    if let Some(tier) = metadata.summary_tier.as_ref() {
+                        for issue in summary::check_summary_cells(tier, entry.zoom, &layers) {
+                            push_err(
+                                report,
+                                args.fail_fast,
+                                format!("tile {:?} summary: {issue}", entry.tile_id()),
+                            )?;
+                        }
                     }
 
                     // Producer-drift detection: track the distinct schema
@@ -389,31 +569,76 @@ fn validate_entries(
         }
     }
 
+    if interval_violations > 0 {
+        push_err(
+            report,
+            args.fail_fast,
+            format!(
+                "interval sanity: {interval_violations} feature(s) with end_time < start_time \
+                 across the decoded tiles; first: {}",
+                interval_first.as_deref().unwrap_or("<unknown>")
+            ),
+        )?;
+    }
+    for (msg, (count, first_tile)) in warning_tally {
+        push_warn(report, format!("{msg} — {count} decoded tile(s), first {first_tile}"));
+    }
+
     report.distinct_schemas = schemas.len();
     report.feature_count_decoded_complete = decode_is_complete(args);
     Ok(())
 }
 
 fn finalize_feature_check(args: &Args, report: &mut Report, metadata: &Metadata) {
-    // Only meaningful when EVERY tile was decoded — a sampled or skipped decode
-    // sums a subset, so comparing it to the metadata grand total would spuriously
-    // fail. Such runs leave `feature_count_decoded_complete = false` and skip it.
+    // Metadata totals vs the directory-derived ground truth (check 11) — no
+    // decode needed, the entry list carries both counts. Zeros are a
+    // pre-0.1.1 writer gap, not corruption: warn, and name the fix.
+    if metadata.tile_count == 0 && report.tile_count > 0 {
+        push_warn(
+            report,
+            format!(
+                "metadata tile_count is 0 with {} directory entries — pre-0.1.1 manifests \
+                 never set the totals; rebuilding with current stt-build repopulates them",
+                report.tile_count
+            ),
+        );
+    } else if metadata.tile_count != report.tile_count as u64 {
+        report.errors.push(format!(
+            "metadata tile_count={} disagrees with directory entry count {}",
+            metadata.tile_count, report.tile_count
+        ));
+    }
+    if metadata.feature_count == 0 && report.feature_count_index > 0 {
+        push_warn(
+            report,
+            format!(
+                "metadata feature_count is 0 with {} features in the directory — pre-0.1.1 \
+                 manifests never set the totals; rebuilding with current stt-build \
+                 repopulates them",
+                report.feature_count_index
+            ),
+        );
+    } else if metadata.feature_count != 0 && metadata.feature_count != report.feature_count_index {
+        report.errors.push(format!(
+            "metadata feature_count={} disagrees with the directory-derived total {}",
+            metadata.feature_count, report.feature_count_index
+        ));
+    }
+    // Decoded grand total: only meaningful when EVERY tile was decoded — a
+    // sampled or skipped decode sums a subset, so comparing it to the metadata
+    // grand total would spuriously fail. Such runs leave
+    // `feature_count_decoded_complete = false` and skip it. When the decoded
+    // sum matches the directory-derived total the cheap check above already
+    // said everything (per-tile mismatches were reported individually), so
+    // this only fires when the payloads disagree with the directory itself.
     if decode_is_complete(args)
+        && report.feature_count_decoded != report.feature_count_index
         && report.feature_count_decoded != metadata.feature_count
         && metadata.feature_count != 0
     {
         report.errors.push(format!(
             "metadata feature_count={} disagrees with decoded sum {}",
             metadata.feature_count, report.feature_count_decoded
-        ));
-    }
-    // tile_count needs no decode at all — the directory entry list is the
-    // ground truth. A zero is tolerated: pre-0.1.1 writers never set the
-    // manifest totals.
-    if metadata.tile_count != 0 && metadata.tile_count != report.tile_count as u64 {
-        report.errors.push(format!(
-            "metadata tile_count={} disagrees with directory entry count {}",
-            metadata.tile_count, report.tile_count
         ));
     }
 }
@@ -439,6 +664,13 @@ fn push_err(report: &mut Report, fail_fast: bool, msg: String) -> Result<()> {
         anyhow::bail!("validation failed (--fail-fast)");
     }
     Ok(())
+}
+
+/// Non-fatal finding: reported (stderr + report), never affects the exit code
+/// and never trips `--fail-fast`.
+fn push_warn(report: &mut Report, msg: String) {
+    eprintln!("warning: {msg}");
+    report.warnings.push(msg);
 }
 
 fn print_summary(report: &Report, metadata: &Metadata) {
@@ -486,6 +718,12 @@ fn print_summary(report: &Report, metadata: &Metadata) {
     );
     println!("zoom range       {} .. {}", metadata.min_zoom, metadata.max_zoom);
     println!("elapsed          {} ms", report.elapsed_ms);
+    if !report.warnings.is_empty() {
+        println!("\n{} warning(s) (never affect the exit code):", report.warnings.len());
+        for w in &report.warnings {
+            println!("  - {w}");
+        }
+    }
     if report.errors.is_empty() {
         println!("\nOK");
     } else {
@@ -528,5 +766,56 @@ mod tests {
             "flags missing from the `stt-validate` section of docs/api/cli-reference.md \
              (document them before shipping): {missing:?}"
         );
+    }
+
+    /// Metadata totals (check 11): zeroed pre-0.1.1 totals warn (naming the
+    /// rebuild fix), while a nonzero total disagreeing with the
+    /// directory-derived count is an error — both without any decode.
+    #[test]
+    fn metadata_totals_zero_warns_and_nonzero_mismatch_errors() {
+        use clap::Parser as _;
+        let args = Args::parse_from(["stt-validate", "--skip-decode", "dataset"]);
+
+        // Pre-0.1.1 manifest: both totals zero, directory non-empty.
+        let mut report = Report {
+            tile_count: 3,
+            feature_count_index: 7,
+            ..Default::default()
+        };
+        let legacy = Metadata::new("legacy");
+        finalize_feature_check(&args, &mut report, &legacy);
+        assert!(report.errors.is_empty(), "errors were: {:?}", report.errors);
+        assert_eq!(report.warnings.len(), 2, "warnings were: {:?}", report.warnings);
+        assert!(
+            report.warnings.iter().all(|w| w.contains("stt-build")),
+            "warnings must name the fix: {:?}",
+            report.warnings
+        );
+
+        // Populated totals that disagree with the directory: errors.
+        let mut report = Report {
+            tile_count: 3,
+            feature_count_index: 7,
+            ..Default::default()
+        };
+        let mut wrong = Metadata::new("wrong");
+        wrong.tile_count = 2;
+        wrong.feature_count = 9;
+        finalize_feature_check(&args, &mut report, &wrong);
+        assert!(report.warnings.is_empty(), "warnings were: {:?}", report.warnings);
+        assert_eq!(report.errors.len(), 2, "errors were: {:?}", report.errors);
+
+        // Matching totals: clean.
+        let mut report = Report {
+            tile_count: 3,
+            feature_count_index: 7,
+            ..Default::default()
+        };
+        let mut ok = Metadata::new("ok");
+        ok.tile_count = 3;
+        ok.feature_count = 7;
+        finalize_feature_check(&args, &mut report, &ok);
+        assert!(report.errors.is_empty(), "errors were: {:?}", report.errors);
+        assert!(report.warnings.is_empty(), "warnings were: {:?}", report.warnings);
     }
 }

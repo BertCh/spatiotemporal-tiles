@@ -54,6 +54,15 @@ pub struct ClipConfig {
     pub min_vertices: usize,
     /// Buffer in degrees to add around tile bounds (prevents gaps at boundaries)
     pub buffer_degrees: f64,
+    /// Buffer for POLYGON coverage clipping — 0 (exact tile rect), unlike the
+    /// trajectory `buffer_degrees` above. Lines need the overlap for stroke
+    /// joins at cut points; fills must NOT overlap: adjacent tiles clipping
+    /// the same ring at the same tile edge emit bit-identical seam vertices,
+    /// so unbuffered pieces rasterize watertight, while a buffered strip
+    /// double-blends under any `opacity < 1` (no renderer masks tiles at
+    /// draw time) — and the world-anchored quant grid preserves the seam
+    /// identity across tiles.
+    pub polygon_buffer_degrees: f64,
     /// Optional temporal granularity for slicing long trajectories (in milliseconds)
     /// If set, trajectories crossing temporal boundaries will be split
     pub temporal_granularity_ms: Option<u64>,
@@ -73,6 +82,8 @@ impl Default for ClipConfig {
             min_vertices: 2,
             // Small buffer (~100m at equator) to ensure visual continuity
             buffer_degrees: 0.001,
+            // Fills are clipped exact — see the field doc.
+            polygon_buffer_degrees: 0.0,
             // No temporal slicing by default
             temporal_granularity_ms: None,
             // Simplification disabled by default
@@ -913,6 +924,236 @@ pub fn clip_trajectory(
     segments
 }
 
+// ----------------------------------------------------------------------------
+// Non-trajectory (polygon) clipping — coverage placement support
+// ----------------------------------------------------------------------------
+
+/// One polygon as GeoJSON-shaped rings: `[ring][vertex][lon, lat, ...]`,
+/// exterior ring first, holes after, each ring closed (first == last).
+pub(crate) type PolygonRings = Vec<Vec<Vec<f64>>>;
+
+/// Buffered WGS84 bounds of one tile — the same rect (tile bounds +
+/// `buffer_degrees` on every side) the trajectory clipper clips against.
+/// Returned as `(min_lon, min_lat, max_lon, max_lat)`.
+pub(crate) fn buffered_tile_bounds(
+    x: u32,
+    y: u32,
+    zoom: u8,
+    buffer_degrees: f64,
+) -> (f64, f64, f64, f64) {
+    let b = TileBounds::from_tile(x, y, zoom).with_buffer(buffer_degrees);
+    (b.min_lon, b.min_lat, b.max_lon, b.max_lat)
+}
+
+/// Clip one closed polygon ring against a rectangle (Sutherland–Hodgman,
+/// clipping successively against the rect's four half-planes). Input is a
+/// GeoJSON ring (closed, first == last); output is a re-closed ring, or empty
+/// when the intersection is empty or degenerate (< 3 distinct vertices).
+/// Altitude (a third coordinate) is dropped — tile geometry columns are 2D.
+///
+/// ACCEPTED ARTIFACT: a strongly concave ring whose intersection with the
+/// rect is disconnected (e.g. a C-shape with both arms poking into the tile)
+/// emits ONE ring with zero-width bridge edges along the rect boundary — the
+/// standard tiling-ecosystem behavior (geojson-vt clips axis-by-axis the same
+/// way). Earcut fills swallow the zero-area bridges; stroked outlines of such
+/// pieces may show hairlines along tile edges. Revisit only if/when geo ≥0.30
+/// lands (its i_overlay `BooleanOps` is robust; the 0.28 Martinez
+/// implementation can panic on degenerate rings, is far slower per clip, and
+/// its vertex ordering is not stable across versions — a byte-reproducibility
+/// hazard).
+fn sutherland_hodgman_ring(ring: &[Vec<f64>], bounds: &TileBounds) -> Vec<Vec<f64>> {
+    let mut pts: Vec<(f64, f64)> = ring
+        .iter()
+        .filter(|c| c.len() >= 2)
+        .map(|c| (c[0], c[1]))
+        .collect();
+    // Drop the GeoJSON closing duplicate; the algorithm works on the open ring.
+    if pts.len() >= 2 && pts.first() == pts.last() {
+        pts.pop();
+    }
+    if pts.len() < 3 {
+        return Vec::new();
+    }
+
+    // Clip against one axis-aligned half-plane (`coord >= value` when
+    // `keep_ge`, else `coord <= value`). A vertex exactly on the boundary
+    // counts as inside, so `cur_in != prev_in` guarantees a non-zero
+    // denominator in the intersection below.
+    let clip_axis = |pts: &[(f64, f64)], value: f64, x_axis: bool, keep_ge: bool| {
+        let coord = |p: &(f64, f64)| if x_axis { p.0 } else { p.1 };
+        let inside = |p: &(f64, f64)| {
+            if keep_ge {
+                coord(p) >= value
+            } else {
+                coord(p) <= value
+            }
+        };
+        let mut out: Vec<(f64, f64)> = Vec::with_capacity(pts.len() + 4);
+        for i in 0..pts.len() {
+            let cur = pts[i];
+            let prev = pts[if i == 0 { pts.len() - 1 } else { i - 1 }];
+            let cur_in = inside(&cur);
+            if cur_in != inside(&prev) {
+                let t = (value - coord(&prev)) / (coord(&cur) - coord(&prev));
+                out.push((prev.0 + t * (cur.0 - prev.0), prev.1 + t * (cur.1 - prev.1)));
+            }
+            if cur_in {
+                out.push(cur);
+            }
+        }
+        out
+    };
+    for (value, x_axis, keep_ge) in [
+        (bounds.min_lon, true, true),
+        (bounds.max_lon, true, false),
+        (bounds.min_lat, false, true),
+        (bounds.max_lat, false, false),
+    ] {
+        pts = clip_axis(&pts, value, x_axis, keep_ge);
+        if pts.is_empty() {
+            return Vec::new();
+        }
+    }
+
+    // Drop consecutive (and wrap-around) near-duplicate vertices the
+    // successive half-plane passes can introduce at rect corners.
+    let close = |a: &(f64, f64), b: &(f64, f64)| {
+        (a.0 - b.0).abs() <= 1e-12 && (a.1 - b.1).abs() <= 1e-12
+    };
+    let mut cleaned: Vec<(f64, f64)> = Vec::with_capacity(pts.len());
+    for p in pts {
+        if cleaned.last().map_or(true, |q| !close(q, &p)) {
+            cleaned.push(p);
+        }
+    }
+    while cleaned.len() >= 2 && close(&cleaned[0], cleaned.last().unwrap()) {
+        cleaned.pop();
+    }
+    if cleaned.len() < 3 {
+        return Vec::new();
+    }
+    let mut out: Vec<Vec<f64>> = cleaned.into_iter().map(|(x, y)| vec![x, y]).collect();
+    out.push(out[0].clone());
+    out
+}
+
+/// Clip a set of polygons against every tile their bbox covers at `zoom`,
+/// returning per-tile clipped polygons. Rings are clipped independently
+/// (Sutherland–Hodgman against the buffered tile rect): a polygon whose
+/// exterior ring vanishes in a tile is dropped there; holes that vanish are
+/// dropped while the surviving exterior is kept, preserving hole structure.
+///
+/// Tiles are emitted in ascending `(x, y)` order — deterministic, no hashing.
+/// Caller is responsible for the antimeridian heuristic (bbox wider than 180°
+/// must NOT reach this function — a straight sweep in clamped lon space would
+/// smear the polygon across the whole world).
+pub(crate) fn clip_polygons_to_tiles(
+    polygons: &[PolygonRings],
+    zoom: u8,
+    buffer_degrees: f64,
+    target: Option<(u32, u32)>,
+) -> Vec<((u32, u32), Vec<PolygonRings>)> {
+    // Per-ring bboxes, hoisted out of the tile sweep — one O(total vertices)
+    // pass up front instead of re-scanning every ring for every swept tile.
+    // A ring whose bbox misses a tile rect is separated from it along some
+    // axis, so that axis's Sutherland–Hodgman half-plane pass would empty
+    // it: the bbox gates below are exactly equivalent to (and far cheaper
+    // than) running the clip and dropping the empty result.
+    let ring_bboxes: Vec<Vec<(f64, f64, f64, f64)>> = polygons
+        .iter()
+        .map(|poly| {
+            poly.iter()
+                .map(|ring| {
+                    let mut bb = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+                    for c in ring.iter().filter(|c| c.len() >= 2) {
+                        bb.0 = bb.0.min(c[0]);
+                        bb.1 = bb.1.min(c[1]);
+                        bb.2 = bb.2.max(c[0]);
+                        bb.3 = bb.3.max(c[1]);
+                    }
+                    bb
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut min_lon = f64::MAX;
+    let mut min_lat = f64::MAX;
+    let mut max_lon = f64::MIN;
+    let mut max_lat = f64::MIN;
+    for bb in ring_bboxes.iter().flatten() {
+        min_lon = min_lon.min(bb.0);
+        min_lat = min_lat.min(bb.1);
+        max_lon = max_lon.max(bb.2);
+        max_lat = max_lat.max(bb.3);
+    }
+    if !(min_lon.is_finite() && min_lat.is_finite() && max_lon.is_finite() && max_lat.is_finite())
+        || min_lon > max_lon
+        || min_lat > max_lat
+    {
+        return Vec::new();
+    }
+
+    let n = 1u32 << zoom;
+    // World-tile coords of the bbox corners (clamped to the Web-Mercator
+    // band, matching the trajectory supercover); note y grows southward.
+    let (wx0, wy0) = lonlat_to_world_tile(min_lon, max_lat, zoom);
+    let (wx1, wy1) = lonlat_to_world_tile(max_lon, min_lat, zoom);
+    let mut x0 = (wx0.floor() as i64).clamp(0, n as i64 - 1) as u32;
+    let mut x1 = (wx1.floor() as i64).clamp(0, n as i64 - 1) as u32;
+    let mut y0 = (wy0.floor() as i64).clamp(0, n as i64 - 1) as u32;
+    let mut y1 = (wy1.floor() as i64).clamp(0, n as i64 - 1) as u32;
+
+    // Single-tile restriction (the stt-serve per-request path): every tile's
+    // clip is independent of the sweep, so restricting the range yields the
+    // byte-identical piece the full sweep would have produced for that tile.
+    if let Some((tx, ty)) = target {
+        if tx < x0 || tx > x1 || ty < y0 || ty > y1 {
+            return Vec::new();
+        }
+        (x0, x1, y0, y1) = (tx, tx, ty, ty);
+    }
+
+    let mut out: Vec<((u32, u32), Vec<PolygonRings>)> = Vec::new();
+    for x in x0..=x1 {
+        for y in y0..=y1 {
+            let bounds = TileBounds::from_tile(x, y, zoom).with_buffer(buffer_degrees);
+            let mut tile_polys: Vec<PolygonRings> = Vec::new();
+            for (poly, bboxes) in polygons.iter().zip(&ring_bboxes) {
+                let (Some(exterior), Some(ext_bb)) = (poly.first(), bboxes.first()) else {
+                    continue;
+                };
+                // Part gate: an exterior whose bbox misses this tile clips
+                // to empty — skip the O(V) passes (archipelago MultiPolygons
+                // otherwise spend ~all sweep time clipping far-away parts).
+                if !bounds.intersects(ext_bb.0, ext_bb.1, ext_bb.2, ext_bb.3) {
+                    continue;
+                }
+                let clipped_exterior = sutherland_hodgman_ring(exterior, &bounds);
+                if clipped_exterior.is_empty() {
+                    continue;
+                }
+                let mut rings: PolygonRings = vec![clipped_exterior];
+                for (hole, hole_bb) in poly[1..].iter().zip(&bboxes[1..]) {
+                    // Hole gate: same bbox-disjoint ⇒ clips-to-empty argument.
+                    if !bounds.intersects(hole_bb.0, hole_bb.1, hole_bb.2, hole_bb.3) {
+                        continue;
+                    }
+                    let clipped_hole = sutherland_hodgman_ring(hole, &bounds);
+                    if !clipped_hole.is_empty() {
+                        rings.push(clipped_hole);
+                    }
+                }
+                tile_polys.push(rings);
+            }
+            if !tile_polys.is_empty() {
+                out.push(((x, y), tile_polys));
+            }
+        }
+    }
+    out
+}
+
 /// Check if a feature is a LineString with duration (trajectory)
 pub fn is_clippable_trajectory(feature: &Feature, end_timestamp: Option<u64>) -> bool {
     // Must have duration
@@ -1281,6 +1522,132 @@ mod tests {
         for (x, y) in &tiles {
             assert!(*x < n && *y < n);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Polygon ring clipping (Sutherland–Hodgman) tests
+    // ------------------------------------------------------------------
+
+    fn closed_ring(pts: &[(f64, f64)]) -> Vec<Vec<f64>> {
+        let mut r: Vec<Vec<f64>> = pts.iter().map(|(x, y)| vec![*x, *y]).collect();
+        r.push(r[0].clone());
+        r
+    }
+
+    #[test]
+    fn sutherland_hodgman_ring_inside_is_unchanged() {
+        let bounds = TileBounds {
+            min_lon: 0.0,
+            min_lat: 0.0,
+            max_lon: 10.0,
+            max_lat: 10.0,
+        };
+        let ring = closed_ring(&[(2.0, 2.0), (8.0, 2.0), (8.0, 8.0), (2.0, 8.0)]);
+        let out = sutherland_hodgman_ring(&ring, &bounds);
+        assert_eq!(out, ring, "fully-inside ring must survive verbatim");
+    }
+
+    #[test]
+    fn sutherland_hodgman_ring_outside_is_empty() {
+        let bounds = TileBounds {
+            min_lon: 0.0,
+            min_lat: 0.0,
+            max_lon: 10.0,
+            max_lat: 10.0,
+        };
+        let ring = closed_ring(&[(20.0, 20.0), (30.0, 20.0), (30.0, 30.0), (20.0, 30.0)]);
+        assert!(sutherland_hodgman_ring(&ring, &bounds).is_empty());
+    }
+
+    #[test]
+    fn sutherland_hodgman_ring_covering_rect_yields_rect() {
+        // A ring that fully contains the clip rect must clip to the rect
+        // itself — the interior-tile case of a large polygon.
+        let bounds = TileBounds {
+            min_lon: 0.0,
+            min_lat: 0.0,
+            max_lon: 10.0,
+            max_lat: 10.0,
+        };
+        let ring = closed_ring(&[(-50.0, -50.0), (50.0, -50.0), (50.0, 50.0), (-50.0, 50.0)]);
+        let out = sutherland_hodgman_ring(&ring, &bounds);
+        assert_eq!(out.len(), 5, "rect = 4 corners + closure, got {out:?}");
+        assert_eq!(out.first(), out.last(), "output ring must be closed");
+        for c in &out {
+            assert!((0.0..=10.0).contains(&c[0]) && (0.0..=10.0).contains(&c[1]));
+        }
+    }
+
+    #[test]
+    fn sutherland_hodgman_ring_straddling_is_clipped_and_closed() {
+        let bounds = TileBounds {
+            min_lon: 0.0,
+            min_lat: 0.0,
+            max_lon: 10.0,
+            max_lat: 10.0,
+        };
+        // Triangle poking into the rect from the left.
+        let ring = closed_ring(&[(-5.0, 5.0), (5.0, 2.0), (5.0, 8.0)]);
+        let out = sutherland_hodgman_ring(&ring, &bounds);
+        assert!(out.len() >= 4, "clipped ring must stay a ring: {out:?}");
+        assert_eq!(out.first(), out.last());
+        for c in &out {
+            assert!(c[0] >= -1e-9 && c[0] <= 10.0 + 1e-9, "x escaped: {out:?}");
+        }
+    }
+
+    #[test]
+    fn clip_polygons_to_tiles_covers_and_preserves_holes() {
+        // A square around the 4-tile corner at (0°, 0°) with a centred hole:
+        // every covered tile keeps its share of BOTH rings.
+        let exterior = closed_ring(&[(-0.1, -0.1), (0.1, -0.1), (0.1, 0.1), (-0.1, 0.1)]);
+        let hole = closed_ring(&[(-0.05, -0.05), (0.05, -0.05), (0.05, 0.05), (-0.05, 0.05)]);
+        let polys = vec![vec![exterior, hole]];
+        let zoom = 10u8;
+        let pieces = clip_polygons_to_tiles(&polys, zoom, 0.0, None);
+        assert_eq!(pieces.len(), 4, "expected the 4 corner tiles, got {pieces:?}");
+        let tiles: Vec<(u32, u32)> = pieces.iter().map(|(t, _)| *t).collect();
+        assert_eq!(tiles, vec![(511, 511), (511, 512), (512, 511), (512, 512)]);
+        for ((x, y), tile_polys) in &pieces {
+            assert_eq!(tile_polys.len(), 1);
+            let rings = &tile_polys[0];
+            assert_eq!(rings.len(), 2, "tile ({x},{y}) lost the hole: {rings:?}");
+            for ring in rings {
+                assert!(ring.len() >= 4, "degenerate ring in ({x},{y})");
+                assert_eq!(ring.first(), ring.last(), "ring not closed in ({x},{y})");
+            }
+        }
+        // Watertight seams: both tiles clip the SAME ring against the same
+        // tile-edge line with identical arithmetic (unbuffered rect), so the
+        // seam vertices they emit are bit-identical — no overlap strip to
+        // double-blend under translucent fills, no gap. Compare the two
+        // pieces' near-seam vertex sets bit-for-bit.
+        let piece = |tx: u32, ty: u32| -> &PolygonRings {
+            &pieces.iter().find(|(t, _)| *t == (tx, ty)).unwrap().1[0]
+        };
+        let seam_bits = |rings: &PolygonRings| -> Vec<(u64, u64)> {
+            let mut v: Vec<(u64, u64)> = rings[0]
+                .iter()
+                .filter(|c| c[0].abs() <= 1e-9)
+                .map(|c| (c[0].to_bits(), c[1].to_bits()))
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let left = seam_bits(piece(511, 511));
+        let right = seam_bits(piece(512, 511));
+        assert!(!left.is_empty(), "left piece should touch the lon=0 seam");
+        assert_eq!(left, right, "seam vertices must be bit-identical across the tile edge");
+
+        // Single-tile restriction (the stt-serve path) returns the
+        // byte-identical piece the full sweep produced for that tile.
+        let restricted = clip_polygons_to_tiles(&polys, zoom, 0.0, Some((512, 511)));
+        assert_eq!(restricted.len(), 1);
+        assert_eq!(restricted[0].0, (512, 511));
+        assert_eq!(&restricted[0].1, &pieces.iter().find(|(t, _)| *t == (512, 511)).unwrap().1);
+        // A target outside the bbox sweeps nothing.
+        assert!(clip_polygons_to_tiles(&polys, zoom, 0.0, Some((0, 0))).is_empty());
     }
 
     #[test]

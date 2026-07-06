@@ -167,85 +167,12 @@ pub fn to_command(
 mod tests {
     use super::*;
     use crate::advisors::AdviceConfidence;
-    use crate::analysis::density::DensityAnalysis;
-    use crate::analysis::geometry::{
-        GeometryAnalysis, GeometryComplexity, PropertyStats, SizeStats, VertexStats,
-    };
-    use crate::analysis::spatial::{SpatialAnalysis, SpatialDistribution};
-    use crate::analysis::temporal::{EventsPerDayStats, TemporalAnalysis, TemporalDistribution};
-    use std::collections::HashMap;
-    use stt_core::types::BoundingBox;
 
     /// Minimal synthetic analysis result — just enough populated fields for
-    /// `generate_recommendations`/`calculate_confidence` to run.
+    /// `generate_recommendations`/`calculate_confidence` to run. The shared
+    /// default fixture is exactly what these tests need.
     fn synthetic_result() -> AnalysisResult {
-        AnalysisResult {
-            source: "synthetic.parquet".to_string(),
-            feature_count: 10_000,
-            bounds: BoundingBox::new(-74.0, 45.0, -73.0, 46.0),
-            spatial: SpatialAnalysis {
-                zoom_coverage: Vec::new(),
-                hotspots: Vec::new(),
-                recommended_min_zoom: 0,
-                recommended_max_zoom: 10,
-                distribution: SpatialDistribution::Regional,
-            },
-            temporal: TemporalAnalysis {
-                time_start: 0,
-                time_end: 86_400_000,
-                duration_ms: 86_400_000,
-                duration_human: "1 day".to_string(),
-                unique_timestamps: 1_000,
-                distribution: TemporalDistribution::Uniform,
-                recommended_bucket_ms: 3_600_000,
-                recommended_bucket_human: "1 hour".to_string(),
-                hourly_distribution: vec![0; 24],
-                daily_distribution: vec![0; 7],
-                monthly_distribution: vec![0; 12],
-                events_per_day: EventsPerDayStats {
-                    min: 0.0,
-                    max: 0.0,
-                    avg: 0.0,
-                    median: 0.0,
-                    std_dev: 0.0,
-                },
-            },
-            geometry: GeometryAnalysis {
-                type_distribution: HashMap::new(),
-                dominant_type: "Point".to_string(),
-                vertex_stats: VertexStats {
-                    min: 1,
-                    max: 1,
-                    avg: 1.0,
-                    median: 1,
-                    p95: 1,
-                    p99: 1,
-                    total: 10_000,
-                },
-                size_stats: SizeStats {
-                    min: 100,
-                    max: 100,
-                    avg: 100.0,
-                    median: 100,
-                    p95: 100,
-                    p99: 100,
-                    total: 1_000_000,
-                },
-                property_stats: PropertyStats {
-                    min: 2,
-                    max: 2,
-                    avg: 2.0,
-                },
-                complexity: GeometryComplexity::Simple,
-            },
-            density: DensityAnalysis {
-                per_zoom: Vec::new(),
-                estimated_tile_count: 100,
-                estimated_archive_size: 1 << 20,
-                issues: Vec::new(),
-            },
-            measured: None,
-        }
+        crate::test_support::sample_analysis()
     }
 
     fn advice(flag: &str, value: Option<&str>, lossy: bool) -> Advice {

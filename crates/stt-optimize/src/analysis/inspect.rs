@@ -490,7 +490,9 @@ pub fn format_text(report: &InspectReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stt_core::arrow_tile::{encode_tile, ColumnarLayer, GeometryColumn, PropertyColumn};
+    use stt_core::arrow_tile::{
+        encode_tile_with, ColumnarLayer, EncoderConfig, GeometryColumn, PropertyColumn,
+    };
     use stt_core::curve::BlobOrdering;
     use stt_core::metadata::Metadata;
     use stt_core::pack::PackWriter;
@@ -545,10 +547,17 @@ mod tests {
 
     /// Build a real tiny packed tileset: 3 line tiles at z5 (one payload
     /// duplicated across two entries → dedup) + 1 at z3, two time buckets.
+    /// Frames ride the writer's (default v2) format version + template
+    /// collector so the fixture is version-coherent.
     fn build_fixture(out: &std::path::Path) {
         let mut w = PackWriter::create(out, BlobOrdering::Auto, 64 * 1024).unwrap();
+        let cfg = EncoderConfig {
+            format_version: w.format_version(),
+            template_collector: Some(w.template_collector()),
+            ..EncoderConfig::default()
+        };
         let bucket = 3_600_000i64;
-        let dup = encode_tile(&[line_layer(7, 40)]).unwrap();
+        let dup = encode_tile_with(&[line_layer(7, 40)], &cfg).unwrap();
         // z5: two entries sharing the SAME payload bytes (different cells) +
         // one distinct, across two time buckets.
         w.add_tile_full(
@@ -571,7 +580,7 @@ mod tests {
             &dup,
         )
         .unwrap();
-        let distinct = encode_tile(&[line_layer(9, 40)]).unwrap();
+        let distinct = encode_tile_with(&[line_layer(9, 40)], &cfg).unwrap();
         w.add_tile_full(
             &TileId::new(5, 3, 1, 0),
             0,
@@ -583,7 +592,7 @@ mod tests {
         )
         .unwrap();
         // z3 overview tile.
-        let overview = encode_tile(&[line_layer(11, 40)]).unwrap();
+        let overview = encode_tile_with(&[line_layer(11, 40)], &cfg).unwrap();
         w.add_tile_full(
             &TileId::new(3, 0, 0, 0),
             0,

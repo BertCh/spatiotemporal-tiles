@@ -242,6 +242,15 @@ pub fn decode_root(bytes: &[u8]) -> Result<PagedRoot> {
     let _reserved = r.u16()?;
     let page_count = r.u32()? as usize;
     let page_entries = r.u32()?;
+    // Adversarial-input guard: descriptors are fixed-width, so a count beyond
+    // what the remaining bytes can hold is corrupt; reject before allocating
+    // the table (guarded by tests/adversarial_decode.rs).
+    if bytes.len().saturating_sub(r.pos) < page_count.saturating_mul(DESCRIPTOR_LEN) {
+        return Err(Error::InvalidArchive(format!(
+            "paged root: header claims {page_count} pages but only {} bytes remain",
+            bytes.len().saturating_sub(r.pos)
+        )));
+    }
     let mut pages = Vec::with_capacity(page_count);
     for _ in 0..page_count {
         let rel_offset = r.u64()?;
@@ -422,14 +431,21 @@ pub fn decode_paged_directory(
     let root = decode_root(&root_raw)?;
     let mut entries = Vec::new();
     for d in &root.pages {
-        let start = rl + d.rel_offset as usize;
-        let end = start + d.length as usize;
-        let frame = bytes.get(start..end).ok_or_else(|| {
-            Error::InvalidArchive(format!(
-                "paged directory: leaf range {start}..{end} exceeds object size {}",
-                bytes.len()
-            ))
-        })?;
+        // Checked range arithmetic: a corrupt root's rel_offset/length must
+        // error, not overflow (guarded by tests/adversarial_decode.rs).
+        let start = root_length.checked_add(d.rel_offset);
+        let end = start.and_then(|s| s.checked_add(d.length as u64));
+        let frame = match (start, end) {
+            (Some(s), Some(e)) if e <= bytes.len() as u64 => &bytes[s as usize..e as usize],
+            _ => {
+                return Err(Error::InvalidArchive(format!(
+                    "paged directory: leaf range rootLength+{}..+{} exceeds object size {}",
+                    d.rel_offset,
+                    d.length,
+                    bytes.len()
+                )))
+            }
+        };
         let raw = unframe(frame, zstd)?;
         let mut page = decode_directory(&raw)?;
         if page.len() != d.entry_count as usize {
@@ -483,14 +499,21 @@ pub fn verify_paged_structure(bytes: &[u8], root_length: u64, zstd: bool) -> Res
     let mut prev_last: Option<(u8, u64, i64)> = None;
     for (pi, d) in root.pages.iter().enumerate() {
         declared_total += d.entry_count as usize;
-        let start = rl + d.rel_offset as usize;
-        let end = start + d.length as usize;
-        let frame = match bytes.get(start..end) {
-            Some(f) => f,
-            None => {
+        // Checked range arithmetic, mirroring `decode_paged_directory`: a
+        // corrupt descriptor must be reported, not overflow.
+        let start = root_length.checked_add(d.rel_offset);
+        let end = start.and_then(|s| s.checked_add(d.length as u64));
+        let frame = match (start, end) {
+            (Some(s), Some(e)) if e <= bytes.len() as u64 => &bytes[s as usize..e as usize],
+            _ => {
                 push(
                     &mut issues,
-                    format!("page {pi}: leaf range {start}..{end} exceeds object size {}", bytes.len()),
+                    format!(
+                        "page {pi}: leaf range rootLength+{}..+{} exceeds object size {}",
+                        d.rel_offset,
+                        d.length,
+                        bytes.len()
+                    ),
                 );
                 continue;
             }

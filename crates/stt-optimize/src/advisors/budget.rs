@@ -313,34 +313,10 @@ mod tests {
     use crate::analysis::geometry::{
         GeometryAnalysis, GeometryComplexity, PropertyStats, SizeStats, VertexStats,
     };
-    use crate::analysis::spatial::{Hotspot, SpatialAnalysis, SpatialDistribution};
-    use crate::analysis::temporal::{EventsPerDayStats, TemporalAnalysis, TemporalDistribution};
+    use crate::analysis::spatial::{Hotspot, SpatialDistribution};
     use crate::measure::MeasuredEncoding;
     use std::collections::HashMap;
     use stt_core::types::{BoundingBox, TimeRange};
-
-    fn temporal() -> TemporalAnalysis {
-        TemporalAnalysis {
-            time_start: 0,
-            time_end: 86_400_000,
-            duration_ms: 86_400_000,
-            duration_human: "1 day".to_string(),
-            unique_timestamps: 1_000,
-            distribution: TemporalDistribution::Uniform,
-            recommended_bucket_ms: 3_600_000,
-            recommended_bucket_human: "1 hour".to_string(),
-            hourly_distribution: vec![0; 24],
-            daily_distribution: vec![0; 7],
-            monthly_distribution: vec![0; 12],
-            events_per_day: EventsPerDayStats {
-                min: 0.0,
-                max: 0.0,
-                avg: 0.0,
-                median: 0.0,
-                std_dev: 0.0,
-            },
-        }
-    }
 
     fn geometry(dominant: &str) -> GeometryAnalysis {
         GeometryAnalysis {
@@ -410,14 +386,12 @@ mod tests {
             source: "synthetic.parquet".to_string(),
             feature_count,
             bounds: BoundingBox::new(-74.0, 40.0, -73.0, 41.0),
-            spatial: SpatialAnalysis {
-                zoom_coverage: Vec::new(),
-                hotspots: Vec::new(),
-                recommended_min_zoom: min_zoom,
-                recommended_max_zoom: max_zoom,
-                distribution: SpatialDistribution::Regional,
-            },
-            temporal: temporal(),
+            spatial: crate::test_support::sample_spatial(
+                min_zoom,
+                max_zoom,
+                SpatialDistribution::Regional,
+            ),
+            temporal: crate::test_support::sample_temporal(),
             geometry: geometry(dominant),
             density: DensityAnalysis {
                 per_zoom,

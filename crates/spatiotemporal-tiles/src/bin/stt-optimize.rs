@@ -1,7 +1,8 @@
 //! stt-optimize CLI — a thin wrapper around the library in `lib.rs`.
 
 use stt_optimize::{
-    advisors, analysis, diff, doctor, loader, measure, recommend, report, PackedTileset,
+    advisors, analysis, diff, doctor, loader, measure, order_audit, recommend, report,
+    PackedTileset,
 };
 
 use anyhow::Result;
@@ -154,6 +155,28 @@ enum Commands {
         #[arg(long)]
         strict: bool,
     },
+
+    /// Audit blob ordering on a built packed tileset: measure per-ordering
+    /// range-read cost (scrub + pan, over the directory) and recommend
+    /// `--blob-ordering`
+    OrderAudit {
+        /// Packed dataset directory (or its manifest.json)
+        #[arg(short, long)]
+        archive: PathBuf,
+
+        /// Output format: "text" or "json"
+        #[arg(long, default_value = "text")]
+        format: String,
+
+        /// Output file path (default: stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Exit non-zero if the archive's recorded ordering isn't the measured
+        /// recommendation (CI gate; passes when the ordering isn't recorded)
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -212,6 +235,12 @@ fn main() -> Result<()> {
             output,
             strict,
         } => run_doctor(&archive, sample, &format, output, strict),
+        Commands::OrderAudit {
+            archive,
+            format,
+            output,
+            strict,
+        } => run_order_audit(&archive, &format, output, strict),
     }
 }
 
@@ -466,6 +495,42 @@ fn run_doctor(
             std::process::exit(1);
         }
         eprintln!("--strict gate OK: no Warning-or-worse findings");
+    }
+    Ok(())
+}
+
+fn run_order_audit(
+    archive: &PathBuf,
+    format: &str,
+    output: Option<PathBuf>,
+    strict: bool,
+) -> Result<()> {
+    let tileset = PackedTileset::open(archive)?;
+    let report = order_audit::order_audit(&tileset)?;
+
+    let rendered = match format {
+        "json" => serde_json::to_string_pretty(&report)?,
+        _ => order_audit::format_text(&report),
+    };
+    write_or_print(&rendered, output)?;
+
+    if strict {
+        // Fail only when the archive RECORDS an ordering that isn't the measured
+        // recommendation; a legacy archive with no recorded ordering warns and
+        // passes (it can't be re-derived without a rebuild).
+        match &report.current {
+            Some(cur) if *cur != report.recommended => {
+                eprintln!(
+                    "FAIL: --strict — current ordering '{cur}' != measured recommendation '{}'",
+                    report.recommended
+                );
+                std::process::exit(1);
+            }
+            Some(_) => eprintln!("--strict gate OK: current ordering is the measured recommendation"),
+            None => eprintln!(
+                "--strict gate: current ordering not recorded (pre-2026-07 archive) — passing"
+            ),
+        }
     }
     Ok(())
 }

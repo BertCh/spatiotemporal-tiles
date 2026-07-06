@@ -1,0 +1,55 @@
+{
+  "format": "stt-packed",
+  "formatVersion": 1,
+  "capabilities": [
+    "attr-quant",
+    "coord-quant"
+  ],
+  "compression": "zstd",
+  "blobOrdering": "spatial",
+  "directory": {
+    "key": "index/41b69c93c8f13de2fd17a66f31228ab7.sttd",
+    "length": 279,
+    "directoryVersion": 5,
+    "encoding": "zstd",
+    "layout": "paged",
+    "rootLength": 85,
+    "pageCount": 2,
+    "pageEntries": 3
+  },
+  "packs": [
+    {
+      "key": "packs/85a3cf032dad79a7a6ffe4ec3c801b41.sttp",
+      "length": 3277
+    },
+    {
+      "key": "packs/debf8927f9ac4822e3f64de35d70315e.sttp",
+      "length": 1769
+    }
+  ],
+  "metadata": {
+    "name": "v1-golden",
+    "description": "Frozen formatVersion-1 byte-identity fixture",
+    "attribution": "",
+    "bounds": {
+      "min_lon": -180.0,
+      "min_lat": -85.0511,
+      "max_lon": 180.0,
+      "max_lat": 85.0511
+    },
+    "time_range": {
+      "start": 1699999200000,
+      "end": 1700006399999
+    },
+    "min_zoom": 5,
+    "max_zoom": 5,
+    "tile_count": 6,
+    "feature_count": 22,
+    "layers": [
+      "default"
+    ],
+    "properties": {},
+    "temporal_bucket_ms": 3600000,
+    "summary_tier": null
+  }
+}

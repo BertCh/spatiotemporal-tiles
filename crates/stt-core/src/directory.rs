@@ -342,6 +342,25 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
     let has_pack_id = version >= 5;
     let n = get_uvarint(bytes, &mut pos)? as usize;
     let run_count = get_uvarint(bytes, &mut pos)? as usize;
+    // Adversarial-input guard: every entry costs ≥ 8 wire bytes (8 one-byte-
+    // minimum varints) and every run ≥ 8 (v4) / 9 (v5, with the Δpack_id
+    // column), and entries + runs share this one buffer — so
+    // 8·(n + run_count) ≤ bytes.len() must hold for any decodable input
+    // (/8 blanket keeps degenerate zero-length-run v4 buffers decodable).
+    // Rejecting BEFORE the `with_capacity` calls below keeps a doctored
+    // header from forcing a huge allocation: the scratch `Key` is 56 B/entry,
+    // so the un-divided `n > bytes.len()` form of this guard still allowed a
+    // 56× amplification (a 100 MB object claiming n = 100 M entries forced a
+    // 5.6 GB allocation). Post-division the worst case is 56·(len/8) = 7×
+    // the buffer — the same as a maximally compact legitimate directory,
+    // i.e. tight without parsing (guarded by tests/adversarial_decode.rs).
+    if n.saturating_add(run_count) > bytes.len() / 8 {
+        return Err(Error::InvalidArchive(format!(
+            "directory: header claims {n} entries + {run_count} runs, more than the \
+             {}-byte buffer can hold at ≥8 bytes per record",
+            bytes.len()
+        )));
+    }
 
     // Decode the per-entry key columns into a scratch buffer; blob fields are
     // filled in during the run expansion below.
@@ -453,7 +472,9 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
         );
         pos += 4;
 
-        if cursor + run_len > n {
+        // Phrased as a subtraction (cursor ≤ n is a loop invariant) so a
+        // doctored run_len near u64::MAX can't overflow `cursor + run_len`.
+        if run_len > n - cursor {
             return Err(Error::InvalidArchive(
                 "directory: run length exceeds entry count".into(),
             ));

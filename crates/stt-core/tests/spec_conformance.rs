@@ -27,64 +27,16 @@ use stt_core::arrow_tile::{
     AttrQuant, ColumnarLayer, Coord, EncoderConfig, GeometryColumn, PropertyColumn, QuantAffine,
     DecodedLayer, VectorElem, STT_QUANT_ATTR_META_KEY, STT_QUANT_META_KEY, TRIANGLES_METADATA_KEY,
 };
-use stt_core::metadata::{
-    Metadata, SummaryAggregation, SummaryColumn, SummaryScheme, SummaryTier,
-};
+
+mod common;
+// The points/timed-linestring fixtures are shared with `reproducible_build.rs`;
+// their exact time values don't matter to these schema-lock assertions, only
+// their column *shapes* (numeric+categorical props, tight-span vertex times).
+use common::{line_fixture as line_layer, point_fixture as point_layer};
 
 /// The standard GeoArrow extension-name metadata key the spec mandates on the
 /// `geometry` field.
 const GEOARROW_EXT_KEY: &str = "ARROW:extension:name";
-
-fn point_layer() -> ColumnarLayer {
-    ColumnarLayer {
-        name: "points".to_string(),
-        feature_ids: vec![1, 2, 3],
-        start_times: vec![1000, 2000, 3000],
-        end_times: vec![1500, 2500, 3500],
-        geometry: GeometryColumn::Point(vec![
-            [-122.4, 37.7],
-            [-122.5, 37.8],
-            [-122.6, 37.9],
-        ]),
-        vertex_times: None,
-        vertex_values: None,
-        triangles: None,
-        vertex_value_matrix: None,
-        properties: vec![
-            (
-                "speed".to_string(),
-                PropertyColumn::Numeric(vec![Some(10.0), None, Some(30.0)]),
-            ),
-            (
-                "kind".to_string(),
-                PropertyColumn::Categorical(vec![
-                    Some("car".to_string()),
-                    Some("bus".to_string()),
-                    None,
-                ]),
-            ),
-        ],
-    }
-}
-
-fn line_layer() -> ColumnarLayer {
-    ColumnarLayer {
-        name: "tracks".to_string(),
-        feature_ids: vec![10, 11],
-        start_times: vec![0, 100],
-        end_times: vec![50, 200],
-        geometry: GeometryColumn::LineString(vec![
-            vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]],
-            vec![[5.0, 5.0], [6.0, 6.0]],
-        ]),
-        // A tight temporal span → u16-delta vertex-time encoding (per spec).
-        vertex_times: Some(vec![vec![0, 25, 50], vec![100, 200]]),
-        vertex_values: None,
-        triangles: None,
-        vertex_value_matrix: None,
-        properties: vec![],
-    }
-}
 
 fn polygon_layer(triangles: Option<Vec<Vec<u32>>>) -> ColumnarLayer {
     ColumnarLayer {
@@ -536,123 +488,3 @@ fn vertex_value_matrix_carries_consistent_bucket_count() {
     }
 }
 
-#[test]
-fn paged_directory_encode_decode_roundtrips() {
-    // The paged `.sttd` container (packed-format §4.1): encode → decode must
-    // reproduce the entry list in directory order `(zoom, hilbert, time_start,
-    // temporal_bucket_ms)` for any page size and both framings, and the
-    // structural validator must find a clean encode clean.
-    use stt_core::TileEntry;
-    use stt_core::tile::TileId;
-    use stt_core::{decode_paged_directory, encode_paged_directory, verify_paged_structure};
-
-    let entry = |z: u8, x: u32, y: u32, ts: i64| TileEntry {
-        zoom: z,
-        x,
-        y,
-        time_start: ts,
-        time_end: ts + 3_599_000,
-        pack_id: 0,
-        offset: (x as u64) * 64,
-        length: 50 + x,
-        uncompressed_size: 100 + x,
-        feature_count: 1 + x,
-        hilbert: TileId::new(z, x, y, 0).hilbert_index(),
-        crc32c: 0xC0FFEE ^ x,
-        temporal_bucket_ms: Some(3_600_000),
-        cover_t_min: Some(ts + 250),
-    };
-    let mut entries = Vec::new();
-    for z in [4u8, 8] {
-        for i in 0..9u32 {
-            for b in 0..2i64 {
-                entries.push(entry(z, (i * 7) % (1 << z), (i * 13) % (1 << z), b * 3_600_000));
-            }
-        }
-    }
-
-    let mut want = entries.clone();
-    want.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start, e.temporal_bucket_ms));
-
-    for page_entries in [1usize, 5, 4096] {
-        for zstd in [true, false] {
-            let enc = encode_paged_directory(&entries, page_entries, zstd)
-                .expect("encode_paged_directory");
-            assert_eq!(enc.page_count, entries.len().div_ceil(page_entries));
-            let got = decode_paged_directory(&enc.bytes, enc.root_length, zstd)
-                .expect("decode_paged_directory");
-            assert_eq!(
-                got, want,
-                "paged decode must equal the directory-ordered input \
-                 (page_entries={page_entries}, zstd={zstd})"
-            );
-            let issues = verify_paged_structure(&enc.bytes, enc.root_length, zstd)
-                .expect("verify_paged_structure");
-            assert!(issues.is_empty(), "clean encode reported issues: {issues:?}");
-        }
-    }
-}
-
-#[test]
-fn summary_tier_quadbin_and_sub_buckets_roundtrip() {
-    // Both the CARTO `quadbin` scheme and multi-`sub_buckets` summary tiers are
-    // shipped + documented; they must survive the manifest JSON round-trip and
-    // the scheme must serialize with its documented lowercase spelling.
-    let tier = SummaryTier {
-        scheme: SummaryScheme::Quadbin,
-        min_zoom: 0,
-        max_zoom: 6,
-        cell_resolution_per_zoom: vec![0, 1, 2, 3, 4, 5, 6],
-        columns: vec![SummaryColumn {
-            name: "magnitude".to_string(),
-            agg: SummaryAggregation::Mean,
-        }],
-        layer_name: "summary".to_string(),
-        sub_buckets: 24,
-    };
-    let bytes = Metadata::new("q")
-        .with_summary_tier(tier)
-        .to_json_bytes()
-        .expect("serialize metadata");
-    let decoded = Metadata::from_json_bytes(&bytes).expect("deserialize metadata");
-    let dt = decoded.summary_tier.expect("summary tier round-trips");
-    assert_eq!(dt.scheme, SummaryScheme::Quadbin, "quadbin scheme survives");
-    assert_eq!(dt.sub_buckets, 24, "sub_buckets survives the round-trip");
-    assert_eq!(dt.max_zoom, 6);
-
-    let json = String::from_utf8(bytes).unwrap();
-    assert!(json.contains("quadbin"), "scheme serializes lowercase: {json}");
-    assert!(json.contains("sub_buckets"), "sub_buckets is a manifest field: {json}");
-}
-
-#[test]
-fn summary_tier_h3_defaults_to_single_sub_bucket() {
-    // A pre-`sub_buckets` manifest (the field absent) must decode to the legacy
-    // single-count behaviour via serde's documented default.
-    let json = br#"{
-        "name": "old-summary",
-        "description": "",
-        "attribution": "",
-        "bounds": {"min_lon":-180.0,"min_lat":-85.0,"max_lon":180.0,"max_lat":85.0},
-        "time_range": {"start":0,"end":1000},
-        "min_zoom": 0,
-        "max_zoom": 8,
-        "tile_count": 0,
-        "feature_count": 0,
-        "layers": ["default"],
-        "properties": {},
-        "temporal_bucket_ms": 3600000,
-        "summary_tier": {
-            "scheme": "h3",
-            "min_zoom": 0,
-            "max_zoom": 4,
-            "cell_resolution_per_zoom": [0,1,2,3,4],
-            "columns": [{"name":"magnitude","agg":"mean"}]
-        }
-    }"#;
-    let m = Metadata::from_json_bytes(json).expect("legacy summary tier decodes");
-    let dt = m.summary_tier.expect("summary tier present");
-    assert_eq!(dt.scheme, SummaryScheme::H3);
-    assert_eq!(dt.sub_buckets, 1, "absent sub_buckets defaults to 1");
-    assert_eq!(dt.layer_name, "summary", "absent layer_name defaults to 'summary'");
-}
