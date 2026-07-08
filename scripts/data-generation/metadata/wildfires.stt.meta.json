@@ -39,5 +39,3 @@
     "sttBuildArgs": "--time-field timestamp --min-zoom 3 --max-zoom 12 --compression gzip"
   }
 }
-
-

@@ -13,7 +13,7 @@ all flags away.
 
 > **Internal implementation crate** of
 > [`spatiotemporal-tiles`](https://crates.io/crates/spatiotemporal-tiles):
-> this is the tiler/encoder *library* (the facade's `build` module). The
+> this is the tiler/encoder _library_ (the facade's `build` module). The
 > `stt-build` CLI ships with the facade:
 >
 > ```bash

@@ -4,8 +4,19 @@
     {
       "AllowedOrigins": ["*"],
       "AllowedMethods": ["GET", "HEAD"],
-      "AllowedHeaders": ["Range", "If-Match", "If-None-Match", "If-Modified-Since"],
-      "ExposeHeaders": ["Content-Range", "Content-Length", "Accept-Ranges", "ETag", "Last-Modified"],
+      "AllowedHeaders": [
+        "Range",
+        "If-Match",
+        "If-None-Match",
+        "If-Modified-Since"
+      ],
+      "ExposeHeaders": [
+        "Content-Range",
+        "Content-Length",
+        "Accept-Ranges",
+        "ETag",
+        "Last-Modified"
+      ],
       "MaxAgeSeconds": 86400
     }
   ]

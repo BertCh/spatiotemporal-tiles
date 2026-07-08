@@ -54,15 +54,15 @@ python3 -m venv venv
 
 Useful knobs (`--help` for all):
 
-| flag | default | meaning |
-|------|---------|---------|
-| `--particles` | 20000 | number of seed particles |
-| `--step-days` | 5 | vertex cadence (one point every N days) |
-| `--substeps` | 5 | RK4 integration substeps per output step (accuracy) |
-| `--lat-limit` | 80 | don't seed poleward of ±this latitude |
-| `--seed` | 42 | RNG seed — reproducible particle clouds |
-| `--max-zoom` | 5 | stt-build max zoom |
-| `--temporal-bucket` | 5d | stt-build time bucket (match `--step-days`) |
+| flag                | default | meaning                                             |
+| ------------------- | ------- | --------------------------------------------------- |
+| `--particles`       | 20000   | number of seed particles                            |
+| `--step-days`       | 5       | vertex cadence (one point every N days)             |
+| `--substeps`        | 5       | RK4 integration substeps per output step (accuracy) |
+| `--lat-limit`       | 80      | don't seed poleward of ±this latitude               |
+| `--seed`            | 42      | RNG seed — reproducible particle clouds             |
+| `--max-zoom`        | 5       | stt-build max zoom                                  |
+| `--temporal-bucket` | 5d      | stt-build time bucket (match `--step-days`)         |
 
 Particles that beach (hit a land/ice NaN cell) end their track; tracks are
 split at the antimeridian so nothing draws across the dateline.
@@ -80,18 +80,18 @@ The showcase entry lives in `examples/showcase/src/datasets.ts` under id
 
 ## Output schema (stt-build LineString contract)
 
-| column | type | notes |
-|--------|------|-------|
-| `geometry` | WKB `Binary` | LineString (lon, lat) |
-| `timestamp` | `Int64` | track start, Unix-ms (`--time-format unix-ms`) |
-| `end_timestamp` | `Int64` | track end, Unix-ms (`--end-time-field`) |
-| `vertex_timestamps` | `List<Int64>` | absolute Unix-ms, one per vertex |
-| `vertex_values` | `List<Float32>` | current speed (m/s), one per vertex |
-| `speed` | `Float64` | mean speed along track (numeric property) |
-| `seed_lat` | `Float64` | seeding latitude (numeric property) |
-| `basin` | `Utf8` | coarse ocean-basin label (categorical) |
+| column              | type            | notes                                          |
+| ------------------- | --------------- | ---------------------------------------------- |
+| `geometry`          | WKB `Binary`    | LineString (lon, lat)                          |
+| `timestamp`         | `Int64`         | track start, Unix-ms (`--time-format unix-ms`) |
+| `end_timestamp`     | `Int64`         | track end, Unix-ms (`--end-time-field`)        |
+| `vertex_timestamps` | `List<Int64>`   | absolute Unix-ms, one per vertex               |
+| `vertex_values`     | `List<Float32>` | current speed (m/s), one per vertex            |
+| `speed`             | `Float64`       | mean speed along track (numeric property)      |
+| `seed_lat`          | `Float64`       | seeding latitude (numeric property)            |
+| `basin`             | `Utf8`          | coarse ocean-basin label (categorical)         |
 
 ## Citation
 
-ECCO Consortium et al. (2021), *ECCO Central Estimate (Version 4 Release 4)*,
+ECCO Consortium et al. (2021), _ECCO Central Estimate (Version 4 Release 4)_,
 NASA PO.DAAC. DOI [10.5067/ECG5D-OVE44](https://doi.org/10.5067/ECG5D-OVE44).

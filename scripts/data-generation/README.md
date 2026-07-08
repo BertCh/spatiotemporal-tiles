@@ -27,21 +27,21 @@ See the [Data Generation Guide](../../docs/guides/data-generation.md) for full d
 Most datasets auto-download from their source; a few take a local `--input`
 (e.g. BIXI). Run `stt-generate <subcommand> --help` for per-dataset flags.
 
-| Dataset | Source | Command |
-|---------|--------|---------|
-| Earthquakes | USGS API | `stt-generate earthquakes` |
-| AIS Maritime | NOAA Marine Cadastre | `stt-generate ais --date 2024-01-01` |
-| Flight Traffic | OpenSky Network | `stt-generate flights --date 2020-01-06` |
-| Hurricanes | NOAA IBTrACS | `stt-generate hurricanes` |
-| Wildfires | NIFC | `stt-generate wildfires` |
-| NYC Rideshare | TLC + OSRM | `stt-generate nyc-rideshare --download 2016-01` |
-| NYC Taxi Points | derived from rideshare | `stt-generate nyc-taxi-points` |
-| BIXI Flowmap | BIXI Montréal open data | `stt-generate bixi --input <csv>` |
-| Satellites | CelesTrak TLE | `stt-generate satellites` |
-| Ocean Drifters | NOAA GDP | `stt-generate drifters` (or `drifters-hourly`) |
-| Animal Migration | Movebank | `stt-generate animals` |
-| OSM Edits | OSM changesets | `stt-generate osm-edits` |
-| Storm Radar | NEXRAD Level II | `stt-generate storms` |
+| Dataset          | Source                  | Command                                         |
+| ---------------- | ----------------------- | ----------------------------------------------- |
+| Earthquakes      | USGS API                | `stt-generate earthquakes`                      |
+| AIS Maritime     | NOAA Marine Cadastre    | `stt-generate ais --date 2024-01-01`            |
+| Flight Traffic   | OpenSky Network         | `stt-generate flights --date 2020-01-06`        |
+| Hurricanes       | NOAA IBTrACS            | `stt-generate hurricanes`                       |
+| Wildfires        | NIFC                    | `stt-generate wildfires`                        |
+| NYC Rideshare    | TLC + OSRM              | `stt-generate nyc-rideshare --download 2016-01` |
+| NYC Taxi Points  | derived from rideshare  | `stt-generate nyc-taxi-points`                  |
+| BIXI Flowmap     | BIXI Montréal open data | `stt-generate bixi --input <csv>`               |
+| Satellites       | CelesTrak TLE           | `stt-generate satellites`                       |
+| Ocean Drifters   | NOAA GDP                | `stt-generate drifters` (or `drifters-hourly`)  |
+| Animal Migration | Movebank                | `stt-generate animals`                          |
+| OSM Edits        | OSM changesets          | `stt-generate osm-edits`                        |
+| Storm Radar      | NEXRAD Level II         | `stt-generate storms`                           |
 
 Run `stt-generate --help` for the authoritative subcommand list.
 
@@ -95,7 +95,7 @@ stt-build \
 Downloaded data is cached locally and gitignored:
 
 - `data/ais/` - AIS data from NOAA Marine Cadastre
-- `data/opensky-historical/` - Flight data from OpenSky Network  
+- `data/opensky-historical/` - Flight data from OpenSky Network
 - `data/` - Other cached downloads
 
 ## Utility Scripts
@@ -128,7 +128,7 @@ These produce GeoParquet for `stt-build` outside the Rust generators:
   camera), runs `argoverse_extract.py`, and deletes the raw log. Needs the
   `venv-av2` python + a release `stt-build`. Run `bash argoverse_batch.sh`.
 - `waymo_extract.py` / `waymo_batch.sh` - builds the curated Waymo Open Dataset
-  (Perception **v2.0.1**, the *modular Parquet* release) cockpit scenes. Reads the
+  (Perception **v2.0.1**, the _modular Parquet_ release) cockpit scenes. Reads the
   Parquet components with pyarrow and decodes the 5-laser LIDAR range images in
   pure numpy — **no TensorFlow / waymo-open-dataset lib** (its wheels are
   Linux-only). Deviations from the contract: no HD map (v2.0.1 ships none) and no
@@ -136,7 +136,7 @@ These produce GeoParquet for `stt-build` outside the Rust generators:
   anchored to an APPROXIMATE local lat/lon by metro and rides the cockpit's dark
   basemap. License-gated: accept the Waymo Dataset License Agreement
   (**non-commercial, no redistribution**) at waymo.com/open, then `gcloud auth
-  login`. Needs the `venv-waymo` python (`pyarrow numpy shapely pandas`) + a
+login`. Needs the `venv-waymo` python (`pyarrow numpy shapely pandas`) + a
   release `stt-build`. Run `bash waymo_batch.sh` (`FORCE=1` to rebuild).
 
 ### Python virtualenvs
@@ -145,15 +145,15 @@ The Python pipelines run out of per-domain virtualenvs in this directory (the
 heavy devkits conflict, so they are NOT merged). Each venv is reproducible from
 its `pip freeze` snapshot:
 
-| venv | requirements file | used by |
-|------|-------------------|---------|
-| `venv` | `requirements-venv.txt` | `ecco_advect.py` (ECCO advection; `requirements-ecco.txt` is the curated unpinned list, see [ECCO.md](./ECCO.md)) |
-| `venv-dl` | `requirements-dl.txt` | `download_ecco.py` (NASA Earthdata `earthaccess` download) |
-| `venv-av2` | `requirements-av2.txt` | `argoverse_extract.py` + every `argoverse_*_batch.sh` (av2 devkit) |
-| `venv-waymo` | `requirements-waymo.txt` | `waymo_extract.py` + every `waymo_*_batch.sh`, `lidar_summarize_eval.py` |
-| `venv-nuscenes` | `requirements-nuscenes.txt` | `nuscenes_extract.py`, `av_synthetic.py` (nuscenes-devkit) |
-| `venv-comma` | `requirements-comma.txt` | `comma_extract.py` (comma2k19) |
-| `venv-test` | `requirements-test.txt` | the test files below (numpy/pyarrow/scipy/shapely only) |
+| venv            | requirements file           | used by                                                                                                           |
+| --------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `venv`          | `requirements-venv.txt`     | `ecco_advect.py` (ECCO advection; `requirements-ecco.txt` is the curated unpinned list, see [ECCO.md](./ECCO.md)) |
+| `venv-dl`       | `requirements-dl.txt`       | `download_ecco.py` (NASA Earthdata `earthaccess` download)                                                        |
+| `venv-av2`      | `requirements-av2.txt`      | `argoverse_extract.py` + every `argoverse_*_batch.sh` (av2 devkit)                                                |
+| `venv-waymo`    | `requirements-waymo.txt`    | `waymo_extract.py` + every `waymo_*_batch.sh`, `lidar_summarize_eval.py`                                          |
+| `venv-nuscenes` | `requirements-nuscenes.txt` | `nuscenes_extract.py`, `av_synthetic.py` (nuscenes-devkit)                                                        |
+| `venv-comma`    | `requirements-comma.txt`    | `comma_extract.py` (comma2k19)                                                                                    |
+| `venv-test`     | `requirements-test.txt`     | the test files below (numpy/pyarrow/scipy/shapely only)                                                           |
 
 Recreate one with `python3 -m venv <name> && <name>/bin/pip install -r
 requirements-<suffix>.txt`. After changing a venv, re-freeze it

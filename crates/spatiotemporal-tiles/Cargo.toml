@@ -67,7 +67,12 @@ h3o = { version = "0.7", optional = true }
 
 # stt-serve (feature `serve`): HTTP server + runtime.
 axum = { version = "0.7", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"], optional = true }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "signal",
+], optional = true }
 
 # stt-serve Postgres backend (feature `serve-postgres`): async client +
 # pool. `tokio_postgres::Row` is exactly the `postgres::Row` stt-build's
@@ -85,7 +90,13 @@ r2d2 = { version = "0.8", optional = true }
 # light pure-Rust dependency set (stt-serve gets the PostGIS backend; the
 # bundled-DuckDB backend is a heavy C++ build, opt in via `serve-duckdb` or
 # `cli`). Library consumers should depend with `default-features = false`.
-default = ["build-cli", "optimize-cli", "validate-cli", "bundle-cli", "serve-postgres"]
+default = [
+  "build-cli",
+  "optimize-cli",
+  "validate-cli",
+  "bundle-cli",
+  "serve-postgres",
+]
 # Library re-exports: `spatiotemporal_tiles::build` / `::optimize`.
 build = ["dep:stt-build"]
 optimize = ["dep:stt-optimize"]
@@ -116,7 +127,12 @@ bundle-cli = ["cli-core"]
 # it without a backend is a compile error (see the compile_error! guard in
 # src/bin/stt-serve.rs) — enable `serve` or a `serve-*` backend instead.
 serve-core = ["build", "cli-core", "dep:axum", "dep:tokio"]
-serve-postgres = ["serve-core", "postgres", "dep:tokio-postgres", "dep:deadpool-postgres"]
+serve-postgres = [
+  "serve-core",
+  "postgres",
+  "dep:tokio-postgres",
+  "dep:deadpool-postgres",
+]
 serve-duckdb = ["serve-core", "duckdb", "dep:duckdb", "dep:r2d2"]
 # The full stt-serve binary as documented: both backends.
 serve = ["serve-postgres", "serve-duckdb"]

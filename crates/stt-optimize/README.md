@@ -40,12 +40,12 @@ The crate also houses the **style-hints profiler**
 --style-hints`: bounded per-property value profiles (numeric percentiles
 with a `[min, ~p97]` `suggested_domain`, categorical cardinality) plus a
 suggested playback duration and a layer-type hint, baked into archive
-metadata as a versioned `style_hints` block. Hints are render *defaults*
+metadata as a versioned `style_hints` block. Hints are render _defaults_
 readers may always override; old readers are unaffected.
 
 > **Internal implementation crate** of
 > [`spatiotemporal-tiles`](https://crates.io/crates/spatiotemporal-tiles):
-> the analysis *library* (the facade's `optimize` module). The
+> the analysis _library_ (the facade's `optimize` module). The
 > `stt-optimize` CLI ships with the facade:
 >
 > ```bash

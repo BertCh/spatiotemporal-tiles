@@ -8,21 +8,21 @@
  * Usage: node generate-datasets-config.js <metadata-dir> <output-file>
  */
 
-const fs = require("fs");
-const path = require("path");
+const fs = require('fs');
+const path = require('path');
 
-const METADATA_DIR = process.argv[2] || "./metadata";
+const METADATA_DIR = process.argv[2] || './metadata';
 const OUTPUT_FILE =
-  process.argv[3] || "../../examples/showcase/src/datasets.ts";
+  process.argv[3] || '../../examples/showcase/src/datasets.ts';
 
 // Dataset template configurations
 const DATASET_CONFIGS = {
-  "earthquake-activity": {
-    id: "earthquake-activity",
-    name: "Earthquake Activity",
+  'earthquake-activity': {
+    id: 'earthquake-activity',
+    name: 'Earthquake Activity',
     description:
-      "USGS earthquake archive — global M4.5+ events, 2020-01 → 2024-12",
-    type: "point",
+      'USGS earthquake archive — global M4.5+ events, 2020-01 → 2024-12',
+    type: 'point',
     timeWindow: 86400000 * 30, // 30 day window for multi-year data
     targetPlaybackSeconds: 120, // ~5 years plays in ~2 min
     initialViewState: {
@@ -34,42 +34,42 @@ const DATASET_CONFIGS = {
     },
     // Radius scales with magnitude. Earthquake energy is log-scale
     // (≈ 10^(1.5·M)), so a near-quadratic visual mapping reads better.
-    radiusProperty: "magnitude",
-    radiusUnits: "pixels",
+    radiusProperty: 'magnitude',
+    radiusUnits: 'pixels',
     radiusScale: 1,
     radiusMinPixels: 2,
     radiusMaxPixels: 40,
-    radiusTransform: "(mag) => Math.max(2, (mag - 3) * 2.2)",
+    radiusTransform: '(mag) => Math.max(2, (mag - 3) * 2.2)',
     // Color by magnitude band (categorical column emitted by stt-generate).
-    colorProperty: "mag_band",
+    colorProperty: 'mag_band',
     colorMapping: {
-      "1-M4.5-5": [254, 229, 217, 230],
-      "2-M5-6": [252, 174, 145, 230],
-      "3-M6-7": [251, 106, 74, 230],
-      "4-M7-8": [222, 45, 38, 230],
-      "5-M8+": [165, 15, 21, 240],
+      '1-M4.5-5': [254, 229, 217, 230],
+      '2-M5-6': [252, 174, 145, 230],
+      '3-M6-7': [251, 106, 74, 230],
+      '4-M7-8': [222, 45, 38, 230],
+      '5-M8+': [165, 15, 21, 240],
     },
     colorMappingDefault: [120, 120, 120, 180],
     stroked: true,
     strokeColor: [20, 20, 20, 180],
     lineWidthMinPixels: 0.5,
     legend: {
-      title: "Magnitude",
+      title: 'Magnitude',
       items: [
-        { color: "#FEE5D9", label: "M4.5–5.0" },
-        { color: "#FCAE91", label: "M5.0–6.0" },
-        { color: "#FB6A4A", label: "M6.0–7.0" },
-        { color: "#DE2D26", label: "M7.0–8.0" },
-        { color: "#A50F15", label: "M8.0+" },
+        { color: '#FEE5D9', label: 'M4.5–5.0' },
+        { color: '#FCAE91', label: 'M5.0–6.0' },
+        { color: '#FB6A4A', label: 'M6.0–7.0' },
+        { color: '#DE2D26', label: 'M7.0–8.0' },
+        { color: '#A50F15', label: 'M8.0+' },
       ],
     },
   },
   hurricanes: {
-    id: "hurricanes",
-    name: "Hurricane Tracks",
+    id: 'hurricanes',
+    name: 'Hurricane Tracks',
     description:
-      "IBTrACS historical hurricane data (Atlantic basin, 2000-2020)",
-    type: "point",
+      'IBTrACS historical hurricane data (Atlantic basin, 2000-2020)',
+    type: 'point',
     timeWindow: 86400000 * 30, // 30 days
     animationSpeed: 86400000 * 30, // 30 days per second
     initialViewState: {
@@ -81,10 +81,10 @@ const DATASET_CONFIGS = {
     },
   },
   flights: {
-    id: "flights",
-    name: "Flight Traffic",
-    description: "Simulated flight paths over continental US",
-    type: "point",
+    id: 'flights',
+    name: 'Flight Traffic',
+    description: 'Simulated flight paths over continental US',
+    type: 'point',
     timeWindow: 3600000, // 1 hour
     animationSpeed: 3600000, // 1 hour per second
     initialViewState: {
@@ -95,12 +95,12 @@ const DATASET_CONFIGS = {
       bearing: 0,
     },
   },
-  "ship-traffic": {
-    id: "ship-traffic",
-    name: "Maritime Traffic (AIS)",
+  'ship-traffic': {
+    id: 'ship-traffic',
+    name: 'Maritime Traffic (AIS)',
     description:
-      "Real AIS data from NOAA Marine Cadastre - US East Coast, Jan 1 2024",
-    type: "point",
+      'Real AIS data from NOAA Marine Cadastre - US East Coast, Jan 1 2024',
+    type: 'point',
     timeWindow: 3600000, // 1 hour
     animationSpeed: 3600000, // 1 hour per second
     initialViewState: {
@@ -111,12 +111,12 @@ const DATASET_CONFIGS = {
       bearing: 0,
     },
     legend: {
-      title: "Vessel Type",
+      title: 'Vessel Type',
       items: [
-        { color: "#4A90E2", label: "Cargo" },
-        { color: "#F5A623", label: "Tanker" },
-        { color: "#50E3C2", label: "Passenger" },
-        { color: "#B8E986", label: "Fishing" },
+        { color: '#4A90E2', label: 'Cargo' },
+        { color: '#F5A623', label: 'Tanker' },
+        { color: '#50E3C2', label: 'Passenger' },
+        { color: '#B8E986', label: 'Fishing' },
       ],
     },
   },
@@ -126,12 +126,12 @@ const DATASET_CONFIGS = {
 function loadMetadata() {
   const metadataFiles = fs
     .readdirSync(METADATA_DIR)
-    .filter((f) => f.endsWith(".meta.json"));
+    .filter((f) => f.endsWith('.meta.json'));
 
   const metadata = {};
   for (const file of metadataFiles) {
-    const datasetId = file.replace(".meta.json", "");
-    const content = fs.readFileSync(path.join(METADATA_DIR, file), "utf8");
+    const datasetId = file.replace('.meta.json', '');
+    const content = fs.readFileSync(path.join(METADATA_DIR, file), 'utf8');
     metadata[datasetId] = JSON.parse(content);
   }
 
@@ -191,10 +191,10 @@ export const datasets: Dataset[] = [
     output += `    },\n`;
     output += `    timeWindow: ${dataset.timeWindow},\n`;
     output += `    animationSpeed: ${dataset.animationSpeed},\n`;
-    output += `    initialViewState: ${JSON.stringify(dataset.initialViewState, null, 6).replace(/\n/g, "\n    ")},\n`;
+    output += `    initialViewState: ${JSON.stringify(dataset.initialViewState, null, 6).replace(/\n/g, '\n    ')},\n`;
 
     if (dataset.legend) {
-      output += `    legend: ${JSON.stringify(dataset.legend, null, 6).replace(/\n/g, "\n    ")},\n`;
+      output += `    legend: ${JSON.stringify(dataset.legend, null, 6).replace(/\n/g, '\n    ')},\n`;
     }
 
     output += `  },\n`;
@@ -215,10 +215,10 @@ export const defaultDatasetId = 'earthquake-activity';\n`;
 
 // Main
 try {
-  console.log("📝 Generating datasets configuration...");
+  console.log('📝 Generating datasets configuration...');
   console.log(`   Metadata dir: ${METADATA_DIR}`);
   console.log(`   Output file: ${OUTPUT_FILE}`);
-  console.log("");
+  console.log('');
 
   if (!fs.existsSync(METADATA_DIR)) {
     console.error(`Error: Metadata directory not found: ${METADATA_DIR}`);
@@ -231,11 +231,11 @@ try {
   const content = generateDatasetsFile(metadata);
 
   // Write output
-  fs.writeFileSync(OUTPUT_FILE, content, "utf8");
+  fs.writeFileSync(OUTPUT_FILE, content, 'utf8');
 
-  console.log("✅ Generated datasets.ts successfully");
-  console.log("");
+  console.log('✅ Generated datasets.ts successfully');
+  console.log('');
 } catch (error) {
-  console.error("Error generating datasets config:", error.message);
+  console.error('Error generating datasets config:', error.message);
   process.exit(1);
 }

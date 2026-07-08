@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "crates/stt-core",
-    "crates/stt-build",
-    "crates/stt-generate",
-    "crates/stt-optimize",
-    "crates/spatiotemporal-tiles",
+  "crates/stt-core",
+  "crates/stt-build",
+  "crates/stt-generate",
+  "crates/stt-optimize",
+  "crates/spatiotemporal-tiles",
 ]
 resolver = "2"
 
@@ -35,11 +35,23 @@ geo-traits = "0.2"
 earcutr = "0.5"
 
 # Arrow / GeoParquet ecosystem
-arrow = { version = "59", default-features = false, features = ["chrono-tz", "ipc"] }
-parquet = { version = "59", default-features = false, features = ["arrow", "flate2", "flate2-rust_backened", "snap", "zstd"] }
+arrow = { version = "59", default-features = false, features = [
+  "chrono-tz",
+  "ipc",
+] }
+parquet = { version = "59", default-features = false, features = [
+  "arrow",
+  "flate2",
+  "flate2-rust_backened",
+  "snap",
+  "zstd",
+] }
 
 # WKB / geometry decoding for input parsing
-geozero = { version = "0.14", default-features = false, features = ["with-wkb", "with-geo"] }
+geozero = { version = "0.14", default-features = false, features = [
+  "with-wkb",
+  "with-geo",
+] }
 arrow-schema = "59"
 arrow-array = "59"
 

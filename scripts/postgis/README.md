@@ -46,12 +46,12 @@ SCRATCH=scratch-postgis scripts/postgis/bench-serve.sh
 
 ## Files
 
-| file | role |
-|---|---|
-| `setup.sh` | Colima + PostGIS container + `CREATE EXTENSION postgis` |
-| `load-ibtracs.sh` | `data/ibtracs.csv` → typed `hurricane_obs` (Point/4326 + indexes) |
-| `export-points-parquet.py` | CSV dump → Parquet (the file-ingest baseline) |
-| `bench-ingest.sh` | file vs PostGIS ingest: parity (via `stt-validate`) + wall-clock |
-| `bench-serve.sh` | materialize tiles, then load-test dynamic vs static |
-| `bench_serve.py` | concurrent HTTP latency driver (percentiles, server-gen time) |
-| `gen_tile_urls.py` | sample points → `(z,x,y,t)` tile paths that contain data |
+| file                       | role                                                              |
+| -------------------------- | ----------------------------------------------------------------- |
+| `setup.sh`                 | Colima + PostGIS container + `CREATE EXTENSION postgis`           |
+| `load-ibtracs.sh`          | `data/ibtracs.csv` → typed `hurricane_obs` (Point/4326 + indexes) |
+| `export-points-parquet.py` | CSV dump → Parquet (the file-ingest baseline)                     |
+| `bench-ingest.sh`          | file vs PostGIS ingest: parity (via `stt-validate`) + wall-clock  |
+| `bench-serve.sh`           | materialize tiles, then load-test dynamic vs static               |
+| `bench_serve.py`           | concurrent HTTP latency driver (percentiles, server-gen time)     |
+| `gen_tile_urls.py`         | sample points → `(z,x,y,t)` tile paths that contain data          |
