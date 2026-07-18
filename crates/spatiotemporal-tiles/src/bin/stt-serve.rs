@@ -373,6 +373,46 @@ enum Backend {
     DuckDb(DuckPool),
 }
 
+/// Whether the parsed connection string asks for an encrypted connection.
+/// Only an explicit `sslmode=require` (or a stricter mode) opts in — the
+/// tokio-postgres default (`Prefer`) and `disable` both keep the NoTls path so
+/// existing local usage is byte-for-byte unchanged.
+#[cfg(feature = "serve-postgres")]
+fn conn_requires_tls(pg_config: &tokio_postgres::Config) -> bool {
+    !matches!(
+        pg_config.get_ssl_mode(),
+        tokio_postgres::config::SslMode::Disable | tokio_postgres::config::SslMode::Prefer
+    )
+}
+
+/// Build a pool manager that negotiates TLS. Gated behind the optional
+/// `serve-postgres-tls` cargo feature (which pulls in a TLS connector); without
+/// it, a TLS-requesting connection string fails fast with an actionable error
+/// instead of silently downgrading to plaintext.
+#[cfg(feature = "serve-postgres")]
+fn build_tls_manager(pg_config: tokio_postgres::Config) -> Result<Manager> {
+    #[cfg(feature = "serve-postgres-tls")]
+    {
+        let connector = native_tls::TlsConnector::new().context("build native-tls connector")?;
+        let tls = postgres_native_tls::MakeTlsConnector::new(connector);
+        Ok(Manager::from_config(
+            pg_config,
+            tls,
+            ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            },
+        ))
+    }
+    #[cfg(not(feature = "serve-postgres-tls"))]
+    {
+        let _ = pg_config;
+        anyhow::bail!(
+            "connection string requests TLS (sslmode=require) but stt-serve was built without \
+             TLS support — rebuild with the `serve-postgres-tls` cargo feature"
+        )
+    }
+}
+
 /// Shared, immutable server state.
 struct ServerState {
     backend: Backend,
@@ -402,7 +442,12 @@ fn tile_bbox(z: u8, x: u32, y: u32) -> [f64; 4] {
     let n = (1u64 << z) as f64;
     let min_lon = x as f64 / n * 360.0 - 180.0;
     let max_lon = (x + 1) as f64 / n * 360.0 - 180.0;
-    let lat = |yy: f64| (std::f64::consts::PI * (1.0 - 2.0 * yy / n)).sinh().atan().to_degrees();
+    let lat = |yy: f64| {
+        (std::f64::consts::PI * (1.0 - 2.0 * yy / n))
+            .sinh()
+            .atan()
+            .to_degrees()
+    };
     let max_lat = lat(y as f64);
     let min_lat = lat((y + 1) as f64);
     // The clipper pads every tile by a fixed 0.001° band
@@ -430,7 +475,11 @@ async fn tile_handler_multi(
 ) -> Response {
     match reg.datasets.get(&dataset) {
         Some(st) => serve_tile(st, z, x, y, t).await,
-        None => (StatusCode::NOT_FOUND, format!("unknown dataset '{dataset}'")).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            format!("unknown dataset '{dataset}'"),
+        )
+            .into_response(),
     }
 }
 
@@ -442,17 +491,45 @@ fn tile_in_range(z: u8, x: u32, y: u32) -> bool {
     z <= 31 && u64::from(x) < (1u64 << z) && u64::from(y) < (1u64 << z)
 }
 
+/// Whether `z` is within the archive's advertised `[min_zoom, max_zoom]`.
+/// Requests outside this band are rejected before any source query, so a very
+/// low zoom over a global source can't trigger a full-dataset scan amplifier
+/// (the tile bbox at e.g. z = 0 spans the whole world).
+fn zoom_in_served_range(z: u8, min_zoom: u8, max_zoom: u8) -> bool {
+    z >= min_zoom && z <= max_zoom
+}
+
 /// The shared tile-serving core: parse `t`, generate the tile, and build the
 /// HTTP response. Reused by the single- and multi-dataset routes.
 async fn serve_tile(st: &Arc<ServerState>, z: u8, x: u32, y: u32, t: String) -> Response {
     if !tile_in_range(z, x, y) {
-        return (StatusCode::BAD_REQUEST, "tile out of range: need z <= 31 and x, y < 2^z")
+        return (
+            StatusCode::BAD_REQUEST,
+            "tile out of range: need z <= 31 and x, y < 2^z",
+        )
+            .into_response();
+    }
+    // Reject zooms outside the archive's advertised range before touching the
+    // source: a request for a very low zoom over a global dataset would scan the
+    // whole table for a tile the client never advertises support for.
+    if !zoom_in_served_range(z, st.config.min_zoom, st.config.max_zoom) {
+        return (
+            StatusCode::NOT_FOUND,
+            format!(
+                "zoom {z} outside served range {}..={}",
+                st.config.min_zoom, st.config.max_zoom
+            ),
+        )
             .into_response();
     }
     let t_ms = match t.trim_end_matches(".stt").parse::<i64>() {
         Ok(v) => v,
         Err(_) => {
-            return (StatusCode::BAD_REQUEST, "t must be an integer (ms since epoch)").into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                "t must be an integer (ms since epoch)",
+            )
+                .into_response()
         }
     };
     match build_tile(st, z, x, y, t_ms).await {
@@ -469,7 +546,11 @@ async fn serve_tile(st: &Arc<ServerState>, z: u8, x: u32, y: u32, t: String) -> 
             // Full error chain (SQL, connection strings, …) goes to the log
             // only — clients get an opaque 500.
             tracing::error!("tile {z}/{x}/{y}/{t_ms} failed: {e:#}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error generating tile").into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error generating tile",
+            )
+                .into_response()
         }
     }
 }
@@ -618,7 +699,11 @@ async fn metadata_handler_multi(
 ) -> Response {
     match reg.datasets.get(&dataset) {
         Some(st) => Json(st.metadata.clone()).into_response(),
-        None => (StatusCode::NOT_FOUND, format!("unknown dataset '{dataset}'")).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            format!("unknown dataset '{dataset}'"),
+        )
+            .into_response(),
     }
 }
 
@@ -628,9 +713,7 @@ async fn datasets_handler(State(reg): State<Arc<Registry>>) -> Json<serde_json::
     names.sort();
     let list: Vec<serde_json::Value> = names
         .into_iter()
-        .map(|name| {
-            serde_json::json!({ "name": name, "metadata": reg.datasets[name].metadata })
-        })
+        .map(|name| serde_json::json!({ "name": name, "metadata": reg.datasets[name].metadata }))
         .collect();
     Json(serde_json::json!({ "datasets": list }))
 }
@@ -729,7 +812,10 @@ async fn load_metadata_pg(
             FROM {source} \
          ) q",
     );
-    let row = client.query_one(&sql, &[]).await.context("metadata aggregate query")?;
+    let row = client
+        .query_one(&sql, &[])
+        .await
+        .context("metadata aggregate query")?;
     let t_start: Option<f64> = row.get(4);
     let t_end: Option<f64> = row.get(5);
     let heatmap = load_heatmap_pg(
@@ -779,7 +865,10 @@ async fn load_heatmap_pg(
                         percentile_cont(0.95) WITHIN GROUP (ORDER BY {wq})::float8 \
                  FROM {source} WHERE {wq} IS NOT NULL"
             );
-            let row = client.query_one(&sql, &[]).await.context("heatmap aggregate")?;
+            let row = client
+                .query_one(&sql, &[])
+                .await
+                .context("heatmap aggregate")?;
             let mn: Option<f64> = row.get(0);
             let mx: Option<f64> = row.get(1);
             match mn {
@@ -801,7 +890,10 @@ async fn load_heatmap_pg(
                  FROM {source} WHERE {wq} IS NOT NULL AND {cq} IS NOT NULL \
                  GROUP BY {cq} ORDER BY {cq} LIMIT 8"
             );
-            let rows = client.query(&sql, &[]).await.context("heatmap class aggregate")?;
+            let rows = client
+                .query(&sql, &[])
+                .await
+                .context("heatmap class aggregate")?;
             rows.iter()
                 .map(|r| {
                     let id: String = r.get(0);
@@ -822,7 +914,10 @@ async fn load_heatmap_pg(
                 "SELECT {cq}::text AS cls FROM {source} WHERE {cq} IS NOT NULL \
                  GROUP BY {cq} ORDER BY {cq} LIMIT 8"
             );
-            let rows = client.query(&sql, &[]).await.context("heatmap class enum")?;
+            let rows = client
+                .query(&sql, &[])
+                .await
+                .context("heatmap class enum")?;
             rows.iter()
                 .map(|r| HeatmapClassDomain {
                     id: r.get(0),
@@ -855,7 +950,9 @@ fn load_metadata_duckdb(
         args.time_format,
         args.source_srid,
     );
-    let mut stmt = conn.prepare(&sql).context("prepare DuckDB metadata query")?;
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("prepare DuckDB metadata query")?;
     let mut rows = stmt.query([]).context("DuckDB metadata query")?;
     let row = rows
         .next()
@@ -936,7 +1033,9 @@ fn load_heatmap_duckdb(
                  FROM {source} WHERE {wq} IS NOT NULL AND {cq} IS NOT NULL \
                  GROUP BY {cq} ORDER BY {cq} LIMIT 8"
             );
-            let mut stmt = conn.prepare(&sql).context("prepare heatmap class aggregate")?;
+            let mut stmt = conn
+                .prepare(&sql)
+                .context("prepare heatmap class aggregate")?;
             let mut rows = stmt.query([]).context("heatmap class aggregate")?;
             let mut out = Vec::new();
             while let Some(row) = rows.next().context("heatmap class row")? {
@@ -1067,10 +1166,16 @@ fn build_config(
         enc_enabled.push(format!("vector-groups={}", encoder.vector_groups.len()));
     }
     if !encoder.point_elevation_column.is_empty() {
-        enc_enabled.push(format!("point-elevation-column={}", encoder.point_elevation_column));
+        enc_enabled.push(format!(
+            "point-elevation-column={}",
+            encoder.point_elevation_column
+        ));
     }
     if encoder.vertex_time_max_step_ms != stt_core::arrow_tile::DEFAULT_VERTEX_TIME_MAX_STEP_MS {
-        enc_enabled.push(format!("vertex-time-precision={}ms", encoder.vertex_time_max_step_ms));
+        enc_enabled.push(format!(
+            "vertex-time-precision={}ms",
+            encoder.vertex_time_max_step_ms
+        ));
     }
     if !enc_enabled.is_empty() {
         tracing::info!("Encoder settings ENABLED: {}", enc_enabled.join(", "));
@@ -1156,7 +1261,10 @@ fn build_config(
         active.push(format!("max-zoom-field={z}"));
     }
     if args.min_features_per_tile != 1 {
-        active.push(format!("min-features-per-tile={}", args.min_features_per_tile));
+        active.push(format!(
+            "min-features-per-tile={}",
+            args.min_features_per_tile
+        ));
     }
     if let Some(srid) = args.source_srid {
         active.push(format!("source-srid={srid}"));
@@ -1250,7 +1358,9 @@ async fn build_dataset_state(args: &Args) -> Result<(String, ServerState)> {
                 where_clause: None,
                 reproject_from_srid: args.source_srid,
             };
-            let conn = pool.get().context("get DuckDB connection for schema probe")?;
+            let conn = pool
+                .get()
+                .context("get DuckDB connection for schema probe")?;
             match duckdb_input::property_kinds_on(
                 &conn,
                 &probe_spec,
@@ -1275,14 +1385,23 @@ async fn build_dataset_state(args: &Args) -> Result<(String, ServerState)> {
             .or_else(|| std::env::var("STT_POSTGRES_URL").ok())
             .or_else(|| std::env::var("DATABASE_URL").ok());
         if let Some(conn) = pg_conn {
-            let pg_config: tokio_postgres::Config = conn.parse().context("parse connection string")?;
-            let mgr = Manager::from_config(
-                pg_config,
-                NoTls,
-                ManagerConfig {
-                    recycling_method: RecyclingMethod::Fast,
-                },
-            );
+            let pg_config: tokio_postgres::Config =
+                conn.parse().context("parse connection string")?;
+            // Opt-in TLS: the default (and `sslmode=disable`/`prefer`) keeps the
+            // historical NoTls path so local dev is unchanged. `sslmode=require`
+            // (or a stricter mode) in the connection string opts into an
+            // encrypted connection.
+            let mgr = if conn_requires_tls(&pg_config) {
+                build_tls_manager(pg_config)?
+            } else {
+                Manager::from_config(
+                    pg_config,
+                    NoTls,
+                    ManagerConfig {
+                        recycling_method: RecyclingMethod::Fast,
+                    },
+                )
+            };
             let pool = PgPool::builder(mgr)
                 .max_size(args.pool_size)
                 .build()
@@ -1300,7 +1419,10 @@ async fn build_dataset_state(args: &Args) -> Result<(String, ServerState)> {
                 reproject_from_srid: args.source_srid,
             }
             .wrapped_query();
-            let client = pool.get().await.context("get PG connection for schema probe")?;
+            let client = pool
+                .get()
+                .await
+                .context("get PG connection for schema probe")?;
             match client.prepare(&probe).await {
                 Ok(stmt) => {
                     config.property_types = Arc::new(postgres_input::property_kinds_from_columns(
@@ -1411,7 +1533,12 @@ async fn main() -> Result<()> {
             // `/tiles/…` template only exists in single-dataset mode).
             state.metadata["tileUrlTemplate"] =
                 serde_json::Value::String(format!("/{name}/tiles/{{z}}/{{x}}/{{y}}/{{t}}.stt"));
-            tracing::info!("dataset '{name}' ready ({} zoom {}..={})", ds.temporal_bucket, ds.min_zoom, ds.max_zoom);
+            tracing::info!(
+                "dataset '{name}' ready ({} zoom {}..={})",
+                ds.temporal_bucket,
+                ds.min_zoom,
+                ds.max_zoom
+            );
             datasets.insert(name, Arc::new(state));
         }
         let n = datasets.len();
@@ -1472,6 +1599,34 @@ mod tests {
         assert!(!tile_in_range(32, 0, 0));
         assert!(!tile_in_range(64, 0, 0));
         assert!(!tile_in_range(255, 0, 0));
+    }
+
+    #[test]
+    fn zoom_in_served_range_rejects_out_of_band() {
+        // In-band zooms pass; a request below min_zoom or above max_zoom (which
+        // would otherwise trigger a full-dataset scan for an unserved tile) is
+        // rejected.
+        assert!(zoom_in_served_range(5, 0, 14));
+        assert!(zoom_in_served_range(0, 0, 14));
+        assert!(zoom_in_served_range(14, 0, 14));
+        assert!(!zoom_in_served_range(15, 0, 14));
+        assert!(!zoom_in_served_range(1, 2, 10));
+        assert!(!zoom_in_served_range(11, 2, 10));
+    }
+
+    #[cfg(feature = "serve-postgres")]
+    #[test]
+    fn tls_is_opt_in_via_sslmode_require() {
+        // Default (Prefer) and explicit disable both keep the NoTls path so
+        // local dev is unchanged; only sslmode=require opts into TLS.
+        let default: tokio_postgres::Config = "host=localhost user=u".parse().unwrap();
+        assert!(!conn_requires_tls(&default));
+        let disable: tokio_postgres::Config =
+            "host=localhost user=u sslmode=disable".parse().unwrap();
+        assert!(!conn_requires_tls(&disable));
+        let require: tokio_postgres::Config =
+            "host=localhost user=u sslmode=require".parse().unwrap();
+        assert!(conn_requires_tls(&require));
     }
 
     #[test]
@@ -1580,7 +1735,11 @@ mod tests {
             );
         }
         // The advisory heatmap key specifically must be the camelCase spelling.
-        assert!(obj.contains_key("heatmapDomain"), "keys: {:?}", obj.keys().collect::<Vec<_>>());
+        assert!(
+            obj.contains_key("heatmapDomain"),
+            "keys: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
         assert!(!obj.contains_key("heatmap_domain"));
     }
 
@@ -1606,9 +1765,14 @@ mod tests {
             "/../../docs/api/cli-reference.md"
         ))
         .expect("read docs/api/cli-reference.md");
-        let start = doc.find("## `stt-serve`").expect("stt-serve section heading");
+        let start = doc
+            .find("## `stt-serve`")
+            .expect("stt-serve section heading");
         let body = &doc[start + 1..];
-        let end = body.find("\n## `").map(|i| start + 1 + i).unwrap_or(doc.len());
+        let end = body
+            .find("\n## `")
+            .map(|i| start + 1 + i)
+            .unwrap_or(doc.len());
         let section = &doc[start..end];
         let missing: Vec<String> = Args::command()
             .get_arguments()

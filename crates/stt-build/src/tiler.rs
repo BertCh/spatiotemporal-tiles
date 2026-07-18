@@ -11,9 +11,9 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use stt_core::arrow_tile::ColumnarLayer;
 #[cfg(test)]
 use stt_core::arrow_tile::encode_tile;
+use stt_core::arrow_tile::ColumnarLayer;
 use stt_core::budget::TileBudget;
 use stt_core::projection;
 use stt_core::tile::TileId;
@@ -830,7 +830,9 @@ fn place_polygon<'a>(
         return place_whole_feature(feature, zoom, counters);
     }
     if max_lon - min_lon > 180.0 {
-        counters.antimeridian_fallback.fetch_add(1, Ordering::Relaxed);
+        counters
+            .antimeridian_fallback
+            .fetch_add(1, Ordering::Relaxed);
         return place_whole_feature(feature, zoom, counters);
     }
     let rep_tile = projection::lonlat_to_tile(feature.lon, feature.lat, zoom).ok();
@@ -944,8 +946,7 @@ fn place_polyline<'a>(
         max_lon = max_lon.max(c[0]);
         max_lat = max_lat.max(c[1]);
     }
-    if !(min_lon.is_finite() && min_lat.is_finite() && max_lon.is_finite() && max_lat.is_finite())
-    {
+    if !(min_lon.is_finite() && min_lat.is_finite() && max_lon.is_finite() && max_lat.is_finite()) {
         return place_whole_feature(feature, zoom, counters);
     }
     // Fast path: fully inside the representative tile's buffered rect —
@@ -1081,7 +1082,9 @@ fn place_polyline<'a>(
         }
         let synthetic = geojson::Feature {
             bbox: None,
-            geometry: Some(geojson::Geometry::new(geojson::Value::LineString(part.clone()))),
+            geometry: Some(geojson::Geometry::new(geojson::Value::LineString(
+                part.clone(),
+            ))),
             id: feature.geojson.id.clone(),
             properties: None,
             foreign_members: None,
@@ -1122,8 +1125,11 @@ fn place_polyline<'a>(
             } else {
                 geojson::Value::MultiLineString(geom_parts)
             };
-            let vertex_timestamps = supplied_times
-                .map(|_| segs.iter().flat_map(|s| s.timestamps.iter().copied()).collect());
+            let vertex_timestamps = supplied_times.map(|_| {
+                segs.iter()
+                    .flat_map(|s| s.timestamps.iter().copied())
+                    .collect()
+            });
             let vertex_values = supplied_values.map(|_| {
                 segs.iter()
                     .flat_map(|s| s.vertex_values.iter().copied())
@@ -1200,7 +1206,13 @@ fn place_non_trajectory<'a>(
                 // honour the user's explicit whole-trajectory placement.
                 place_whole_feature(feature, zoom, counters)
             } else {
-                place_polyline(feature, std::slice::from_ref(coords), zoom, clip_config, counters)
+                place_polyline(
+                    feature,
+                    std::slice::from_ref(coords),
+                    zoom,
+                    clip_config,
+                    counters,
+                )
             }
         }
         G::MultiLineString(parts) => {
@@ -1298,9 +1310,13 @@ fn process_zoom_level(
 
     // Build tiles in parallel: each spatial cell is chunked into temporal
     // buckets, and every (cell, bucket) pair becomes one tile.
+    // Per-layer build errors are already logged-and-skipped inside `build_tile`
+    // (a bad layer never discards the tile's other features). Any error that
+    // still escapes `build_tile` is genuinely tile-fatal, so propagate it rather
+    // than silently swallowing a whole tile.
     let tiles: Vec<GeneratedTile> = spatial
         .into_par_iter()
-        .flat_map(|((x, y), feats)| {
+        .map(|((x, y), feats)| -> Result<Vec<GeneratedTile>> {
             let buckets = match config.adaptive_target_features {
                 Some(target) => chunk_adaptive_by_count(feats, target),
                 None => chunk_by_temporal_bucket(feats, config.temporal_bucket_ms),
@@ -1316,14 +1332,17 @@ fn process_zoom_level(
                     .max()
                     .unwrap_or(bucket_start + config.temporal_bucket_ms);
                 let id = TileId::new(zoom, x, y, bucket_start);
-                match build_tile(id, &chunk, config, bucket_start as i64, time_end as i64) {
-                    Ok(Some(tile)) => out.push(tile),
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!("failed to build tile {id:?}: {e}"),
+                if let Some(tile) =
+                    build_tile(id, &chunk, config, bucket_start as i64, time_end as i64)?
+                {
+                    out.push(tile);
                 }
             }
-            out
+            Ok(out)
         })
+        .collect::<Result<Vec<Vec<GeneratedTile>>>>()?
+        .into_iter()
+        .flatten()
         .collect();
 
     Ok(tiles)
@@ -1362,9 +1381,7 @@ fn chunk_adaptive_by_count(
     for f in features {
         if current.is_empty() {
             current_start = f.timestamp();
-        } else if current.len() >= target
-            && f.timestamp() != current.last().unwrap().timestamp()
-        {
+        } else if current.len() >= target && f.timestamp() != current.last().unwrap().timestamp() {
             // Window is full and the next feature opens a new timestamp — close
             // here so two windows can't share a start time (TileId collision).
             out.push((current_start, std::mem::take(&mut current)));
@@ -1398,9 +1415,7 @@ fn build_tile(
     // Materialise the surviving feature list only when the budget actually
     // dropped something; otherwise reference the originals in place.
     let kept_features: Vec<&TileFeature> = match &kept_indices {
-        Some(keep) if keep.len() < features.len() => {
-            keep.iter().map(|&i| &features[i]).collect()
-        }
+        Some(keep) if keep.len() < features.len() => keep.iter().map(|&i| &features[i]).collect(),
         _ => features.iter().collect(),
     };
 
@@ -1416,12 +1431,19 @@ fn build_tile(
 
     let mut layers: Vec<ColumnarLayer> = Vec::new();
 
+    // A failure building ONE layer must not discard the whole tile's other
+    // features (the clipped-segment layer and the whole-feature layer are
+    // independent). Log the failing layer's feature count and skip just that
+    // layer; if every layer fails the tile collapses to `Ok(None)` below,
+    // exactly as an empty tile would.
     if !segments.is_empty() {
-        layers.push(build_layer_from_segments(
-            &segments,
-            &config.layer_name,
-            &config.columnar_options(),
-        )?);
+        match build_layer_from_segments(&segments, &config.layer_name, &config.columnar_options()) {
+            Ok(layer) => layers.push(layer),
+            Err(e) => tracing::warn!(
+                "tile {id:?}: dropping {} clipped-segment feature(s); layer build failed: {e}",
+                segments.len()
+            ),
+        }
     }
     if !originals.is_empty() {
         // Suffix the originals layer name when clipped segments are also
@@ -1431,11 +1453,13 @@ fn build_tile(
         } else {
             format!("{}_originals", config.layer_name)
         };
-        layers.extend(build_layers_from_features_with(
-            &originals,
-            &base,
-            config.columnar_options(),
-        )?);
+        match build_layers_from_features_with(&originals, &base, config.columnar_options()) {
+            Ok(built) => layers.extend(built),
+            Err(e) => tracing::warn!(
+                "tile {id:?}: dropping {} whole-feature(s); layer build failed: {e}",
+                originals.len()
+            ),
+        }
     }
 
     if layers.is_empty() {
@@ -1508,11 +1532,7 @@ fn geojson_vertex_count(f: &geojson::Feature) -> usize {
 /// Run a tile's gathered features through the budget, returning the indices to
 /// KEEP (ascending). Logs the per-tile dropped count whenever anything is
 /// dropped — the "no silent caps" guarantee.
-fn apply_tile_budget(
-    budget: &TileBudget,
-    id: TileId,
-    features: &[TileFeature],
-) -> Vec<usize> {
+fn apply_tile_budget(budget: &TileBudget, id: TileId, features: &[TileFeature]) -> Vec<usize> {
     let keep = budget.enforce_indexed(
         features.len(),
         |i| {
@@ -1548,8 +1568,7 @@ fn apply_tile_budget(
 fn pack_encoder_config(writer: &stt_core::PackWriter) -> stt_core::arrow_tile::EncoderConfig {
     stt_core::arrow_tile::EncoderConfig {
         format_version: writer.format_version(),
-        template_collector: (writer.format_version()
-            == stt_core::pack::PACKED_FORMAT_VERSION_V2)
+        template_collector: (writer.format_version() == stt_core::pack::PACKED_FORMAT_VERSION_V2)
             .then(|| writer.template_collector()),
         ..stt_core::arrow_tile::EncoderConfig::from_globals()
     }
@@ -1587,7 +1606,11 @@ fn encode_and_add_tiles(
 ) -> Result<()> {
     let encoder = pack_encoder_config(writer);
     let budget = writer.memory_budget();
-    let byte_cap: u64 = if budget > 0 { (budget / 4).max(1) } else { u64::MAX };
+    let byte_cap: u64 = if budget > 0 {
+        (budget / 4).max(1)
+    } else {
+        u64::MAX
+    };
     // Unlimited budget: one wave = the whole chunk (the legacy single
     // par_iter). Budgeted: waves of `workers` tiles, so at most one wave's
     // encoded bytes overshoot the cap.
@@ -1608,9 +1631,7 @@ fn encode_and_add_tiles(
                 let wave_end = (end + wave).min(chunk.len());
                 let encoded: Vec<Vec<u8>> = chunk[end..wave_end]
                     .par_iter()
-                    .map(|(tile, _)| {
-                        stt_core::arrow_tile::encode_tile_with(&tile.layers, &encoder)
-                    })
+                    .map(|(tile, _)| stt_core::arrow_tile::encode_tile_with(&tile.layers, &encoder))
                     .collect::<std::result::Result<Vec<_>, stt_core::Error>>()?;
                 bytes += encoded.iter().map(|p| p.len() as u64).sum::<u64>();
                 payloads.extend(encoded);
@@ -1657,7 +1678,8 @@ pub fn write_tiles_parallel(
 /// encoded with [`pack_encoder_config`] (frame version follows the writer).
 impl TileWriter for stt_core::PackWriter {
     fn write_tile(&mut self, tile: &GeneratedTile) -> Result<()> {
-        let payload = stt_core::arrow_tile::encode_tile_with(&tile.layers, &pack_encoder_config(self))?;
+        let payload =
+            stt_core::arrow_tile::encode_tile_with(&tile.layers, &pack_encoder_config(self))?;
         self.add_tile_full(
             &tile.id,
             tile.time_start,
@@ -1673,8 +1695,7 @@ impl TileWriter for stt_core::PackWriter {
     /// Batch write with parallel encode (on the caller's current rayon pool)
     /// and strictly ordered hand-off — see [`encode_and_add_tiles`].
     fn write_tiles(&mut self, tiles: &[&GeneratedTile]) -> Result<()> {
-        let tagged: Vec<(&GeneratedTile, Option<u64>)> =
-            tiles.iter().map(|t| (*t, None)).collect();
+        let tagged: Vec<(&GeneratedTile, Option<u64>)> = tiles.iter().map(|t| (*t, None)).collect();
         encode_and_add_tiles(self, &tagged, || {})
     }
 }
@@ -1695,7 +1716,8 @@ impl LodTileWriter for stt_core::PackWriter {
         tile: &GeneratedTile,
         temporal_bucket_ms: Option<u64>,
     ) -> Result<()> {
-        let payload = stt_core::arrow_tile::encode_tile_with(&tile.layers, &pack_encoder_config(self))?;
+        let payload =
+            stt_core::arrow_tile::encode_tile_with(&tile.layers, &pack_encoder_config(self))?;
         self.add_tile_full(
             &tile.id,
             tile.time_start,
@@ -1713,8 +1735,8 @@ impl LodTileWriter for stt_core::PackWriter {
 mod tests {
     use super::*;
     use geojson::{Feature, Geometry, Value as GeomValue};
-    use stt_core::{BlobOrdering, PackWriter, PackedReader};
     use stt_core::metadata::Metadata;
+    use stt_core::{BlobOrdering, PackWriter, PackedReader};
 
     fn point(lon: f64, lat: f64, ts: u64) -> ParsedFeature {
         let props = serde_json::json!({ "v": ts as f64 })
@@ -1785,15 +1807,24 @@ mod tests {
         assert_eq!(rows, 2, "only the two points in this (tile, bucket)");
 
         // A different spatial cell is empty.
-        assert!(encode_single_tile(&feats, z, x + 9, y, bucket_start as i64, &config, &enc)
-            .unwrap()
-            .is_none());
+        assert!(
+            encode_single_tile(&feats, z, x + 9, y, bucket_start as i64, &config, &enc)
+                .unwrap()
+                .is_none()
+        );
 
         // The next bucket carries the single later point.
-        let next =
-            encode_single_tile(&feats, z, x, y, (bucket_start + bucket_ms) as i64, &config, &enc)
-            .unwrap()
-            .expect("next bucket tile");
+        let next = encode_single_tile(
+            &feats,
+            z,
+            x,
+            y,
+            (bucket_start + bucket_ms) as i64,
+            &config,
+            &enc,
+        )
+        .unwrap()
+        .expect("next bucket tile");
         let n: usize = decode_tile(&next)
             .unwrap()
             .iter()
@@ -1961,7 +1992,8 @@ mod tests {
         );
 
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
+        let mut writer =
+            PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
         for tile in &tiles {
             writer.write_tile(tile).unwrap();
         }
@@ -2003,20 +2035,23 @@ mod tests {
         assert!(!tiles.is_empty(), "expected tiles to be generated");
 
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
+        let mut writer =
+            PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
         for tile in &tiles {
             writer.write_tile(tile).unwrap();
         }
-        let total_features: usize =
-            tiles.iter().map(|t| t.feature_count() as usize).sum();
+        let total_features: usize = tiles.iter().map(|t| t.feature_count() as usize).sum();
         writer.finalize(&Metadata::new("e2e-points")).unwrap();
 
         let reader = PackedReader::open(dir.path().join("manifest.json")).unwrap();
         assert_eq!(reader.entries().len(), tiles.len());
 
         // Every feature is represented somewhere (summed over all tiles).
-        let archived: usize =
-            reader.entries().iter().map(|e| e.feature_count as usize).sum();
+        let archived: usize = reader
+            .entries()
+            .iter()
+            .map(|e| e.feature_count as usize)
+            .sum();
         assert_eq!(archived, total_features);
 
         // Decode one tile and confirm its Arrow layer is intact.
@@ -2067,30 +2102,34 @@ mod tests {
         let dir_par = tempfile::tempdir().unwrap();
         let mut w_par =
             PackWriter::create(dir_par.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
-        let tagged: Vec<(&GeneratedTile, Option<u64>)> =
-            tiles.iter().map(|t| (t, None)).collect();
+        let tagged: Vec<(&GeneratedTile, Option<u64>)> = tiles.iter().map(|t| (t, None)).collect();
         let mut written = 0usize;
         write_tiles_parallel(&mut w_par, &tagged, 4, || written += 1).unwrap();
         assert_eq!(written, tiles.len());
         let m_par = w_par.finalize(&Metadata::new("par-enc")).unwrap();
 
-        assert_eq!(m_seq.directory.key, m_par.directory.key, "directory hash differs");
+        assert_eq!(
+            m_seq.directory.key, m_par.directory.key,
+            "directory hash differs"
+        );
         assert_eq!(
             m_seq.packs.iter().map(|p| &p.key).collect::<Vec<_>>(),
             m_par.packs.iter().map(|p| &p.key).collect::<Vec<_>>(),
             "pack hashes differ"
         );
-        assert_eq!(m_seq.to_json_bytes().unwrap(), m_par.to_json_bytes().unwrap());
+        assert_eq!(
+            m_seq.to_json_bytes().unwrap(),
+            m_par.to_json_bytes().unwrap()
+        );
 
         // Parallel encode under a TINY writer memory budget: the encode loop
         // now cuts sub-batches on the ~budget/4 encoded-byte cap (and the
         // writer itself spills), but the hand-off order — and therefore every
         // output byte — must not change.
         let dir_bud = tempfile::tempdir().unwrap();
-        let mut w_bud =
-            PackWriter::create(dir_bud.path(), BlobOrdering::Auto, 64 * 1024 * 1024)
-                .unwrap()
-                .with_memory_budget(1024);
+        let mut w_bud = PackWriter::create(dir_bud.path(), BlobOrdering::Auto, 64 * 1024 * 1024)
+            .unwrap()
+            .with_memory_budget(1024);
         let mut written_bud = 0usize;
         write_tiles_parallel(&mut w_bud, &tagged, 4, || written_bud += 1).unwrap();
         assert_eq!(written_bud, tiles.len());
@@ -2104,7 +2143,10 @@ mod tests {
             m_bud.packs.iter().map(|p| &p.key).collect::<Vec<_>>(),
             "pack hashes must not depend on the encode-batch budget"
         );
-        assert_eq!(m_seq.to_json_bytes().unwrap(), m_bud.to_json_bytes().unwrap());
+        assert_eq!(
+            m_seq.to_json_bytes().unwrap(),
+            m_bud.to_json_bytes().unwrap()
+        );
     }
 
     /// Trajectory clipping produces clipped linestring segments with
@@ -2130,7 +2172,8 @@ mod tests {
         );
 
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
+        let mut writer =
+            PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
         for tile in &tiles {
             writer.write_tile(tile).unwrap();
         }
@@ -2252,8 +2295,14 @@ mod tests {
         let config = TileConfig {
             temporal_bucket_ms: 3_600_000,
             temporal_lod: vec![
-                TemporalLodLevel { bucket_ms: 24 * 3_600_000, max_zoom_level: 6 },
-                TemporalLodLevel { bucket_ms: 2 * 3_600_000, max_zoom_level: 6 },
+                TemporalLodLevel {
+                    bucket_ms: 24 * 3_600_000,
+                    max_zoom_level: 6,
+                },
+                TemporalLodLevel {
+                    bucket_ms: 2 * 3_600_000,
+                    max_zoom_level: 6,
+                },
             ],
             ..TileConfig::default()
         };
@@ -2276,25 +2325,37 @@ mod tests {
             layer_name: "default".to_string(),
             temporal_bucket_ms: hour,
             clip_trajectories: false,
-            temporal_lod: vec![TemporalLodLevel { bucket_ms: day, max_zoom_level: 9 }],
+            temporal_lod: vec![TemporalLodLevel {
+                bucket_ms: day,
+                max_zoom_level: 9,
+            }],
             ..TileConfig::default()
         };
         let tagged = generate_tiles_with_lod(&features, &config, 1).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
+        let mut writer =
+            PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
         for t in &tagged {
-            writer.write_lod_tile(&t.tile, t.temporal_bucket_ms).unwrap();
+            writer
+                .write_lod_tile(&t.tile, t.temporal_bucket_ms)
+                .unwrap();
         }
         let metadata = stt_core::metadata::Metadata::new("lod")
             .with_temporal_bucket_ms(hour)
-            .with_temporal_lod(vec![TemporalLodLevel { bucket_ms: day, max_zoom_level: 9 }])
+            .with_temporal_lod(vec![TemporalLodLevel {
+                bucket_ms: day,
+                max_zoom_level: 9,
+            }])
             .unwrap();
         writer.finalize(&metadata).unwrap();
 
         let reader = PackedReader::open(dir.path().join("manifest.json")).unwrap();
-        let buckets: std::collections::BTreeSet<Option<u64>> =
-            reader.entries().iter().map(|e| e.temporal_bucket_ms).collect();
+        let buckets: std::collections::BTreeSet<Option<u64>> = reader
+            .entries()
+            .iter()
+            .map(|e| e.temporal_bucket_ms)
+            .collect();
         // The on-disk index distinguishes base + LOD bucket sizes.
         assert!(buckets.contains(&Some(hour)));
         assert!(buckets.contains(&Some(day)));
@@ -2378,7 +2439,12 @@ mod tests {
 
         let total: usize = tiles.iter().map(|t| t.feature_count() as usize).sum();
         assert_eq!(total, 100, "every feature must appear exactly once");
-        assert_eq!(tiles.len(), 10, "expected 10 windows of 10, got {}", tiles.len());
+        assert_eq!(
+            tiles.len(),
+            10,
+            "expected 10 windows of 10, got {}",
+            tiles.len()
+        );
 
         let keys: std::collections::BTreeSet<(u8, u32, u32, i64)> = tiles
             .iter()
@@ -2386,7 +2452,11 @@ mod tests {
             .collect();
         assert_eq!(keys.len(), tiles.len(), "window keys must be distinct");
         for t in &tiles {
-            assert!(t.feature_count() <= 11, "window over budget: {}", t.feature_count());
+            assert!(
+                t.feature_count() <= 11,
+                "window over budget: {}",
+                t.feature_count()
+            );
         }
     }
 
@@ -2408,7 +2478,11 @@ mod tests {
             ..TileConfig::default()
         };
         let tiles = generate_tiles(&features, &config, 1).unwrap();
-        assert_eq!(tiles.len(), 1, "identical-timestamp features can't be split into tiles");
+        assert_eq!(
+            tiles.len(),
+            1,
+            "identical-timestamp features can't be split into tiles"
+        );
         assert_eq!(tiles[0].feature_count(), 50);
     }
 
@@ -2431,11 +2505,17 @@ mod tests {
             ..TileConfig::default()
         };
         let tiles = generate_tiles(&[feat], &config, 1).unwrap();
-        assert!(!tiles.is_empty(), "time-aware simplify should still produce tiles");
+        assert!(
+            !tiles.is_empty(),
+            "time-aware simplify should still produce tiles"
+        );
         // Clipped trajectory layers carry per-vertex times (TD-TR preserved them).
         for t in &tiles {
             for l in &t.layers {
-                assert!(l.vertex_times.is_some(), "trajectory layer should carry vertex_times");
+                assert!(
+                    l.vertex_times.is_some(),
+                    "trajectory layer should carry vertex_times"
+                );
             }
         }
     }
@@ -2512,7 +2592,10 @@ mod tests {
         let tiles = generate_tiles(&features, &config, 1).unwrap();
         let total: u32 = tiles.iter().map(|t| t.feature_count()).sum();
         assert!(total < 30, "byte cap must drop some features, kept {total}");
-        assert!(total >= 1, "byte cap should still keep at least one feature");
+        assert!(
+            total >= 1,
+            "byte cap should still keep at least one feature"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2569,7 +2652,11 @@ mod tests {
             for rings in features {
                 assert!(!rings.is_empty(), "feature with no rings in {:?}", tile.id);
                 for ring in rings {
-                    assert!(ring.len() >= 4, "degenerate ring in {:?}: {ring:?}", tile.id);
+                    assert!(
+                        ring.len() >= 4,
+                        "degenerate ring in {:?}: {ring:?}",
+                        tile.id
+                    );
                     assert_eq!(ring.first(), ring.last(), "unclosed ring in {:?}", tile.id);
                     for [lon, lat] in ring {
                         assert!(
@@ -2588,10 +2675,7 @@ mod tests {
     /// one holding its representative point.
     #[test]
     fn polygon_spanning_four_tiles_is_clipped_into_each() {
-        let feat = polygon_feature(
-            vec![square_ring(-0.1, -0.1, 0.1, 0.1)],
-            1_700_000_000_000,
-        );
+        let feat = polygon_feature(vec![square_ring(-0.1, -0.1, 0.1, 0.1)], 1_700_000_000_000);
         let config = TileConfig {
             min_zoom: 10,
             max_zoom: 10,
@@ -2638,7 +2722,11 @@ mod tests {
             ..TileConfig::default()
         };
         let tiles = generate_tiles(&[feat], &config, 1).unwrap();
-        assert_eq!(tiles.len(), 4, "holed polygon still covers the 4 corner tiles");
+        assert_eq!(
+            tiles.len(),
+            4,
+            "holed polygon still covers the 4 corner tiles"
+        );
         for tile in &tiles {
             assert_valid_polygon_rings(tile);
             let layer = &tile.layers[0];
@@ -2666,8 +2754,7 @@ mod tests {
     #[test]
     fn fully_inside_polygon_is_byte_identical_to_legacy_path() {
         let ts = 1_700_000_000_000u64;
-        let make =
-            || polygon_feature(vec![square_ring(-122.5, 37.8, -122.45, 37.85)], ts);
+        let make = || polygon_feature(vec![square_ring(-122.5, 37.8, -122.45, 37.85)], ts);
         let config = TileConfig {
             min_zoom: 10,
             max_zoom: 10,
@@ -2685,8 +2772,18 @@ mod tests {
         assert_eq!(new_tiles.len(), 1);
         assert_eq!(old_tiles.len(), 1);
         assert_eq!(
-            (new_tiles[0].id.z, new_tiles[0].id.x, new_tiles[0].id.y, new_tiles[0].id.t),
-            (old_tiles[0].id.z, old_tiles[0].id.x, old_tiles[0].id.y, old_tiles[0].id.t),
+            (
+                new_tiles[0].id.z,
+                new_tiles[0].id.x,
+                new_tiles[0].id.y,
+                new_tiles[0].id.t
+            ),
+            (
+                old_tiles[0].id.z,
+                old_tiles[0].id.x,
+                old_tiles[0].id.y,
+                old_tiles[0].id.t
+            ),
         );
         let new_bytes = encode_tile(&new_tiles[0].layers).unwrap();
         let old_bytes = encode_tile(&old_tiles[0].layers).unwrap();
@@ -2701,10 +2798,7 @@ mod tests {
     /// single tile containing its representative point.
     #[test]
     fn whole_feature_placement_restores_single_tile_placement() {
-        let feat = polygon_feature(
-            vec![square_ring(-0.1, -0.1, 0.1, 0.1)],
-            1_700_000_000_000,
-        );
+        let feat = polygon_feature(vec![square_ring(-0.1, -0.1, 0.1, 0.1)], 1_700_000_000_000);
         let config = TileConfig {
             min_zoom: 10,
             max_zoom: 10,
@@ -2715,7 +2809,11 @@ mod tests {
             ..TileConfig::default()
         };
         let tiles = generate_tiles(&[feat], &config, 1).unwrap();
-        assert_eq!(tiles.len(), 1, "kill switch must restore single-tile placement");
+        assert_eq!(
+            tiles.len(),
+            1,
+            "kill switch must restore single-tile placement"
+        );
         // Representative point = first exterior vertex (-0.1, -0.1) → (511, 512).
         assert_eq!((tiles[0].id.x, tiles[0].id.y), (511, 512));
         assert_eq!(tiles[0].feature_count(), 1);
@@ -2908,11 +3006,17 @@ mod tests {
             ..TileConfig::default()
         };
         let mut writer = CaptureWriter(Vec::new());
-        let stats =
-            generate_tiles_streaming(&[good, bad], &config, &mut writer, 1).unwrap();
+        let stats = generate_tiles_streaming(&[good, bad], &config, &mut writer, 1).unwrap();
         // Counted once per (feature, zoom): zooms 0..=5.
-        assert_eq!(stats.dropped_invalid_coords, 6, "drop must be counted per zoom");
-        assert_eq!(writer.0.len(), 6, "one tile per zoom for the valid point only");
+        assert_eq!(
+            stats.dropped_invalid_coords, 6,
+            "drop must be counted per zoom"
+        );
+        assert_eq!(
+            writer.0.len(),
+            6,
+            "one tile per zoom for the valid point only"
+        );
         for (z, x, y, count) in &writer.0 {
             assert_eq!(*count, 1, "phantom feature leaked into z{z}/{x}/{y}");
             let (ex, ey) = projection::lonlat_to_tile(-122.4194, 37.7749, *z).unwrap();

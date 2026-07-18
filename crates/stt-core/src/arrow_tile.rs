@@ -744,7 +744,11 @@ fn build_geometry_array_q(
     // 3D POINT path: interleave [x,y,z] into a FixedSizeList<_,3> leaf.
     if let (GeometryColumn::Point(points), Some(elev)) = (geom, point_elev) {
         let list_size = 3;
-        let dt = if quant.is_some() { DataType::Int32 } else { DataType::Float64 };
+        let dt = if quant.is_some() {
+            DataType::Int32
+        } else {
+            DataType::Float64
+        };
         let field = Arc::new(Field::new("xyz", dt, false));
         let child: ArrayRef = match quant {
             Some(q) => {
@@ -766,7 +770,9 @@ fn build_geometry_array_q(
                 Arc::new(Float64Array::from(flat))
             }
         };
-        return Ok(Arc::new(FixedSizeListArray::new(field, list_size, child, None)));
+        return Ok(Arc::new(FixedSizeListArray::new(
+            field, list_size, child, None,
+        )));
     }
 
     let coord_field = || {
@@ -846,12 +852,8 @@ fn build_geometry_array_q(
             // Ring level: List<FixedSizeList>.
             let ring_offsets = offsets_from_counts(ring_sizes.into_iter())?;
             let vertex_field = Arc::new(Field::new("vertices", coords.data_type().clone(), false));
-            let rings: ArrayRef = Arc::new(ListArray::new(
-                vertex_field,
-                ring_offsets,
-                coords,
-                None,
-            ));
+            let rings: ArrayRef =
+                Arc::new(ListArray::new(vertex_field, ring_offsets, coords, None));
             // Feature level: List<List<FixedSizeList>>.
             let feature_offsets = offsets_from_counts(rings_per_feature.into_iter())?;
             let ring_field = Arc::new(Field::new("rings", rings.data_type().clone(), false));
@@ -993,7 +995,6 @@ pub fn set_quantize_attrs(map: HashMap<String, f64>) {
 pub fn quantize_attrs() -> HashMap<String, f64> {
     quant_attrs_cell().read().unwrap().clone()
 }
-
 
 /// When set, EVERY `Float64` numeric property not given an explicit precision in
 /// the [`set_quantize_attrs`] map is quantized automatically: its step is sized
@@ -1218,7 +1219,10 @@ fn group_vector_properties(
     let mut any = false;
     for g in groups {
         if g.components.is_empty()
-            || !g.components.iter().all(|c| numeric.contains_key(c.as_str()))
+            || !g
+                .components
+                .iter()
+                .all(|c| numeric.contains_key(c.as_str()))
         {
             continue;
         }
@@ -1386,9 +1390,7 @@ fn build_quantized_numeric(
 /// previous behaviour silently collapsed every overflowing value to a single
 /// index, mislabeling features without a trace. A producer that genuinely needs
 /// >65k distinct strings should split the column or widen the key type.
-fn build_dictionary_indices(
-    values: &[Option<String>],
-) -> Result<(Vec<Option<u16>>, Vec<String>)> {
+fn build_dictionary_indices(values: &[Option<String>]) -> Result<(Vec<Option<u16>>, Vec<String>)> {
     let mut categories: Vec<String> = Vec::new();
     let mut lookup: HashMap<String, u16> = HashMap::new();
     let mut indices: Vec<Option<u16>> = Vec::with_capacity(values.len());
@@ -1487,7 +1489,8 @@ fn build_vertex_time_array(
                             // step this branch can only fire on inputs that
                             // disagree with the (min,max) scan above (e.g.
                             // a `vertex_times` longer than feature_count).
-                            let delta = ((t - min) as u64 / step as u64).min(u16::MAX as u64) as u16;
+                            let delta =
+                                ((t - min) as u64 / step as u64).min(u16::MAX as u64) as u16;
                             builder.values().append_value(delta);
                         }
                         builder.append(true);
@@ -1678,25 +1681,24 @@ fn build_layer_parts(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Layer
     // 3rd coordinate, so the tile ships true 3D points the renderer binds
     // zero-copy (no per-point pad). The column is then dropped from properties.
     let elev_col = cfg.point_elevation_column.clone();
-    let point_elev: Option<Vec<f64>> = if !elev_col.is_empty()
-        && matches!(layer.geometry, GeometryColumn::Point(_))
-    {
-        layer.properties.iter().find_map(|(name, col)| match col {
-            PropertyColumn::Numeric(v) if name == &elev_col => {
-                let n = layer.feature_count();
-                let mut out = vec![0.0f64; n];
-                for (i, x) in v.iter().enumerate() {
-                    if let Some(val) = x {
-                        out[i] = *val;
+    let point_elev: Option<Vec<f64>> =
+        if !elev_col.is_empty() && matches!(layer.geometry, GeometryColumn::Point(_)) {
+            layer.properties.iter().find_map(|(name, col)| match col {
+                PropertyColumn::Numeric(v) if name == &elev_col => {
+                    let n = layer.feature_count();
+                    let mut out = vec![0.0f64; n];
+                    for (i, x) in v.iter().enumerate() {
+                        if let Some(val) = x {
+                            out[i] = *val;
+                        }
                     }
+                    Some(out)
                 }
-                Some(out)
-            }
-            _ => None,
-        })
-    } else {
-        None
-    };
+                _ => None,
+            })
+        } else {
+            None
+        };
     let elev_consumed = point_elev.is_some();
 
     // Geometry column carries the GeoArrow extension name in field metadata.
@@ -1754,7 +1756,9 @@ fn build_layer_parts(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Layer
     // Track per-layer vertex-time encoding so the schema metadata (set
     // below) records the origin/step needed for the u16-delta reader path.
     let mut vertex_time_encoding: Option<(i64, u32)> = None;
-    if let Some(vt_col) = build_vertex_time_array(&layer.vertex_times, n, cfg.vertex_time_max_step_ms) {
+    if let Some(vt_col) =
+        build_vertex_time_array(&layer.vertex_times, n, cfg.vertex_time_max_step_ms)
+    {
         fields.push(Arc::new(Field::new(
             "vertex_time",
             vt_col.array.data_type().clone(),
@@ -1852,8 +1856,7 @@ fn build_layer_parts(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Layer
     // quantized. No groups configured ⇒ iterate `layer.properties` with no clone.
     let grouped =
         group_vector_properties(&layer.properties, layer.feature_count(), &cfg.vector_groups);
-    let props_iter: &[(String, PropertyColumn)] =
-        grouped.as_deref().unwrap_or(&layer.properties);
+    let props_iter: &[(String, PropertyColumn)] = grouped.as_deref().unwrap_or(&layer.properties);
     for (name, col) in props_iter {
         // The point-elevation column now lives in the geometry's 3rd coordinate;
         // don't also emit it as a scalar property.
@@ -1868,12 +1871,7 @@ fn build_layer_parts(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Layer
                 // For a LiDAR `z` column this is the single largest size lever
                 // after `id` — a raw Float64 elevation barely compresses, while
                 // the i16 grid is both smaller and far more compressible.
-                let quantized = match cfg
-                    .quantize_attrs
-                    .get(name)
-                    .copied()
-                    .filter(|p| *p > 0.0)
-                {
+                let quantized = match cfg.quantize_attrs.get(name).copied().filter(|p| *p > 0.0) {
                     Some(p) => build_quantized_numeric(values, p)?,
                     None => None,
                 }
@@ -1910,14 +1908,21 @@ fn build_layer_parts(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Layer
                 fields.push(Arc::new(Field::new(name, dict_type, true)));
 
                 let value_array: ArrayRef = Arc::new(StringArray::from(
-                    categories.iter().map(|s| Some(s.as_str())).collect::<Vec<_>>(),
+                    categories
+                        .iter()
+                        .map(|s| Some(s.as_str()))
+                        .collect::<Vec<_>>(),
                 ));
                 let key_array = UInt16Array::from(indices);
                 let dict = DictionaryArray::<UInt16Type>::try_new(key_array, value_array)
                     .map_err(|e| Error::Other(format!("dictionary build failed: {e}")))?;
                 columns.push(Arc::new(dict));
             }
-            PropertyColumn::Vector { width, elem, values } => {
+            PropertyColumn::Vector {
+                width,
+                elem,
+                values,
+            } => {
                 // Interleaved GPU-ready vector → FixedSizeList<leaf, width>. The
                 // child buffer is the flattened row-major run, so the TS decoder
                 // hands `child.values.subarray(...)` straight to deck.gl with no
@@ -1944,11 +1949,7 @@ fn build_layer_parts(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Layer
                     ))
                 })?;
                 let fsl = FixedSizeListArray::new(item_field, width_i32, child, None);
-                fields.push(Arc::new(Field::new(
-                    name,
-                    fsl.data_type().clone(),
-                    true,
-                )));
+                fields.push(Arc::new(Field::new(name, fsl.data_type().clone(), true)));
                 columns.push(Arc::new(fsl));
             }
         }
@@ -2023,9 +2024,8 @@ fn assemble_layer_ipc_v1(parts: LayerParts) -> Result<Vec<u8>> {
     if parts.has_triangles {
         schema_meta.insert(TRIANGLES_METADATA_KEY.to_string(), "true".to_string());
     }
-    let schema = Arc::new(
-        Schema::new(parts.fields).with_metadata(schema_meta.into_iter().collect()),
-    );
+    let schema =
+        Arc::new(Schema::new(parts.fields).with_metadata(schema_meta.into_iter().collect()));
     write_ipc_stream(schema, parts.columns)
 }
 
@@ -2098,14 +2098,15 @@ fn sort_rows_by_start_time(layer: &ColumnarLayer) -> Cow<'_, ColumnarLayer> {
     // than the feature count at encode (`vt.get(i)` ⇒ null list); the
     // permutation preserves that semantic via `.get(..).unwrap_or_default()`.
     fn permute_nested<T: Clone>(v: &Option<Vec<Vec<T>>>, idx: &[usize]) -> Option<Vec<Vec<T>>> {
-        v.as_ref()
-            .map(|v| idx.iter().map(|&i| v.get(i).cloned().unwrap_or_default()).collect())
+        v.as_ref().map(|v| {
+            idx.iter()
+                .map(|&i| v.get(i).cloned().unwrap_or_default())
+                .collect()
+        })
     }
 
     let geometry = match &layer.geometry {
-        GeometryColumn::Point(v) => {
-            GeometryColumn::Point(idx.iter().map(|&i| v[i]).collect())
-        }
+        GeometryColumn::Point(v) => GeometryColumn::Point(idx.iter().map(|&i| v[i]).collect()),
         GeometryColumn::LineString(v) => {
             GeometryColumn::LineString(idx.iter().map(|&i| v[i].clone()).collect())
         }
@@ -2124,7 +2125,11 @@ fn sort_rows_by_start_time(layer: &ColumnarLayer) -> Cow<'_, ColumnarLayer> {
                 PropertyColumn::Categorical(v) => {
                     PropertyColumn::Categorical(idx.iter().map(|&i| v[i].clone()).collect())
                 }
-                PropertyColumn::Vector { width, elem, values } => PropertyColumn::Vector {
+                PropertyColumn::Vector {
+                    width,
+                    elem,
+                    values,
+                } => PropertyColumn::Vector {
                     width: *width,
                     elem: *elem,
                     values: idx
@@ -2176,9 +2181,8 @@ fn encode_layer_v2_parts(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<E
     // (`AttrQuant::to_json` is a pure function of `(o, s)`), so decode
     // re-injects byte-identical field metadata.
     let mut qa: BTreeMap<String, (f64, f64)> = BTreeMap::new();
-    let mut props_fields: Vec<Arc<Field>> = Vec::with_capacity(
-        parts.fields.len() - parts.reserved_len,
-    );
+    let mut props_fields: Vec<Arc<Field>> =
+        Vec::with_capacity(parts.fields.len() - parts.reserved_len);
     for field in &parts.fields[parts.reserved_len..] {
         let mut meta = field.metadata().clone();
         if let Some(json) = meta.remove(STT_QUANT_ATTR_META_KEY) {
@@ -2216,9 +2220,8 @@ fn encode_layer_v2_parts(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<E
     }
     let core_fields: Vec<Arc<Field>> = parts.fields[..parts.reserved_len].to_vec();
     let core_columns: Vec<ArrayRef> = parts.columns[..parts.reserved_len].to_vec();
-    let core_schema = Arc::new(
-        Schema::new(core_fields).with_metadata(core_meta.into_iter().collect()),
-    );
+    let core_schema =
+        Arc::new(Schema::new(core_fields).with_metadata(core_meta.into_iter().collect()));
     let core_ipc = write_ipc_stream(core_schema, core_columns)?;
     let core_boundary = split_ipc_at_schema(&core_ipc)?;
     let core_tail = core_ipc[core_boundary..].to_vec();
@@ -2453,7 +2456,9 @@ pub fn decode_layer(ipc: &[u8]) -> Result<RecordBatch> {
         batches.push(batch.map_err(|e| Error::Other(format!("Arrow IPC read failed: {e}")))?);
     }
     match batches.len() {
-        0 => Err(Error::Other("tile layer IPC contained no record batch".into())),
+        0 => Err(Error::Other(
+            "tile layer IPC contained no record batch".into(),
+        )),
         1 => Ok(batches.into_iter().next().unwrap()),
         // A layer is written as exactly one batch; concatenating is the safe
         // fallback if a producer ever splits it.
@@ -2500,13 +2505,18 @@ pub fn decode_tile_with_templates(
 /// The v1 frame walk — UNCHANGED from the 0.3.x reader.
 fn decode_tile_v1(payload: &[u8]) -> Result<Vec<DecodedLayer>> {
     if payload.len() < 2 {
-        return Err(Error::Other("tile payload too short for layer frame".into()));
+        return Err(Error::Other(
+            "tile payload too short for layer frame".into(),
+        ));
     }
     let raw_count = u16::from_le_bytes([payload[0], payload[1]]);
     let aligned = raw_count & ALIGNED_FRAME_FLAG != 0;
     let count = (raw_count & !ALIGNED_FRAME_FLAG) as usize;
     let mut pos = 2usize;
-    let mut layers = Vec::with_capacity(count);
+    // Cap the pre-allocation: `count` is attacker-controlled (up to 0x7FFE) and
+    // each real layer costs many wire bytes, so a doctored count must not force
+    // a giant up-front allocation. Mirrors the v2 walker.
+    let mut layers = Vec::with_capacity(count.min(64));
     for _ in 0..count {
         let name_len = read_u16(payload, &mut pos)? as usize;
         let name = read_slice(payload, &mut pos, name_len)?;
@@ -2560,7 +2570,9 @@ fn resolve_template<'a>(
 ) -> Result<&'a [u8]> {
     match ref_kind {
         REF_KIND_INLINE => inline.ok_or_else(|| {
-            Error::Other(format!("{what}: inline schema section missing from the frame"))
+            Error::Other(format!(
+                "{what}: inline schema section missing from the frame"
+            ))
         }),
         REF_KIND_TEMPLATE_HASH => {
             let hash = hash.expect("hash read for ref_kind 1");
@@ -2740,9 +2752,9 @@ fn decode_tile_v2(
             registry,
             &format!("layer '{name}' core"),
         )?;
-        let core_tail = sections.get(&SECTION_CORE_BATCH).ok_or_else(|| {
-            Error::Other(format!("layer '{name}': CORE_BATCH section missing"))
-        })?;
+        let core_tail = sections
+            .get(&SECTION_CORE_BATCH)
+            .ok_or_else(|| Error::Other(format!("layer '{name}': CORE_BATCH section missing")))?;
         let core = splice_decode(core_template, core_tail, &format!("layer '{name}' core"))?;
 
         let props = if ref_props == REF_KIND_NO_PROPS {
@@ -2764,7 +2776,11 @@ fn decode_tile_v2(
             let tail = sections.get(&SECTION_PROPS_BATCH).ok_or_else(|| {
                 Error::Other(format!("layer '{name}': PROPS_BATCH section missing"))
             })?;
-            Some(splice_decode(template, tail, &format!("layer '{name}' props"))?)
+            Some(splice_decode(
+                template,
+                tail,
+                &format!("layer '{name}' props"),
+            )?)
         };
 
         let batch = merge_v2_layer(core, props, &tile_meta)?;
@@ -2862,11 +2878,7 @@ mod tests {
             feature_ids: vec![1, 2, 3],
             start_times: vec![1000, 2000, 3000],
             end_times: vec![1500, 2500, 3500],
-            geometry: GeometryColumn::Point(vec![
-                [-122.4, 37.7],
-                [-122.5, 37.8],
-                [-122.6, 37.9],
-            ]),
+            geometry: GeometryColumn::Point(vec![[-122.4, 37.7], [-122.5, 37.8], [-122.6, 37.9]]),
             vertex_times: None,
             vertex_values: None,
             triangles: None,
@@ -2929,7 +2941,11 @@ mod tests {
         // All three still decode to the SAME feature set — encoding differs, data
         // does not.
         for tile in [&plain, &quant, &attr] {
-            let rows: usize = decode_tile(tile).unwrap().iter().map(|l| l.batch.num_rows()).sum();
+            let rows: usize = decode_tile(tile)
+                .unwrap()
+                .iter()
+                .map(|l| l.batch.num_rows())
+                .sum();
             assert_eq!(rows, 3);
         }
     }
@@ -3012,11 +3028,7 @@ mod tests {
             .as_any()
             .downcast_ref::<DictionaryArray<UInt16Type>>()
             .unwrap();
-        let values = col
-            .values()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let values = col.values().as_any().downcast_ref::<StringArray>().unwrap();
         // First-seen order: "car" then "bus".
         let mut categories: Vec<&str> = (0..values.len()).map(|i| values.value(i)).collect();
         categories.sort();
@@ -3060,7 +3072,11 @@ mod tests {
         // Every geometry field carries the GeoArrow extension *name* and the
         // CRS in extension *metadata*, so external GeoArrow readers see WGS84
         // lon/lat (OGC:CRS84) rather than an unknown CRS.
-        for layer in [sample_point_layer(), sample_line_layer(), sample_polygon_layer()] {
+        for layer in [
+            sample_point_layer(),
+            sample_line_layer(),
+            sample_polygon_layer(),
+        ] {
             let ipc = encode_layer(&layer).unwrap();
             let batch = decode_layer(&ipc).unwrap();
             let field = batch.schema().field_with_name("geometry").unwrap().clone();
@@ -3107,7 +3123,10 @@ mod tests {
         // Geometry field carries the GeoArrow extension name.
         let geom_field = batch.schema().field_with_name("geometry").unwrap().clone();
         assert_eq!(
-            geom_field.metadata().get(GEOARROW_EXT_KEY).map(String::as_str),
+            geom_field
+                .metadata()
+                .get(GEOARROW_EXT_KEY)
+                .map(String::as_str),
             Some("geoarrow.point")
         );
 
@@ -3173,10 +3192,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Float32Array>()
             .unwrap();
-        assert_eq!(
-            qchild.values(),
-            &[0.0, 0.0, 0.0, 1.0, 0.5, 0.5, 0.5, 0.5]
-        );
+        assert_eq!(qchild.values(), &[0.0, 0.0, 0.0, 1.0, 0.5, 0.5, 0.5, 0.5]);
 
         let rgba = batch
             .column_by_name("surfel_rgba")
@@ -3185,11 +3201,7 @@ mod tests {
             .downcast_ref::<FixedSizeListArray>()
             .unwrap();
         assert_eq!(rgba.value_length(), 4);
-        let cchild = rgba
-            .values()
-            .as_any()
-            .downcast_ref::<UInt8Array>()
-            .unwrap();
+        let cchild = rgba.values().as_any().downcast_ref::<UInt8Array>().unwrap();
         assert_eq!(cchild.values(), &[255, 0, 0, 128, 0, 255, 0, 255]);
     }
 
@@ -3209,11 +3221,26 @@ mod tests {
             triangles: None,
             vertex_value_matrix: None,
             properties: vec![
-                ("qx".into(), PropertyColumn::Numeric(vec![Some(0.0), Some(0.5)])),
-                ("qy".into(), PropertyColumn::Numeric(vec![Some(0.0), Some(0.5)])),
-                ("qz".into(), PropertyColumn::Numeric(vec![Some(0.0), Some(0.5)])),
-                ("qw".into(), PropertyColumn::Numeric(vec![Some(1.0), Some(0.5)])),
-                ("z".into(), PropertyColumn::Numeric(vec![Some(3.0), Some(4.0)])),
+                (
+                    "qx".into(),
+                    PropertyColumn::Numeric(vec![Some(0.0), Some(0.5)]),
+                ),
+                (
+                    "qy".into(),
+                    PropertyColumn::Numeric(vec![Some(0.0), Some(0.5)]),
+                ),
+                (
+                    "qz".into(),
+                    PropertyColumn::Numeric(vec![Some(0.0), Some(0.5)]),
+                ),
+                (
+                    "qw".into(),
+                    PropertyColumn::Numeric(vec![Some(1.0), Some(0.5)]),
+                ),
+                (
+                    "z".into(),
+                    PropertyColumn::Numeric(vec![Some(3.0), Some(4.0)]),
+                ),
             ],
         };
         // Explicit config (not the process-global setter) so this test can't
@@ -3262,8 +3289,14 @@ mod tests {
             triangles: None,
             vertex_value_matrix: None,
             properties: vec![
-                ("z".into(), PropertyColumn::Numeric(vec![Some(3.5), Some(9.0)])),
-                ("speed".into(), PropertyColumn::Numeric(vec![Some(1.0), Some(2.0)])),
+                (
+                    "z".into(),
+                    PropertyColumn::Numeric(vec![Some(3.5), Some(9.0)]),
+                ),
+                (
+                    "speed".into(),
+                    PropertyColumn::Numeric(vec![Some(1.0), Some(2.0)]),
+                ),
             ],
         };
         let cfg = EncoderConfig {
@@ -3281,11 +3314,21 @@ mod tests {
             .downcast_ref::<FixedSizeListArray>()
             .unwrap();
         assert_eq!(geom.value_length(), 3);
-        let coords = geom.values().as_any().downcast_ref::<Float64Array>().unwrap();
+        let coords = geom
+            .values()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         assert_eq!(coords.value(2), 3.5); // feature 0 z
         assert_eq!(coords.value(5), 9.0); // feature 1 z
-        assert!(batch.column_by_name("z").is_none(), "z folded into geometry");
-        assert!(batch.column_by_name("speed").is_some(), "other props untouched");
+        assert!(
+            batch.column_by_name("z").is_none(),
+            "z folded into geometry"
+        );
+        assert!(
+            batch.column_by_name("speed").is_some(),
+            "other props untouched"
+        );
     }
 
     #[test]
@@ -3312,7 +3355,8 @@ mod tests {
         let batch = decode_layer(&ipc).unwrap();
 
         let field = batch.schema().field_with_name("geometry").unwrap().clone();
-        let affine = QuantAffine::from_json(field.metadata().get(STT_QUANT_META_KEY).unwrap()).unwrap();
+        let affine =
+            QuantAffine::from_json(field.metadata().get(STT_QUANT_META_KEY).unwrap()).unwrap();
         assert_eq!(affine.z0, Some(0.0));
         assert_eq!(affine.sz, Some(0.05));
         let geom = batch
@@ -3325,7 +3369,10 @@ mod tests {
         let coords = geom.values().as_any().downcast_ref::<Int32Array>().unwrap();
         // z = 5.0 / 0.05 = 100; reconstructs to z0 + 100*sz = 5.0.
         assert_eq!(coords.value(2), 100);
-        assert_eq!(affine.z0.unwrap() + coords.value(2) as f64 * affine.sz.unwrap(), 5.0);
+        assert_eq!(
+            affine.z0.unwrap() + coords.value(2) as f64 * affine.sz.unwrap(),
+            5.0
+        );
     }
 
     #[test]
@@ -3351,11 +3398,7 @@ mod tests {
             .downcast_ref::<FixedSizeListArray>()
             .unwrap();
         assert_eq!(geom.value_type(), DataType::Int32);
-        let coords = geom
-            .values()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
+        let coords = geom.values().as_any().downcast_ref::<Int32Array>().unwrap();
 
         let original = [[-122.4, 37.7], [-122.5, 37.8], [-122.6, 37.9]];
         for (i, [lon, lat]) in original.iter().enumerate() {
@@ -3374,8 +3417,7 @@ mod tests {
         // A LiDAR-style `z` elevation column: high-entropy Float64 by default,
         // but fixed-point UInt16 when the build opts the column in. The reader
         // reconstructs `value = o + q*s`, lossy to <= s/2.
-        let zvals: Vec<Option<f64>> =
-            vec![Some(1.07), Some(-2.4), Some(15.9), None, Some(40.02)];
+        let zvals: Vec<Option<f64>> = vec![Some(1.07), Some(-2.4), Some(15.9), None, Some(40.02)];
         let make = || ColumnarLayer {
             name: "lidar".into(),
             feature_ids: vec![1, 2, 3, 4, 5],
@@ -3482,12 +3524,21 @@ mod tests {
 
         let field = batch.schema().field_with_name("depth").unwrap().clone();
         assert_eq!(field.data_type(), &DataType::UInt16);
-        let aff = AttrQuant::from_json(field.metadata().get(STT_QUANT_ATTR_META_KEY).unwrap()).unwrap();
-        let col = batch.column_by_name("depth").unwrap().as_any().downcast_ref::<UInt16Array>().unwrap();
+        let aff =
+            AttrQuant::from_json(field.metadata().get(STT_QUANT_ATTR_META_KEY).unwrap()).unwrap();
+        let col = batch
+            .column_by_name("depth")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .unwrap();
         let tol = (700.0 - 0.0) / u16::MAX as f64 / 2.0 + 1e-9;
         for (i, want) in depth.iter().enumerate() {
             let got = aff.value(col.value(i) as i64);
-            assert!((got - want.unwrap()).abs() <= tol, "depth[{i}] {got} vs {want:?}");
+            assert!(
+                (got - want.unwrap()).abs() <= tol,
+                "depth[{i}] {got} vs {want:?}"
+            );
         }
         // Min and max land on the index endpoints (full 16-bit span used).
         assert_eq!(col.value(0), 0);
@@ -3576,7 +3627,10 @@ mod tests {
             .unwrap();
         assert_eq!(vt.len(), 2);
         let first = vt.value(0);
-        let deltas = first.as_any().downcast_ref::<arrow::array::UInt16Array>().unwrap();
+        let deltas = first
+            .as_any()
+            .downcast_ref::<arrow::array::UInt16Array>()
+            .unwrap();
         let absolutes: Vec<i64> = deltas
             .values()
             .iter()
@@ -3615,12 +3669,18 @@ mod tests {
             .unwrap();
         assert_eq!(vv.len(), 2);
         let first = vv.value(0);
-        let vals = first.as_any().downcast_ref::<arrow::array::Float32Array>().unwrap();
+        let vals = first
+            .as_any()
+            .downcast_ref::<arrow::array::Float32Array>()
+            .unwrap();
         assert_eq!(vals.value(0), 5.0);
         assert!(vals.value(1).is_nan());
         assert_eq!(vals.value(2), 27.5);
         let second = vv.value(1);
-        let vals2 = second.as_any().downcast_ref::<arrow::array::Float32Array>().unwrap();
+        let vals2 = second
+            .as_any()
+            .downcast_ref::<arrow::array::Float32Array>()
+            .unwrap();
         assert_eq!(vals2.values(), &[12.0, 13.0]);
     }
 
@@ -3660,10 +3720,16 @@ mod tests {
             .unwrap();
         assert_eq!(vm.len(), 2);
         let f0 = vm.value(0);
-        let f0v = f0.as_any().downcast_ref::<arrow::array::Float32Array>().unwrap();
+        let f0v = f0
+            .as_any()
+            .downcast_ref::<arrow::array::Float32Array>()
+            .unwrap();
         assert_eq!(f0v.values(), &[10.0, 11.0, 20.0, 21.0, 30.0, 31.0]);
         let f1 = vm.value(1);
-        let f1v = f1.as_any().downcast_ref::<arrow::array::Float32Array>().unwrap();
+        let f1v = f1
+            .as_any()
+            .downcast_ref::<arrow::array::Float32Array>()
+            .unwrap();
         assert_eq!(f1v.values(), &[40.0, 41.0, 50.0, 51.0]);
 
         // num_buckets = matrix_len / vertex_count = 6 / 3 = 2, in schema meta.
@@ -3803,13 +3869,7 @@ mod tests {
     fn tessellate_polygon_emits_two_triangles_for_a_square() {
         // A simple closed square (5 verts, last duplicates first) earcuts into
         // exactly 2 triangles, 6 indices in [0, 3].
-        let ring: Vec<Coord> = vec![
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [1.0, 1.0],
-            [0.0, 1.0],
-            [0.0, 0.0],
-        ];
+        let ring: Vec<Coord> = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]];
         let tris = tessellate_polygon(&[ring]);
         assert_eq!(tris.len(), 6);
         for &i in &tris {
@@ -3822,10 +3882,8 @@ mod tests {
         // 4x4 square with a 1x1 hole — earcut should still produce a valid
         // tessellation. Index count is implementation-dependent but must be a
         // multiple of 3 and reference valid vertex indices.
-        let exterior: Vec<Coord> =
-            vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]];
-        let hole: Vec<Coord> =
-            vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]];
+        let exterior: Vec<Coord> = vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]];
+        let hole: Vec<Coord> = vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]];
         let tris = tessellate_polygon(&[exterior, hole]);
         assert!(tris.len() >= 6);
         assert_eq!(tris.len() % 3, 0);
@@ -3845,8 +3903,7 @@ mod tests {
 
     #[test]
     fn polygon_layer_with_triangles_roundtrips() {
-        let exterior: Vec<Coord> =
-            vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]];
+        let exterior: Vec<Coord> = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]];
         let tris = tessellate_polygon(&[exterior.clone()]);
         assert_eq!(tris.len(), 6);
         let layer = ColumnarLayer {
@@ -3888,7 +3945,11 @@ mod tests {
             .downcast_ref::<arrow::array::UInt16Array>()
             .expect("triangle values are UInt16 for small feature-local indices");
         assert_eq!(
-            values.values().iter().map(|&v| v as u32).collect::<Vec<_>>(),
+            values
+                .values()
+                .iter()
+                .map(|&v| v as u32)
+                .collect::<Vec<_>>(),
             tris
         );
     }
@@ -3898,8 +3959,7 @@ mod tests {
         // A feature-local triangle index beyond u16::MAX (pathological, but
         // possible for a single giant polygon) must fall back to UInt32
         // rather than silently truncating.
-        let exterior: Vec<Coord> =
-            vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]];
+        let exterior: Vec<Coord> = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]];
         let big_tris = vec![0u32, 1, 70_000];
         let layer = ColumnarLayer {
             name: "zones".into(),
@@ -3938,7 +3998,10 @@ mod tests {
         let layer = sample_polygon_layer();
         let ipc = encode_layer(&layer).unwrap();
         let batch = decode_layer(&ipc).unwrap();
-        assert!(!batch.schema().metadata().contains_key(TRIANGLES_METADATA_KEY));
+        assert!(!batch
+            .schema()
+            .metadata()
+            .contains_key(TRIANGLES_METADATA_KEY));
         assert!(batch.column_by_name("triangles").is_none());
     }
 
@@ -3952,7 +4015,10 @@ mod tests {
         layer.triangles = Some(vec![vec![0, 1, 2]; layer.feature_ids.len()]);
         let ipc = encode_layer(&layer).unwrap();
         let batch = decode_layer(&ipc).unwrap();
-        assert!(!batch.schema().metadata().contains_key(TRIANGLES_METADATA_KEY));
+        assert!(!batch
+            .schema()
+            .metadata()
+            .contains_key(TRIANGLES_METADATA_KEY));
         assert!(batch.column_by_name("triangles").is_none());
     }
 
@@ -3965,8 +4031,7 @@ mod tests {
         let mut pos = 2usize;
         let mut out = Vec::new();
         for _ in 0..count {
-            let name_len =
-                u16::from_le_bytes([payload[pos], payload[pos + 1]]) as usize;
+            let name_len = u16::from_le_bytes([payload[pos], payload[pos + 1]]) as usize;
             pos += 2 + name_len;
             let ipc_len = u32::from_le_bytes([
                 payload[pos],
@@ -3996,7 +4061,11 @@ mod tests {
         let payload = encode_tile(&[a, b]).unwrap();
 
         let raw = u16::from_le_bytes([payload[0], payload[1]]);
-        assert_ne!(raw & ALIGNED_FRAME_FLAG, 0, "writer must set the aligned flag");
+        assert_ne!(
+            raw & ALIGNED_FRAME_FLAG,
+            0,
+            "writer must set the aligned flag"
+        );
 
         let offsets = ipc_offsets(&payload);
         assert_eq!(offsets.len(), 2);
@@ -4123,7 +4192,10 @@ mod tests {
 
         let over = offsets_from_counts([i32::MAX as usize, 1].into_iter())
             .expect_err("i32::MAX + 1 total vertices must error");
-        assert!(over.to_string().contains("32-bit list offsets"), "got: {over}");
+        assert!(
+            over.to_string().contains("32-bit list offsets"),
+            "got: {over}"
+        );
 
         // A single count beyond i32::MAX errors too (the per-count try_from).
         assert!(offsets_from_counts([usize::MAX].into_iter()).is_err());
@@ -4189,8 +4261,8 @@ mod tests {
         // Sane altitude still encodes.
         assert!(encode_layer_with(&make(5.0), &cfg).is_ok());
         // 1e18 m at a 0.05 m step → index 2e19, far outside i32.
-        let err = encode_layer_with(&make(1.0e18), &cfg)
-            .expect_err("overflowing altitude must error");
+        let err =
+            encode_layer_with(&make(1.0e18), &cfg).expect_err("overflowing altitude must error");
         let msg = err.to_string();
         // f64 Display renders 1.0e18 as its full integer form.
         assert!(
@@ -4227,7 +4299,10 @@ mod tests {
         )
         .expect_err("index 3e9 > i32::MAX must error");
         let msg = err.to_string();
-        assert!(msg.contains("overflows") && msg.contains("3000000000"), "got: {msg}");
+        assert!(
+            msg.contains("overflows") && msg.contains("3000000000"),
+            "got: {msg}"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -4307,11 +4382,7 @@ mod tests {
             properties: vec![
                 (
                     "kind".to_string(),
-                    PropertyColumn::Categorical(vec![
-                        Some("car".into()),
-                        Some("bus".into()),
-                        None,
-                    ]),
+                    PropertyColumn::Categorical(vec![Some("car".into()), Some("bus".into()), None]),
                 ),
                 (
                     "color".to_string(),
@@ -4349,8 +4420,7 @@ mod tests {
             properties: vec![],
         };
 
-        let exterior: Vec<Coord> =
-            vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]];
+        let exterior: Vec<Coord> = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]];
         let triangles = ColumnarLayer {
             triangles: Some(vec![tessellate_polygon(&[exterior.clone()])]),
             geometry: GeometryColumn::Polygon(vec![vec![exterior]]),
@@ -4420,9 +4490,10 @@ mod tests {
             )],
         };
 
-        let decoded =
-            decode_tile(&encode_tile_with(&[unsorted.clone()], &v2_inline(&EncoderConfig::default())).unwrap())
-                .unwrap();
+        let decoded = decode_tile(
+            &encode_tile_with(&[unsorted.clone()], &v2_inline(&EncoderConfig::default())).unwrap(),
+        )
+        .unwrap();
         let batch = &decoded[0].batch;
         let starts = batch
             .column_by_name("start_time")
@@ -4482,7 +4553,9 @@ mod tests {
                 (
                     "speed".into(),
                     PropertyColumn::Numeric(
-                        (0..n).map(|i| Some(seed as f64 * 0.01 + i as f64)).collect(),
+                        (0..n)
+                            .map(|i| Some(seed as f64 * 0.01 + i as f64))
+                            .collect(),
                     ),
                 ),
                 (
@@ -4512,7 +4585,11 @@ mod tests {
         };
         let c = encode_tile_with(&[narrow], &cfg).unwrap();
         let d = encode_tile_with(&[wide], &cfg).unwrap();
-        assert_eq!(collector.len(), 4, "u16 vs Int64 vertex_time are distinct templates");
+        assert_eq!(
+            collector.len(),
+            4,
+            "u16 vs Int64 vertex_time are distinct templates"
+        );
 
         // Every frame resolves through a registry built from the collector.
         let registry = registry_from(&collector);
@@ -4583,9 +4660,11 @@ mod tests {
     /// 4-byte end-of-stream and silently EMPTY the tile.
     #[test]
     fn v2_stray_zeros_in_batch_section_error_instead_of_empty_tile() {
-        let payload =
-            encode_tile_with(&[sample_point_layer()], &v2_inline(&EncoderConfig::default()))
-                .unwrap();
+        let payload = encode_tile_with(
+            &[sample_point_layer()],
+            &v2_inline(&EncoderConfig::default()),
+        )
+        .unwrap();
         let (_, off, len) = *v2_section_spans(&payload)
             .iter()
             .find(|(tag, _, _)| *tag == SECTION_CORE_BATCH)
@@ -4609,12 +4688,17 @@ mod tests {
     /// TOC length overrunning the payload is rejected before Arrow sees it.
     #[test]
     fn v2_truncated_header_and_lying_toc_length_error() {
-        let payload =
-            encode_tile_with(&[sample_point_layer()], &v2_inline(&EncoderConfig::default()))
-                .unwrap();
+        let payload = encode_tile_with(
+            &[sample_point_layer()],
+            &v2_inline(&EncoderConfig::default()),
+        )
+        .unwrap();
         let first_section_off = v2_section_spans(&payload)[0].1;
         for cut in 0..first_section_off {
-            assert!(decode_tile(&payload[..cut]).is_err(), "cut at {cut} must error");
+            assert!(
+                decode_tile(&payload[..cut]).is_err(),
+                "cut at {cut} must error"
+            );
         }
 
         // Inflate the first TOC length (u32 after the 1-byte tag): the
@@ -4645,9 +4729,11 @@ mod tests {
     /// batch — only the re-injected per-tile metadata disappears.
     #[test]
     fn v2_unknown_section_tag_is_skipped() {
-        let payload =
-            encode_tile_with(&[sample_point_layer()], &v2_inline(&EncoderConfig::default()))
-                .unwrap();
+        let payload = encode_tile_with(
+            &[sample_point_layer()],
+            &v2_inline(&EncoderConfig::default()),
+        )
+        .unwrap();
         let toc0 = first_toc_offset(&payload);
         let mut doctored = payload.clone();
         // TOC entries are (u8 tag, u32 len); find TILE_META's entry.
@@ -4664,7 +4750,12 @@ mod tests {
         let decoded = decode_tile(&doctored).unwrap();
         assert_eq!(decoded[0].batch.num_rows(), 3);
         assert!(
-            decoded[0].batch.schema().metadata().get(TIME_OFFSET_MS_KEY).is_none(),
+            decoded[0]
+                .batch
+                .schema()
+                .metadata()
+                .get(TIME_OFFSET_MS_KEY)
+                .is_none(),
             "skipped TILE_META means no t0 re-injection"
         );
     }
@@ -4715,12 +4806,21 @@ mod tests {
 
         let a = encode_layer_v2_parts(&early, &quant).unwrap();
         let b = encode_layer_v2_parts(&late, &quant).unwrap();
-        assert_eq!(a.core_template, b.core_template, "CORE template must be constant");
+        assert_eq!(
+            a.core_template, b.core_template,
+            "CORE template must be constant"
+        );
         let (a_props_template, a_props_tail) = a.props.as_ref().unwrap();
         let (b_props_template, b_props_tail) = b.props.as_ref().unwrap();
-        assert_eq!(a_props_template, b_props_template, "PROPS template must be constant");
+        assert_eq!(
+            a_props_template, b_props_template,
+            "PROPS template must be constant"
+        );
         assert_ne!(a.core_tail, b.core_tail, "t0 shift must land in the tail");
-        assert_ne!(a.tile_meta_json, b.tile_meta_json, "TILE_META varies per tile");
+        assert_ne!(
+            a.tile_meta_json, b.tile_meta_json,
+            "TILE_META varies per tile"
+        );
         // Same qa affine + same categories here → identical props tails is
         // fine; what matters is templates never absorb per-tile variance.
         let _ = (a_props_tail, b_props_tail);

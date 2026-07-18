@@ -2,7 +2,11 @@
 
 use crate::columnar::{PropertyKind, PropertyTypes};
 use anyhow::{Context, Result};
-use arrow::array::{Array, BinaryViewArray, Float32Array, Float64Array, Int64Array, LargeBinaryArray, ListArray, StringArray, TimestampSecondArray, TimestampMillisecondArray, TimestampMicrosecondArray, TimestampNanosecondArray};
+use arrow::array::{
+    Array, BinaryViewArray, Float32Array, Float64Array, Int64Array, LargeBinaryArray, ListArray,
+    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
+};
 use arrow::datatypes::DataType;
 use geojson::{Feature, Geometry, Value as GeomValue};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -107,14 +111,22 @@ pub fn load_features(
 ) -> Result<Vec<ParsedFeature>> {
     let mut features = Vec::new();
     let mut row_count = 0usize;
-    stream_features(path, time_field, end_time_field, time_format, time_strictness, geometry_strictness, |batch| {
-        row_count += batch.len();
-        features.extend(batch);
-        if row_count.is_multiple_of(100_000) {
-            tracing::info!("Loaded {} features...", row_count);
-        }
-        Ok(())
-    })?;
+    stream_features(
+        path,
+        time_field,
+        end_time_field,
+        time_format,
+        time_strictness,
+        geometry_strictness,
+        |batch| {
+            row_count += batch.len();
+            features.extend(batch);
+            if row_count.is_multiple_of(100_000) {
+                tracing::info!("Loaded {} features...", row_count);
+            }
+            Ok(())
+        },
+    )?;
     tracing::info!("Loaded {} total features", features.len());
     Ok(features)
 }
@@ -173,27 +185,40 @@ where
             time_field
         );
     }
-    let end_time_col_idx = end_time_field
-        .and_then(|field| schema.fields().iter().position(|f| f.name() == field));
+    let end_time_col_idx =
+        end_time_field.and_then(|field| schema.fields().iter().position(|f| f.name() == field));
 
     // Optional per-vertex timestamps column (List<Timestamp> or List<Int64>).
     // Producers that have real per-segment timing (e.g. nyc-rideshare with
     // OSRM annotations) populate this; absence falls back to legacy
     // uniform-by-distance interpolation in columnar.rs.
-    let vertex_times_col_idx = schema.fields().iter().position(|f| f.name() == "vertex_timestamps");
+    let vertex_times_col_idx = schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == "vertex_timestamps");
 
     // Optional per-vertex scalar column (List<Float32> or List<Float64>),
     // e.g. sea-surface temperature for the ocean-drifter dataset. Aligned with
     // the geometry vertices like `vertex_timestamps`.
-    let vertex_values_col_idx = schema.fields().iter().position(|f| f.name() == "vertex_values");
+    let vertex_values_col_idx = schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == "vertex_values");
 
     // Optional per-vertex × per-bucket value matrix (List<Float32>), flattened
     // vertex-major. Present for static-geometry overviews (flow corridors);
     // animated by selecting the active bucket column at render time.
-    let vertex_value_matrix_col_idx =
-        schema.fields().iter().position(|f| f.name() == "vertex_value_matrix");
+    let vertex_value_matrix_col_idx = schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == "vertex_value_matrix");
 
     let reader = builder.build()?;
+
+    // Coordinate columns actually consumed as geometry for this build — only
+    // these are withheld from the property set (a real `x`/`lat` attribute on a
+    // WKB-geometry input survives).
+    let coordinate_cols = consumed_coordinate_columns(&schema, &geom_col_name);
 
     // Property column indices computed once.
     let property_cols: Vec<usize> = schema
@@ -201,7 +226,13 @@ where
         .iter()
         .enumerate()
         .filter_map(|(idx, field)| {
-            if is_property_column(field.name(), &geom_col_name, time_field, end_time_field) {
+            if is_property_column(
+                field.name(),
+                &geom_col_name,
+                time_field,
+                end_time_field,
+                &coordinate_cols,
+            ) {
                 Some(idx)
             } else {
                 None
@@ -311,11 +342,18 @@ fn parse_batch(
     time_parse_failures: &mut usize,
 ) -> Result<Vec<ParsedFeature>> {
     let geometries = extract_geometries_from_batch(batch, geom_col_name)?;
-    let (timestamps, batch_time_failures) =
-        extract_timestamps_from_batch(batch, time_col_idx, time_format, time_strictness, row_offset)?;
+    let (timestamps, batch_time_failures) = extract_timestamps_from_batch(
+        batch,
+        time_col_idx,
+        time_format,
+        time_strictness,
+        row_offset,
+    )?;
     *time_parse_failures += batch_time_failures;
     let end_timestamps = end_time_col_idx
-        .map(|idx| extract_timestamps_from_batch(batch, idx, time_format, time_strictness, row_offset))
+        .map(|idx| {
+            extract_timestamps_from_batch(batch, idx, time_format, time_strictness, row_offset)
+        })
         .transpose()?
         .map(|(ts, _)| ts);
     let vertex_times = vertex_times_col_idx
@@ -410,11 +448,14 @@ fn parse_batch(
 /// column. Tolerates both `List<Timestamp(Millisecond)>` and `List<Int64>`
 /// children (ms in either case). Null rows return `None` for that slot;
 /// non-list columns return an error.
-/// Column names every input adaptor treats as geometry-component coordinates
-/// rather than user properties — excluded from the property set so a tile never
-/// carries coordinates twice. Case-SENSITIVE lowercase. Shared by the GeoParquet
-/// file reader and the PostGIS/DuckDB readers so all adaptors exclude the
-/// identical set (one source of truth — see also [`is_vertex_metadata_column`]).
+/// Column names that *may* denote geometry-component coordinates rather than
+/// user properties. Case-SENSITIVE lowercase. Still used by the PostGIS/DuckDB
+/// readers (whose SELECTed lon/lat columns are always the coordinate source).
+///
+/// The GeoParquet file reader no longer excludes columns by this blanket name
+/// test — a column named `x`/`lat`/etc. that is NOT actually consumed as this
+/// build's geometry is a real attribute — and instead withholds only the
+/// precise columns from [`consumed_coordinate_columns`].
 pub fn is_coordinate_column_name(name: &str) -> bool {
     matches!(name, "lon" | "lat" | "longitude" | "latitude" | "x" | "y")
 }
@@ -431,21 +472,61 @@ pub fn is_vertex_metadata_column(name: &str) -> bool {
     VERTEX_METADATA_COLUMNS.contains(&name)
 }
 
+/// The top-level column name(s) actually consumed as geometry coordinates for
+/// THIS build. Empty unless the geometry comes from separated lon/lat columns
+/// (`geom_col_name == "__lon_lat__"`), in which case it is exactly the two
+/// columns resolved as the lon and lat legs — the first present of
+/// `lon`/`longitude`/`x` and of `lat`/`latitude`/`y`, matching the resolution
+/// order in [`extract_geometries_from_batch`] and [`find_geometry_column`].
+///
+/// A WKB / GeoArrow-struct geometry consumes NO top-level coordinate columns
+/// (the struct's x/y legs are nested inside the geometry column, already
+/// excluded by name), so in that case a column that merely happens to be named
+/// `x`/`lat`/etc. is a genuine user attribute and must survive into tiles.
+fn consumed_coordinate_columns(
+    schema: &arrow::datatypes::Schema,
+    geom_col_name: &str,
+) -> Vec<String> {
+    if geom_col_name != "__lon_lat__" {
+        return Vec::new();
+    }
+    let mut cols = Vec::new();
+    for candidate in ["lon", "longitude", "x"] {
+        if schema.field_with_name(candidate).is_ok() {
+            cols.push(candidate.to_string());
+            break;
+        }
+    }
+    for candidate in ["lat", "latitude", "y"] {
+        if schema.field_with_name(candidate).is_ok() {
+            cols.push(candidate.to_string());
+            break;
+        }
+    }
+    cols
+}
+
 /// Whether a source column is a user property (vs geometry / time / vertex
 /// metadata / coordinate component). The single predicate behind BOTH the
 /// row-reading property selection in [`stream_features`] and the schema-level
 /// [`property_kinds`] map, so the two can't disagree.
+///
+/// `coordinate_cols` is the precise set of coordinate columns actually consumed
+/// as this build's geometry (from [`consumed_coordinate_columns`]) — NOT every
+/// column that happens to be named `x`/`lat`/etc. A real `x`/`lat` attribute on
+/// a WKB-geometry input therefore stays a property instead of being dropped.
 fn is_property_column(
     name: &str,
     geom_col_name: &str,
     time_field: &str,
     end_time_field: Option<&str>,
+    coordinate_cols: &[String],
 ) -> bool {
     !(name == geom_col_name
         || name == time_field
         || end_time_field.map(|f| name == f).unwrap_or(false)
         || is_vertex_metadata_column(name)
-        || is_coordinate_column_name(name))
+        || coordinate_cols.iter().any(|c| c == name))
 }
 
 /// Schema-level mirror of [`extract_property_value`]'s downcasts: the tile
@@ -454,10 +535,33 @@ fn is_property_column(
 /// are reported by the EOF drop accounting.
 fn property_kind_for(dt: &DataType) -> Option<PropertyKind> {
     match dt {
-        DataType::Float64 | DataType::Float32 | DataType::Int64 | DataType::Int32 => {
-            Some(PropertyKind::Numeric)
+        // Floats + every signed/unsigned integer width. Unsigned and narrow
+        // integers used to fall through to `None`, silently dropping common
+        // columns (e.g. a UInt32 id/count) from every tile.
+        DataType::Float64
+        | DataType::Float32
+        | DataType::Int64
+        | DataType::Int32
+        | DataType::Int16
+        | DataType::Int8
+        | DataType::UInt64
+        | DataType::UInt32
+        | DataType::UInt16
+        | DataType::UInt8
+        // Dates/timestamps are emitted as epoch-ms numerics; times as their
+        // raw sub-day integer; decimals as f64. See `extract_property_value`.
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Timestamp(_, _)
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _) => Some(PropertyKind::Numeric),
+        // `LargeUtf8` is the 64-bit-offset string layout — carried categorical
+        // exactly like `Utf8`.
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Boolean => {
+            Some(PropertyKind::Categorical)
         }
-        DataType::Utf8 | DataType::Boolean => Some(PropertyKind::Categorical),
         _ => None,
     }
 }
@@ -486,10 +590,17 @@ pub fn property_kinds(
         &schema,
     );
     let geom_col_name = find_geometry_column(&schema, geo_meta.as_ref())?;
+    let coordinate_cols = consumed_coordinate_columns(&schema, &geom_col_name);
 
     let mut kinds = PropertyTypes::new();
     for field in schema.fields() {
-        if !is_property_column(field.name(), &geom_col_name, time_field, end_time_field) {
+        if !is_property_column(
+            field.name(),
+            &geom_col_name,
+            time_field,
+            end_time_field,
+            &coordinate_cols,
+        ) {
             continue;
         }
         if let Some(kind) = property_kind_for(field.data_type()) {
@@ -530,35 +641,64 @@ fn extract_vertex_timestamps_from_batch(
         let scale = |value: i64, unit: TimestampUnit| -> Result<u64> {
             Ok(normalize_timestamp_to_ms(row_no, value, unit)?)
         };
-        let row_times: Vec<u64> = if let Some(ts) =
-            values.as_any().downcast_ref::<TimestampSecondArray>()
-        {
-            (0..ts.len())
-                .map(|i| if ts.is_valid(i) { scale(ts.value(i), TimestampUnit::Second) } else { Ok(0) })
-                .collect::<Result<Vec<u64>>>()?
-        } else if let Some(ts) = values.as_any().downcast_ref::<TimestampMillisecondArray>() {
-            (0..ts.len())
-                .map(|i| if ts.is_valid(i) { scale(ts.value(i), TimestampUnit::Millisecond) } else { Ok(0) })
-                .collect::<Result<Vec<u64>>>()?
-        } else if let Some(ts) = values.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-            (0..ts.len())
-                .map(|i| if ts.is_valid(i) { scale(ts.value(i), TimestampUnit::Microsecond) } else { Ok(0) })
-                .collect::<Result<Vec<u64>>>()?
-        } else if let Some(ts) = values.as_any().downcast_ref::<TimestampNanosecondArray>() {
-            (0..ts.len())
-                .map(|i| if ts.is_valid(i) { scale(ts.value(i), TimestampUnit::Nanosecond) } else { Ok(0) })
-                .collect::<Result<Vec<u64>>>()?
-        } else if let Some(ints) = values.as_any().downcast_ref::<Int64Array>() {
-            (0..ints.len())
-                .map(|i| if ints.is_valid(i) { scale(ints.value(i), TimestampUnit::Millisecond) } else { Ok(0) })
-                .collect::<Result<Vec<u64>>>()?
-        } else {
-            anyhow::bail!(
-                "vertex_timestamps child must be a Timestamp (second/millisecond/microsecond/\
+        let row_times: Vec<u64> =
+            if let Some(ts) = values.as_any().downcast_ref::<TimestampSecondArray>() {
+                (0..ts.len())
+                    .map(|i| {
+                        if ts.is_valid(i) {
+                            scale(ts.value(i), TimestampUnit::Second)
+                        } else {
+                            Ok(0)
+                        }
+                    })
+                    .collect::<Result<Vec<u64>>>()?
+            } else if let Some(ts) = values.as_any().downcast_ref::<TimestampMillisecondArray>() {
+                (0..ts.len())
+                    .map(|i| {
+                        if ts.is_valid(i) {
+                            scale(ts.value(i), TimestampUnit::Millisecond)
+                        } else {
+                            Ok(0)
+                        }
+                    })
+                    .collect::<Result<Vec<u64>>>()?
+            } else if let Some(ts) = values.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                (0..ts.len())
+                    .map(|i| {
+                        if ts.is_valid(i) {
+                            scale(ts.value(i), TimestampUnit::Microsecond)
+                        } else {
+                            Ok(0)
+                        }
+                    })
+                    .collect::<Result<Vec<u64>>>()?
+            } else if let Some(ts) = values.as_any().downcast_ref::<TimestampNanosecondArray>() {
+                (0..ts.len())
+                    .map(|i| {
+                        if ts.is_valid(i) {
+                            scale(ts.value(i), TimestampUnit::Nanosecond)
+                        } else {
+                            Ok(0)
+                        }
+                    })
+                    .collect::<Result<Vec<u64>>>()?
+            } else if let Some(ints) = values.as_any().downcast_ref::<Int64Array>() {
+                (0..ints.len())
+                    .map(|i| {
+                        if ints.is_valid(i) {
+                            scale(ints.value(i), TimestampUnit::Millisecond)
+                        } else {
+                            Ok(0)
+                        }
+                    })
+                    .collect::<Result<Vec<u64>>>()?
+            } else {
+                anyhow::bail!(
+                    "vertex_timestamps child must be a Timestamp (second/millisecond/microsecond/\
                  nanosecond) or Int64 (raw ms) array; got {:?}",
-                values.data_type()
-            );
-        };
+                    values.data_type()
+                );
+            };
         out.push(Some(row_times));
     }
     Ok(out)
@@ -585,15 +725,26 @@ fn extract_vertex_values_from_batch(
             continue;
         }
         let values = list.value(row);
-        let row_vals: Vec<f32> = if let Some(f32s) =
-            values.as_any().downcast_ref::<Float32Array>()
+        let row_vals: Vec<f32> = if let Some(f32s) = values.as_any().downcast_ref::<Float32Array>()
         {
             (0..f32s.len())
-                .map(|i| if f32s.is_valid(i) { f32s.value(i) } else { f32::NAN })
+                .map(|i| {
+                    if f32s.is_valid(i) {
+                        f32s.value(i)
+                    } else {
+                        f32::NAN
+                    }
+                })
                 .collect()
         } else if let Some(f64s) = values.as_any().downcast_ref::<Float64Array>() {
             (0..f64s.len())
-                .map(|i| if f64s.is_valid(i) { f64s.value(i) as f32 } else { f32::NAN })
+                .map(|i| {
+                    if f64s.is_valid(i) {
+                        f64s.value(i) as f32
+                    } else {
+                        f32::NAN
+                    }
+                })
                 .collect()
         } else {
             anyhow::bail!(
@@ -755,7 +906,11 @@ fn crs_is_lonlat_wgs84(crs: &serde_json::Value) -> std::result::Result<(), Strin
                     }
                     None => false,
                 };
-            if ok { Ok(()) } else { Err(format!("'{norm}'")) }
+            if ok {
+                Ok(())
+            } else {
+                Err(format!("'{norm}'"))
+            }
         }
         serde_json::Value::Object(obj) => {
             // PROJJSON: prefer the authority id, fall back to the name.
@@ -905,7 +1060,10 @@ fn find_geometry_column(
         return Ok("__lon_lat__".to_string());
     }
 
-    anyhow::bail!("Could not find geometry column in Parquet schema. Expected columns: {:?}", common_names)
+    anyhow::bail!(
+        "Could not find geometry column in Parquet schema. Expected columns: {:?}",
+        common_names
+    )
 }
 
 /// Extract geometries from a batch. A `None` slot means the row's geometry
@@ -945,10 +1103,12 @@ fn extract_geometries_from_batch(
 
     // Handle separate lon/lat columns
     if geom_col_name == "__lon_lat__" {
-        let lon_col = batch.column_by_name("lon")
+        let lon_col = batch
+            .column_by_name("lon")
             .or_else(|| batch.column_by_name("longitude"))
             .or_else(|| batch.column_by_name("x"));
-        let lat_col = batch.column_by_name("lat")
+        let lat_col = batch
+            .column_by_name("lat")
             .or_else(|| batch.column_by_name("latitude"))
             .or_else(|| batch.column_by_name("y"));
 
@@ -963,15 +1123,21 @@ fn extract_geometries_from_batch(
         anyhow::bail!("Expected lon/lat columns but could not read them");
     }
 
-    let geom_col = batch.column_by_name(geom_col_name)
+    let geom_col = batch
+        .column_by_name(geom_col_name)
         .ok_or_else(|| anyhow::anyhow!("Geometry column '{}' not found", geom_col_name))?;
 
     // Try GeoArrow struct
-    if let Some(struct_array) = geom_col.as_any().downcast_ref::<arrow::array::StructArray>() {
-        let x_col = struct_array.column_by_name("x")
+    if let Some(struct_array) = geom_col
+        .as_any()
+        .downcast_ref::<arrow::array::StructArray>()
+    {
+        let x_col = struct_array
+            .column_by_name("x")
             .or_else(|| struct_array.column_by_name("longitude"))
             .or_else(|| struct_array.column_by_name("lon"));
-        let y_col = struct_array.column_by_name("y")
+        let y_col = struct_array
+            .column_by_name("y")
             .or_else(|| struct_array.column_by_name("latitude"))
             .or_else(|| struct_array.column_by_name("lat"));
 
@@ -986,7 +1152,10 @@ fn extract_geometries_from_batch(
     }
 
     // Try WKB binary column — all three binary layouts carry the same bytes.
-    if let Some(arr) = geom_col.as_any().downcast_ref::<arrow::array::BinaryArray>() {
+    if let Some(arr) = geom_col
+        .as_any()
+        .downcast_ref::<arrow::array::BinaryArray>()
+    {
         return Ok(points_from_wkb(
             (0..batch.num_rows()).map(|i| arr.is_valid(i).then(|| arr.value(i))),
         ));
@@ -1003,10 +1172,12 @@ fn extract_geometries_from_batch(
     }
 
     // Fallback: separate lon/lat columns
-    let lon_col = batch.column_by_name("lon")
+    let lon_col = batch
+        .column_by_name("lon")
         .or_else(|| batch.column_by_name("longitude"))
         .or_else(|| batch.column_by_name("x"));
-    let lat_col = batch.column_by_name("lat")
+    let lat_col = batch
+        .column_by_name("lat")
         .or_else(|| batch.column_by_name("latitude"))
         .or_else(|| batch.column_by_name("y"));
 
@@ -1055,16 +1226,15 @@ fn extract_timestamps_from_batch(
     // In Warn mode they are coerced to Unix epoch 0 and we log; in Strict
     // mode we fail the build on the first bad row with row context.
     let mut parse_failures: usize = 0;
-    let record_failure =
-        |row: usize, parse_failures: &mut usize, reason: &str| -> Result<u64> {
-            *parse_failures += 1;
-            if strictness == InputStrictness::Strict {
-                anyhow::bail!(
-                    "row {row}: {reason} (rerun without --strict-times to coerce to epoch 0)"
-                );
-            }
-            Ok(0)
-        };
+    let record_failure = |row: usize, parse_failures: &mut usize, reason: &str| -> Result<u64> {
+        *parse_failures += 1;
+        if strictness == InputStrictness::Strict {
+            anyhow::bail!(
+                "row {row}: {reason} (rerun without --strict-times to coerce to epoch 0)"
+            );
+        }
+        Ok(0)
+    };
 
     // Arrow Timestamp columns are self-describing: scale any precision to ms
     // through the shared `normalize_timestamp_to_ms` (agrees with the per-vertex
@@ -1074,9 +1244,17 @@ fn extract_timestamps_from_batch(
         ($arr:expr, $unit:expr) => {{
             for i in 0..batch.num_rows() {
                 if $arr.is_valid(i) {
-                    timestamps.push(normalize_timestamp_to_ms(row_offset + i, $arr.value(i), $unit)?);
+                    timestamps.push(normalize_timestamp_to_ms(
+                        row_offset + i,
+                        $arr.value(i),
+                        $unit,
+                    )?);
                 } else {
-                    timestamps.push(record_failure(row_offset + i, &mut parse_failures, "null timestamp")?);
+                    timestamps.push(record_failure(
+                        row_offset + i,
+                        &mut parse_failures,
+                        "null timestamp",
+                    )?);
                 }
             }
             warn_timestamp_failures(parse_failures, batch.num_rows());
@@ -1108,9 +1286,17 @@ fn extract_timestamps_from_batch(
         };
         for i in 0..batch.num_rows() {
             if int_array.is_valid(i) {
-                timestamps.push(normalize_timestamp_to_ms(row_offset + i, int_array.value(i), unit)?);
+                timestamps.push(normalize_timestamp_to_ms(
+                    row_offset + i,
+                    int_array.value(i),
+                    unit,
+                )?);
             } else {
-                timestamps.push(record_failure(row_offset + i, &mut parse_failures, "null timestamp")?);
+                timestamps.push(record_failure(
+                    row_offset + i,
+                    &mut parse_failures,
+                    "null timestamp",
+                )?);
             }
         }
         warn_timestamp_failures(parse_failures, batch.num_rows());
@@ -1129,11 +1315,19 @@ fn extract_timestamps_from_batch(
                     }
                     Err(_) => {
                         let reason = format!("unparseable ISO8601 timestamp {s:?}");
-                        timestamps.push(record_failure(row_offset + i, &mut parse_failures, &reason)?);
+                        timestamps.push(record_failure(
+                            row_offset + i,
+                            &mut parse_failures,
+                            &reason,
+                        )?);
                     }
                 }
             } else {
-                timestamps.push(record_failure(row_offset + i, &mut parse_failures, "null timestamp")?);
+                timestamps.push(record_failure(
+                    row_offset + i,
+                    &mut parse_failures,
+                    "null timestamp",
+                )?);
             }
         }
         warn_timestamp_failures(parse_failures, batch.num_rows());
@@ -1181,11 +1375,11 @@ fn extract_property_value(
     row_idx: usize,
 ) -> Option<serde_json::Value> {
     let column = batch.column(col_idx);
-    
+
     if !column.is_valid(row_idx) {
         return None;
     }
-    
+
     if let Some(arr) = column.as_any().downcast_ref::<Float64Array>() {
         return Some(serde_json::json!(arr.value(row_idx)));
     }
@@ -1204,7 +1398,110 @@ fn extract_property_value(
     if let Some(arr) = column.as_any().downcast_ref::<arrow::array::Int32Array>() {
         return Some(serde_json::json!(arr.value(row_idx) as i64));
     }
-    
+    if let Some(arr) = column.as_any().downcast_ref::<arrow::array::Int16Array>() {
+        return Some(serde_json::json!(arr.value(row_idx) as i64));
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<arrow::array::Int8Array>() {
+        return Some(serde_json::json!(arr.value(row_idx) as i64));
+    }
+    // Unsigned integers: a `serde_json::Number` holds each width natively (u64
+    // as u64), so these round-trip through `value_as_f64` without loss for the
+    // common cases. Previously dropped entirely.
+    if let Some(arr) = column.as_any().downcast_ref::<arrow::array::UInt8Array>() {
+        return Some(serde_json::json!(arr.value(row_idx)));
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<arrow::array::UInt16Array>() {
+        return Some(serde_json::json!(arr.value(row_idx)));
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<arrow::array::UInt32Array>() {
+        return Some(serde_json::json!(arr.value(row_idx)));
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<arrow::array::UInt64Array>() {
+        return Some(serde_json::json!(arr.value(row_idx)));
+    }
+    // Date columns → epoch ms (Date32 is whole days since epoch, Date64 ms).
+    if let Some(arr) = column.as_any().downcast_ref::<arrow::array::Date32Array>() {
+        return Some(serde_json::json!(arr.value(row_idx) as i64 * 86_400_000));
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<arrow::array::Date64Array>() {
+        return Some(serde_json::json!(arr.value(row_idx)));
+    }
+    // Timestamp columns of any precision → epoch ms via the shared normalizer
+    // (agrees with the `--time-field` path and the DuckDB reader). Values that
+    // overflow or predate the epoch drop to `None` rather than wrap silently.
+    if let Some(arr) = column.as_any().downcast_ref::<TimestampSecondArray>() {
+        return normalize_timestamp_to_ms(row_idx, arr.value(row_idx), TimestampUnit::Second)
+            .ok()
+            .map(|ms| serde_json::json!(ms));
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        return normalize_timestamp_to_ms(row_idx, arr.value(row_idx), TimestampUnit::Millisecond)
+            .ok()
+            .map(|ms| serde_json::json!(ms));
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        return normalize_timestamp_to_ms(row_idx, arr.value(row_idx), TimestampUnit::Microsecond)
+            .ok()
+            .map(|ms| serde_json::json!(ms));
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        return normalize_timestamp_to_ms(row_idx, arr.value(row_idx), TimestampUnit::Nanosecond)
+            .ok()
+            .map(|ms| serde_json::json!(ms));
+    }
+    // Time-of-day columns → their raw sub-day integer (seconds/ms for Time32,
+    // micros/nanos for Time64). Better preserved as numeric than dropped.
+    if let Some(arr) = column
+        .as_any()
+        .downcast_ref::<arrow::array::Time32SecondArray>()
+    {
+        return Some(serde_json::json!(arr.value(row_idx) as i64));
+    }
+    if let Some(arr) = column
+        .as_any()
+        .downcast_ref::<arrow::array::Time32MillisecondArray>()
+    {
+        return Some(serde_json::json!(arr.value(row_idx) as i64));
+    }
+    if let Some(arr) = column
+        .as_any()
+        .downcast_ref::<arrow::array::Time64MicrosecondArray>()
+    {
+        return Some(serde_json::json!(arr.value(row_idx)));
+    }
+    if let Some(arr) = column
+        .as_any()
+        .downcast_ref::<arrow::array::Time64NanosecondArray>()
+    {
+        return Some(serde_json::json!(arr.value(row_idx)));
+    }
+    // Decimal → f64 (unscaled value / 10^scale). A Decimal256 magnitude that
+    // exceeds i128 drops to `None` rather than producing a garbage f64.
+    if let Some(arr) = column
+        .as_any()
+        .downcast_ref::<arrow::array::Decimal128Array>()
+    {
+        let scaled = arr.value(row_idx) as f64 / 10f64.powi(arr.scale() as i32);
+        return Some(serde_json::json!(scaled));
+    }
+    if let Some(arr) = column
+        .as_any()
+        .downcast_ref::<arrow::array::Decimal256Array>()
+    {
+        let scale = arr.scale() as i32;
+        return arr
+            .value(row_idx)
+            .to_i128()
+            .map(|v| serde_json::json!(v as f64 / 10f64.powi(scale)));
+    }
+    // 64-bit-offset UTF-8 strings — categorical exactly like `StringArray`.
+    if let Some(arr) = column
+        .as_any()
+        .downcast_ref::<arrow::array::LargeStringArray>()
+    {
+        return Some(serde_json::json!(arr.value(row_idx)));
+    }
+
     None
 }
 
@@ -1270,27 +1567,48 @@ mod tests {
 
     #[test]
     fn parses_zoned_timestamps() {
-        assert_eq!(parse_iso8601("2024-09-28T12:00:00Z").unwrap(), SEP_28_2024_NOON_MS);
-        assert_eq!(parse_iso8601("2024-09-28T14:00:00+02:00").unwrap(), SEP_28_2024_NOON_MS);
+        assert_eq!(
+            parse_iso8601("2024-09-28T12:00:00Z").unwrap(),
+            SEP_28_2024_NOON_MS
+        );
+        assert_eq!(
+            parse_iso8601("2024-09-28T14:00:00+02:00").unwrap(),
+            SEP_28_2024_NOON_MS
+        );
     }
 
     #[test]
     fn parses_naive_timestamps_as_utc() {
         // The T-separated zone-less form (NOAA AIS BaseDateTime and most CSV
         // exports) and the space-separated form must agree, both = UTC.
-        assert_eq!(parse_iso8601("2024-09-28T12:00:00").unwrap(), SEP_28_2024_NOON_MS);
-        assert_eq!(parse_iso8601("2024-09-28 12:00:00").unwrap(), SEP_28_2024_NOON_MS);
+        assert_eq!(
+            parse_iso8601("2024-09-28T12:00:00").unwrap(),
+            SEP_28_2024_NOON_MS
+        );
+        assert_eq!(
+            parse_iso8601("2024-09-28 12:00:00").unwrap(),
+            SEP_28_2024_NOON_MS
+        );
     }
 
     #[test]
     fn parses_naive_fractional_seconds() {
-        assert_eq!(parse_iso8601("2024-09-28T12:00:00.250").unwrap(), SEP_28_2024_NOON_MS + 250);
-        assert_eq!(parse_iso8601("2024-09-28 12:00:00.250").unwrap(), SEP_28_2024_NOON_MS + 250);
+        assert_eq!(
+            parse_iso8601("2024-09-28T12:00:00.250").unwrap(),
+            SEP_28_2024_NOON_MS + 250
+        );
+        assert_eq!(
+            parse_iso8601("2024-09-28 12:00:00.250").unwrap(),
+            SEP_28_2024_NOON_MS + 250
+        );
     }
 
     #[test]
     fn parses_date_only_as_utc_midnight() {
-        assert_eq!(parse_iso8601("2024-09-28").unwrap(), SEP_28_2024_NOON_MS - 12 * 3_600_000);
+        assert_eq!(
+            parse_iso8601("2024-09-28").unwrap(),
+            SEP_28_2024_NOON_MS - 12 * 3_600_000
+        );
     }
 
     #[test]
@@ -1298,5 +1616,141 @@ mod tests {
         assert!(parse_iso8601("not a time").is_err());
         assert!(parse_iso8601("2024-13-40T99:00:00").is_err());
         assert!(parse_iso8601("").is_err());
+    }
+
+    // ---- property type coverage (finding: silent column drop) ----
+
+    use crate::columnar::PropertyKind;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn property_kind_covers_unsigned_narrow_date_and_largeutf8() {
+        // Types that previously fell through to `None` and silently dropped the
+        // whole column from every tile.
+        for dt in [
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Date32,
+            DataType::Date64,
+            DataType::Decimal128(38, 9),
+        ] {
+            assert_eq!(
+                super::property_kind_for(&dt),
+                Some(PropertyKind::Numeric),
+                "{dt:?} should map to Numeric"
+            );
+        }
+        assert_eq!(
+            super::property_kind_for(&DataType::LargeUtf8),
+            Some(PropertyKind::Categorical)
+        );
+        // Genuinely unmappable types still drop (and are reported at EOF).
+        assert_eq!(super::property_kind_for(&DataType::Binary), None);
+    }
+
+    #[test]
+    fn extract_value_handles_uint_largeutf8_and_date() {
+        use arrow::array::{ArrayRef, Date32Array, LargeStringArray, UInt32Array};
+        use std::sync::Arc;
+
+        let u: ArrayRef = Arc::new(UInt32Array::from(vec![Some(7u32), None]));
+        let s: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("hello"), None]));
+        // Date32 counts whole days since the epoch → 1 day == 86_400_000 ms.
+        let d: ArrayRef = Arc::new(Date32Array::from(vec![Some(1i32), None]));
+        let schema = Schema::new(vec![
+            Field::new("u", DataType::UInt32, true),
+            Field::new("s", DataType::LargeUtf8, true),
+            Field::new("d", DataType::Date32, true),
+        ]);
+        let batch =
+            arrow::record_batch::RecordBatch::try_new(Arc::new(schema), vec![u, s, d]).unwrap();
+
+        assert_eq!(
+            super::extract_property_value(&batch, 0, 0),
+            Some(serde_json::json!(7))
+        );
+        assert_eq!(
+            super::extract_property_value(&batch, 1, 0),
+            Some(serde_json::json!("hello"))
+        );
+        assert_eq!(
+            super::extract_property_value(&batch, 2, 0),
+            Some(serde_json::json!(86_400_000i64))
+        );
+        // Null slots still yield None for every new type.
+        assert_eq!(super::extract_property_value(&batch, 0, 1), None);
+        assert_eq!(super::extract_property_value(&batch, 1, 1), None);
+        assert_eq!(super::extract_property_value(&batch, 2, 1), None);
+    }
+
+    // ---- coordinate-column narrowing (finding: real x/lat attrs dropped) ----
+
+    #[test]
+    fn wkb_geometry_keeps_named_coordinate_attributes() {
+        // A WKB-geometry input consumes NO top-level coordinate columns, so a
+        // real `x` / `lat` attribute must survive as a property.
+        let schema = Schema::new(vec![
+            Field::new("geometry", DataType::Binary, true),
+            Field::new("x", DataType::Float64, true),
+            Field::new("lat", DataType::Float64, true),
+        ]);
+        let coords = super::consumed_coordinate_columns(&schema, "geometry");
+        assert!(
+            coords.is_empty(),
+            "WKB build consumes no coordinate columns"
+        );
+        assert!(super::is_property_column(
+            "x", "geometry", "t", None, &coords
+        ));
+        assert!(super::is_property_column(
+            "lat", "geometry", "t", None, &coords
+        ));
+    }
+
+    #[test]
+    fn lonlat_geometry_excludes_only_the_consumed_legs() {
+        // A separated lon/lat build consumes exactly its lon + lat legs; those
+        // are withheld, everything else (including a stray `x`) stays a property.
+        let schema = Schema::new(vec![
+            Field::new("lon", DataType::Float64, true),
+            Field::new("lat", DataType::Float64, true),
+            Field::new("x", DataType::Float64, true),
+            Field::new("value", DataType::Float64, true),
+        ]);
+        let coords = super::consumed_coordinate_columns(&schema, "__lon_lat__");
+        assert_eq!(coords, vec!["lon".to_string(), "lat".to_string()]);
+        assert!(!super::is_property_column(
+            "lon",
+            "__lon_lat__",
+            "t",
+            None,
+            &coords
+        ));
+        assert!(!super::is_property_column(
+            "lat",
+            "__lon_lat__",
+            "t",
+            None,
+            &coords
+        ));
+        // `x` is present but NOT the resolved lon leg (lon won), so it survives.
+        assert!(super::is_property_column(
+            "x",
+            "__lon_lat__",
+            "t",
+            None,
+            &coords
+        ));
+        assert!(super::is_property_column(
+            "value",
+            "__lon_lat__",
+            "t",
+            None,
+            &coords
+        ));
     }
 }

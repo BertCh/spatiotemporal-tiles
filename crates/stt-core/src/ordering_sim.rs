@@ -28,6 +28,15 @@ use crate::curve::{self, BlobOrdering};
 /// so the simulation models what the client actually does.
 pub const DEFAULT_COALESCE_GAP_BYTES: u64 = 2 * 1024 * 1024;
 
+/// Default pack-object target: the `stt-build` default (`--pack-size 64`). The
+/// reader coalesces **per pack** — a range request can never bridge two pack
+/// objects (`packages/core`, archive.ts: "Coalescing is per-pack") — so the
+/// simulator force-closes a coalesced run at every pack boundary. Without this
+/// a scattered query fused into a single archive-spanning read, which no client
+/// can issue (it modelled spatial-major's whole-map pan as one 500 MB+ read and
+/// so systematically over-preferred time-major on space-wide datasets).
+pub const DEFAULT_PACK_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The orderings evaluated, in **final-tiebreak priority order**: a genuine
 /// cost tie resolves to the earliest entry, so `SpatialMajor` wins ties (which
 /// reproduces the shallow-time `choose` rule for free) and `Morton3` sits
@@ -55,16 +64,24 @@ pub struct TileSample {
     pub len: u64,
 }
 
-/// Simulation knobs. The build path always uses the default so pack hashes stay
-/// reproducible; `coalesce_gap_bytes` is exposed for offline sweeps.
+/// Simulation knobs. The build path passes the archive's real pack target so the
+/// simulated layout matches the packs the writer cuts; `coalesce_gap_bytes` is
+/// exposed for offline sweeps.
 #[derive(Debug, Clone, Copy)]
 pub struct SimOptions {
     pub coalesce_gap_bytes: u64,
+    /// Pack-object target (bytes). Coalesced runs are force-closed at each pack
+    /// boundary because the reader never bridges two pack objects. Defaults to
+    /// [`DEFAULT_PACK_BYTES`]; the writer/audit pass the archive's actual target.
+    pub pack_bytes: u64,
 }
 
 impl Default for SimOptions {
     fn default() -> Self {
-        Self { coalesce_gap_bytes: DEFAULT_COALESCE_GAP_BYTES }
+        Self {
+            coalesce_gap_bytes: DEFAULT_COALESCE_GAP_BYTES,
+            pack_bytes: DEFAULT_PACK_BYTES,
+        }
     }
 }
 
@@ -136,15 +153,24 @@ pub fn evaluate(samples: &[TileSample], opts: SimOptions) -> Vec<OrderingCost> {
         .fold((i64::MAX, i64::MIN), |(lo, hi), s| (lo.min(s.tb), hi.max(s.tb)));
     let tb_span = tb_max - tb_min;
 
-    let scrub = scrub_hits(samples);
-    let pan = pan_hits(samples);
+    // Both canonical queries read the SAME bounded viewport (the central spatial
+    // band): playback (scrub) sweeps all time within it, pan reads one instant
+    // within it. Keeping their spatial extent symmetric is what stops pan from
+    // dominating (see `central_band`).
+    let band = central_band(samples);
+    let scrub = scrub_hits(samples, &band);
+    let pan = pan_hits(samples, &band);
 
+    let pack_bytes = opts.pack_bytes.max(1);
     let mut costs: Vec<OrderingCost> = CANDIDATES
         .iter()
         .map(|&ordering| {
             let order = linearize(samples, ordering, tb_min, tb_span);
-            let sc = simulate_query(&order, samples, &scrub, gap);
-            let pn = simulate_query(&order, samples, &pan, gap);
+            // Pack assignment for THIS ordering: the writer cuts packs greedily
+            // in byte order, so a coalesced run can't span a pack boundary.
+            let packs = pack_assignment(&order, samples, pack_bytes);
+            let sc = simulate_query(&order, samples, &scrub, gap, &packs);
+            let pn = simulate_query(&order, samples, &pan, gap, &packs);
             let total_reads = sc.reads + pn.reads;
             let total_bytes_read = sc.bytes_read + pn.bytes_read;
             OrderingCost {
@@ -194,10 +220,39 @@ fn linearize(samples: &[TileSample], ordering: BlobOrdering, tb_min: i64, tb_spa
     idx
 }
 
+/// Greedy pack index per linearized position: the writer streams blobs into the
+/// current pack in byte order and cuts a new one when the next blob would exceed
+/// `pack_bytes` (matches `PackStreamWriter` in pack.rs finalize). `packs[k]` is
+/// the pack holding `order[k]`. Dedup is not modelled here (nor anywhere in this
+/// simulator), so this is the same cut the writer makes on the pre-dedup stream.
+fn pack_assignment(order: &[u32], samples: &[TileSample], pack_bytes: u64) -> Vec<u64> {
+    let mut packs = vec![0u64; order.len()];
+    let mut cur_pack = 0u64;
+    let mut fill = 0u64;
+    for (k, &i) in order.iter().enumerate() {
+        let len = samples[i as usize].len;
+        if fill > 0 && fill + len > pack_bytes {
+            cur_pack += 1;
+            fill = 0;
+        }
+        packs[k] = cur_pack;
+        fill += len;
+    }
+    packs
+}
+
 /// Simulate one access pattern: walk the linearized blobs, fusing two needed
 /// blobs into one request when at most `gap_bytes` unneeded bytes lie between
-/// them (else a new request). `bytes_read` sums every blob inside a fused run.
-fn simulate_query(order: &[u32], samples: &[TileSample], hit: &[bool], gap_bytes: u64) -> QueryCost {
+/// them (else a new request). A run is ALSO force-closed at every pack boundary
+/// (`packs[k]` changes) because the reader coalesces per-pack and a range can
+/// never bridge two pack objects. `bytes_read` sums every blob inside a fused run.
+fn simulate_query(
+    order: &[u32],
+    samples: &[TileSample],
+    hit: &[bool],
+    gap_bytes: u64,
+    packs: &[u64],
+) -> QueryCost {
     let mut reads = 0u64;
     let mut bytes_read = 0u64;
     let mut bytes_needed = 0u64;
@@ -205,10 +260,20 @@ fn simulate_query(order: &[u32], samples: &[TileSample], hit: &[bool], gap_bytes
     let mut in_run = false;
     let mut run_bytes = 0u64; // needed + swept over-read in the current fused run
     let mut gap_since_hit = 0u64; // unneeded bytes since the last hit (fuse candidate)
+    let mut run_pack = 0u64; // pack the current run started in
 
-    for &i in order {
+    for (k, &i) in order.iter().enumerate() {
         let s = &samples[i as usize];
         let h = hit[i as usize];
+        // A coalesced range can't bridge two pack objects: crossing into a new
+        // pack closes any open run before this blob is considered.
+        if in_run && packs[k] != run_pack {
+            reads += 1;
+            bytes_read += run_bytes;
+            in_run = false;
+            run_bytes = 0;
+            gap_since_hit = 0;
+        }
         if h {
             bytes_needed += s.len;
         }
@@ -217,6 +282,7 @@ fn simulate_query(order: &[u32], samples: &[TileSample], hit: &[bool], gap_bytes
                 in_run = true;
                 run_bytes = s.len;
                 gap_since_hit = 0;
+                run_pack = packs[k];
             }
             // leading unneeded blobs are simply skipped
         } else if h {
@@ -242,33 +308,47 @@ fn simulate_query(order: &[u32], samples: &[TileSample], hit: &[bool], gap_bytes
     QueryCost { reads, bytes_read, bytes_needed }
 }
 
-/// "Scrub a viewport": a contiguous 2D-Hilbert spatial band (the central quarter
-/// of the distinct occupied cells in Hilbert order) read across ALL time — a
-/// neighbourhood you zoom to and play through. Rewards keeping each cell's whole
-/// timeline byte-contiguous (`SpatialMajor`).
-fn scrub_hits(samples: &[TileSample]) -> Vec<bool> {
+/// The bounded viewport both canonical queries read: the central quarter of the
+/// distinct occupied cells in 2D-Hilbert order (a contiguous Hilbert band — the
+/// neighbourhood you'd zoom to). BOTH queries share it so they stay symmetric in
+/// spatial extent. The earlier `pan` read one instant across the ENTIRE map — an
+/// access no client issues (a viewport never holds the whole map's tiles at
+/// once); under per-pack coalescing that scattered whole-map read fused into
+/// whole-pack over-reads, which systematically over-preferred `time-major` on
+/// every space-wide dataset. Bounding pan to the same viewport removes that bias.
+///
+/// Integer math equal to the FE's `floor(m*0.375)..floor(m*0.625)` (3/8, 5/8 are
+/// exact) so this and the showcase probe pick the same band.
+fn central_band(samples: &[TileSample]) -> HashSet<u64> {
     let mut hs: Vec<u64> = samples.iter().map(|s| s.hilbert).collect();
     hs.sort_unstable();
     hs.dedup();
     let m = hs.len();
     if m == 0 {
-        return vec![false; samples.len()];
+        return HashSet::new();
     }
-    // Central quarter by rank: [m*3/8 .. max(m*5/8, m*3/8 + 1)) — integer math,
-    // equal to the FE's floor(m*0.375)..floor(m*0.625) (3/8, 5/8 are exact).
     let lo = m * 3 / 8;
     let hi = (m * 5 / 8).max(lo + 1);
-    let band: HashSet<u64> = hs[lo..hi].iter().copied().collect();
+    hs[lo..hi].iter().copied().collect()
+}
+
+/// "Scrub a viewport": the central spatial `band` read across ALL time — a
+/// neighbourhood you zoom to and play through. Rewards keeping each cell's whole
+/// timeline byte-contiguous (`SpatialMajor`).
+fn scrub_hits(samples: &[TileSample], band: &HashSet<u64>) -> Vec<bool> {
     samples.iter().map(|s| band.contains(&s.hilbert)).collect()
 }
 
-/// "Pan at one instant": the single densest time bucket (by summed bytes; ties
-/// resolve to the smallest bucket for determinism) read across the whole map.
-/// Rewards keeping one instant's whole map byte-contiguous (`TimeMajor`).
-fn pan_hits(samples: &[TileSample]) -> Vec<bool> {
+/// "Pan at one instant": the SAME viewport `band` at its single densest time
+/// bucket (by summed bytes; ties resolve to the smallest bucket for determinism)
+/// — dragging the map at a fixed time, a bounded viewport rather than the whole
+/// planet. Rewards keeping one instant's viewport byte-contiguous (`TimeMajor`).
+fn pan_hits(samples: &[TileSample], band: &HashSet<u64>) -> Vec<bool> {
     let mut by_tb: BTreeMap<i64, u64> = BTreeMap::new();
     for s in samples {
-        *by_tb.entry(s.tb).or_insert(0) += s.len;
+        if band.contains(&s.hilbert) {
+            *by_tb.entry(s.tb).or_insert(0) += s.len;
+        }
     }
     let mut best_tb = 0i64;
     let mut best_w = 0u64;
@@ -281,7 +361,10 @@ fn pan_hits(samples: &[TileSample]) -> Vec<bool> {
             found = true;
         }
     }
-    samples.iter().map(|s| s.tb == best_tb).collect()
+    samples
+        .iter()
+        .map(|s| band.contains(&s.hilbert) && s.tb == best_tb)
+        .collect()
 }
 
 #[cfg(test)]
@@ -292,7 +375,7 @@ mod tests {
     // coalescing engages but over-read is penalised — so the blended cost
     // actually discriminates orderings (the 2 MiB default would fuse tiny
     // fixtures to ~1 read for everything).
-    const OPTS: SimOptions = SimOptions { coalesce_gap_bytes: 1500 };
+    const OPTS: SimOptions = SimOptions { coalesce_gap_bytes: 1500, pack_bytes: 1 << 30 };
     const LEN: u64 = 1000;
 
     fn s(x: u32, y: u32, hilbert: u64, tb: i64, len: u64) -> TileSample {

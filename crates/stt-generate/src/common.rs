@@ -1,7 +1,10 @@
 //! Common utilities for data generation
 
 use anyhow::Result;
-use arrow::array::{ArrayRef, Float32Builder, Float64Builder, ListBuilder, StringBuilder, TimestampMillisecondBuilder};
+use arrow::array::{
+    ArrayRef, Float32Builder, Float64Builder, ListBuilder, StringBuilder,
+    TimestampMillisecondBuilder,
+};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
@@ -28,6 +31,12 @@ pub fn download_file(url: &str, output_path: &Path) -> Result<()> {
     }
 
     let response = reqwest::blocking::get(url)?;
+    // Guard against saving a 404/500 error page as if it were the payload:
+    // a non-2xx body would later be parsed as garbage data.
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("Download failed with HTTP {} for {}", status, url);
+    }
     let total_size = response.content_length().unwrap_or(0);
 
     let pb = ProgressBar::new(total_size);
@@ -127,7 +136,11 @@ pub fn create_linestring_feature_with_time_range(
 
 /// Write GeoJSON FeatureCollection to file
 pub fn write_geojson(features: Vec<Feature>, output_path: &Path) -> Result<()> {
-    println!("💾 Writing {} features to {:?}", features.len(), output_path);
+    println!(
+        "💾 Writing {} features to {:?}",
+        features.len(),
+        output_path
+    );
 
     // Ensure parent directory exists
     if let Some(parent) = output_path.parent() {
@@ -160,7 +173,12 @@ pub struct PointRecord {
 }
 
 impl PointRecord {
-    pub fn new(lon: f64, lat: f64, timestamp: DateTime<Utc>, properties: Map<String, JsonValue>) -> Self {
+    pub fn new(
+        lon: f64,
+        lat: f64,
+        timestamp: DateTime<Utc>,
+        properties: Map<String, JsonValue>,
+    ) -> Self {
         Self {
             lon,
             lat,
@@ -195,10 +213,16 @@ pub struct PropertyColumn {
 
 impl PropertyColumn {
     pub fn numeric(name: impl Into<String>) -> Self {
-        Self { name: name.into(), kind: PropertyKind::Numeric }
+        Self {
+            name: name.into(),
+            kind: PropertyKind::Numeric,
+        }
     }
     pub fn string(name: impl Into<String>) -> Self {
-        Self { name: name.into(), kind: PropertyKind::String }
+        Self {
+            name: name.into(),
+            kind: PropertyKind::String,
+        }
     }
 }
 
@@ -211,7 +235,9 @@ impl PropertyBuilder {
     fn new(kind: &PropertyKind, capacity: usize) -> Self {
         match kind {
             PropertyKind::Numeric => Self::Numeric(Float64Builder::with_capacity(capacity)),
-            PropertyKind::String => Self::String(StringBuilder::with_capacity(capacity, capacity * 32)),
+            PropertyKind::String => {
+                Self::String(StringBuilder::with_capacity(capacity, capacity * 32))
+            }
         }
     }
     fn append(&mut self, value: Option<&JsonValue>) {
@@ -274,7 +300,11 @@ impl StreamingParquetWriter {
         let mut fields = vec![
             Field::new("lon", DataType::Float64, false),
             Field::new("lat", DataType::Float64, false),
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), false),
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                false,
+            ),
         ];
 
         for col in &property_columns {
@@ -362,7 +392,10 @@ impl StreamingParquetWriter {
     pub fn finish(mut self) -> Result<usize> {
         self.flush_batch()?;
         self.writer.close()?;
-        println!("✓ GeoParquet written successfully ({} rows)", self.total_rows);
+        println!(
+            "✓ GeoParquet written successfully ({} rows)",
+            self.total_rows
+        );
         Ok(self.total_rows)
     }
 
@@ -411,7 +444,11 @@ impl StreamingCsvWriter {
             return Ok(());
         }
 
-        let mut headers = vec!["lon".to_string(), "lat".to_string(), "timestamp".to_string()];
+        let mut headers = vec![
+            "lon".to_string(),
+            "lat".to_string(),
+            "timestamp".to_string(),
+        ];
         headers.extend(self.property_columns.clone());
         self.writer.write_record(&headers)?;
         self.headers_written = true;
@@ -480,16 +517,16 @@ fn json_value_to_string(value: &JsonValue) -> String {
 pub fn encode_wkb_linestring(coordinates: &[[f64; 2]]) -> Vec<u8> {
     let num_points = coordinates.len() as u32;
     let mut wkb = Vec::with_capacity(9 + num_points as usize * 16);
-    
+
     wkb.push(1); // Little-endian
     wkb.extend_from_slice(&2u32.to_le_bytes()); // LineString type
     wkb.extend_from_slice(&num_points.to_le_bytes());
-    
+
     for [lon, lat] in coordinates {
         wkb.extend_from_slice(&lon.to_le_bytes());
         wkb.extend_from_slice(&lat.to_le_bytes());
     }
-    
+
     wkb
 }
 
@@ -500,21 +537,21 @@ pub fn encode_wkb_polygon(rings: &[Vec<[f64; 2]>]) -> Vec<u8> {
     let num_rings = rings.len() as u32;
     let total_points: usize = rings.iter().map(|r| r.len()).sum();
     let mut wkb = Vec::with_capacity(9 + num_rings as usize * 4 + total_points * 16);
-    
+
     wkb.push(1); // Little-endian
     wkb.extend_from_slice(&3u32.to_le_bytes()); // Polygon type
     wkb.extend_from_slice(&num_rings.to_le_bytes());
-    
+
     for ring in rings {
         let num_points = ring.len() as u32;
         wkb.extend_from_slice(&num_points.to_le_bytes());
-        
+
         for [lon, lat] in ring {
             wkb.extend_from_slice(&lon.to_le_bytes());
             wkb.extend_from_slice(&lat.to_le_bytes());
         }
     }
-    
+
     wkb
 }
 
@@ -602,10 +639,7 @@ impl StreamingLineStringParquetWriter {
     /// misclassified as Categorical by stt-build's columnar inference and
     /// can't drive numeric color ramps / `radiusProperty` / elevation. Use
     /// [`PropertyColumn::string`] explicitly for genuine string columns.
-    pub fn with_columns(
-        output_path: &Path,
-        property_columns: Vec<PropertyColumn>,
-    ) -> Result<Self> {
+    pub fn with_columns(output_path: &Path, property_columns: Vec<PropertyColumn>) -> Result<Self> {
         Self::with_columns_impl(output_path, property_columns, 100_000, None)
     }
 
@@ -649,8 +683,16 @@ impl StreamingLineStringParquetWriter {
         // vertex_timestamps (optional list), then properties.
         let mut fields = vec![
             Field::new("geometry", DataType::Binary, false),
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), false),
-            Field::new("end_timestamp", DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), true),
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new(
+                "end_timestamp",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                true,
+            ),
             Field::new(
                 "vertex_timestamps",
                 DataType::List(Arc::new(vertex_time_field.clone())),
@@ -679,8 +721,8 @@ impl StreamingLineStringParquetWriter {
         let schema = Arc::new(Schema::new(fields));
 
         let file = File::create(output_path)?;
-        let mut props_builder = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(Default::default()));
+        let mut props_builder =
+            WriterProperties::builder().set_compression(Compression::ZSTD(Default::default()));
         if let Some(rows) = max_row_group_rows {
             props_builder = props_builder.set_max_row_group_row_count(Some(rows));
         }
@@ -712,7 +754,10 @@ impl StreamingLineStringParquetWriter {
             writer,
             schema,
             property_columns,
-            geometry_builder: arrow::array::BinaryBuilder::with_capacity(batch_size, batch_size * 256),
+            geometry_builder: arrow::array::BinaryBuilder::with_capacity(
+                batch_size,
+                batch_size * 256,
+            ),
             timestamp_builder: TimestampMillisecondBuilder::with_capacity(batch_size),
             end_timestamp_builder: TimestampMillisecondBuilder::with_capacity(batch_size),
             vertex_timestamps_builder,
@@ -744,10 +789,21 @@ impl StreamingLineStringParquetWriter {
                 }
                 self.vertex_timestamps_builder.append(true);
             }
-            _ => {
-                // Either absent or a length mismatch — leave null so stt-build
-                // falls back to even-distance interpolation. A mismatch is
-                // silently dropped; callers should validate before writing.
+            Some(vt) => {
+                // Length mismatch vs geometry: drop the array (fall back to
+                // even-distance interpolation) but warn loudly naming the row
+                // and the mismatch so it is not silently lost.
+                eprintln!(
+                    "⚠️  linestring row {}: vertex_timestamps_ms length {} != {} vertices — dropping per-vertex timestamps",
+                    self.total_rows,
+                    vt.len(),
+                    record.coordinates.len()
+                );
+                self.vertex_timestamps_builder.append(false);
+            }
+            None => {
+                // Absent — leave null so stt-build falls back to even-distance
+                // interpolation.
                 self.vertex_timestamps_builder.append(false);
             }
         }
@@ -760,9 +816,19 @@ impl StreamingLineStringParquetWriter {
                 }
                 self.vertex_values_builder.append(true);
             }
-            _ => {
-                // Absent or length mismatch — leave null so no value channel
-                // is emitted for this row.
+            Some(vv) => {
+                // Length mismatch vs geometry: drop and warn rather than
+                // silently emit no value channel.
+                eprintln!(
+                    "⚠️  linestring row {}: vertex_values length {} != {} vertices — dropping per-vertex values",
+                    self.total_rows,
+                    vv.len(),
+                    record.coordinates.len()
+                );
+                self.vertex_values_builder.append(false);
+            }
+            None => {
+                // Absent — leave null so no value channel is emitted for this row.
                 self.vertex_values_builder.append(false);
             }
         }
@@ -776,9 +842,20 @@ impl StreamingLineStringParquetWriter {
                 }
                 self.vertex_value_matrix_builder.append(true);
             }
+            Some(m) if !m.is_empty() => {
+                // Present but not a clean multiple of the vertex count: drop
+                // and warn rather than silently emit no matrix channel.
+                eprintln!(
+                    "⚠️  linestring row {}: vertex_value_matrix length {} is not a multiple of {} vertices — dropping per-vertex matrix",
+                    self.total_rows,
+                    m.len(),
+                    nverts
+                );
+                self.vertex_value_matrix_builder.append(false);
+            }
             _ => {
-                // Absent or not a clean multiple of the vertex count — leave
-                // null so no matrix channel is emitted for this row.
+                // Absent (or empty) — leave null so no matrix channel is
+                // emitted for this row.
                 self.vertex_value_matrix_builder.append(false);
             }
         }
@@ -826,7 +903,10 @@ impl StreamingLineStringParquetWriter {
     pub fn finish(mut self) -> Result<usize> {
         self.flush_batch()?;
         self.writer.close()?;
-        println!("✓ GeoParquet (LineString) written successfully ({} rows)", self.total_rows);
+        println!(
+            "✓ GeoParquet (LineString) written successfully ({} rows)",
+            self.total_rows
+        );
         Ok(self.total_rows)
     }
 }
@@ -875,10 +955,7 @@ impl StreamingPolygonParquetWriter {
     /// Declare each column's [`PropertyKind`] — a number stored as Utf8 is
     /// misclassified as Categorical by stt-build's columnar inference. Use
     /// [`PropertyColumn::string`] explicitly for genuine string columns.
-    pub fn with_columns(
-        output_path: &Path,
-        property_columns: Vec<PropertyColumn>,
-    ) -> Result<Self> {
+    pub fn with_columns(output_path: &Path, property_columns: Vec<PropertyColumn>) -> Result<Self> {
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -886,7 +963,11 @@ impl StreamingPolygonParquetWriter {
         // Build schema: geometry (WKB), timestamp, then properties
         let mut fields = vec![
             Field::new("geometry", DataType::Binary, false),
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), false),
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                false,
+            ),
         ];
 
         for col in &property_columns {
@@ -916,7 +997,10 @@ impl StreamingPolygonParquetWriter {
             writer,
             schema,
             property_columns,
-            geometry_builder: arrow::array::BinaryBuilder::with_capacity(batch_size, batch_size * 1024),
+            geometry_builder: arrow::array::BinaryBuilder::with_capacity(
+                batch_size,
+                batch_size * 1024,
+            ),
             timestamp_builder: TimestampMillisecondBuilder::with_capacity(batch_size),
             property_builders,
             batch_size,
@@ -958,10 +1042,10 @@ impl StreamingPolygonParquetWriter {
         for builder in &mut self.property_builders {
             columns.push(builder.finish());
         }
-        
+
         let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
         self.writer.write(&batch)?;
-        
+
         self.current_batch_size = 0;
         Ok(())
     }
@@ -969,7 +1053,10 @@ impl StreamingPolygonParquetWriter {
     pub fn finish(mut self) -> Result<usize> {
         self.flush_batch()?;
         self.writer.close()?;
-        println!("✓ GeoParquet (Polygon) written successfully ({} rows)", self.total_rows);
+        println!(
+            "✓ GeoParquet (Polygon) written successfully ({} rows)",
+            self.total_rows
+        );
         Ok(self.total_rows)
     }
 
@@ -994,7 +1081,16 @@ pub fn run_stt_build(
     max_zoom: u8,
     compression: &str,
 ) -> Result<()> {
-    run_stt_build_with_options(input, output, time_field, None, min_zoom, max_zoom, compression, None)
+    run_stt_build_with_options(
+        input,
+        output,
+        time_field,
+        None,
+        min_zoom,
+        max_zoom,
+        compression,
+        None,
+    )
 }
 
 /// Find the stt-build binary - uses local binary if available, otherwise falls back to PATH
@@ -1016,7 +1112,16 @@ pub fn run_stt_build_with_end_time(
     max_zoom: u8,
     compression: &str,
 ) -> Result<()> {
-    run_stt_build_with_options(input, output, time_field, end_time_field, min_zoom, max_zoom, compression, None)
+    run_stt_build_with_options(
+        input,
+        output,
+        time_field,
+        end_time_field,
+        min_zoom,
+        max_zoom,
+        compression,
+        None,
+    )
 }
 
 /// Run stt-build to create an STT archive with all options
@@ -1277,5 +1382,3 @@ pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 
     EARTH_RADIUS * c
 }
-
-

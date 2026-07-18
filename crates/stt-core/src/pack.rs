@@ -33,8 +33,8 @@
 
 use crate::arrow_tile::{TemplateCollector, TemplateRegistry};
 use crate::compression;
-use crate::directory::TileEntry;
 use crate::curve::BlobOrdering;
+use crate::directory::TileEntry;
 use crate::error::{Error, Result};
 use crate::metadata::Metadata;
 use crate::tile::TileId;
@@ -87,7 +87,16 @@ const OBJECT_MAGIC_VERSION: u8 = 2;
 
 /// The full 8-byte magic prelude for a v2 object kind.
 fn object_magic(kind: [u8; 4]) -> [u8; OBJECT_MAGIC_LEN] {
-    [kind[0], kind[1], kind[2], kind[3], OBJECT_MAGIC_VERSION, 0, 0, 0]
+    [
+        kind[0],
+        kind[1],
+        kind[2],
+        kind[3],
+        OBJECT_MAGIC_VERSION,
+        0,
+        0,
+        0,
+    ]
 }
 
 /// Validate a v2 object's 8-byte magic prelude and return the bytes after it.
@@ -213,13 +222,21 @@ pub struct DirectoryRef {
     /// for the root under formatVersion 1, or `bytes=0-(8+rootLength-1)` under
     /// formatVersion 2 (the 8-byte object magic shifts the root), then leaf
     /// ranges on demand.
-    #[serde(default, rename = "rootLength", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "rootLength",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub root_length: Option<u64>,
     /// Number of leaf pages (informational / validation). Paged only.
     #[serde(default, rename = "pageCount", skip_serializing_if = "Option::is_none")]
     pub page_count: Option<u64>,
     /// Nominal entries-per-page used at build (informational). Paged only.
-    #[serde(default, rename = "pageEntries", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "pageEntries",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub page_entries: Option<u64>,
 }
 
@@ -318,7 +335,11 @@ pub struct Manifest {
     /// omit it (a reader infers the order from the `(pack_id, offset)` layout).
     /// Never `auto`/`measured` — those resolve to a concrete order at build.
     /// Omitted from the JSON when `None` so pre-field builds stay byte-identical.
-    #[serde(default, rename = "blobOrdering", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "blobOrdering",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub blob_ordering: Option<String>,
     /// Pointer to the encoded directory object.
     pub directory: DirectoryRef,
@@ -372,7 +393,10 @@ enum PendingPayload {
     /// here would silently truncate what the spill file faithfully stored.
     /// (Payloads over u32::MAX never get this far: [`check_payload_len`]
     /// rejects them at [`PackWriter::add_tile_full`].)
-    Spilled { offset: u64, len: u64 },
+    Spilled {
+        offset: u64,
+        len: u64,
+    },
 }
 
 impl PendingPayload {
@@ -779,7 +803,11 @@ impl PackWriter {
             let t = tb(p);
             (lo.min(t), hi.max(t))
         });
-        let tb_span = if pending.is_empty() { 0 } else { tb_max - tb_min };
+        let tb_span = if pending.is_empty() {
+            0
+        } else {
+            tb_max - tb_min
+        };
         // Occupied spatial extent over the native (max-zoom) tier only — coarse
         // LOD tiers have artificially small x/y ranges. Measuring the OCCUPIED
         // bbox (not the raw 2^zoom grid) makes the space axis symmetric with the
@@ -812,9 +840,17 @@ impl PackWriter {
                     len: p.payload.len() as u64,
                 })
                 .collect();
+            // Pass the archive's real pack target so the simulated per-pack
+            // coalescing matches the packs this build will actually cut. (Blob
+            // weights here are uncompressed payload lengths vs the writer's
+            // compressed cut, so boundaries land a little early — but uniformly
+            // across all orderings, so the RELATIVE ranking is preserved.)
             crate::ordering_sim::measured_ordering(
                 &samples,
-                crate::ordering_sim::SimOptions::default(),
+                crate::ordering_sim::SimOptions {
+                    pack_bytes: pack_target_bytes,
+                    ..crate::ordering_sim::SimOptions::default()
+                },
             )
         } else {
             match ordering {
@@ -1231,12 +1267,7 @@ impl Drop for OpenPack {
 }
 
 impl PackStreamWriter {
-    fn new(
-        out_dir: &Path,
-        packs_dir: &Path,
-        format_version: u32,
-        pack_target_bytes: u64,
-    ) -> Self {
+    fn new(out_dir: &Path, packs_dir: &Path, format_version: u32, pack_target_bytes: u64) -> Self {
         Self {
             out_dir: out_dir.to_path_buf(),
             packs_dir: packs_dir.to_path_buf(),
@@ -1484,8 +1515,8 @@ pub fn verify_packed_objects<P: AsRef<Path>>(manifest_path: P) -> Result<Vec<Str
             Some(rl) => {
                 if let Ok(dir_bytes) = fs::read(root.join(&manifest.directory.key)) {
                     if let Ok(codec) = directory_codec_bytes(&dir_bytes, manifest.format_version) {
-                        let zstd = manifest.directory.encoding.as_deref()
-                            == Some(DIRECTORY_ENCODING_ZSTD);
+                        let zstd =
+                            manifest.directory.encoding.as_deref() == Some(DIRECTORY_ENCODING_ZSTD);
                         match crate::directory_page::verify_paged_structure(codec, rl, zstd) {
                             Ok(mut more) => issues.append(&mut more),
                             Err(e) => issues.push(format!("paged structure check failed: {e}")),
@@ -1574,16 +1605,24 @@ fn verify_v2_frame_template_refs<F>(
         else {
             continue;
         };
-        let (start, end) = (e.offset as usize, e.offset as usize + e.length as usize);
-        if end > pack.len() {
-            issues.push(format!(
-                "tile {:?} blob range {start}..{end} exceeds pack {} size {}",
-                e.tile_id(),
-                e.pack_id,
-                pack.len()
-            ));
-            continue;
-        }
+        // Compute the exclusive end in u64: a corrupt offset near u64::MAX
+        // would wrap the `usize` add and slip past the `end > pack.len()`
+        // guard into a slice panic.
+        let start = e.offset as usize;
+        let end = match e.offset.checked_add(e.length as u64) {
+            Some(end) if end <= pack.len() as u64 => end as usize,
+            _ => {
+                issues.push(format!(
+                    "tile {:?} blob range at offset {} (length {}) exceeds pack {} size {}",
+                    e.tile_id(),
+                    e.offset,
+                    e.length,
+                    e.pack_id,
+                    pack.len()
+                ));
+                continue;
+            }
+        };
         let payload = match manifest.compression.as_str() {
             "zstd" => match compression::decompress_zstd_with_dict(&pack[start..end], None) {
                 Ok(p) => p,
@@ -1814,7 +1853,10 @@ impl PackedReader {
         let mut by_key: HashMap<&str, (u64, u64)> = HashMap::with_capacity(header.objects.len());
         for o in &header.objects {
             let end = o.offset.checked_add(o.length).ok_or_else(|| {
-                Error::InvalidArchive(format!("bundle object {:?}: offset+length overflows", o.key))
+                Error::InvalidArchive(format!(
+                    "bundle object {:?}: offset+length overflows",
+                    o.key
+                ))
             })?;
             if o.offset < header_end || end > mmap.len() as u64 {
                 return Err(Error::InvalidArchive(format!(
@@ -1824,7 +1866,10 @@ impl PackedReader {
                     mmap.len()
                 )));
             }
-            if by_key.insert(o.key.as_str(), (o.offset, o.length)).is_some() {
+            if by_key
+                .insert(o.key.as_str(), (o.offset, o.length))
+                .is_some()
+            {
                 return Err(Error::InvalidArchive(format!(
                     "bundle header lists object key {:?} twice",
                     o.key
@@ -1849,8 +1894,11 @@ impl PackedReader {
             .then(|| build_template_registry(&manifest.schemas))
             .transpose()?;
 
-        let (dir_off, dir_len) =
-            lookup(&manifest.directory.key, manifest.directory.length, "directory")?;
+        let (dir_off, dir_len) = lookup(
+            &manifest.directory.key,
+            manifest.directory.length,
+            "directory",
+        )?;
         let dir_object = &mmap[dir_off as usize..(dir_off + dir_len) as usize];
         let codec_bytes = directory_codec_bytes(dir_object, manifest.format_version)?;
         let entries = decode_directory_entries(codec_bytes, &manifest.directory)?;
@@ -1917,12 +1965,15 @@ impl PackedReader {
                         bundle.windows.len()
                     ))
                 })?;
-            let end_in_pack = entry.offset.checked_add(entry.length as u64).ok_or_else(|| {
-                Error::InvalidArchive(format!(
-                    "tile {:?}: blob offset+length overflows",
-                    entry.tile_id()
-                ))
-            })?;
+            let end_in_pack = entry
+                .offset
+                .checked_add(entry.length as u64)
+                .ok_or_else(|| {
+                    Error::InvalidArchive(format!(
+                        "tile {:?}: blob offset+length overflows",
+                        entry.tile_id()
+                    ))
+                })?;
             if end_in_pack > pack_length {
                 return Err(Error::InvalidArchive(format!(
                     "tile {:?} blob range {}..{end_in_pack} exceeds pack size {pack_length}",
@@ -1964,25 +2015,34 @@ impl PackedReader {
             // offsets are object-absolute under v2, so the slice math below
             // is version-independent.)
             if self.format_version == PACKED_FORMAT_VERSION_V2 {
-                strip_object_magic(
-                    &mmap,
-                    PACK_MAGIC,
-                    &format!("pack {}", pack.path.display()),
-                )?;
+                strip_object_magic(&mmap, PACK_MAGIC, &format!("pack {}", pack.path.display()))?;
             }
             pack.mmap = Some(mmap);
         }
         let mmap = pack.mmap.as_ref().expect("just loaded");
 
-        let start = entry.offset as usize;
-        let end = start + entry.length as usize;
-        if end > mmap.len() {
+        // Compute the exclusive end in u64 first: a corrupt entry offset near
+        // u64::MAX would wrap a `usize` add and bypass the length guard, then
+        // panic in the slice. Mirror the bundle path above.
+        let end = entry
+            .offset
+            .checked_add(entry.length as u64)
+            .ok_or_else(|| {
+                Error::InvalidArchive(format!(
+                    "tile {:?}: blob offset+length overflows",
+                    entry.tile_id()
+                ))
+            })?;
+        if end > mmap.len() as u64 {
             return Err(Error::InvalidArchive(format!(
-                "tile {:?} blob range {start}..{end} exceeds pack size {}",
+                "tile {:?} blob range {}..{end} exceeds pack size {}",
                 entry.tile_id(),
+                entry.offset,
                 mmap.len()
             )));
         }
+        let start = entry.offset as usize;
+        let end = end as usize;
         self.decode_blob(entry, &mmap[start..end])
     }
 
@@ -2145,7 +2205,9 @@ fn validate_bundle_key(key: &str) -> Result<()> {
         || key.starts_with('/')
         || key.contains('\\')
         || key.contains(':')
-        || key.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..");
+        || key
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..");
     if bad {
         return Err(Error::InvalidArchive(format!(
             "unsafe bundle object key {key:?} (keys must be relative paths \
@@ -2457,7 +2519,10 @@ pub fn unpack_bundle<P: AsRef<Path>, Q: AsRef<Path>>(
             )));
         }
         let end = o.offset.checked_add(o.length).ok_or_else(|| {
-            Error::InvalidArchive(format!("bundle object {:?}: offset+length overflows", o.key))
+            Error::InvalidArchive(format!(
+                "bundle object {:?}: offset+length overflows",
+                o.key
+            ))
         })?;
         if o.offset < header_end || end > mmap.len() as u64 {
             return Err(Error::InvalidArchive(format!(
@@ -2485,7 +2550,10 @@ pub fn unpack_bundle<P: AsRef<Path>, Q: AsRef<Path>>(
     let mut bytes_written = 0u64;
     for o in &header.objects {
         let path = out_dir.join(&o.key);
-        let parent = path.parent().map(Path::to_path_buf).unwrap_or_else(|| out_dir.to_path_buf());
+        let parent = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| out_dir.to_path_buf());
         fs::create_dir_all(&parent)?;
         write_atomic(
             &parent,
@@ -2677,14 +2745,10 @@ pub fn verify_bundle_objects<P: AsRef<Path>>(bundle_path: P) -> Result<Vec<Strin
                                 == Some(DIRECTORY_ENCODING_ZSTD);
                             match crate::directory_page::verify_paged_structure(codec, rl, zstd) {
                                 Ok(mut more) => issues.append(&mut more),
-                                Err(e) => {
-                                    issues.push(format!("paged structure check failed: {e}"))
-                                }
+                                Err(e) => issues.push(format!("paged structure check failed: {e}")),
                             }
                         }
-                        None => {
-                            issues.push("paged directory: manifest missing rootLength".into())
-                        }
+                        None => issues.push("paged directory: manifest missing rootLength".into()),
                     }
                 }
             }
@@ -2763,8 +2827,14 @@ mod tests {
                 page_entries: None,
             },
             packs: vec![
-                PackRef { key: "packs/a.sttp".to_string(), length: 100 },
-                PackRef { key: "packs/b.sttp".to_string(), length: 200 },
+                PackRef {
+                    key: "packs/a.sttp".to_string(),
+                    length: 100,
+                },
+                PackRef {
+                    key: "packs/b.sttp".to_string(),
+                    length: 200,
+                },
             ],
             metadata: Metadata::new("manifest-test"),
         };
@@ -2801,8 +2871,7 @@ mod tests {
         // A pre-capabilities manifest (no `capabilities` key — the shape of
         // every deployed dataset) parses to an empty list.
         assert!(legacy_back.capabilities.is_empty());
-        let legacy_out =
-            String::from_utf8(legacy_back.to_json_bytes().unwrap()).unwrap();
+        let legacy_out = String::from_utf8(legacy_back.to_json_bytes().unwrap()).unwrap();
         assert!(!legacy_out.contains("\"encoding\""), "{legacy_out}");
     }
 
@@ -2831,8 +2900,16 @@ mod tests {
                 distinct_tile(k)
             };
             let id = TileId::new(zoom, (k % 7) as u32, (k / 7) as u32, t as u64);
-            w.add_tile_full(&id, t, t + bucket - 1, Some(t), 6, Some(bucket as u64), &payload)
-                .unwrap();
+            w.add_tile_full(
+                &id,
+                t,
+                t + bucket - 1,
+                Some(t),
+                6,
+                Some(bucket as u64),
+                &payload,
+            )
+            .unwrap();
             expected.push((id, t, t + bucket - 1, payload));
         }
         assert_eq!(w.tile_count(), 30);
@@ -2841,7 +2918,11 @@ mod tests {
         let manifest = w.finalize(&meta).unwrap();
 
         // >1 pack produced at the tiny target.
-        assert!(manifest.packs.len() > 1, "expected multiple packs, got {}", manifest.packs.len());
+        assert!(
+            manifest.packs.len() > 1,
+            "expected multiple packs, got {}",
+            manifest.packs.len()
+        );
 
         // Every pack file ≤ target, except a lone oversized blob owning a pack.
         for p in &manifest.packs {
@@ -2892,9 +2973,7 @@ mod tests {
             let e = reader
                 .entries()
                 .iter()
-                .find(|e| {
-                    e.zoom == id.z && e.x == id.x && e.y == id.y && e.time_start == *ts
-                })
+                .find(|e| e.zoom == id.z && e.x == id.x && e.y == id.y && e.time_start == *ts)
                 .expect("entry present");
             let got = reader.read_payload(e).unwrap();
             assert_eq!(&got, payload, "payload mismatch for {id:?}");
@@ -2930,7 +3009,8 @@ mod tests {
                 let t = b * bucket;
                 let id = TileId::new(14, 10_000 + x, 20_000, t as u64);
                 let payload = format!("f1-{x}-{b}").into_bytes();
-                w.add_tile_full(&id, t, t + bucket - 1, Some(t), 1, None, &payload).unwrap();
+                w.add_tile_full(&id, t, t + bucket - 1, Some(t), 1, None, &payload)
+                    .unwrap();
             }
         }
         let meta = Metadata::new("f1").with_temporal_bucket_ms(bucket as u64);
@@ -2947,15 +3027,15 @@ mod tests {
         let build = || {
             let dir = tempfile::tempdir().unwrap();
             let out = dir.path().join("m");
-            let mut w = v1_writer(&out, BlobOrdering::Auto, 1 << 20)
-                .with_measured_ordering(true);
+            let mut w = v1_writer(&out, BlobOrdering::Auto, 1 << 20).with_measured_ordering(true);
             let bucket = 3_600_000i64;
             for x in 0..2u32 {
                 for b in 0..24i64 {
                     let t = b * bucket;
                     let id = TileId::new(10, 5_000 + x, 6_000, t as u64);
                     let payload = format!("m-{x}-{b}").into_bytes();
-                    w.add_tile_full(&id, t, t + bucket - 1, Some(t), 1, None, &payload).unwrap();
+                    w.add_tile_full(&id, t, t + bucket - 1, Some(t), 1, None, &payload)
+                        .unwrap();
                 }
             }
             let meta = Metadata::new("m").with_temporal_bucket_ms(bucket as u64);
@@ -2965,7 +3045,10 @@ mod tests {
         let b = build();
         assert_eq!(a, b, "measured resolution must be deterministic");
         let o = a.expect("measured records a concrete order");
-        assert!(matches!(o.as_str(), "spatial" | "time-major" | "hilbert3" | "morton3"));
+        assert!(matches!(
+            o.as_str(),
+            "spatial" | "time-major" | "hilbert3" | "morton3"
+        ));
     }
 
     /// A **paged** directory build round-trips end-to-end through
@@ -2991,8 +3074,7 @@ mod tests {
             input.push((id, t, t + bucket - 1, distinct_tile(k)));
         }
         let build = |out: &Path, page_entries: Option<usize>| -> Manifest {
-            let mut w = v1_writer(out, BlobOrdering::Auto, 16 * 1024)
-                .with_paging(page_entries);
+            let mut w = v1_writer(out, BlobOrdering::Auto, 16 * 1024).with_paging(page_entries);
             for (id, ts, te, payload) in &input {
                 w.add_tile_full(id, *ts, *te, Some(*ts), 6, Some(bucket as u64), payload)
                     .unwrap();
@@ -3010,12 +3092,24 @@ mod tests {
 
         // Paged manifest carries the container fields; single does not.
         assert!(single.directory.layout.is_none());
-        assert_eq!(paged.directory.layout.as_deref(), Some(DIRECTORY_LAYOUT_PAGED));
+        assert_eq!(
+            paged.directory.layout.as_deref(),
+            Some(DIRECTORY_LAYOUT_PAGED)
+        );
         assert!(paged.directory.root_length.unwrap() > 0);
-        assert!(paged.directory.page_count.unwrap() >= 2, "expected multiple leaf pages");
+        assert!(
+            paged.directory.page_count.unwrap() >= 2,
+            "expected multiple leaf pages"
+        );
         assert_eq!(paged.directory.page_entries, Some(16));
-        assert_eq!(paged.directory.directory_version, crate::directory::DIRECTORY_VERSION);
-        assert_eq!(paged.directory.encoding.as_deref(), Some(DIRECTORY_ENCODING_ZSTD));
+        assert_eq!(
+            paged.directory.directory_version,
+            crate::directory::DIRECTORY_VERSION
+        );
+        assert_eq!(
+            paged.directory.encoding.as_deref(),
+            Some(DIRECTORY_ENCODING_ZSTD)
+        );
 
         let r_single = PackedReader::open(single_out.join("manifest.json")).unwrap();
         let r_paged = PackedReader::open(paged_out.join("manifest.json")).unwrap();
@@ -3027,8 +3121,16 @@ mod tests {
         // decoded directory entries — the paged build differs from the single
         // build ONLY in the directory object's container shape.
         assert_eq!(
-            single.packs.iter().map(|p| (&p.key, p.length)).collect::<Vec<_>>(),
-            paged.packs.iter().map(|p| (&p.key, p.length)).collect::<Vec<_>>(),
+            single
+                .packs
+                .iter()
+                .map(|p| (&p.key, p.length))
+                .collect::<Vec<_>>(),
+            paged
+                .packs
+                .iter()
+                .map(|p| (&p.key, p.length))
+                .collect::<Vec<_>>(),
             "pack content addresses must match across single vs paged builds"
         );
         assert_eq!(r_single.entries(), r_paged.entries());
@@ -3040,7 +3142,11 @@ mod tests {
                 .iter()
                 .find(|x| x.zoom == id.z && x.x == id.x && x.y == id.y && x.time_start == *ts)
                 .expect("paged entry present");
-            assert_eq!(&r_paged.read_payload(e).unwrap(), payload, "payload mismatch {id:?}");
+            assert_eq!(
+                &r_paged.read_payload(e).unwrap(),
+                payload,
+                "payload mismatch {id:?}"
+            );
         }
 
         // Content-address integrity verifies clean on the paged dataset.
@@ -3063,7 +3169,9 @@ mod tests {
             start_times: vec![0; big_ids.len()],
             end_times: vec![100; big_ids.len()],
             geometry: GeometryColumn::Point(
-                (0..big_ids.len()).map(|i| [i as f64 * 0.01, i as f64 * 0.013]).collect(),
+                (0..big_ids.len())
+                    .map(|i| [i as f64 * 0.01, i as f64 * 0.013])
+                    .collect(),
             ),
             vertex_times: None,
             vertex_values: None,
@@ -3072,15 +3180,19 @@ mod tests {
             properties: vec![],
         }])
         .unwrap();
-        let big_compressed_len = compression::compress_zstd_with_dict(&big, None).unwrap().len();
+        let big_compressed_len = compression::compress_zstd_with_dict(&big, None)
+            .unwrap()
+            .len();
 
         let mut w = v1_writer(&out, BlobOrdering::SpatialMajor, 4 * 1024);
         // target 4 KiB < big blob.
         assert!(big_compressed_len as u64 > 4 * 1024);
-        w.add_tile_full(&TileId::new(10, 0, 0, 0), 0, 100, None, 4000, None, &big).unwrap();
+        w.add_tile_full(&TileId::new(10, 0, 0, 0), 0, 100, None, 4000, None, &big)
+            .unwrap();
         for k in 1..4u64 {
             let p = distinct_tile(k);
-            w.add_tile_full(&TileId::new(10, k as u32, 0, 0), 0, 100, None, 6, None, &p).unwrap();
+            w.add_tile_full(&TileId::new(10, k as u32, 0, 0), 0, 100, None, 6, None, &p)
+                .unwrap();
         }
         let _manifest = w.finalize(&Metadata::new("big")).unwrap();
 
@@ -3102,12 +3214,16 @@ mod tests {
         let mut w = v1_writer(&out, BlobOrdering::Auto, 64 * 1024 * 1024);
         for k in 0..4u64 {
             let p = distinct_tile(k);
-            w.add_tile_full(&TileId::new(10, k as u32, 0, 0), 0, 100, None, 6, None, &p).unwrap();
+            w.add_tile_full(&TileId::new(10, k as u32, 0, 0), 0, 100, None, 6, None, &p)
+                .unwrap();
         }
         let manifest = w.finalize(&Metadata::new("crc")).unwrap();
 
         // Clean read before corruption.
-        let entry = PackedReader::open(out.join("manifest.json")).unwrap().entries()[0].clone();
+        let entry = PackedReader::open(out.join("manifest.json"))
+            .unwrap()
+            .entries()[0]
+            .clone();
         assert!(PackedReader::open(out.join("manifest.json"))
             .unwrap()
             .read_payload(&entry)
@@ -3124,6 +3240,39 @@ mod tests {
         assert!(
             reader.read_payload(&entry).is_err(),
             "corrupt pack blob must fail the read-path CRC32C check"
+        );
+    }
+
+    /// A corrupt entry whose `offset` sits near `u64::MAX` must make
+    /// `read_payload` return `Err`, not overflow the `offset + length` slice
+    /// math and panic. Guards the checked-add in the non-bundle read path.
+    #[test]
+    fn read_payload_offset_overflow_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+
+        let mut w = v1_writer(&out, BlobOrdering::Auto, 64 * 1024 * 1024);
+        w.add_tile_full(
+            &TileId::new(10, 0, 0, 0),
+            0,
+            100,
+            None,
+            6,
+            None,
+            &distinct_tile(0),
+        )
+        .unwrap();
+        w.finalize(&Metadata::new("ovf")).unwrap();
+
+        let reader = PackedReader::open(out.join("manifest.json")).unwrap();
+        let mut entry = reader.entries()[0].clone();
+        // offset + length overflows u64: a wrapping `usize` add would slip past
+        // the `end > pack.len()` guard into a slice panic pre-fix.
+        entry.offset = u64::MAX - 3;
+        entry.length = 16;
+        assert!(
+            reader.read_payload(&entry).is_err(),
+            "an entry offset near u64::MAX must error, not panic"
         );
     }
 
@@ -3176,7 +3325,10 @@ mod tests {
         let (_d1, m1) = build(&forward);
         let (_d2, m2) = build(&reverse);
 
-        assert_eq!(m1.directory.key, m2.directory.key, "directory hash must be stable");
+        assert_eq!(
+            m1.directory.key, m2.directory.key,
+            "directory hash must be stable"
+        );
         assert_eq!(
             m1.packs.iter().map(|p| &p.key).collect::<Vec<_>>(),
             m2.packs.iter().map(|p| &p.key).collect::<Vec<_>>(),
@@ -3238,7 +3390,10 @@ mod tests {
             in_mem.packs.iter().map(|p| &p.key).collect::<Vec<_>>(),
             "pack hashes must not depend on the payload storage medium"
         );
-        assert_eq!(spilled.to_json_bytes().unwrap(), in_mem.to_json_bytes().unwrap());
+        assert_eq!(
+            spilled.to_json_bytes().unwrap(),
+            in_mem.to_json_bytes().unwrap()
+        );
 
         // Multi-pack at the tiny target, so the STREAMING pack phase
         // (incremental blake3, per-seal temp→content-address renames) crossed
@@ -3246,13 +3401,18 @@ mod tests {
         // sealed objects verify clean and leave no `.tmp-*` residue.
         assert!(spilled.packs.len() > 1, "fixture must span multiple packs");
         let spilled_out = d1.path().join("dataset");
-        assert!(verify_packed_objects(spilled_out.join("manifest.json")).unwrap().is_empty());
+        assert!(verify_packed_objects(spilled_out.join("manifest.json"))
+            .unwrap()
+            .is_empty());
         let tmp_residue: Vec<_> = fs::read_dir(spilled_out.join("packs"))
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp-"))
             .collect();
-        assert!(tmp_residue.is_empty(), "streaming pack temp left behind: {tmp_residue:?}");
+        assert!(
+            tmp_residue.is_empty(),
+            "streaming pack temp left behind: {tmp_residue:?}"
+        );
 
         // Abandon path: dropping a writer that spilled (no finalize) must
         // remove the spill file too.
@@ -3284,7 +3444,10 @@ mod tests {
     fn payload_len_guard_rejects_4gib_payloads() {
         let id = TileId::new(5, 1, 2, 0);
         assert!(check_payload_len(&id, 0).is_ok());
-        assert!(check_payload_len(&id, u32::MAX as u64).is_ok(), "exact u32::MAX still fits");
+        assert!(
+            check_payload_len(&id, u32::MAX as u64).is_ok(),
+            "exact u32::MAX still fits"
+        );
         let err = check_payload_len(&id, u32::MAX as u64 + 1).unwrap_err();
         assert!(
             err.to_string().contains("uncompressed_size") && err.to_string().contains("4 GiB"),
@@ -3316,8 +3479,8 @@ mod tests {
         .unwrap();
 
         // v1 frame → v2 (default) writer.
-        let mut w2 = PackWriter::create(dir.path().join("v2"), BlobOrdering::Auto, 8 * 1024)
-            .unwrap();
+        let mut w2 =
+            PackWriter::create(dir.path().join("v2"), BlobOrdering::Auto, 8 * 1024).unwrap();
         let err = w2
             .add_tile_full(&id, 0, 100, None, 2, None, &v1_payload)
             .unwrap_err();
@@ -3339,8 +3502,10 @@ mod tests {
         );
 
         // Matching versions pass (both directions).
-        w2.add_tile_full(&id, 0, 100, None, 2, None, &v2_payload).unwrap();
-        w1.add_tile_full(&id, 0, 100, None, 2, None, &v1_payload).unwrap();
+        w2.add_tile_full(&id, 0, 100, None, 2, None, &v2_payload)
+            .unwrap();
+        w1.add_tile_full(&id, 0, 100, None, 2, None, &v1_payload)
+            .unwrap();
     }
 
     /// The directory ships zstd-compressed at rest (declared via
@@ -3371,7 +3536,10 @@ mod tests {
         let raw = compression::decompress_zstd_with_dict(&at_rest, None).unwrap();
         assert!(crate::directory::decode_directory(&raw).is_ok());
         assert!(verify_packed_objects(&manifest_path).unwrap().is_empty());
-        let entries_compressed = PackedReader::open(&manifest_path).unwrap().entries().to_vec();
+        let entries_compressed = PackedReader::open(&manifest_path)
+            .unwrap()
+            .entries()
+            .to_vec();
 
         // Rewrite the dataset as a legacy (raw-directory) manifest: store the
         // raw codec bytes under their own content address and drop `encoding`.
@@ -3392,7 +3560,10 @@ mod tests {
         fs::write(&manifest_path, legacy.to_json_bytes().unwrap()).unwrap();
 
         assert!(verify_packed_objects(&manifest_path).unwrap().is_empty());
-        let entries_raw = PackedReader::open(&manifest_path).unwrap().entries().to_vec();
+        let entries_raw = PackedReader::open(&manifest_path)
+            .unwrap()
+            .entries()
+            .to_vec();
         assert_eq!(entries_raw, entries_compressed);
 
         // An unknown encoding must fail loudly, not decode garbage.
@@ -3410,8 +3581,16 @@ mod tests {
         let out = dir.path().join("dataset");
 
         let mut w = v1_writer(&out, BlobOrdering::Auto, 8 * 1024);
-        w.add_tile_full(&TileId::new(10, 0, 0, 0), 0, 100, None, 6, None, &distinct_tile(1))
-            .unwrap();
+        w.add_tile_full(
+            &TileId::new(10, 0, 0, 0),
+            0,
+            100,
+            None,
+            6,
+            None,
+            &distinct_tile(1),
+        )
+        .unwrap();
         w.finalize(&Metadata::new("ver")).unwrap();
         let manifest_path = out.join("manifest.json");
         assert!(PackedReader::open(&manifest_path).is_ok());
@@ -3426,7 +3605,10 @@ mod tests {
             Ok(_) => panic!("formatVersion 3 must be rejected at open"),
             Err(e) => e,
         };
-        assert!(err.to_string().contains("formatVersion"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("formatVersion"),
+            "unexpected error: {err}"
+        );
     }
 
     /// The manifest's `formatVersion` is AUTHORITATIVE (design §1 ★F6):
@@ -3440,8 +3622,16 @@ mod tests {
         let mut w = PackWriter::create(&out, BlobOrdering::Auto, 8 * 1024)
             .unwrap()
             .with_format_version(PACKED_FORMAT_VERSION_V1);
-        w.add_tile_full(&TileId::new(10, 0, 0, 0), 0, 100, None, 6, None, &distinct_tile(1))
-            .unwrap();
+        w.add_tile_full(
+            &TileId::new(10, 0, 0, 0),
+            0,
+            100,
+            None,
+            6,
+            None,
+            &distinct_tile(1),
+        )
+        .unwrap();
         w.finalize(&Metadata::new("ver")).unwrap();
         let manifest_path = out.join("manifest.json");
 
@@ -3473,12 +3663,23 @@ mod tests {
                 CAPABILITY_COORD_QUANT.to_string(),
                 CAPABILITY_COORD_QUANT.to_string(),
             ]);
-        w.add_tile_full(&TileId::new(10, 0, 0, 0), 0, 100, None, 6, None, &distinct_tile(1))
-            .unwrap();
+        w.add_tile_full(
+            &TileId::new(10, 0, 0, 0),
+            0,
+            100,
+            None,
+            6,
+            None,
+            &distinct_tile(1),
+        )
+        .unwrap();
         let manifest = w.finalize(&Metadata::new("caps")).unwrap();
         assert_eq!(
             manifest.capabilities,
-            vec![CAPABILITY_COORD_QUANT.to_string(), CAPABILITY_ELEVATION_FOLD.to_string()]
+            vec![
+                CAPABILITY_COORD_QUANT.to_string(),
+                CAPABILITY_ELEVATION_FOLD.to_string()
+            ]
         );
 
         let manifest_path = out.join("manifest.json");
@@ -3497,8 +3698,16 @@ mod tests {
         let out = dir.path().join("dataset");
 
         let mut w = v1_writer(&out, BlobOrdering::Auto, 8 * 1024);
-        w.add_tile_full(&TileId::new(10, 0, 0, 0), 0, 100, None, 6, None, &distinct_tile(1))
-            .unwrap();
+        w.add_tile_full(
+            &TileId::new(10, 0, 0, 0),
+            0,
+            100,
+            None,
+            6,
+            None,
+            &distinct_tile(1),
+        )
+        .unwrap();
         w.finalize(&Metadata::new("caps")).unwrap();
         let manifest_path = out.join("manifest.json");
 
@@ -3551,7 +3760,9 @@ mod tests {
 
         let issues = verify_packed_objects(&manifest_path).unwrap();
         assert!(
-            issues.iter().any(|s| s.contains("content-address mismatch")),
+            issues
+                .iter()
+                .any(|s| s.contains("content-address mismatch")),
             "expected a content-address mismatch, got {issues:?}"
         );
     }
@@ -3577,8 +3788,16 @@ mod tests {
                 distinct_tile(k)
             };
             let id = TileId::new(10, (k % 5) as u32, (k / 5) as u32, t as u64);
-            w.add_tile_full(&id, t, t + bucket - 1, Some(t), 6, Some(bucket as u64), &payload)
-                .unwrap();
+            w.add_tile_full(
+                &id,
+                t,
+                t + bucket - 1,
+                Some(t),
+                6,
+                Some(bucket as u64),
+                &payload,
+            )
+            .unwrap();
         }
         let meta = Metadata::new("bundle-fixture").with_temporal_bucket_ms(bucket as u64);
         w.finalize(&meta).unwrap()
@@ -3592,7 +3811,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("dataset");
         let manifest = build_bundle_fixture(&src);
-        assert!(manifest.packs.len() > 1, "fixture should span multiple packs");
+        assert!(
+            manifest.packs.len() > 1,
+            "fixture should span multiple packs"
+        );
         let manifest_path = src.join("manifest.json");
 
         // Deterministic pack: two runs produce byte-identical bundles.
@@ -3601,7 +3823,11 @@ mod tests {
         let summary = write_bundle(&manifest_path, &bundle_a).unwrap();
         write_bundle(&manifest_path, &bundle_b).unwrap();
         let bytes_a = fs::read(&bundle_a).unwrap();
-        assert_eq!(bytes_a, fs::read(&bundle_b).unwrap(), "bundling must be deterministic");
+        assert_eq!(
+            bytes_a,
+            fs::read(&bundle_b).unwrap(),
+            "bundling must be deterministic"
+        );
         assert_eq!(bytes_a.len() as u64, summary.bytes);
         assert_eq!(summary.objects, 1 + manifest.packs.len());
 
@@ -3611,7 +3837,10 @@ mod tests {
         assert_eq!(&bytes_a[5..8], &[0, 0, 0]);
         let (header, header_end) = parse_bundle_header(&bytes_a).unwrap();
         assert_eq!(header.objects.len(), summary.objects);
-        assert_eq!(header.objects[0].key, manifest.directory.key, "directory first");
+        assert_eq!(
+            header.objects[0].key, manifest.directory.key,
+            "directory first"
+        );
         for (o, p) in header.objects[1..].iter().zip(&manifest.packs) {
             assert_eq!(o.key, p.key, "packs in pack_id order");
         }
@@ -3631,15 +3860,17 @@ mod tests {
         let back = unpack_bundle(&bundle_a, &out).unwrap();
         assert_eq!(back.objects, summary.objects);
         assert!(
-            verify_packed_objects(out.join("manifest.json")).unwrap().is_empty(),
+            verify_packed_objects(out.join("manifest.json"))
+                .unwrap()
+                .is_empty(),
             "unpacked dataset must re-verify its content addresses"
         );
         assert_eq!(
             fs::read(out.join("manifest.json")).unwrap(),
             fs::read(&manifest_path).unwrap()
         );
-        for key in std::iter::once(&manifest.directory.key)
-            .chain(manifest.packs.iter().map(|p| &p.key))
+        for key in
+            std::iter::once(&manifest.directory.key).chain(manifest.packs.iter().map(|p| &p.key))
         {
             assert_eq!(
                 fs::read(out.join(key)).unwrap(),
@@ -3659,8 +3890,8 @@ mod tests {
         for paged in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let src = dir.path().join("dataset");
-            let mut w = v1_writer(&src, BlobOrdering::Auto, 8 * 1024)
-                .with_paging(paged.then_some(4));
+            let mut w =
+                v1_writer(&src, BlobOrdering::Auto, 8 * 1024).with_paging(paged.then_some(4));
             for k in 0..20u64 {
                 w.add_tile_full(
                     &TileId::new(10, (k % 5) as u32, (k / 5) as u32, 0),
@@ -3719,7 +3950,9 @@ mod tests {
 
         let issues = verify_bundle_objects(&bundle).unwrap();
         assert!(
-            issues.iter().any(|s| s.contains("content-address mismatch")),
+            issues
+                .iter()
+                .any(|s| s.contains("content-address mismatch")),
             "expected a content-address mismatch, got {issues:?}"
         );
         let reader = PackedReader::open_bundle(&bundle).unwrap();
@@ -3727,7 +3960,10 @@ mod tests {
             .entries()
             .iter()
             .find(|e| reader.read_payload(e).is_err());
-        assert!(bad.is_some(), "some tile in the corrupted pack must fail its CRC");
+        assert!(
+            bad.is_some(),
+            "some tile in the corrupted pack must fail its CRC"
+        );
     }
 
     /// Truncated / doctored bundles error loudly — never panic, never
@@ -3744,7 +3980,11 @@ mod tests {
         let open_err = |bytes: &[u8]| {
             let p = dir.path().join("bad.sttb");
             fs::write(&p, bytes).unwrap();
-            assert!(PackedReader::open_bundle(&p).is_err(), "must reject {} bytes", bytes.len());
+            assert!(
+                PackedReader::open_bundle(&p).is_err(),
+                "must reject {} bytes",
+                bytes.len()
+            );
             assert!(unpack_bundle(&p, dir.path().join("bad-out")).is_err());
         };
 
@@ -3787,9 +4027,18 @@ mod tests {
         fs::write(&p, &evil).unwrap();
         let out = dir.path().join("evil-out");
         let err = unpack_bundle(&p, &out).unwrap_err();
-        assert!(err.to_string().contains("unsafe bundle object key"), "got: {err}");
-        assert!(!dir.path().join("evil-out").exists(), "nothing may be written");
-        assert!(!dir.path().join("evil").exists(), "traversal target must not exist");
+        assert!(
+            err.to_string().contains("unsafe bundle object key"),
+            "got: {err}"
+        );
+        assert!(
+            !dir.path().join("evil-out").exists(),
+            "nothing may be written"
+        );
+        assert!(
+            !dir.path().join("evil").exists(),
+            "traversal target must not exist"
+        );
     }
 
     // ---- formatVersion 2 (template-referencing frames + object magic) ------
@@ -3805,7 +4054,9 @@ mod tests {
             start_times: (0..n as i64).map(|i| base + i * 1000).collect(),
             end_times: (0..n as i64).map(|i| base + i * 1000 + 500).collect(),
             geometry: GeometryColumn::Point(
-                (0..n).map(|i| [-122.4 + seed as f64 * 0.01, 37.7 + i as f64 * 1e-4]).collect(),
+                (0..n)
+                    .map(|i| [-122.4 + seed as f64 * 0.01, 37.7 + i as f64 * 1e-4])
+                    .collect(),
             ),
             vertex_times: None,
             vertex_values: None,
@@ -3821,7 +4072,9 @@ mod tests {
                 (
                     "kind".to_string(),
                     PropertyColumn::Categorical(
-                        (0..n).map(|i| Some(["car", "bus"][i % 2].to_string())).collect(),
+                        (0..n)
+                            .map(|i| Some(["car", "bus"][i % 2].to_string()))
+                            .collect(),
                     ),
                 ),
             ],
@@ -3892,7 +4145,10 @@ mod tests {
         // layer shape (constancy: five differing tiles, ONE template pair).
         assert_eq!(manifest.schemas.len(), 2, "expected core+props templates");
         let hashes: Vec<&str> = manifest.schemas.iter().map(|s| s.hash.as_str()).collect();
-        assert!(hashes.windows(2).all(|w| w[0] < w[1]), "schemas sorted by hash");
+        assert!(
+            hashes.windows(2).all(|w| w[0] < w[1]),
+            "schemas sorted by hash"
+        );
 
         // Object magic on every object; content addresses cover it.
         let dir_bytes = fs::read(out.join(&manifest.directory.key)).unwrap();
@@ -3912,10 +4168,16 @@ mod tests {
         assert_eq!(reader.format_version(), PACKED_FORMAT_VERSION_V2);
         assert!(reader.templates().is_some());
         for e in reader.entries() {
-            assert!(e.offset >= OBJECT_MAGIC_LEN as u64, "offset {} inside magic", e.offset);
+            assert!(
+                e.offset >= OBJECT_MAGIC_LEN as u64,
+                "offset {} inside magic",
+                e.offset
+            );
         }
 
-        assert!(verify_packed_objects(out.join("manifest.json")).unwrap().is_empty());
+        assert!(verify_packed_objects(out.join("manifest.json"))
+            .unwrap()
+            .is_empty());
 
         // Decode parity: each tile equals the v1 decode of the same layer.
         for (k, layer) in layers.iter().enumerate() {
@@ -3965,8 +4227,16 @@ mod tests {
         let mut w = PackWriter::create(&v1_out, BlobOrdering::Auto, 8 * 1024)
             .unwrap()
             .with_format_version(PACKED_FORMAT_VERSION_V1);
-        w.add_tile_full(&TileId::new(10, 0, 0, 0), 0, 100, None, 6, None, &distinct_tile(1))
-            .unwrap();
+        w.add_tile_full(
+            &TileId::new(10, 0, 0, 0),
+            0,
+            100,
+            None,
+            6,
+            None,
+            &distinct_tile(1),
+        )
+        .unwrap();
         w.finalize(&Metadata::new("v1")).unwrap();
         let v1_reader = PackedReader::open(v1_out.join("manifest.json")).unwrap();
         let v2_payload = encode_tile_with(
@@ -4030,7 +4300,9 @@ mod tests {
         let issues = verify_packed_objects(&manifest_path).unwrap();
         assert!(issues.iter().any(|i| i.contains("STTP")), "{issues:?}");
         assert!(
-            issues.iter().any(|i| i.contains("content-address mismatch")),
+            issues
+                .iter()
+                .any(|i| i.contains("content-address mismatch")),
             "{issues:?}"
         );
         fs::write(&pack0, {
@@ -4060,8 +4332,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("dataset");
         let (manifest, layers) = build_v2_dataset(&out, Some(2));
-        assert_eq!(manifest.directory.layout.as_deref(), Some(DIRECTORY_LAYOUT_PAGED));
-        assert!(verify_packed_objects(out.join("manifest.json")).unwrap().is_empty());
+        assert_eq!(
+            manifest.directory.layout.as_deref(),
+            Some(DIRECTORY_LAYOUT_PAGED)
+        );
+        assert!(verify_packed_objects(out.join("manifest.json"))
+            .unwrap()
+            .is_empty());
         let reader = PackedReader::open(out.join("manifest.json")).unwrap();
         assert_eq!(reader.entries().len(), layers.len());
         for e in reader.entries() {
@@ -4098,7 +4375,9 @@ mod tests {
         let unpacked = dir.path().join("unpacked");
         unpack_bundle(&bundle, &unpacked).unwrap();
         assert!(
-            verify_packed_objects(unpacked.join("manifest.json")).unwrap().is_empty(),
+            verify_packed_objects(unpacked.join("manifest.json"))
+                .unwrap()
+                .is_empty(),
             "unpacked v2 dataset must re-verify"
         );
     }
@@ -4138,11 +4417,17 @@ mod tests {
         // The seeded templates published (sorted + deduped by construction).
         assert_eq!(
             manifest.schemas.iter().map(|s| &s.hash).collect::<Vec<_>>(),
-            src_manifest.schemas.iter().map(|s| &s.hash).collect::<Vec<_>>(),
+            src_manifest
+                .schemas
+                .iter()
+                .map(|s| &s.hash)
+                .collect::<Vec<_>>(),
             "seeded schemas must match the source's table"
         );
 
-        assert!(verify_packed_objects(out.join("manifest.json")).unwrap().is_empty());
+        assert!(verify_packed_objects(out.join("manifest.json"))
+            .unwrap()
+            .is_empty());
         let re = PackedReader::open(out.join("manifest.json")).unwrap();
         assert_eq!(re.entries().len(), layers.len());
         for e in re.entries() {

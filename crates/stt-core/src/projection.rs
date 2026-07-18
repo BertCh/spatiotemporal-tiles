@@ -107,7 +107,10 @@ pub fn lonlat_to_tile_coords(
 /// # Returns
 /// Point with lon/lat coordinates
 pub fn tile_to_lonlat(tile_x: u32, tile_y: u32, zoom: u8) -> Point<f64> {
-    let n = (1u32 << zoom) as f64;
+    // `2^zoom` via `powi` rather than `1u32 << zoom`: a corrupt zoom >= 32
+    // (reachable from an untrusted paged-directory descriptor) would shift-
+    // overflow. For every valid zoom (0..=31) this yields the identical value.
+    let n = 2f64.powi(zoom as i32);
 
     let lon = (tile_x as f64 / n) * 360.0 - 180.0;
     // Web Mercator inverse: lat = atan(sinh(π·(1 - 2y/n))).
@@ -134,7 +137,9 @@ pub fn tile_to_lonlat(tile_x: u32, tile_y: u32, zoom: u8) -> Point<f64> {
 /// compares stored bboxes against its lon/lat viewport directly).
 pub fn tile_geo_bounds(zoom: u8, tile_x: u32, tile_y: u32) -> (f64, f64, f64, f64) {
     let nw = tile_to_lonlat(tile_x, tile_y, zoom);
-    let se = tile_to_lonlat(tile_x + 1, tile_y + 1, zoom);
+    // `saturating_add`: a corrupt `x`/`y` == u32::MAX (from an untrusted
+    // descriptor) would overflow the `+ 1` for the adjacent tile edge.
+    let se = tile_to_lonlat(tile_x.saturating_add(1), tile_y.saturating_add(1), zoom);
     (nw.x(), se.y(), se.x(), nw.y())
 }
 
@@ -228,7 +233,9 @@ pub fn meters_to_wgs84(point: Point<f64>) -> Result<Point<f64>> {
 /// Calculate tile bounds in WGS84 coordinates
 pub fn tile_bounds(tile_x: u32, tile_y: u32, zoom: u8) -> crate::types::BoundingBox {
     let nw = tile_to_lonlat(tile_x, tile_y, zoom);
-    let se = tile_to_lonlat(tile_x + 1, tile_y + 1, zoom);
+    // `saturating_add`: a corrupt `x`/`y` == u32::MAX (from an untrusted
+    // descriptor) would overflow the `+ 1` for the adjacent tile edge.
+    let se = tile_to_lonlat(tile_x.saturating_add(1), tile_y.saturating_add(1), zoom);
 
     crate::types::BoundingBox::new(
         nw.x(), // min_lon

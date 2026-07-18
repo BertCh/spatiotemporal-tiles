@@ -418,8 +418,8 @@ fn directory_header_midrange_entry_count_lie_errors() {
     buf.push(0xe8);
     buf.push(0x07); // n = 1000 (two-byte LEB128)
     buf.push(0x00); // run_count = 0
-    // ~1 KB of zeros: 1000 entries would need ≥ 8000 wire bytes, so the
-    // guard must fire even though n < bytes.len().
+                    // ~1 KB of zeros: 1000 entries would need ≥ 8000 wire bytes, so the
+                    // guard must fire even though n < bytes.len().
     buf.extend_from_slice(&[0x00; 1024]);
     assert!(decode_directory(&buf).is_err());
 }
@@ -475,6 +475,28 @@ fn paged_leaf_range_overflow_errors() {
     let root = encode_root(1, &[d]);
     let rl = root.len() as u64;
     assert!(decode_paged_directory(&root, rl, false).is_err());
+}
+
+/// A post-unframe root page of exactly ONE byte (`[PAGED_ROOT_VERSION]`) must
+/// error, not index the missing descriptor-kind byte and panic (`decode_root`
+/// used to read byte 1 unconditionally after guarding only byte 0).
+#[test]
+fn paged_root_one_byte_page_errors() {
+    // 1 == PAGED_ROOT_VERSION; the descriptor-kind byte is absent.
+    assert!(stt_core::directory_page::decode_root(&[1u8]).is_err());
+}
+
+/// A corrupt paged descriptor can carry an out-of-range zoom or a max-value
+/// tile x/y; the geo-bounds inverse projection (reached from
+/// `verify_paged_structure`) must compute without shift- or add-overflow
+/// panicking.
+#[test]
+fn tile_geo_bounds_out_of_range_does_not_panic() {
+    // zoom >= 32 would shift-overflow `1u32 << zoom`; x/y == u32::MAX would
+    // overflow the `+ 1` adjacent-tile-edge lookup.
+    let _ = stt_core::projection::tile_geo_bounds(40, u32::MAX, u32::MAX);
+    let _ = stt_core::projection::tile_geo_bounds(255, 0, 0);
+    let _ = stt_core::projection::tile_to_lonlat(u32::MAX, u32::MAX, 40);
 }
 
 // ----------------------------------------------------------------------

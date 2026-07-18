@@ -25,9 +25,7 @@ use anyhow::Result;
 use h3o::{LatLng, Resolution};
 use std::collections::{BTreeMap, HashMap};
 use stt_core::arrow_tile::{ColumnarLayer, Coord, GeometryColumn, PropertyColumn};
-use stt_core::metadata::{
-    SummaryAggregation, SummaryColumn, SummaryScheme, SummaryTier,
-};
+use stt_core::metadata::{SummaryAggregation, SummaryColumn, SummaryScheme, SummaryTier};
 use stt_core::projection;
 use stt_core::tile::TileId;
 
@@ -60,9 +58,8 @@ impl SummaryConfig {
     /// `cell_resolution_per_zoom` table is computed by [`h3_resolution_for_zoom`]
     /// for H3, and by `zoom` directly for quadbin.
     pub fn to_tier(&self) -> SummaryTier {
-        let mut resolutions: Vec<u8> = Vec::with_capacity(
-            (self.max_zoom - self.min_zoom + 1) as usize,
-        );
+        let mut resolutions: Vec<u8> =
+            Vec::with_capacity((self.max_zoom - self.min_zoom + 1) as usize);
         for z in self.min_zoom..=self.max_zoom {
             resolutions.push(match self.scheme {
                 SummaryScheme::H3 => h3_resolution_for_zoom(z),
@@ -209,37 +206,53 @@ pub fn build_summary_tier<W: TileWriter>(
         let quad_z = quadbin_zoom_for_zoom(zoom);
 
         // (tile_x, tile_y, time_bucket) -> (cell_id -> aggregate)
-        let mut buckets: BTreeMap<(u32, u32, u64), HashMap<u64, CellAggregate>> =
-            BTreeMap::new();
+        let mut buckets: BTreeMap<(u32, u32, u64), HashMap<u64, CellAggregate>> = BTreeMap::new();
 
         for feature in features {
-            let (tx, ty) =
-                match projection::lonlat_to_tile(feature.lon, feature.lat, zoom) {
-                    Ok(xy) => xy,
-                    Err(_) => continue,
-                };
             let bucket_start = (feature.timestamp / bucket_ms) * bucket_ms;
-            let cell_id: u64 = match config.scheme {
+            // Resolve the cell AND its owning (tile_x, tile_y) together. The
+            // owning tile determines which summary tile the cell's aggregate is
+            // emitted in, and the two schemes anchor it differently:
+            let (tx, ty, cell_id): (u32, u32, u64) = match config.scheme {
                 SummaryScheme::H3 => {
                     let res = h3_res.expect("H3 resolution resolved above");
-                    match LatLng::new(feature.lat, feature.lon) {
-                        Ok(ll) => ll.to_cell(res).into(),
+                    let cell = match LatLng::new(feature.lat, feature.lon) {
+                        Ok(ll) => ll.to_cell(res),
                         Err(_) => continue, // out-of-range lat/lon (e.g. NaN)
-                    }
+                    };
+                    // Anchor the cell to the tile containing its CENTROID, not
+                    // the feature's own position. An H3 hexagon can straddle a
+                    // Web-Mercator tile seam; bucketing by feature position
+                    // would split one cell into duplicate rows (same
+                    // cell_id/centroid, partial counts) across adjacent tiles.
+                    // Owning by centroid keeps every feature of a cell in one
+                    // tile → a single row with the full aggregate.
+                    let ll: LatLng = cell.into();
+                    let (tx, ty) = match projection::lonlat_to_tile(ll.lng(), ll.lat(), zoom) {
+                        Ok(xy) => xy,
+                        Err(_) => continue,
+                    };
+                    (tx, ty, cell.into())
                 }
                 SummaryScheme::Quadbin => {
                     // Web-Mercator can't represent NaN/inf lat/lon — skip them
-                    // so a malformed row never poisons a cell.
+                    // so a malformed row never poisons a cell. Quadbin cells are
+                    // nested within exactly one tile at this zoom, so they never
+                    // straddle a seam — bucket by feature position, unchanged.
                     if !feature.lon.is_finite() || !feature.lat.is_finite() {
                         continue;
                     }
-                    quadbin::lonlat_to_quadbin(feature.lon, feature.lat, quad_z)
+                    let (tx, ty) = match projection::lonlat_to_tile(feature.lon, feature.lat, zoom)
+                    {
+                        Ok(xy) => xy,
+                        Err(_) => continue,
+                    };
+                    let cell_id = quadbin::lonlat_to_quadbin(feature.lon, feature.lat, quad_z);
+                    (tx, ty, cell_id)
                 }
             };
 
-            let bucket = buckets
-                .entry((tx, ty, bucket_start))
-                .or_default();
+            let bucket = buckets.entry((tx, ty, bucket_start)).or_default();
             let agg = bucket.entry(cell_id).or_default();
 
             if sub_buckets > 1 {
@@ -247,11 +260,9 @@ pub fn build_summary_tier<W: TileWriter>(
                     agg.sub_bucket_counts = vec![0u32; sub_buckets];
                 }
                 // Index within this outer bucket.
-                let sub_idx = (((feature.timestamp - bucket_start) / sub_bucket_ms)
-                    as usize)
+                let sub_idx = (((feature.timestamp - bucket_start) / sub_bucket_ms) as usize)
                     .min(sub_buckets - 1);
-                agg.sub_bucket_counts[sub_idx] = agg.sub_bucket_counts[sub_idx]
-                    .saturating_add(1);
+                agg.sub_bucket_counts[sub_idx] = agg.sub_bucket_counts[sub_idx].saturating_add(1);
             }
             agg.count += 1;
             let t = feature.timestamp as i64;
@@ -283,10 +294,7 @@ pub fn build_summary_tier<W: TileWriter>(
                             .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
                     });
                     if let Some(v) = v {
-                        agg.sources
-                            .entry(col.name.clone())
-                            .or_default()
-                            .observe(v);
+                        agg.sources.entry(col.name.clone()).or_default().observe(v);
                     }
                 }
             }
@@ -350,8 +358,7 @@ fn build_summary_layer(
     let n = cells.len();
     // Stable ordering: sort by cell_id so successive builds with the same
     // input produce identical tile bytes.
-    let mut entries: Vec<(u64, &CellAggregate)> =
-        cells.iter().map(|(k, v)| (*k, v)).collect();
+    let mut entries: Vec<(u64, &CellAggregate)> = cells.iter().map(|(k, v)| (*k, v)).collect();
     entries.sort_by_key(|(k, _)| *k);
 
     let mut feature_ids: Vec<u64> = Vec::with_capacity(n);
@@ -393,9 +400,9 @@ fn build_summary_layer(
             let acc = agg.sources.get(&col.name);
             let v: Option<f64> = match col.agg {
                 SummaryAggregation::Count => Some(agg.count as f64),
-                SummaryAggregation::Sum => acc.and_then(|a| {
-                    if a.has_any { Some(a.sum) } else { None }
-                }),
+                SummaryAggregation::Sum => {
+                    acc.and_then(|a| if a.has_any { Some(a.sum) } else { None })
+                }
                 SummaryAggregation::Mean => acc.and_then(|a| {
                     if a.sum_count > 0 {
                         Some(a.sum / a.sum_count as f64)
@@ -403,12 +410,12 @@ fn build_summary_layer(
                         None
                     }
                 }),
-                SummaryAggregation::Min => acc.and_then(|a| {
-                    if a.has_any { Some(a.min) } else { None }
-                }),
-                SummaryAggregation::Max => acc.and_then(|a| {
-                    if a.has_any { Some(a.max) } else { None }
-                }),
+                SummaryAggregation::Min => {
+                    acc.and_then(|a| if a.has_any { Some(a.min) } else { None })
+                }
+                SummaryAggregation::Max => {
+                    acc.and_then(|a| if a.has_any { Some(a.max) } else { None })
+                }
             };
             per_column[i].push(v);
         }
@@ -432,11 +439,7 @@ fn build_summary_layer(
         for sub_idx in 0..sub_bucket_n {
             let mut col_vals: Vec<Option<f64>> = Vec::with_capacity(entries.len());
             for (_, agg) in &entries {
-                let v = agg
-                    .sub_bucket_counts
-                    .get(sub_idx)
-                    .copied()
-                    .unwrap_or(0) as f64;
+                let v = agg.sub_bucket_counts.get(sub_idx).copied().unwrap_or(0) as f64;
                 col_vals.push(Some(v));
             }
             properties.push((
@@ -518,9 +521,9 @@ pub fn parse_summary_columns(spec: &str) -> Result<Vec<SummaryColumn>> {
             "min" => SummaryAggregation::Min,
             "max" => SummaryAggregation::Max,
             "count" => SummaryAggregation::Count,
-            other => anyhow::bail!(
-                "unknown summary aggregation '{other}' (use sum|mean|min|max|count)"
-            ),
+            other => {
+                anyhow::bail!("unknown summary aggregation '{other}' (use sum|mean|min|max|count)")
+            }
         };
         out.push(SummaryColumn {
             name: name.trim().to_string(),
@@ -602,7 +605,12 @@ mod tests {
         let mut features = Vec::new();
         // SF cluster:
         for i in 0..5 {
-            features.push(point(-122.45 + 0.001 * i as f64, 37.77, 1_000_000, 5.0 + i as f64));
+            features.push(point(
+                -122.45 + 0.001 * i as f64,
+                37.77,
+                1_000_000,
+                5.0 + i as f64,
+            ));
         }
         // London:
         features.push(point(-0.1278, 51.5074, 1_000_000, 6.0));
@@ -640,8 +648,7 @@ mod tests {
             assert_eq!(tile.layers.len(), 1);
             let layer = &tile.layers[0];
             assert_eq!(layer.name, "summary");
-            let prop_names: Vec<&str> =
-                layer.properties.iter().map(|(n, _)| n.as_str()).collect();
+            let prop_names: Vec<&str> = layer.properties.iter().map(|(n, _)| n.as_str()).collect();
             assert!(prop_names.contains(&"count"));
             assert!(prop_names.contains(&"mean_magnitude"));
             assert!(prop_names.contains(&"max_magnitude"));
@@ -668,7 +675,12 @@ mod tests {
         let mut features = Vec::new();
         for i in 0..n_cluster {
             // ~SF, sub-cell spacing so they share a Quadbin cell at z=8.
-            features.push(point(-122.4194 + 0.0001 * i as f64, 37.7749, 1_000_000, 5.0));
+            features.push(point(
+                -122.4194 + 0.0001 * i as f64,
+                37.7749,
+                1_000_000,
+                5.0,
+            ));
         }
         // A far-away point (Tokyo) to confirm distinct cells stay distinct.
         features.push(point(139.6917, 35.6895, 1_000_000, 9.0));
@@ -776,6 +788,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn build_summary_tier_h3_dedupes_cell_across_tile_seam() {
+        use h3o::CellIndex;
+
+        // At zoom 1, H3 res-1 hexagons are far larger than a Web-Mercator tile,
+        // so a single cell readily straddles the x=0 tile seam (lon 0). Find a
+        // pair of nearby longitudes that share ONE H3 cell but fall in DIFFERENT
+        // tiles — the exact shape the seam-split bug duplicates into two rows.
+        let zoom = 1u8;
+        let res = Resolution::try_from(h3_resolution_for_zoom(zoom)).unwrap();
+        let lat = 5.0;
+        let mut prev: Option<(f64, CellIndex, (u32, u32))> = None;
+        let mut straddle: Option<(f64, f64, u64)> = None;
+        let mut lon = -5.0_f64;
+        while lon <= 5.0 {
+            let cell = LatLng::new(lat, lon).unwrap().to_cell(res);
+            let tile = projection::lonlat_to_tile(lon, lat, zoom).unwrap();
+            if let Some((plon, pcell, ptile)) = prev {
+                if pcell == cell && ptile != tile {
+                    straddle = Some((plon, lon, cell.into()));
+                    break;
+                }
+            }
+            prev = Some((lon, cell, tile));
+            lon += 0.05;
+        }
+        let (lon_a, lon_b, cell_id) =
+            straddle.expect("fixture must contain an H3 cell straddling a tile seam");
+
+        // Two features in that one cell, on opposite sides of the seam, same
+        // time bucket. Correct aggregation → one row with count == 2.
+        let features = vec![
+            point(lon_a, lat, 1_000_000, 1.0),
+            point(lon_b, lat, 1_000_000, 1.0),
+        ];
+        let config = SummaryConfig {
+            scheme: SummaryScheme::H3,
+            min_zoom: zoom,
+            max_zoom: zoom,
+            temporal_bucket_ms: 3_600_000,
+            columns: vec![SummaryColumn {
+                name: "_count".into(),
+                agg: SummaryAggregation::Count,
+            }],
+            layer_name: "summary".into(),
+            sub_buckets: 1,
+        };
+        let mut writer = CollectingWriter { tiles: Vec::new() };
+        build_summary_tier(&features, &config, &mut writer).unwrap();
+
+        // The straddling cell must appear in EXACTLY ONE emitted tile, carrying
+        // the FULL count of both features — not split into two partial rows.
+        let mut tiles_with_cell = 0usize;
+        let mut total_count = 0.0f64;
+        for tile in &writer.tiles {
+            let layer = &tile.layers[0];
+            if let Some(pos) = layer.feature_ids.iter().position(|&id| id == cell_id) {
+                tiles_with_cell += 1;
+                let counts = layer
+                    .properties
+                    .iter()
+                    .find(|(n, _)| n == "count")
+                    .map(|(_, c)| c)
+                    .expect("count column present");
+                if let PropertyColumn::Numeric(vals) = counts {
+                    total_count += vals[pos].expect("cell has a count");
+                }
+            }
+        }
+        assert_eq!(
+            tiles_with_cell, 1,
+            "an H3 cell straddling a tile seam must be emitted in exactly one tile"
+        );
+        assert_eq!(
+            total_count, 2.0,
+            "both features must aggregate into the one row"
+        );
     }
 
     #[test]

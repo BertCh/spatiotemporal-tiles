@@ -79,6 +79,10 @@ tokio = { version = "1", features = [
 # postgres_input decodes, so `decode_rows` accepts these rows directly.
 tokio-postgres = { version = "0.7", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
+# stt-serve opt-in Postgres TLS (feature `serve-postgres-tls`): only compiled
+# when the feature is enabled; the default `serve-postgres` build stays NoTls.
+postgres-native-tls = { version = "0.5", optional = true }
+native-tls = { version = "0.2", optional = true }
 
 # stt-serve DuckDB backend (feature `serve-duckdb`): embedded engine + r2d2
 # pool (DuckDB `Connection` is Send but !Sync — one connection per worker).
@@ -132,6 +136,14 @@ serve-postgres = [
   "postgres",
   "dep:tokio-postgres",
   "dep:deadpool-postgres",
+]
+# Opt-in TLS for the stt-serve Postgres backend (sslmode=require). Pulls in a
+# native-tls connector; never a default (keeps the light dep set + local-dev
+# NoTls path intact).
+serve-postgres-tls = [
+  "serve-postgres",
+  "dep:postgres-native-tls",
+  "dep:native-tls",
 ]
 serve-duckdb = ["serve-core", "duckdb", "dep:duckdb", "dep:r2d2"]
 # The full stt-serve binary as documented: both backends.

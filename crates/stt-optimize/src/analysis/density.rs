@@ -144,6 +144,11 @@ fn bucket_zoom(
     // (feature count, estimated bytes) per (x, y, t_bucket) tile.
     let mut tiles: HashMap<(u32, u32, u64), (usize, usize)> = HashMap::new();
 
+    // NOTE: this model assigns each feature to the single tile containing its
+    // centroid. It does NOT replicate the builder's trajectory/polygon clipping,
+    // which can place one non-point feature into several tiles (and split its
+    // bytes across them). So for LineString/Polygon/Multi* inputs the per-tile
+    // counts and sizes here are approximate; point datasets are exact.
     for feature in &data.features {
         if let Ok((x, y)) = projection::lonlat_to_tile(feature.lon, feature.lat, zoom) {
             let t_bucket = if bucket_ms > 0 {
@@ -379,7 +384,9 @@ mod tests {
         // 100 features at ONE location spread over 100s: with a 10s bucket the
         // single spatial tile must split into 10 (x, y, t) tiles; with no
         // bucketing (bucket_ms = 0) it stays a single tile.
-        let features: Vec<_> = (0..100u64).map(|i| feature(-100.0, 40.0, i * 1_000)).collect();
+        let features: Vec<_> = (0..100u64)
+            .map(|i| feature(-100.0, 40.0, i * 1_000))
+            .collect();
         let data = LoadedData {
             features,
             bounds: BoundingBox::new(-100.0, 40.0, -100.0, 40.0),
@@ -401,7 +408,9 @@ mod tests {
     fn test_measured_calibration_replaces_formula() {
         // A measured sample encoding must drive both size estimates (real
         // bytes/feature and zstd ratio), replacing the formula + /3 fallback.
-        let features: Vec<_> = (0..100u64).map(|i| feature(-100.0, 40.0, i * 1_000)).collect();
+        let features: Vec<_> = (0..100u64)
+            .map(|i| feature(-100.0, 40.0, i * 1_000))
+            .collect();
         let data = LoadedData {
             features,
             bounds: BoundingBox::new(-100.0, 40.0, -100.0, 40.0),
@@ -436,8 +445,7 @@ mod tests {
         let temporal = crate::analysis::temporal::analyze(&data).unwrap();
         let density = analyze(&data, &spatial, &temporal, None).unwrap();
 
-        let expected_zooms =
-            (spatial.recommended_min_zoom..=spatial.recommended_max_zoom).count();
+        let expected_zooms = (spatial.recommended_min_zoom..=spatial.recommended_max_zoom).count();
         assert_eq!(density.per_zoom.len(), expected_zooms);
         assert_eq!(
             density.estimated_tile_count,

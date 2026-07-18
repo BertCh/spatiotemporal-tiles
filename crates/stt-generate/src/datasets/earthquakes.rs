@@ -84,7 +84,7 @@ pub fn run(args: Args) -> Result<()> {
 
     let use_parquet = common::is_parquet_output(&intermediate_path);
     let use_csv = common::is_csv_output(&intermediate_path);
-    
+
     if use_parquet {
         println!("📄 Using streaming GeoParquet output (efficient)");
     } else if use_csv {
@@ -107,8 +107,7 @@ pub fn run(args: Args) -> Result<()> {
         PropertyColumn::string("title"),
         PropertyColumn::string("mag_band"),
     ];
-    let property_column_names: Vec<String> =
-        typed_columns.iter().map(|c| c.name.clone()).collect();
+    let property_column_names: Vec<String> = typed_columns.iter().map(|c| c.name.clone()).collect();
 
     let mut all_features = Vec::new();
     let mut parquet_writer = if use_parquet {
@@ -244,9 +243,21 @@ pub fn run(args: Args) -> Result<()> {
 /// carries an out-of-range epoch — a corrupt record placed at "today" would
 /// land far outside the advertised timeRange and contaminate the temporal
 /// index. The caller skips and counts these.
-fn extract_usgs_data(usgs: UsgsFeature) -> Result<Option<(f64, f64, DateTime<Utc>, Map<String, serde_json::Value>)>> {
-    let lon = usgs.geometry.coordinates[0];
-    let lat = usgs.geometry.coordinates[1];
+fn extract_usgs_data(
+    usgs: UsgsFeature,
+) -> Result<Option<(f64, f64, DateTime<Utc>, Map<String, serde_json::Value>)>> {
+    // A malformed USGS record can carry fewer than two coordinates; index
+    // access would panic and abort the whole run. Skip-and-warn instead.
+    let (Some(&lon), Some(&lat)) = (
+        usgs.geometry.coordinates.first(),
+        usgs.geometry.coordinates.get(1),
+    ) else {
+        eprintln!(
+            "⚠️  Skipping earthquake record with malformed coordinates {:?} ({})",
+            usgs.geometry.coordinates, usgs.properties.title
+        );
+        return Ok(None);
+    };
     let depth = usgs.geometry.coordinates.get(2).copied().unwrap_or(0.0);
 
     let Some(timestamp) = DateTime::from_timestamp_millis(usgs.properties.time) else {
@@ -282,5 +293,3 @@ fn mag_band(mag: f64) -> &'static str {
         "5-M8+"
     }
 }
-
-

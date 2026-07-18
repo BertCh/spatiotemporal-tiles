@@ -42,8 +42,8 @@
 //! round-trip tests. The HTTP reader (TS) decodes the root and fetches leaves on
 //! demand — that is where the cold-start win is realized.
 
-use crate::directory::TileEntry;
 use crate::compression;
+use crate::directory::TileEntry;
 use crate::directory::{decode_directory, encode_directory};
 use crate::error::{Error, Result};
 use crate::projection::tile_geo_bounds;
@@ -232,8 +232,9 @@ pub fn decode_root(bytes: &[u8]) -> Result<PagedRoot> {
             "paged root: unsupported version {version} (expected {PAGED_ROOT_VERSION})"
         )));
     }
-    let descriptor_kind = *bytes.get(1).unwrap();
-    r.pos = 2;
+    // Read through the bounds-checked reader (a 1-byte root that is exactly
+    // `[PAGED_ROOT_VERSION]` used to index byte 1 unconditionally and panic).
+    let descriptor_kind = r.take(1)?[0];
     if descriptor_kind != DESCRIPTOR_GEO_BBOX {
         return Err(Error::InvalidArchive(format!(
             "paged root: unsupported descriptor kind {descriptor_kind}"
@@ -528,7 +529,11 @@ pub fn verify_paged_structure(bytes: &[u8], root_length: u64, zstd: bool) -> Res
         if leaf.len() != d.entry_count as usize {
             push(
                 &mut issues,
-                format!("page {pi}: descriptor declares {} entries, leaf decoded {}", d.entry_count, leaf.len()),
+                format!(
+                    "page {pi}: descriptor declares {} entries, leaf decoded {}",
+                    d.entry_count,
+                    leaf.len()
+                ),
             );
         }
         decoded_total += leaf.len();
@@ -537,7 +542,10 @@ pub fn verify_paged_structure(bytes: &[u8], root_length: u64, zstd: bool) -> Res
             if e.zoom < d.min_zoom || e.zoom > d.max_zoom {
                 push(
                     &mut issues,
-                    format!("page {pi}: entry zoom {} outside descriptor [{}, {}]", e.zoom, d.min_zoom, d.max_zoom),
+                    format!(
+                        "page {pi}: entry zoom {} outside descriptor [{}, {}]",
+                        e.zoom, d.min_zoom, d.max_zoom
+                    ),
                 );
             }
             let b = tile_geo_bounds(e.zoom, e.x, e.y);
@@ -548,14 +556,20 @@ pub fn verify_paged_structure(bytes: &[u8], root_length: u64, zstd: bool) -> Res
             {
                 push(
                     &mut issues,
-                    format!("page {pi}: descriptor bbox does not cover tile {}/{}/{}", e.zoom, e.x, e.y),
+                    format!(
+                        "page {pi}: descriptor bbox does not cover tile {}/{}/{}",
+                        e.zoom, e.x, e.y
+                    ),
                 );
             }
             let lo = e.cover_t_min.unwrap_or(e.time_start);
             if lo < d.t_min || e.time_end > d.t_max {
                 push(
                     &mut issues,
-                    format!("page {pi}: descriptor t-bounds [{}, {}] do not cover entry [{}, {}]", d.t_min, d.t_max, lo, e.time_end),
+                    format!(
+                        "page {pi}: descriptor t-bounds [{}, {}] do not cover entry [{}, {}]",
+                        d.t_min, d.t_max, lo, e.time_end
+                    ),
                 );
             }
         }
@@ -687,8 +701,8 @@ mod tests {
     fn descriptor_bounds_cover_their_entries() {
         let c = corpus(true);
         let enc = encode_paged_directory(&c, 37, true).unwrap();
-        let root = decode_root(&unframe(&enc.bytes[..enc.root_length as usize], true).unwrap())
-            .unwrap();
+        let root =
+            decode_root(&unframe(&enc.bytes[..enc.root_length as usize], true).unwrap()).unwrap();
         // Re-derive the sorted slices the encoder used.
         let mut sorted = c.clone();
         sorted.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start, e.temporal_bucket_ms));
@@ -725,7 +739,10 @@ mod tests {
         for w in got.windows(2) {
             let a = (w[0].zoom, w[0].hilbert, w[0].time_start);
             let b = (w[1].zoom, w[1].hilbert, w[1].time_start);
-            assert!(a <= b, "directory order violated across pages: {a:?} > {b:?}");
+            assert!(
+                a <= b,
+                "directory order violated across pages: {a:?} > {b:?}"
+            );
         }
     }
 
@@ -791,12 +808,44 @@ mod tests {
             ..a.clone()
         };
         // Query box over A's region, A's time.
-        assert!(a.overlaps(10, -735_000_000, 405_000_000, -731_000_000, 408_000_000, 0, 1000));
-        assert!(!b.overlaps(10, -735_000_000, 405_000_000, -731_000_000, 408_000_000, 0, 1000));
+        assert!(a.overlaps(
+            10,
+            -735_000_000,
+            405_000_000,
+            -731_000_000,
+            408_000_000,
+            0,
+            1000
+        ));
+        assert!(!b.overlaps(
+            10,
+            -735_000_000,
+            405_000_000,
+            -731_000_000,
+            408_000_000,
+            0,
+            1000
+        ));
         // Wrong zoom prunes A.
-        assert!(!a.overlaps(9, -735_000_000, 405_000_000, -731_000_000, 408_000_000, 0, 1000));
+        assert!(!a.overlaps(
+            9,
+            -735_000_000,
+            405_000_000,
+            -731_000_000,
+            408_000_000,
+            0,
+            1000
+        ));
         // Disjoint time prunes A.
-        assert!(!a.overlaps(10, -735_000_000, 405_000_000, -731_000_000, 408_000_000, 2000, 3000));
+        assert!(!a.overlaps(
+            10,
+            -735_000_000,
+            405_000_000,
+            -731_000_000,
+            408_000_000,
+            2000,
+            3000
+        ));
     }
 
     #[test]
@@ -824,8 +873,7 @@ mod tests {
         // Reassemble: bad root frame + original leaves. rootLength changes.
         let mut bad = bad_root_frame.clone();
         bad.extend_from_slice(&enc.bytes[enc.root_length as usize..]);
-        let bad_issues =
-            verify_paged_structure(&bad, bad_root_frame.len() as u64, true).unwrap();
+        let bad_issues = verify_paged_structure(&bad, bad_root_frame.len() as u64, true).unwrap();
         assert!(
             bad_issues.iter().any(|s| s.contains("bbox does not cover")),
             "expected a bbox-cover violation, got {bad_issues:?}"

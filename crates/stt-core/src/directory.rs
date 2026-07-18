@@ -143,13 +143,25 @@ fn get_uvarint(buf: &[u8], pos: &mut usize) -> Result<u64> {
             .get(*pos)
             .ok_or_else(|| Error::InvalidArchive("directory: truncated varint".into()))?;
         *pos += 1;
+        if shift == 63 {
+            // 10th continuation byte: only bit 0 fits into a u64. A value with
+            // any higher bit set (or a further continuation) is an over-long /
+            // oversized varint — reject it instead of silently truncating.
+            if byte & 0x80 != 0 || byte > 1 {
+                return Err(Error::InvalidArchive(
+                    "directory: varint exceeds 64 bits".into(),
+                ));
+            }
+        }
         result |= ((byte & 0x7f) as u64) << shift;
         if byte & 0x80 == 0 {
             break;
         }
         shift += 7;
         if shift >= 64 {
-            return Err(Error::InvalidArchive("directory: varint exceeds 64 bits".into()));
+            return Err(Error::InvalidArchive(
+                "directory: varint exceeds 64 bits".into(),
+            ));
         }
     }
     Ok(result)
@@ -578,7 +590,9 @@ mod tests {
         crc: u32,
         tb: Option<u64>,
     ) -> TileEntry {
-        let mut e = entry(zoom, x, y, hilbert, ts, te, offset, length, unc, fc, crc, tb);
+        let mut e = entry(
+            zoom, x, y, hilbert, ts, te, offset, length, unc, fc, crc, tb,
+        );
         e.pack_id = pack_id;
         e
     }
@@ -590,6 +604,33 @@ mod tests {
         assert!(back.is_empty());
     }
 
+    /// The uvarint decoder must round-trip every representative value — crucially
+    /// including `u64::MAX`, whose 10th byte is `0x01` — and must REJECT an
+    /// over-long / oversized encoding (a 10th byte with bits above bit 0, or a
+    /// further continuation) instead of silently truncating the top bits.
+    #[test]
+    fn uvarint_rejects_oversized_encoding() {
+        // Valid round-trips, including the max value (10-byte encoding).
+        for v in [0u64, 1, 127, 128, 300, u32::MAX as u64, u64::MAX] {
+            let mut buf = Vec::new();
+            put_uvarint(&mut buf, v);
+            let mut pos = 0;
+            assert_eq!(get_uvarint(&buf, &mut pos).unwrap(), v);
+            assert_eq!(pos, buf.len());
+        }
+        // 10th byte carries bits above bit 0 (0x02): pre-fix this silently
+        // truncated to 0; now it must error.
+        let oversized = [0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+        let mut pos = 0;
+        assert!(get_uvarint(&oversized, &mut pos).is_err());
+        // 10th byte still sets the continuation bit (over-long): must error.
+        let overlong = [
+            0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x81, 0x00,
+        ];
+        let mut pos = 0;
+        assert!(get_uvarint(&overlong, &mut pos).is_err());
+    }
+
     /// The optional covering section round-trips `cover_t_min` exactly (incl. a
     /// value BELOW `time_start` — a feature starting before its bucket edge).
     #[test]
@@ -597,12 +638,26 @@ mod tests {
         let mut entries = Vec::new();
         for i in 0..20u32 {
             let mut e = entry(
-                10, i, i, i as u64, (i as i64) * 1000, (i as i64) * 1000 + 900,
-                64 + i as u64 * 50, 50, 100, i, 0x100 + i, Some(1000),
+                10,
+                i,
+                i,
+                i as u64,
+                (i as i64) * 1000,
+                (i as i64) * 1000 + 900,
+                64 + i as u64 * 50,
+                50,
+                100,
+                i,
+                0x100 + i,
+                Some(1000),
             );
             // tight lower bound: usually inside the bucket, but entry 0 starts
             // 500ms BEFORE its bucket boundary to exercise the signed delta.
-            e.cover_t_min = Some(if i == 0 { -500 } else { (i as i64) * 1000 + 250 });
+            e.cover_t_min = Some(if i == 0 {
+                -500
+            } else {
+                (i as i64) * 1000 + 250
+            });
             entries.push(e);
         }
         let bytes = encode_directory(&entries);
@@ -628,7 +683,20 @@ mod tests {
 
     #[test]
     fn single_entry_roundtrips() {
-        let e = entry(10, 5, 7, 42, 1000, 2000, 64, 128, 256, 3, 0xDEAD_BEEF, Some(3_600_000));
+        let e = entry(
+            10,
+            5,
+            7,
+            42,
+            1000,
+            2000,
+            64,
+            128,
+            256,
+            3,
+            0xDEAD_BEEF,
+            Some(3_600_000),
+        );
         let bytes = encode_directory(std::slice::from_ref(&e));
         let back = decode_directory(&bytes).unwrap();
         assert_eq!(back, vec![e]);
@@ -679,11 +747,11 @@ mod tests {
                 77, // same hilbert (same cell)
                 (b as i64) * 3_600_000,
                 (b as i64) * 3_600_000 + 3_599_999,
-                4096,   // same offset (deduped blob)
-                512,    // same length
-                1024,   // same uncompressed
+                4096, // same offset (deduped blob)
+                512,  // same length
+                1024, // same uncompressed
                 64,
-                crc,    // same crc
+                crc, // same crc
                 Some(3_600_000),
             ));
         }
@@ -766,7 +834,20 @@ mod tests {
     #[test]
     fn negative_and_extreme_times_roundtrip() {
         let entries = vec![
-            entry(0, 0, 0, 0, i64::MIN + 1, i64::MIN + 10, 64, 8, 16, 1, 1, None),
+            entry(
+                0,
+                0,
+                0,
+                0,
+                i64::MIN + 1,
+                i64::MIN + 10,
+                64,
+                8,
+                16,
+                1,
+                1,
+                None,
+            ),
             entry(0, 0, 0, 0, -5000, -1000, 72, 8, 16, 1, 2, Some(1)),
             entry(0, 0, 0, 0, 0, 0, 80, 8, 16, 1, 3, None),
             entry(0, 0, 0, 0, i64::MAX - 10, i64::MAX, 88, 8, 16, 1, 4, None),
@@ -886,20 +967,38 @@ mod tests {
         // Pack 0: one static cell across 50 hourly buckets — one run.
         for b in 0..50u64 {
             entries.push(entry_pack(
-                0, 9, 3, 4, 77,
+                0,
+                9,
+                3,
+                4,
+                77,
                 (b as i64) * 3_600_000,
                 (b as i64) * 3_600_000 + 3_599_999,
-                4096, 512, 1024, 64, crc, Some(3_600_000),
+                4096,
+                512,
+                1024,
+                64,
+                crc,
+                Some(3_600_000),
             ));
         }
         // Pack 1: same blob fields (offset/len/unc/crc) but a different pack —
         // a separate physical object, so it must stay its own run.
         for b in 0..50u64 {
             entries.push(entry_pack(
-                1, 9, 5, 6, 99,
+                1,
+                9,
+                5,
+                6,
+                99,
                 (b as i64) * 3_600_000,
                 (b as i64) * 3_600_000 + 3_599_999,
-                4096, 512, 1024, 64, crc, Some(3_600_000),
+                4096,
+                512,
+                1024,
+                64,
+                crc,
+                Some(3_600_000),
             ));
         }
         let bytes = encode_directory(&entries);
@@ -918,9 +1017,19 @@ mod tests {
         for i in 0..12u32 {
             let pack_id = i / 4; // packs 0,1,2
             let mut e = entry_pack(
-                pack_id, 10, i, i, i as u64,
-                (i as i64) * 1000, (i as i64) * 1000 + 900,
-                (i % 4) as u64 * 50, 50, 100, i, 0x300 + i, Some(1000),
+                pack_id,
+                10,
+                i,
+                i,
+                i as u64,
+                (i as i64) * 1000,
+                (i as i64) * 1000 + 900,
+                (i % 4) as u64 * 50,
+                50,
+                100,
+                i,
+                0x300 + i,
+                Some(1000),
             );
             e.cover_t_min = Some((i as i64) * 1000 + 250);
             entries.push(e);

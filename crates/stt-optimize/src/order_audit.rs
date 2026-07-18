@@ -38,6 +38,9 @@ pub struct OrderAuditReport {
     pub native_tiles: usize,
     /// Coalescing gap used (bytes) — the reader's real default.
     pub coalesce_gap_bytes: u64,
+    /// Pack-object target used (bytes): the reader coalesces per-pack, so runs
+    /// are force-closed at pack boundaries. Derived from the archive's packs.
+    pub pack_bytes: u64,
     /// Every ordering, cheapest-first.
     pub orderings: Vec<OrderingCostRow>,
     /// The measured-best ordering.
@@ -71,7 +74,18 @@ pub fn order_audit(tileset: &PackedTileset) -> Result<OrderAuditReport> {
         })
         .collect();
 
-    let opts = SimOptions::default();
+    // Coalesce per-pack, using the archive's real pack target. The largest pack
+    // object is the target (packs fill to target then cut; only the last is
+    // short), so max pack length is the target proxy — floored at 1 MiB.
+    let pack_bytes = tileset
+        .manifest()
+        .packs
+        .iter()
+        .map(|p| p.length)
+        .max()
+        .unwrap_or(ordering_sim::DEFAULT_PACK_BYTES)
+        .max(1 << 20);
+    let opts = SimOptions { pack_bytes, ..SimOptions::default() };
     let ranked = ordering_sim::evaluate(&samples, opts);
     // The recommendation is the cheapest SELECTABLE ordering (never morton3) —
     // identical to what `--blob-ordering measured` would resolve.
@@ -114,6 +128,7 @@ pub fn order_audit(tileset: &PackedTileset) -> Result<OrderAuditReport> {
     Ok(OrderAuditReport {
         native_tiles: samples.len(),
         coalesce_gap_bytes: opts.coalesce_gap_bytes,
+        pack_bytes: opts.pack_bytes,
         orderings,
         recommended: recommended.as_str().to_string(),
         auto_choice: auto_choice.as_str().to_string(),
@@ -137,9 +152,10 @@ pub fn format_text(r: &OrderAuditReport) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "Blob-ordering audit — {} native tiles, {} coalescing gap",
+        "Blob-ordering audit — {} native tiles, {} coalescing gap, {} packs",
         r.native_tiles,
-        mib(r.coalesce_gap_bytes)
+        mib(r.coalesce_gap_bytes),
+        mib(r.pack_bytes)
     );
     let _ = writeln!(s);
     let _ = writeln!(

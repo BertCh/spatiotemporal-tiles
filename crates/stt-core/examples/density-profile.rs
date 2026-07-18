@@ -106,9 +106,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             len: e.length as u64,
         })
         .collect();
+    // Pack target (the reader coalesces per-pack): the largest pack object, over
+    // ALL zooms (a pack holds every tier). max(offset+length) per pack, then the
+    // max across packs — floored at 1 MiB.
+    let pack_bytes = {
+        let mut ends: BTreeMap<u32, u64> = BTreeMap::new();
+        for e in reader.entries() {
+            let end = e.offset + e.length as u64;
+            let slot = ends.entry(e.pack_id).or_insert(0);
+            *slot = (*slot).max(end);
+        }
+        ends.values()
+            .copied()
+            .max()
+            .unwrap_or(stt_core::ordering_sim::DEFAULT_PACK_BYTES)
+            .max(1 << 20)
+    };
     let measured_key = ordering_key(stt_core::ordering_sim::measured_ordering(
         &samples,
-        stt_core::ordering_sim::SimOptions::default(),
+        stt_core::ordering_sim::SimOptions {
+            pack_bytes,
+            ..stt_core::ordering_sim::SimOptions::default()
+        },
     ));
 
     // For each ordering, sort the true tiles into byte order and count the

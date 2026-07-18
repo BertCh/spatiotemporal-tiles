@@ -3,7 +3,10 @@
 //! Provides unified data loading from different sources for analysis.
 
 use anyhow::{Context, Result};
-use arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampSecondArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray};
+use arrow::array::{
+    Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+};
 use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::path::{Path, PathBuf};
@@ -23,11 +26,10 @@ pub enum DataSource {
 impl DataSource {
     pub fn display_name(&self) -> String {
         match self {
-            DataSource::GeoParquet { path, .. } => {
-                path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            }
+            DataSource::GeoParquet { path, .. } => path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
         }
     }
 }
@@ -121,9 +123,11 @@ pub struct LoadedData {
 /// Load data from a data source
 pub fn load_data(source: &DataSource) -> Result<LoadedData> {
     match source {
-        DataSource::GeoParquet { path, time_field, time_format } => {
-            load_geoparquet(path, time_field, time_format)
-        }
+        DataSource::GeoParquet {
+            path,
+            time_field,
+            time_format,
+        } => load_geoparquet(path, time_field, time_format),
     }
 }
 
@@ -145,7 +149,10 @@ fn load_geoparquet(path: &Path, time_field: &str, time_format: &str) -> Result<L
 
     // Find geometry and time columns
     let geom_col_name = find_geometry_column(&schema)?;
-    let time_col_idx = schema.fields().iter().position(|f| f.name() == time_field)
+    let time_col_idx = schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == time_field)
         .ok_or_else(|| anyhow::anyhow!("Time field '{}' not found", time_field))?;
 
     // Deterministic stride sample: every Nth row (first row included), sized
@@ -175,18 +182,35 @@ fn load_geoparquet(path: &Path, time_field: &str, time_format: &str) -> Result<L
         let property_count = schema.fields().len() - 2; // Exclude geometry and time
 
         for i in 0..batch.num_rows() {
-            let (geom_type, vertex_count, lon, lat) = geometries.get(i)
-                .cloned()
-                .unwrap_or((GeometryType::Unknown, 0, 0.0, 0.0));
-            let timestamp = timestamps.get(i).copied().unwrap_or(0);
+            // `row_index` counts every physical row so the deterministic sample
+            // stride stays aligned with the file-wide row count, even when a row
+            // is skipped below.
+            let current_row = row_index;
+            row_index += 1;
 
-            // Update bounds
+            // Skip rows whose geometry is null or failed to parse: do not fold a
+            // phantom (0, 0) into the spatial bounds or append it as a feature.
+            // (Mirrors `sample_geometry_at` returning `None` for the same rows.)
+            let Some((geom_type, vertex_count, lon, lat)) = geometries.get(i).copied().flatten()
+            else {
+                continue;
+            };
+            // A null/unparseable timestamp is kept out of the temporal min/max
+            // (`timestamp_opt`) but the feature is still retained for spatial
+            // stats with a 0 placeholder.
+            let timestamp_opt = timestamps.get(i).copied().flatten();
+            let timestamp = timestamp_opt.unwrap_or(0);
+
+            // Update spatial bounds (valid geometry only).
             min_lon = min_lon.min(lon);
             max_lon = max_lon.max(lon);
             min_lat = min_lat.min(lat);
             max_lat = max_lat.max(lat);
-            min_time = min_time.min(timestamp);
-            max_time = max_time.max(timestamp);
+            // Update temporal bounds only for rows with a valid timestamp.
+            if let Some(ts) = timestamp_opt {
+                min_time = min_time.min(ts);
+                max_time = max_time.max(ts);
+            }
 
             // Estimate size: base overhead + vertices + properties
             let estimated_size = 100 + (vertex_count * 16) + (property_count * 20);
@@ -203,8 +227,8 @@ fn load_geoparquet(path: &Path, time_field: &str, time_format: &str) -> Result<L
 
             // Sample retention: rows on the stride keep their full geometry
             // and property values (rows whose geometry fails to parse are
-            // skipped, matching the (Unknown, 0, ...) summary above).
-            if row_index % sample_stride == 0 && sample.len() < MAX_SAMPLE_FEATURES {
+            // already skipped above and never reach the sample).
+            if current_row % sample_stride == 0 && sample.len() < MAX_SAMPLE_FEATURES {
                 if let Some(geometry) = sample_geometry_at(&batch, &geom_col_name, i) {
                     sample.push(SampledFeature {
                         geometry,
@@ -213,7 +237,6 @@ fn load_geoparquet(path: &Path, time_field: &str, time_format: &str) -> Result<L
                     });
                 }
             }
-            row_index += 1;
         }
 
         if features.len() % 100_000 == 0 {
@@ -222,6 +245,14 @@ fn load_geoparquet(path: &Path, time_field: &str, time_format: &str) -> Result<L
     }
 
     pb.finish_with_message(format!("Loaded {} features", features.len()));
+
+    // If no row carried a valid timestamp the min/max sentinels never moved;
+    // collapse them to an empty [0, 0] range rather than leaking u64::MAX.
+    let (min_time, max_time) = if min_time == u64::MAX {
+        (0, 0)
+    } else {
+        (min_time, max_time)
+    };
 
     Ok(LoadedData {
         features,
@@ -274,19 +305,26 @@ fn find_geometry_column(schema: &arrow::datatypes::Schema) -> Result<String> {
     anyhow::bail!("Could not find geometry column in Parquet schema")
 }
 
-/// Extract geometries from a batch
+/// Extract geometries from a batch.
+///
+/// Each slot is `Some((type, vertex_count, lon, lat))` for a readable geometry,
+/// or `None` for a null cell or one whose WKB failed to parse. `None` rows are
+/// skipped entirely by the caller (no bounds fold, no feature) rather than
+/// coerced into a phantom `(0, 0)` point.
 fn extract_geometries_from_batch(
     batch: &arrow::record_batch::RecordBatch,
     geom_col_name: &str,
-) -> Result<Vec<(GeometryType, usize, f64, f64)>> {
+) -> Result<Vec<Option<(GeometryType, usize, f64, f64)>>> {
     let mut results = Vec::with_capacity(batch.num_rows());
 
     // Handle separate lon/lat columns
     if geom_col_name == "__lon_lat__" {
-        let lon_col = batch.column_by_name("lon")
+        let lon_col = batch
+            .column_by_name("lon")
             .or_else(|| batch.column_by_name("longitude"))
             .or_else(|| batch.column_by_name("x"));
-        let lat_col = batch.column_by_name("lat")
+        let lat_col = batch
+            .column_by_name("lat")
             .or_else(|| batch.column_by_name("latitude"))
             .or_else(|| batch.column_by_name("y"));
 
@@ -297,9 +335,14 @@ fn extract_geometries_from_batch(
             ) {
                 for i in 0..batch.num_rows() {
                     if lon_arr.is_valid(i) && lat_arr.is_valid(i) {
-                        results.push((GeometryType::Point, 1, lon_arr.value(i), lat_arr.value(i)));
+                        results.push(Some((
+                            GeometryType::Point,
+                            1,
+                            lon_arr.value(i),
+                            lat_arr.value(i),
+                        )));
                     } else {
-                        results.push((GeometryType::Unknown, 0, 0.0, 0.0));
+                        results.push(None);
                     }
                 }
                 return Ok(results);
@@ -308,15 +351,21 @@ fn extract_geometries_from_batch(
         anyhow::bail!("Expected lon/lat columns but could not read them");
     }
 
-    let geom_col = batch.column_by_name(geom_col_name)
+    let geom_col = batch
+        .column_by_name(geom_col_name)
         .ok_or_else(|| anyhow::anyhow!("Geometry column '{}' not found", geom_col_name))?;
 
     // Try GeoArrow struct
-    if let Some(struct_array) = geom_col.as_any().downcast_ref::<arrow::array::StructArray>() {
-        let x_col = struct_array.column_by_name("x")
+    if let Some(struct_array) = geom_col
+        .as_any()
+        .downcast_ref::<arrow::array::StructArray>()
+    {
+        let x_col = struct_array
+            .column_by_name("x")
             .or_else(|| struct_array.column_by_name("longitude"))
             .or_else(|| struct_array.column_by_name("lon"));
-        let y_col = struct_array.column_by_name("y")
+        let y_col = struct_array
+            .column_by_name("y")
             .or_else(|| struct_array.column_by_name("latitude"))
             .or_else(|| struct_array.column_by_name("lat"));
 
@@ -327,9 +376,14 @@ fn extract_geometries_from_batch(
             ) {
                 for i in 0..batch.num_rows() {
                     if x_arr.is_valid(i) && y_arr.is_valid(i) {
-                        results.push((GeometryType::Point, 1, x_arr.value(i), y_arr.value(i)));
+                        results.push(Some((
+                            GeometryType::Point,
+                            1,
+                            x_arr.value(i),
+                            y_arr.value(i),
+                        )));
                     } else {
-                        results.push((GeometryType::Unknown, 0, 0.0, 0.0));
+                        results.push(None);
                     }
                 }
                 return Ok(results);
@@ -338,27 +392,32 @@ fn extract_geometries_from_batch(
     }
 
     // Try WKB binary column
-    if let Some(binary_array) = geom_col.as_any().downcast_ref::<arrow::array::BinaryArray>() {
+    if let Some(binary_array) = geom_col
+        .as_any()
+        .downcast_ref::<arrow::array::BinaryArray>()
+    {
         for i in 0..batch.num_rows() {
             if binary_array.is_valid(i) {
                 let wkb = binary_array.value(i);
                 if let Some((geom_type, vertex_count, lon, lat)) = parse_wkb_info(wkb) {
-                    results.push((geom_type, vertex_count, lon, lat));
+                    results.push(Some((geom_type, vertex_count, lon, lat)));
                 } else {
-                    results.push((GeometryType::Unknown, 0, 0.0, 0.0));
+                    results.push(None);
                 }
             } else {
-                results.push((GeometryType::Unknown, 0, 0.0, 0.0));
+                results.push(None);
             }
         }
         return Ok(results);
     }
 
     // Fallback: try separate lon/lat columns
-    let lon_col = batch.column_by_name("lon")
+    let lon_col = batch
+        .column_by_name("lon")
         .or_else(|| batch.column_by_name("longitude"))
         .or_else(|| batch.column_by_name("x"));
-    let lat_col = batch.column_by_name("lat")
+    let lat_col = batch
+        .column_by_name("lat")
         .or_else(|| batch.column_by_name("latitude"))
         .or_else(|| batch.column_by_name("y"));
 
@@ -369,16 +428,24 @@ fn extract_geometries_from_batch(
         ) {
             for i in 0..batch.num_rows() {
                 if lon_arr.is_valid(i) && lat_arr.is_valid(i) {
-                    results.push((GeometryType::Point, 1, lon_arr.value(i), lat_arr.value(i)));
+                    results.push(Some((
+                        GeometryType::Point,
+                        1,
+                        lon_arr.value(i),
+                        lat_arr.value(i),
+                    )));
                 } else {
-                    results.push((GeometryType::Unknown, 0, 0.0, 0.0));
+                    results.push(None);
                 }
             }
             return Ok(results);
         }
     }
 
-    anyhow::bail!("Could not extract geometries from column '{}'", geom_col_name)
+    anyhow::bail!(
+        "Could not extract geometries from column '{}'",
+        geom_col_name
+    )
 }
 
 // =============================================================================
@@ -454,7 +521,10 @@ fn lonlat_point_at(
     let lon_arr = lon.as_any().downcast_ref::<Float64Array>()?;
     let lat_arr = lat.as_any().downcast_ref::<Float64Array>()?;
     (lon_arr.is_valid(row) && lat_arr.is_valid(row)).then(|| {
-        geo_types::Geometry::Point(geo_types::Point::new(lon_arr.value(row), lat_arr.value(row)))
+        geo_types::Geometry::Point(geo_types::Point::new(
+            lon_arr.value(row),
+            lat_arr.value(row),
+        ))
     })
 }
 
@@ -537,12 +607,17 @@ fn prop_value_at(col: &dyn Array, row: usize) -> Option<PropValue> {
     }
 }
 
-/// Extract timestamps from a column
+/// Extract timestamps from a column.
+///
+/// Each slot is `Some(unix_ms)` for a valid timestamp, or `None` for a null
+/// cell or (string columns) an unparseable value. `None` rows are excluded from
+/// the temporal min/max rather than coerced to epoch 0, which used to pin
+/// `min_time` to 1970 and inflate the reported duration by decades.
 fn extract_timestamps_from_batch(
     batch: &arrow::record_batch::RecordBatch,
     col_idx: usize,
     time_format: &str,
-) -> Result<Vec<u64>> {
+) -> Result<Vec<Option<u64>>> {
     let column = batch.column(col_idx);
     let mut timestamps = Vec::with_capacity(batch.num_rows());
 
@@ -550,15 +625,15 @@ fn extract_timestamps_from_batch(
     // (stt_core::timestamp) so this analysis loader agrees byte-for-byte with the
     // stt-build scalar/vertex readers and the DuckDB reader — the divergent local
     // `.max(0)`/hand-rolled ÷ arithmetic here was the audited bug. Null entries
-    // still coerce to 0 (this loader's historical tolerance); a pre-1970 or
-    // second→ms-overflowing value now hard-errors like the build path.
+    // yield `None` (skipped from temporal stats, not coerced to 0); a pre-1970 or
+    // second→ms-overflowing value still hard-errors like the build path.
     macro_rules! push_ts_column {
         ($arr:expr, $unit:expr) => {{
             for i in 0..batch.num_rows() {
                 if $arr.is_valid(i) {
-                    timestamps.push(normalize_timestamp_to_ms(i, $arr.value(i), $unit)?);
+                    timestamps.push(Some(normalize_timestamp_to_ms(i, $arr.value(i), $unit)?));
                 } else {
-                    timestamps.push(0);
+                    timestamps.push(None);
                 }
             }
             return Ok(timestamps);
@@ -586,23 +661,27 @@ fn extract_timestamps_from_batch(
         };
         for i in 0..batch.num_rows() {
             if int_array.is_valid(i) {
-                timestamps.push(normalize_timestamp_to_ms(i, int_array.value(i), unit)?);
+                timestamps.push(Some(normalize_timestamp_to_ms(
+                    i,
+                    int_array.value(i),
+                    unit,
+                )?));
             } else {
-                timestamps.push(0);
+                timestamps.push(None);
             }
         }
         return Ok(timestamps);
     }
 
-    // Try as string array (ISO8601)
+    // Try as string array (ISO8601). An unparseable value is excluded from the
+    // temporal stats (`None`) rather than coerced to epoch 0.
     if let Some(str_array) = column.as_any().downcast_ref::<StringArray>() {
         for i in 0..batch.num_rows() {
             if str_array.is_valid(i) {
                 let s = str_array.value(i);
-                let ts = parse_iso8601(s).unwrap_or(0);
-                timestamps.push(ts);
+                timestamps.push(parse_iso8601(s).ok());
             } else {
-                timestamps.push(0);
+                timestamps.push(None);
             }
         }
         return Ok(timestamps);
@@ -669,7 +748,11 @@ fn classify_geometry(geom: &geo_types::Geometry<f64>) -> GeometryType {
 
 fn polygon_vertex_count(polygon: &geo_types::Polygon<f64>) -> usize {
     polygon.exterior().0.len()
-        + polygon.interiors().iter().map(|ring| ring.0.len()).sum::<usize>()
+        + polygon
+            .interiors()
+            .iter()
+            .map(|ring| ring.0.len())
+            .sum::<usize>()
 }
 
 /// Total vertex count across ALL rings and parts (the hand-rolled parser this
@@ -713,7 +796,8 @@ mod tests {
 
     /// Encode a geo-types geometry as ISO WKB via geozero's writer.
     fn wkb(geom: &Geometry<f64>) -> Vec<u8> {
-        geom.to_wkb(CoordDimensions::xy()).expect("encode WKB fixture")
+        geom.to_wkb(CoordDimensions::xy())
+            .expect("encode WKB fixture")
     }
 
     fn closed_ring(coords: &[(f64, f64)]) -> LineString<f64> {
@@ -811,9 +895,13 @@ mod tests {
         let batch = arrow::record_batch::RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(BinaryArray::from_iter_values(wkbs.iter().map(|v| v.as_slice()))),
+                Arc::new(BinaryArray::from_iter_values(
+                    wkbs.iter().map(|v| v.as_slice()),
+                )),
                 Arc::new(Int64Array::from(
-                    (0..n as i64).map(|i| 1_600_000_000_000 + i * 1_000).collect::<Vec<_>>(),
+                    (0..n as i64)
+                        .map(|i| 1_600_000_000_000 + i * 1_000)
+                        .collect::<Vec<_>>(),
                 )),
                 Arc::new(Float64Array::from(
                     (0..n).map(|i| i as f64 * 0.5).collect::<Vec<_>>(),
@@ -854,12 +942,82 @@ mod tests {
         );
 
         // The retained sample is measurable end-to-end.
-        let measured =
-            crate::measure::measure_sample(&data.sample, &crate::measure::MeasureSettings::default())
-                .unwrap()
-                .expect("sample is large enough to measure");
+        let measured = crate::measure::measure_sample(
+            &data.sample,
+            &crate::measure::MeasureSettings::default(),
+        )
+        .unwrap()
+        .expect("sample is large enough to measure");
         assert_eq!(measured.features, n);
         assert_eq!(measured.geometry_kind, "point");
+    }
+
+    #[test]
+    fn bad_timestamp_and_geometry_rows_do_not_poison_bounds_or_time() {
+        // Regression: a null/unparseable timestamp must not pin min_time to
+        // epoch 0, and a parse-failure geometry must not fold a phantom (0, 0)
+        // into the spatial bounds (nor survive as a feature).
+        use arrow::array::{BinaryArray, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let good_a = wkb(&Geometry::Point(Point::new(-73.0, 45.0)));
+        let good_b = wkb(&Geometry::Point(Point::new(-71.0, 46.0)));
+        let bad_geom: Vec<u8> = vec![0xff, 0xff, 0xff, 0xff]; // unparseable WKB
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("geometry", DataType::Binary, false),
+            Field::new("timestamp", DataType::Utf8, true),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values([
+                    good_a.as_slice(),
+                    good_b.as_slice(),
+                    bad_geom.as_slice(),
+                ])),
+                // Row 0: valid ISO (2020-09-13T12:26:40Z == 1_600_000_000_000 ms)
+                // Row 1: unparseable "N/A" -> excluded from temporal stats
+                // Row 2: valid time, but its geometry fails to parse so the whole
+                //        row (including this timestamp) is skipped.
+                Arc::new(StringArray::from(vec![
+                    "2020-09-13T12:26:40Z",
+                    "N/A",
+                    "2020-09-13T12:28:20Z",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad_rows.parquet");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let data = load_data(&DataSource::GeoParquet {
+            path,
+            time_field: "timestamp".to_string(),
+            time_format: "iso8601".to_string(),
+        })
+        .unwrap();
+
+        // The parse-failure geometry row is dropped entirely.
+        assert_eq!(data.features.len(), 2);
+
+        // Only row 0 carried a valid timestamp, so the range is exactly that
+        // instant — NOT collapsed to epoch 0 by the "N/A"/dropped rows.
+        assert_eq!(data.time_range.start, 1_600_000_000_000);
+        assert_eq!(data.time_range.end, 1_600_000_000_000);
+
+        // Bounds span only the two valid points; (0, 0) never leaks in.
+        assert_eq!(data.bounds.min_lon, -73.0);
+        assert_eq!(data.bounds.max_lon, -71.0);
+        assert_eq!(data.bounds.min_lat, 45.0);
+        assert_eq!(data.bounds.max_lat, 46.0);
     }
 
     #[test]
@@ -881,7 +1039,9 @@ mod tests {
         );
 
         let dict: DictionaryArray<Int32Type> = vec!["a", "b", "a"].into_iter().collect();
-        assert_eq!(prop_value_at(&dict, 2), Some(PropValue::Text("a".to_string())));
+        assert_eq!(
+            prop_value_at(&dict, 2),
+            Some(PropValue::Text("a".to_string()))
+        );
     }
 }
-
