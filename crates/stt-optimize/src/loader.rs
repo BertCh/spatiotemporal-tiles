@@ -153,7 +153,7 @@ fn load_geoparquet(path: &Path, time_field: &str, time_format: &str) -> Result<L
         .fields()
         .iter()
         .position(|f| f.name() == time_field)
-        .ok_or_else(|| anyhow::anyhow!("Time field '{}' not found", time_field))?;
+        .ok_or_else(|| time_field_not_found_error(&schema, time_field))?;
 
     // Deterministic stride sample: every Nth row (first row included), sized
     // so at most MAX_SAMPLE_FEATURES rows are retained across the whole file.
@@ -265,6 +265,40 @@ fn load_geoparquet(path: &Path, time_field: &str, time_format: &str) -> Result<L
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+/// Builds an actionable error for a missing `--time-field`: lists the columns
+/// the file actually has, and flags the ones whose names look temporal, so the
+/// caller can pick the right one without separately inspecting the schema.
+pub(crate) fn time_field_not_found_error(
+    schema: &arrow::datatypes::Schema,
+    time_field: &str,
+) -> anyhow::Error {
+    let available: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let likely: Vec<&str> = available
+        .iter()
+        .copied()
+        .filter(|n| looks_temporal(n))
+        .collect();
+    let hint = if likely.is_empty() {
+        String::new()
+    } else {
+        format!(" Likely time column(s): {}.", likely.join(", "))
+    };
+    anyhow::anyhow!(
+        "Time field '{}' not found. Available columns: {}.{} Pass --time-field <name> to select the timestamp column.",
+        time_field,
+        available.join(", "),
+        hint
+    )
+}
+
+/// Heuristic: does a column name look like it holds a timestamp/date?
+/// (`contains("time")`/`contains("date")` already cover "timestamp" and
+/// "datetime".)
+pub(crate) fn looks_temporal(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    l == "ts" || l.contains("time") || l.contains("date") || l.contains("epoch")
+}
 
 /// Find the geometry column in a Parquet schema
 fn find_geometry_column(schema: &arrow::datatypes::Schema) -> Result<String> {
@@ -793,6 +827,44 @@ mod tests {
     use super::*;
     use geo_types::{Geometry, LineString, MultiPolygon, Point, Polygon};
     use geozero::{CoordDimensions, ToWkb};
+
+    #[test]
+    fn missing_time_field_error_lists_columns_and_flags_likely_ones() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Schema::new(vec![
+            Field::new("iso_time", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("wmo_wind", DataType::Float64, false),
+        ]);
+        let err = time_field_not_found_error(&schema, "timestamp").to_string();
+        assert!(err.contains("'timestamp' not found"), "{err}");
+        // Lists every available column…
+        assert!(err.contains("iso_time"), "{err}");
+        assert!(err.contains("wmo_wind"), "{err}");
+        // …and flags the temporal-looking one specifically.
+        assert!(err.contains("Likely time column(s): iso_time"), "{err}");
+    }
+
+    #[test]
+    fn missing_time_field_error_omits_hint_when_no_temporal_columns() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("wind", DataType::Float64, false),
+        ]);
+        let err = time_field_not_found_error(&schema, "timestamp").to_string();
+        assert!(!err.contains("Likely time column(s)"), "{err}");
+    }
+
+    #[test]
+    fn looks_temporal_matches_common_names() {
+        for name in ["iso_time", "timestamp", "start_date", "TS", "epoch_ms", "datetime"] {
+            assert!(looks_temporal(name), "{name} should look temporal");
+        }
+        for name in ["name", "wind", "magnitude", "id"] {
+            assert!(!looks_temporal(name), "{name} should NOT look temporal");
+        }
+    }
 
     /// Encode a geo-types geometry as ISO WKB via geozero's writer.
     fn wkb(geom: &Geometry<f64>) -> Vec<u8> {

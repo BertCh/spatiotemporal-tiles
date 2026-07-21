@@ -285,15 +285,33 @@ fn classify_distribution(
     TemporalDistribution::Uniform
 }
 
-/// Recommend a temporal bucket size
+/// A watchable playback loop's target length in seconds — the number of buckets
+/// (frames) worth animating is derived from this × the frame rate, not a bare
+/// "aim for ~1500 buckets" constant. Matches the 20..90s band the style-hints
+/// `suggested_playback_seconds` clamps to.
+const TARGET_PLAYBACK_SECONDS: f64 = 45.0;
+/// Frames per second the derived bucket-count target assumes for playback.
+const PLAYBACK_FPS: f64 = 30.0;
+/// Don't bucket so finely that the average bucket holds fewer than this many
+/// features — over-fine buckets just fragment the archive without adding
+/// visible temporal detail.
+const MIN_FEATURES_PER_BUCKET: u64 = 10;
+
+/// Recommend a temporal bucket size.
+///
+/// The target bucket (frame) count is DERIVED from a watchable playback loop
+/// (`TARGET_PLAYBACK_SECONDS × PLAYBACK_FPS`, scaled by the distribution), then
+/// bounded by the two data facts the caller actually measured — never bucket
+/// finer than there are distinct timestamps, nor so fine that the average bucket
+/// falls below [`MIN_FEATURES_PER_BUCKET`] features. (These two inputs were
+/// previously ignored, so the recommendation reacts to neither timestamp
+/// resolution nor feature density; now it does.)
 fn recommend_bucket_size(
     duration_ms: u64,
-    _unique_timestamps: usize,
-    _feature_count: usize,
+    unique_timestamps: usize,
+    feature_count: usize,
     distribution: &TemporalDistribution,
 ) -> (u64, String) {
-    // Target: aim for 1000-2000 unique temporal buckets
-
     if duration_ms == 0 {
         return (0, "N/A".to_string());
     }
@@ -316,23 +334,42 @@ fn recommend_bucket_size(
         (2_592_000_000, "30 days"),
     ];
 
-    // Calculate target bucket count
-    let target_buckets = match distribution {
-        TemporalDistribution::Bursty => 2000, // More buckets for bursty data
-        TemporalDistribution::Sparse => 500,  // Fewer buckets for sparse
-        _ => 1500,
+    // Frames a watchable loop wants, scaled by how much temporal structure the
+    // distribution carries: bursty data rewards finer buckets, sparse data
+    // coarser ones.
+    let frame_factor = match distribution {
+        TemporalDistribution::Bursty => 1.5,
+        TemporalDistribution::Sparse => 0.5,
+        _ => 1.0,
     };
+    let mut target_buckets =
+        (TARGET_PLAYBACK_SECONDS * PLAYBACK_FPS * frame_factor).round() as u64;
 
-    // Find bucket size that gives us close to target buckets
+    // Bound by measured data facts (the previously-ignored inputs):
+    //  - never more buckets than distinct timestamps (finer is empty resolution);
+    //  - never so fine the average bucket dips below MIN_FEATURES_PER_BUCKET.
+    if unique_timestamps > 0 {
+        target_buckets = target_buckets.min(unique_timestamps as u64);
+    }
+    if feature_count > 0 {
+        let by_density = (feature_count as u64 / MIN_FEATURES_PER_BUCKET).max(1);
+        target_buckets = target_buckets.min(by_density);
+    }
+    let target_buckets = target_buckets.max(1);
+
+    // Find the FINEST standard size whose bucket count fits the target.
     for (size_ms, name) in bucket_sizes.iter() {
         let bucket_count = duration_ms / size_ms;
-        if bucket_count <= target_buckets as u64 {
+        if bucket_count <= target_buckets {
             return (*size_ms, name.to_string());
         }
     }
 
-    // Default to 1 day if nothing else fits
-    (86_400_000, "1 day".to_string())
+    // Even the coarsest standard size overshoots the target (long span, few
+    // features) — return the coarsest, never a finer size than what was just
+    // rejected as too fine-grained.
+    let (size_ms, name) = bucket_sizes[bucket_sizes.len() - 1];
+    (size_ms, name.to_string())
 }
 
 /// Format duration as human-readable string
@@ -390,12 +427,13 @@ mod tests {
     }
 
     #[test]
-    fn test_recommend_bucket_targets_1500_buckets() {
-        // For a uniform distribution the target is ~1500 buckets. Over a 30-day
-        // span the chosen bucket should land at-or-under that target (the picker
-        // walks bucket sizes up until bucket_count <= target).
+    fn test_recommend_bucket_targets_a_playback_loop() {
+        // Uniform target = 45s × 30fps = 1350 frames, not capped here (5000
+        // distinct timestamps, 50000 features both leave it at 1350). Over a
+        // 30-day span the chosen bucket must land at-or-under that target.
         let span = 30 * 86_400_000u64; // 30 days
-        let target = 1500u64;
+        let target =
+            (super::TARGET_PLAYBACK_SECONDS * super::PLAYBACK_FPS).round() as u64; // 1350
         let (bucket, name) =
             recommend_bucket_size(span, 5000, 50000, &TemporalDistribution::Uniform);
         assert!(bucket > 0, "bucket must be non-zero for a real span");
@@ -407,9 +445,53 @@ mod tests {
             bucket_count,
             target
         );
-        // 30 days / 1500 buckets ~= 28.8 min, so the picker should land on the
-        // 30-minute bucket (the first standard size at-or-under target).
-        assert_eq!(bucket, 1_800_000, "expected 30-minute bucket, got {}", name);
+        // 30 days / 1350 ≈ 32 min, so 30-min (1440 buckets) is too fine; the
+        // finest standard size at-or-under target is 1 hour (720 buckets).
+        assert_eq!(bucket, 3_600_000, "expected 1-hour bucket, got {}", name);
+    }
+
+    #[test]
+    fn test_bucket_size_respects_unique_timestamps() {
+        // Same span/features, but only 100 distinct timestamps: the target can't
+        // exceed that, so the bucket must be COARSER than with many timestamps
+        // (proves unique_timestamps is no longer ignored).
+        let span = 365 * 86_400_000u64; // 1 year
+        let (many, _) =
+            recommend_bucket_size(span, 100_000, 1_000_000, &TemporalDistribution::Uniform);
+        let (few, _) =
+            recommend_bucket_size(span, 100, 1_000_000, &TemporalDistribution::Uniform);
+        assert!(
+            few > many,
+            "100 distinct timestamps should coarsen the bucket ({few} vs {many})",
+        );
+    }
+
+    #[test]
+    fn test_bucket_size_respects_feature_density() {
+        // A tiny feature count caps buckets so they don't average < 10 features,
+        // forcing a coarser bucket than a dense dataset over the same span
+        // (proves feature_count is no longer ignored).
+        let span = 365 * 86_400_000u64; // 1 year
+        let (dense, _) =
+            recommend_bucket_size(span, 100_000, 1_000_000, &TemporalDistribution::Uniform);
+        let (sparse_features, _) =
+            recommend_bucket_size(span, 100_000, 200, &TemporalDistribution::Uniform);
+        assert!(
+            sparse_features > dense,
+            "200 features should coarsen the bucket ({sparse_features} vs {dense})",
+        );
+    }
+
+    #[test]
+    fn test_bucket_size_fallback_is_coarsest_not_finer() {
+        // Long span + few features: the density cap (10 features → target 1)
+        // rejects EVERY standard size, so the fallback must return the
+        // coarsest one (30 days) — never a finer bucket than what the loop
+        // just rejected as producing too many buckets.
+        let span = 10 * 365 * 86_400_000u64; // 10 years
+        let (bucket, name) =
+            recommend_bucket_size(span, 100, 100, &TemporalDistribution::Uniform);
+        assert_eq!(bucket, 2_592_000_000, "expected 30-day fallback, got {name}");
     }
 
     #[test]

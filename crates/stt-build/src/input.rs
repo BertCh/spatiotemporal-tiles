@@ -171,7 +171,7 @@ where
         .fields()
         .iter()
         .position(|f| f.name() == time_field)
-        .ok_or_else(|| anyhow::anyhow!("Time field '{}' not found", time_field))?;
+        .ok_or_else(|| time_field_not_found_error(&schema, time_field))?;
     // An Int64 time column can't hold ISO 8601 strings; the values fall back
     // to the unix-ms interpretation. Surface the mismatch instead of letting
     // the documented default silently mean unix-ms.
@@ -282,6 +282,41 @@ where
     }
     warn_dropped_property_columns(&schema, &property_cols, &seen_props, row_count);
     Ok(())
+}
+
+/// Builds an actionable error for a missing `--time-field`: lists the columns
+/// the source actually has, and flags the ones whose names look temporal, so
+/// the caller can pick the right one without separately inspecting the schema.
+/// Mirrors `stt_optimize`'s recommend loader so both surfaces fail the same way.
+pub(crate) fn time_field_not_found_error(
+    schema: &arrow::datatypes::Schema,
+    time_field: &str,
+) -> anyhow::Error {
+    let available: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let likely: Vec<&str> = available
+        .iter()
+        .copied()
+        .filter(|n| looks_temporal(n))
+        .collect();
+    let hint = if likely.is_empty() {
+        String::new()
+    } else {
+        format!(" Likely time column(s): {}.", likely.join(", "))
+    };
+    anyhow::anyhow!(
+        "Time field '{}' not found. Available columns: {}.{} Pass --time-field <name> to select the timestamp column.",
+        time_field,
+        available.join(", "),
+        hint
+    )
+}
+
+/// Heuristic: does a column name look like it holds a timestamp/date?
+/// (`contains("time")`/`contains("date")` already cover "timestamp" and
+/// "datetime".)
+pub(crate) fn looks_temporal(name: &str) -> bool {
+    let l = name.to_ascii_lowercase();
+    l == "ts" || l.contains("time") || l.contains("date") || l.contains("epoch")
 }
 
 /// Warn once about property columns present in the source but carrying no
@@ -449,13 +484,15 @@ fn parse_batch(
 /// children (ms in either case). Null rows return `None` for that slot;
 /// non-list columns return an error.
 /// Column names that *may* denote geometry-component coordinates rather than
-/// user properties. Case-SENSITIVE lowercase. Still used by the PostGIS/DuckDB
-/// readers (whose SELECTed lon/lat columns are always the coordinate source).
+/// user properties. Case-SENSITIVE lowercase.
 ///
-/// The GeoParquet file reader no longer excludes columns by this blanket name
-/// test — a column named `x`/`lat`/etc. that is NOT actually consumed as this
-/// build's geometry is a real attribute — and instead withholds only the
-/// precise columns from [`consumed_coordinate_columns`].
+/// NO built-in adaptor excludes columns by this blanket name test anymore:
+/// the GeoParquet reader withholds only the precise columns from
+/// [`consumed_coordinate_columns`], and the PostGIS/DuckDB readers keep every
+/// SELECTed column (their geometry always comes from the geometry column, so
+/// a column named `x`/`lat`/etc. is a genuine user attribute there). Kept as
+/// the canonical name list for [`consumed_coordinate_columns`]'s candidates
+/// and for downstream tooling.
 pub fn is_coordinate_column_name(name: &str) -> bool {
     matches!(name, "lon" | "lat" | "longitude" | "latitude" | "x" | "y")
 }
@@ -1561,9 +1598,43 @@ pub(crate) fn parse_wkb_geometry(wkb: &[u8]) -> Option<(Geometry, f64, f64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_iso8601;
+    use super::{looks_temporal, parse_iso8601, time_field_not_found_error};
 
     const SEP_28_2024_NOON_MS: i64 = 1_727_524_800_000; // 2024-09-28T12:00:00Z
+
+    // Guards the invariant asserted in time_field_not_found_error's doc comment:
+    // stt-build fails the same, helpful way as stt-optimize's twin (loader.rs).
+    #[test]
+    fn missing_time_field_error_lists_columns_and_flags_likely_ones() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Schema::new(vec![
+            Field::new("iso_time", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("wmo_wind", DataType::Float64, false),
+        ]);
+        let err = time_field_not_found_error(&schema, "timestamp").to_string();
+        assert!(err.contains("'timestamp' not found"), "{err}");
+        assert!(err.contains("iso_time"), "{err}");
+        assert!(err.contains("wmo_wind"), "{err}");
+        assert!(err.contains("Likely time column(s): iso_time"), "{err}");
+    }
+
+    #[test]
+    fn looks_temporal_matches_common_names() {
+        for name in [
+            "iso_time",
+            "timestamp",
+            "start_date",
+            "TS",
+            "epoch_ms",
+            "datetime",
+        ] {
+            assert!(looks_temporal(name), "{name} should look temporal");
+        }
+        for name in ["name", "wind", "magnitude", "id"] {
+            assert!(!looks_temporal(name), "{name} should NOT look temporal");
+        }
+    }
 
     #[test]
     fn parses_zoned_timestamps() {

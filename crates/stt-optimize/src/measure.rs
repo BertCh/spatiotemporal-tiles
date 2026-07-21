@@ -27,9 +27,13 @@ use stt_core::compression::compress_zstd_with_dict_level;
 use crate::loader::{PropValue, SampledFeature};
 
 /// Below this many usable sampled features the measurement is noise (zstd
-/// framing and dictionary overheads dominate) and [`measure_sample`] returns
-/// `None` — callers fall back to the formula estimates.
-const MIN_MEASURE_FEATURES: usize = 50;
+/// framing and per-tile encoder overheads dominate the per-feature figure) and
+/// [`measure_sample`] returns `None` — callers fall back to the formula
+/// estimates. Set to 24: low enough that most real datasets get MEASURED bytes
+/// (a real encode of two-dozen homogeneous features estimates bytes/feature and
+/// the zstd ratio well within estimate tolerance), high enough that fixed frame
+/// overhead doesn't materially skew the per-feature figure.
+const MIN_MEASURE_FEATURES: usize = 24;
 
 /// Encoder/compression settings for a sample measurement — the same levers a
 /// real `stt-build` run exposes (`--zstd-level`, `--quantize-coords`,

@@ -272,7 +272,9 @@ where
     let mut seen_props: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
-        let rows = txn.query(&fetch, &[]).context("PostGIS cursor FETCH failed")?;
+        let rows = txn
+            .query(&fetch, &[])
+            .context("PostGIS cursor FETCH failed")?;
         if rows.is_empty() {
             break;
         }
@@ -385,7 +387,6 @@ pub fn property_kinds_from_columns(
             || name == time_field
             || end_time_field == Some(name)
             || name == geom_column
-            || crate::input::is_coordinate_column_name(name)
             || crate::input::is_vertex_metadata_column(name)
         {
             continue;
@@ -474,7 +475,9 @@ impl RowSchema {
         let end_time = match end_time_field {
             Some(f) => {
                 let idx = find(f).ok_or_else(|| {
-                    anyhow::anyhow!("--end-time-field '{f}' not found in the PostGIS result columns")
+                    anyhow::anyhow!(
+                        "--end-time-field '{f}' not found in the PostGIS result columns"
+                    )
                 })?;
                 Some(TimeCol {
                     idx,
@@ -497,13 +500,15 @@ impl RowSchema {
         let vertex_value_matrix = array_col("vertex_value_matrix");
 
         // Every remaining column becomes a property, except the system columns
-        // (wkb, time, end-time), the original geometry column, the per-vertex
-        // array columns, and the geometry-component coordinate names — all
-        // excluded via the SHARED `crate::input` predicates so every input
-        // adaptor (file/PostGIS/DuckDB) excludes the identical set and tiles
-        // don't carry coordinates twice. Columns whose type we can't map
-        // (PostGIS `geometry`, unmapped arrays, …) decode to None at read time
-        // and are silently dropped per-row.
+        // (wkb, time, end-time), the original geometry column, and the
+        // per-vertex array columns. Coordinate-NAMED columns (lon/lat/x/y) are
+        // deliberately NOT excluded: geometry always comes from the geometry
+        // column here, so a SELECTed `x`/`lat` is a genuine user attribute —
+        // dropping it by name was silent data loss (same fix as the
+        // GeoParquet reader's consumed-columns narrowing; the SELECT list is
+        // the escape hatch for redundant convenience copies). Columns whose
+        // type we can't map (PostGIS `geometry`, unmapped arrays, …) decode
+        // to None at read time and are silently dropped per-row.
         let mut props = Vec::new();
         for (idx, col) in columns.iter().enumerate() {
             let name = col.name();
@@ -511,7 +516,6 @@ impl RowSchema {
                 || idx == time.idx
                 || end_time.as_ref().map(|e| e.idx) == Some(idx)
                 || name == geom_column
-                || crate::input::is_coordinate_column_name(name)
                 || crate::input::is_vertex_metadata_column(name)
             {
                 continue;
@@ -624,7 +628,12 @@ impl RowSchema {
 
 /// Decode a time column value to Unix milliseconds, mirroring the GeoParquet
 /// reader's per-type rules. Returns `Ok(None)` for SQL NULL / unmappable type.
-fn decode_time(row: &Row, col: &TimeCol, time_format: TimeFormat, row_no: usize) -> Result<Option<u64>> {
+fn decode_time(
+    row: &Row,
+    col: &TimeCol,
+    time_format: TimeFormat,
+    row_no: usize,
+) -> Result<Option<u64>> {
     let ms: Option<i64> = match col.ty {
         Type::TIMESTAMPTZ => row
             .try_get::<_, Option<DateTime<Utc>>>(col.idx)
@@ -701,7 +710,9 @@ fn decode_u64_ms_array(
             .flatten()
             .map(|v| {
                 count_nulls(v.iter().filter(|x| x.is_none()).count());
-                v.into_iter().map(|x| x.map(i64::from).unwrap_or(0)).collect()
+                v.into_iter()
+                    .map(|x| x.map(i64::from).unwrap_or(0))
+                    .collect()
             }),
         Type::TIMESTAMP_ARRAY => row
             .try_get::<_, Option<Vec<Option<NaiveDateTime>>>>(col.idx)
@@ -730,9 +741,7 @@ fn decode_u64_ms_array(
             .map(|v| {
                 count_nulls(
                     v.iter()
-                        .filter(|x| {
-                            x.and_then(|d| d.and_hms_opt(0, 0, 0)).is_none()
-                        })
+                        .filter(|x| x.and_then(|d| d.and_hms_opt(0, 0, 0)).is_none())
                         .count(),
                 );
                 v.into_iter()
@@ -881,7 +890,10 @@ mod tests {
         let q = spec.wrapped_query();
         assert!(q.contains("ST_AsEWKB(q.\"geom\")"), "{q}");
         assert!(q.contains(WKB_ALIAS), "{q}");
-        assert!(q.contains("FROM ( SELECT * FROM public.trips ) AS q"), "{q}");
+        assert!(
+            q.contains("FROM ( SELECT * FROM public.trips ) AS q"),
+            "{q}"
+        );
     }
 
     #[test]
@@ -910,21 +922,52 @@ mod tests {
     fn tile_query_time_filter_honors_time_format() {
         let bbox = [-10.0, -5.0, 10.0, 5.0];
         // Default (Iso8601 → timestamp column): to_timestamp comparison.
-        let iso =
-            build_tile_query("obs", "geom", "ts", TimeFormat::Iso8601, bbox, 1000, 2000, None);
-        assert!(iso.contains("to_timestamp(1000::double precision / 1000.0)"), "{iso}");
-        assert!(iso.contains("to_timestamp(2000::double precision / 1000.0)"), "{iso}");
+        let iso = build_tile_query(
+            "obs",
+            "geom",
+            "ts",
+            TimeFormat::Iso8601,
+            bbox,
+            1000,
+            2000,
+            None,
+        );
+        assert!(
+            iso.contains("to_timestamp(1000::double precision / 1000.0)"),
+            "{iso}"
+        );
+        assert!(
+            iso.contains("to_timestamp(2000::double precision / 1000.0)"),
+            "{iso}"
+        );
 
         // Integer-epoch-ms column: numeric comparison, no to_timestamp.
-        let ms = build_tile_query("obs", "geom", "ts", TimeFormat::UnixMs, bbox, 1000, 2000, None);
+        let ms = build_tile_query(
+            "obs",
+            "geom",
+            "ts",
+            TimeFormat::UnixMs,
+            bbox,
+            1000,
+            2000,
+            None,
+        );
         assert!(ms.contains("q.\"ts\" >= 1000 AND q.\"ts\" < 2000"), "{ms}");
         assert!(!ms.contains("to_timestamp"), "{ms}");
 
         // Seconds: sargable — the RAW column against ceil-divided second
         // bounds (t*1000 >= 1000 ⟺ t >= 1; t*1000 < 2000 ⟺ t < 2), never a
         // scaled-column expression that would defeat a b-tree index.
-        let sec =
-            build_tile_query("obs", "geom", "ts", TimeFormat::UnixSec, bbox, 1000, 2000, None);
+        let sec = build_tile_query(
+            "obs",
+            "geom",
+            "ts",
+            TimeFormat::UnixSec,
+            bbox,
+            1000,
+            2000,
+            None,
+        );
         assert!(sec.contains("q.\"ts\" >= 1 AND q.\"ts\" < 2"), "{sec}");
         assert!(!sec.contains("* 1000"), "{sec}");
 
@@ -1029,7 +1072,11 @@ mod tests {
             Type::TIMESTAMP_ARRAY,
             Type::DATE_ARRAY,
         ] {
-            assert_eq!(property_kind_for_pg(&ty), None, "{ty} must be dropped (None)");
+            assert_eq!(
+                property_kind_for_pg(&ty),
+                None,
+                "{ty} must be dropped (None)"
+            );
         }
     }
 }

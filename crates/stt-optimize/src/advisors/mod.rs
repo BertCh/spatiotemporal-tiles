@@ -55,6 +55,13 @@ pub struct Advice {
     /// Lossy/destructive levers are never auto-applied and never join
     /// `to_command`.
     pub lossy: bool,
+    /// Non-lossy advice that still must NOT be auto-applied (excluded from
+    /// `to_command` and the MCP auto-args): the lever needs a human decision
+    /// first — a quality tradeoff spelled out in `why` (e.g. spatial ordering
+    /// vs. time-playback buffering) or a prerequisite data transform (e.g.
+    /// `--min-zoom-field` needs a numeric rank column baked in).
+    #[serde(default)]
+    pub suggestion_only: bool,
     /// How sure the advisor is.
     pub confidence: AdviceConfidence,
 }

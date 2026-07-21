@@ -1,12 +1,13 @@
-//! Build-time `style_hints` collection (`stt-build --style-hints`).
+//! Build-time `style_hints` collection.
 //!
 //! Bridges the loaded feature set to the generic stt-optimize profiler
-//! ([`stt_optimize::analysis::properties`]): bounded per-property value
-//! sampling, categorical distinct counting, and a layer-kind hint derived
-//! from the kinds the build produces. The resulting
-//! [`stt_core::metadata::StyleHints`] is attached to archive metadata (and so
-//! flows into the packed `manifest.json` verbatim). In-memory pipeline only —
-//! the collector needs the whole feature slice.
+//! ([`stt_optimize::analysis::properties`]): a layer-kind hint derived from the
+//! kinds the build produces plus a suggested playback duration (both cheap,
+//! emitted on EVERY non-streaming build) and — only under `--style-hints` —
+//! bounded per-property value sampling with categorical distinct counting. The
+//! resulting [`stt_core::metadata::StyleHints`] is attached to archive metadata
+//! (and so flows into the packed `manifest.json` verbatim). In-memory pipeline
+//! only — the profiler needs the whole feature slice.
 
 use crate::input::ParsedFeature;
 use std::collections::{BTreeMap, HashSet};
@@ -38,21 +39,50 @@ struct Collector {
 
 /// Profile the loaded features into a [`StyleHints`] block.
 ///
-/// Returns `None` for an empty feature set. Property values are collected at
-/// a deterministic stride (see [`MAX_VALUES_PER_PROPERTY`]): JSON numbers
-/// widen to `f64`, strings feed a capped distinct set
-/// ([`MAX_DISTINCT_VALUES`]); bool/null/array/object values carry no styling
-/// signal and are skipped. A column with both numeric and string values
-/// resolves to the majority kind. `time_range` + `temporal_bucket_ms` drive
-/// the suggested playback duration.
+/// Returns `None` for an empty feature set.
+///
+/// `full` controls how much is computed:
+/// * `false` (the DEFAULT on every non-streaming build) — the cheap signals
+///   only: the geometry-derived [`layer_hint`] and the
+///   `suggested_playback_seconds` duration. `properties` is empty. This is what
+///   makes view-time layer inference and a sensible playback loop work without
+///   the user opting into the expensive profiler.
+/// * `true` (`stt-build --style-hints`) — additionally scans every feature's
+///   properties at a deterministic stride (see [`MAX_VALUES_PER_PROPERTY`]) for
+///   numeric percentiles / categorical cardinality: JSON numbers widen to
+///   `f64`, strings feed a capped distinct set ([`MAX_DISTINCT_VALUES`]);
+///   bool/null/array/object values carry no styling signal and are skipped. A
+///   column with both numeric and string values resolves to the majority kind.
+///
+/// `time_range` + `temporal_bucket_ms` drive the suggested playback duration in
+/// both modes.
 pub fn compute_style_hints(
     features: &[ParsedFeature],
     time_range: &TimeRange,
     temporal_bucket_ms: u64,
+    full: bool,
 ) -> Option<StyleHints> {
     if features.is_empty() {
         return None;
     }
+    let props = if full {
+        collect_property_values(features)
+    } else {
+        Vec::new()
+    };
+
+    Some(profile_properties(
+        &props,
+        time_range.end.saturating_sub(time_range.start),
+        temporal_bucket_ms,
+        layer_hint(features),
+    ))
+}
+
+/// The expensive per-property value scan behind `--style-hints`: a deterministic
+/// stride over the feature slice collecting numeric samples and capped
+/// categorical distinct-sets, resolved to the majority kind per column.
+fn collect_property_values(features: &[ParsedFeature]) -> Vec<(String, PropertyValues)> {
     let stride = features.len().div_ceil(MAX_VALUES_PER_PROPERTY).max(1);
     // BTreeMap: deterministic property order in the emitted block.
     let mut collectors: BTreeMap<String, Collector> = BTreeMap::new();
@@ -82,7 +112,7 @@ pub fn compute_style_hints(
         }
     }
 
-    let props: Vec<(String, PropertyValues)> = collectors
+    collectors
         .into_iter()
         .filter_map(|(name, c)| {
             if !c.numeric.is_empty() && c.numeric_seen >= c.string_seen {
@@ -98,14 +128,7 @@ pub fn compute_style_hints(
                 None
             }
         })
-        .collect();
-
-    Some(profile_properties(
-        &props,
-        time_range.end.saturating_sub(time_range.start),
-        temporal_bucket_ms,
-        layer_hint(features),
-    ))
+        .collect()
 }
 
 /// Layer hint from the kinds the build will produce: points → `"points"`,
@@ -120,8 +143,7 @@ fn layer_hint(features: &[ParsedFeature]) -> Option<&'static str> {
         match f.geojson.geometry.as_ref().map(|g| &g.value) {
             Some(G::Point(_)) | Some(G::MultiPoint(_)) => points += 1,
             Some(G::LineString(_)) | Some(G::MultiLineString(_)) => {
-                if f.vertex_timestamps.is_some()
-                    || f.end_timestamp.is_some_and(|e| e > f.timestamp)
+                if f.vertex_timestamps.is_some() || f.end_timestamp.is_some_and(|e| e > f.timestamp)
                 {
                     trips += 1;
                 } else {
@@ -168,9 +190,7 @@ mod tests {
                 properties: None,
                 foreign_members: None,
             },
-            shared_properties: props
-                .as_object()
-                .map(|m| Arc::new(m.clone())),
+            shared_properties: props.as_object().map(|m| Arc::new(m.clone())),
             timestamp,
             end_timestamp,
             vertex_timestamps,
@@ -197,7 +217,28 @@ mod tests {
 
     #[test]
     fn empty_features_yield_no_hints() {
-        assert!(compute_style_hints(&[], &TimeRange::new(0, 1), 1).is_none());
+        assert!(compute_style_hints(&[], &TimeRange::new(0, 1), 1, false).is_none());
+        assert!(compute_style_hints(&[], &TimeRange::new(0, 1), 1, true).is_none());
+    }
+
+    #[test]
+    fn minimal_mode_emits_layer_hint_and_playback_but_no_properties() {
+        // full=false: the cheap default on every build. Even though the
+        // features carry a numeric property, the expensive profile is skipped —
+        // only layer_hint + playback survive.
+        let features: Vec<ParsedFeature> = (0..100)
+            .map(|i| point(serde_json::json!({ "magnitude": i as f64 / 10.0 })))
+            .collect();
+        let hints = compute_style_hints(
+            &features,
+            &TimeRange::new(0, 4 * 3_600_000),
+            3_600_000,
+            false,
+        )
+        .unwrap();
+        assert_eq!(hints.layer_hint.as_deref(), Some("points"));
+        assert_eq!(hints.suggested_playback_seconds, Some(20));
+        assert!(hints.properties.is_empty(), "{:?}", hints.properties);
     }
 
     #[test]
@@ -215,6 +256,7 @@ mod tests {
             &features,
             &TimeRange::new(0, 4 * 3_600_000),
             3_600_000,
+            true,
         )
         .unwrap();
         assert_eq!(hints.layer_hint.as_deref(), Some("points"));
@@ -233,10 +275,12 @@ mod tests {
 
     #[test]
     fn lines_with_vertex_times_hint_trips_without_hint_paths() {
-        let trips: Vec<ParsedFeature> =
-            vec![line(Some(2_000), None), line(None, Some(vec![1_000, 2_000]))];
+        let trips: Vec<ParsedFeature> = vec![
+            line(Some(2_000), None),
+            line(None, Some(vec![1_000, 2_000])),
+        ];
         assert_eq!(
-            compute_style_hints(&trips, &TimeRange::new(0, 1), 1)
+            compute_style_hints(&trips, &TimeRange::new(0, 1), 1, false)
                 .unwrap()
                 .layer_hint
                 .as_deref(),
@@ -244,7 +288,7 @@ mod tests {
         );
         let paths: Vec<ParsedFeature> = vec![line(None, None), line(None, None)];
         assert_eq!(
-            compute_style_hints(&paths, &TimeRange::new(0, 1), 1)
+            compute_style_hints(&paths, &TimeRange::new(0, 1), 1, false)
                 .unwrap()
                 .layer_hint
                 .as_deref(),
@@ -258,7 +302,7 @@ mod tests {
             (0..3).map(|_| point(serde_json::json!({}))).collect();
         features.push(line(None, None));
         assert_eq!(
-            compute_style_hints(&features, &TimeRange::new(0, 1), 1)
+            compute_style_hints(&features, &TimeRange::new(0, 1), 1, false)
                 .unwrap()
                 .layer_hint
                 .as_deref(),
@@ -278,8 +322,8 @@ mod tests {
             .map(|i| point(serde_json::json!({ "v": i })))
             .collect();
         let tr = TimeRange::new(0, 3_600_000);
-        let a = compute_style_hints(&features, &tr, 3_600_000).unwrap();
-        let b = compute_style_hints(&features, &tr, 3_600_000).unwrap();
+        let a = compute_style_hints(&features, &tr, 3_600_000, true).unwrap();
+        let b = compute_style_hints(&features, &tr, 3_600_000, true).unwrap();
         assert_eq!(a, b);
     }
 
@@ -288,7 +332,7 @@ mod tests {
         let features: Vec<ParsedFeature> = (0..(MAX_DISTINCT_VALUES + 500))
             .map(|i| point(serde_json::json!({ "id": format!("unique-{i}") })))
             .collect();
-        let hints = compute_style_hints(&features, &TimeRange::new(0, 1), 1).unwrap();
+        let hints = compute_style_hints(&features, &TimeRange::new(0, 1), 1, true).unwrap();
         assert_eq!(
             hints.properties[0].cardinality,
             Some(MAX_DISTINCT_VALUES as u32)

@@ -311,16 +311,17 @@ where
     // Safe after `query()` (the statement has been executed). Per-cell values
     // are decoded from their self-describing `ValueRef`, so no type metadata is
     // needed here.
-    let column_names: Vec<String> = rows
-        .as_ref()
-        .map(|s| s.column_names())
-        .unwrap_or_default();
+    let column_names: Vec<String> = rows.as_ref().map(|s| s.column_names()).unwrap_or_default();
     // Capture the result column types once so the end-of-read dropped-column
     // warning can print `name (TYPE)` (helps distinguish an unmappable-type drop
     // from an all-NULL column). Ingest path only.
     let column_types: Vec<String> = rows
         .as_ref()
-        .map(|s| (0..column_names.len()).map(|i| format!("{:?}", s.column_type(i))).collect())
+        .map(|s| {
+            (0..column_names.len())
+                .map(|i| format!("{:?}", s.column_type(i)))
+                .collect()
+        })
         .unwrap_or_default();
     let schema = RowSchema::resolve_with_types(
         &column_names,
@@ -413,15 +414,17 @@ pub fn decode_query(
 ) -> Result<Vec<ParsedFeature>> {
     let mut stmt = conn.prepare(sql).context("prepare DuckDB tile query")?;
     let mut rows = stmt.query([]).context("DuckDB tile query failed")?;
-    let column_names: Vec<String> = rows
-        .as_ref()
-        .map(|s| s.column_names())
-        .unwrap_or_default();
+    let column_names: Vec<String> = rows.as_ref().map(|s| s.column_names()).unwrap_or_default();
     if column_names.is_empty() {
         return Ok(Vec::new());
     }
-    let schema =
-        RowSchema::resolve(&column_names, time_field, end_time_field, geom_column, time_format)?;
+    let schema = RowSchema::resolve(
+        &column_names,
+        time_field,
+        end_time_field,
+        geom_column,
+        time_format,
+    )?;
 
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -485,7 +488,9 @@ pub fn property_kinds_for_query(
     geom_column: &str,
 ) -> Result<crate::columnar::PropertyTypes> {
     let probe = format!("SELECT * FROM ( {sql} ) AS __stt_schema_probe LIMIT 0");
-    let mut stmt = conn.prepare(&probe).context("prepare DuckDB schema probe")?;
+    let mut stmt = conn
+        .prepare(&probe)
+        .context("prepare DuckDB schema probe")?;
     let rows = stmt.query([]).context("DuckDB schema probe failed")?;
     let mut kinds = crate::columnar::PropertyTypes::new();
     let Some(executed) = rows.as_ref() else {
@@ -497,7 +502,6 @@ pub fn property_kinds_for_query(
             || name == time_field
             || end_time_field == Some(name.as_str())
             || name == geom_column
-            || crate::input::is_coordinate_column_name(name)
             || crate::input::is_vertex_metadata_column(name)
         {
             continue;
@@ -578,7 +582,14 @@ impl RowSchema {
         geom_column: &str,
         time_format: TimeFormat,
     ) -> Result<Self> {
-        Self::resolve_with_types(names, &[], time_field, end_time_field, geom_column, time_format)
+        Self::resolve_with_types(
+            names,
+            &[],
+            time_field,
+            end_time_field,
+            geom_column,
+            time_format,
+        )
     }
 
     /// As [`resolve`], but records the per-column DuckDB result type string (from
@@ -616,20 +627,21 @@ impl RowSchema {
         let vertex_value_matrix_idx = find("vertex_value_matrix");
 
         // Every remaining column becomes a property, except the system columns
-        // (wkb, time, end-time), the original geometry column, the per-vertex
-        // array columns, and the geometry-component coordinate names — all
-        // excluded via the SHARED `crate::input` predicates so every input
-        // adaptor (file/PostGIS/DuckDB) excludes the identical set and tiles
-        // don't carry coordinates twice. Columns whose type we can't map (raw
-        // GEOMETRY, decimals, unmapped arrays, …) decode to None at read time
-        // and are silently dropped per-row.
+        // (wkb, time, end-time), the original geometry column, and the
+        // per-vertex array columns. Coordinate-NAMED columns (lon/lat/x/y) are
+        // deliberately NOT excluded: geometry always comes from the geometry
+        // column here, so a SELECTed `x`/`lat` is a genuine user attribute —
+        // dropping it by name was silent data loss (same fix as the
+        // GeoParquet reader's consumed-columns narrowing; the SELECT list is
+        // the escape hatch for redundant convenience copies). Columns whose
+        // type we can't map (raw GEOMETRY, decimals, unmapped arrays, …)
+        // decode to None at read time and are silently dropped per-row.
         let mut props = Vec::new();
         for (idx, name) in names.iter().enumerate() {
             if idx == wkb_idx
                 || idx == time_idx
                 || end_time_idx == Some(idx)
                 || name == geom_column
-                || crate::input::is_coordinate_column_name(name)
                 || crate::input::is_vertex_metadata_column(name)
             {
                 continue;
@@ -779,7 +791,9 @@ fn decode_time_value(v: ValueRef, time_format: TimeFormat, row_no: usize) -> Res
         ValueRef::UBigInt(n) if n <= i64::MAX as u64 => {
             Some(apply_int_time_format(n as i64, time_format, row_no)?)
         }
-        ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok().and_then(|s| parse_iso8601(s).ok()),
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|s| parse_iso8601(s).ok()),
         _ => None,
     })
 }
@@ -908,13 +922,11 @@ fn decode_property_value(v: ValueRef) -> Option<serde_json::Value> {
         // Fixed-point DECIMAL → nearest f64, via the conversion shared with the
         // PostGIS reader's NUMERIC arm (identical value → identical number).
         ValueRef::Decimal(d) => Some(decimal_string_to_json(&d.to_string())),
-        ValueRef::Text(bytes) => {
-            std::str::from_utf8(bytes).ok().map(|s| Value::String(s.to_string()))
-        }
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes)
+            .ok()
+            .map(|s| Value::String(s.to_string())),
         // Overflowing timestamps are dropped like any other unmappable cell.
-        ValueRef::Timestamp(unit, value) => {
-            timestamp_unit_to_ms(unit, value).ok().map(Value::from)
-        }
+        ValueRef::Timestamp(unit, value) => timestamp_unit_to_ms(unit, value).ok().map(Value::from),
         ValueRef::Date32(days) => Some(Value::from((days as i64) * 86_400_000)),
         // NULL, Blob (incl. raw GEOMETRY/WKB), Time64, Interval, and the
         // nested List/Struct/Map/Enum/Array/Union types are dropped.
@@ -1050,8 +1062,14 @@ mod tests {
     fn timestamp_units_to_ms() {
         assert_eq!(timestamp_unit_to_ms(TimeUnit::Second, 5).unwrap(), 5000);
         assert_eq!(timestamp_unit_to_ms(TimeUnit::Millisecond, 5).unwrap(), 5);
-        assert_eq!(timestamp_unit_to_ms(TimeUnit::Microsecond, 5_000).unwrap(), 5);
-        assert_eq!(timestamp_unit_to_ms(TimeUnit::Nanosecond, 5_000_000).unwrap(), 5);
+        assert_eq!(
+            timestamp_unit_to_ms(TimeUnit::Microsecond, 5_000).unwrap(),
+            5
+        );
+        assert_eq!(
+            timestamp_unit_to_ms(TimeUnit::Nanosecond, 5_000_000).unwrap(),
+            5
+        );
     }
 
     #[test]
@@ -1095,7 +1113,13 @@ mod tests {
         let row = rows.next().unwrap().unwrap();
         let mut coercions = VertexCoercions::default();
         let out = schema
-            .parse_row(row, InputStrictness::Warn, InputStrictness::Warn, 0, &mut coercions)
+            .parse_row(
+                row,
+                InputStrictness::Warn,
+                InputStrictness::Warn,
+                0,
+                &mut coercions,
+            )
             .unwrap();
         let RowOutcome::Feature(f) = out else {
             panic!("expected a decoded feature");
@@ -1129,7 +1153,8 @@ mod tests {
              INSERT INTO t VALUES (NULL, TIMESTAMP '2024-06-21 12:00:00', 12.34, NULL);",
         )
         .unwrap();
-        conn.execute("UPDATE t SET g = ?", duckdb::params![POINT_WKB]).unwrap();
+        conn.execute("UPDATE t SET g = ?", duckdb::params![POINT_WKB])
+            .unwrap();
 
         let mut stmt = conn
             .prepare("SELECT g AS __stt_wkb, ts AS \"timestamp\", price, fee FROM t")
@@ -1141,7 +1166,13 @@ mod tests {
         let row = rows.next().unwrap().unwrap();
         let mut coercions = VertexCoercions::default();
         let RowOutcome::Feature(f) = schema
-            .parse_row(row, InputStrictness::Warn, InputStrictness::Warn, 0, &mut coercions)
+            .parse_row(
+                row,
+                InputStrictness::Warn,
+                InputStrictness::Warn,
+                0,
+                &mut coercions,
+            )
             .unwrap()
         else {
             panic!("expected a decoded feature");
@@ -1198,7 +1229,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(feats.len(), 1, "only the NYC point is in the bbox + window");
-        assert!((feats[0].lon - (-73.9)).abs() < 1e-6, "lon {}", feats[0].lon);
+        assert!(
+            (feats[0].lon - (-73.9)).abs() < 1e-6,
+            "lon {}",
+            feats[0].lon
+        );
         assert!((feats[0].lat - 40.7).abs() < 1e-6, "lat {}", feats[0].lat);
         assert_eq!(
             feats[0].shared_properties.as_ref().unwrap().get("mag"),
@@ -1231,8 +1266,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(f2.len(), 1);
-        assert!((f2[0].lon - (-73.9)).abs() < 1e-4, "reprojected lon {}", f2[0].lon);
-        assert!((f2[0].lat - 40.7).abs() < 1e-4, "reprojected lat {}", f2[0].lat);
+        assert!(
+            (f2[0].lon - (-73.9)).abs() < 1e-4,
+            "reprojected lon {}",
+            f2[0].lon
+        );
+        assert!(
+            (f2[0].lat - 40.7).abs() < 1e-4,
+            "reprojected lat {}",
+            f2[0].lat
+        );
 
         // Serve-style reprojected tile query (the --source-srid serve path):
         // the same NYC bbox against the Web-Mercator table must reproject,
@@ -1258,9 +1301,21 @@ mod tests {
             InputStrictness::Warn,
         )
         .unwrap();
-        assert_eq!(f3.len(), 1, "reprojected tile query finds the mercator point");
-        assert!((f3[0].lon - (-73.9)).abs() < 1e-4, "srid tile lon {}", f3[0].lon);
-        assert!((f3[0].lat - 40.7).abs() < 1e-4, "srid tile lat {}", f3[0].lat);
+        assert_eq!(
+            f3.len(),
+            1,
+            "reprojected tile query finds the mercator point"
+        );
+        assert!(
+            (f3[0].lon - (-73.9)).abs() < 1e-4,
+            "srid tile lon {}",
+            f3[0].lon
+        );
+        assert!(
+            (f3[0].lat - 40.7).abs() < 1e-4,
+            "srid tile lat {}",
+            f3[0].lat
+        );
 
         // Reprojected metadata bounds come back in lon/lat.
         let mq_srid = build_metadata_query("merc", "geom", "ts", TimeFormat::Iso8601, Some(3857));
@@ -1285,7 +1340,10 @@ mod tests {
         let t_start: Option<i64> = row.get(4).unwrap();
         let cnt: i64 = row.get(6).unwrap();
         assert_eq!(cnt, 2);
-        assert!(min_lon.unwrap() <= -73.9 && max_lon.unwrap() >= 2.35, "bounds span both points");
+        assert!(
+            min_lon.unwrap() <= -73.9 && max_lon.unwrap() >= 2.35,
+            "bounds span both points"
+        );
         let noon = chrono::NaiveDate::from_ymd_opt(2024, 6, 21)
             .unwrap()
             .and_hms_opt(12, 0, 0)

@@ -329,7 +329,11 @@ def main() -> int:
                     help="output .stt directory (or .parquet with --skip-build)")
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--max-zoom", type=int, default=7)
-    ap.add_argument("--temporal-bucket", default="1m")
+    # 15m, NOT the granule cadence: flashes carry exact per-feature timestamps
+    # regardless of bucket size, and 1m buckets shattered the archive into
+    # ~287k ~1KB tiles — a 30-min render window then kept ~380 tiles resident
+    # and churned hundreds of loads/sec at playback speed (2-6 fps).
+    ap.add_argument("--temporal-bucket", default="15m")
     ap.add_argument("--summary", action="store_true",
                     help="also emit an H3 summary tier (continental density LOD)")
     ap.add_argument("--publish", action="store_true", help="zstd-19 deploy build")

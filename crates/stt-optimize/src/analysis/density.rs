@@ -13,6 +13,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use stt_core::projection;
 
+/// Last-resort zstd compression ratio, used ONLY when the sample is too small to
+/// measure a real ratio (see [`crate::measure::measure_sample`]). A deliberately
+/// conservative rough guess — real STT tiles routinely compress 3–6× — kept as a
+/// named constant so this is clearly an unmeasured estimate, not a fact. When a
+/// measurement exists the real [`MeasuredEncoding::zstd_ratio`] is used instead.
+const FALLBACK_ZSTD_RATIO: f64 = 3.0;
+
 /// Density analysis results
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DensityAnalysis {
@@ -180,9 +187,10 @@ fn bucket_zoom(
     let undersized_tiles = feature_counts.iter().filter(|&&c| c < 10).count();
 
     // Size estimates: calibrated by the measured sample encoding when present
-    // (real encoder + zstd bytes/feature). Without a measurement, fall back to
-    // the summed per-feature formula estimates with an assumed 3x zstd ratio
-    // (a rough guess; real ratios vary by dataset).
+    // (real encoder + real zstd bytes/feature and ratio — the preferred path,
+    // now reached for more datasets since MIN_MEASURE_FEATURES was lowered).
+    // Only when even the reduced sample can't be measured do we fall back to the
+    // summed per-feature formula and a rough assumed compression ratio.
     let (estimated_size_uncompressed, estimated_size_compressed) = match measured {
         Some(m) => {
             let bucketed_features: usize = feature_counts.iter().sum();
@@ -190,7 +198,10 @@ fn bucket_zoom(
             let uncompressed = (compressed as f64 * m.zstd_ratio).round() as usize;
             (uncompressed, compressed)
         }
-        None => (total_uncompressed, total_uncompressed / 3),
+        None => (
+            total_uncompressed,
+            (total_uncompressed as f64 / FALLBACK_ZSTD_RATIO).round() as usize,
+        ),
     };
 
     ZoomDensity {
@@ -430,10 +441,14 @@ mod tests {
         assert_eq!(calibrated.estimated_size_compressed, 100 * 42);
         assert_eq!(calibrated.estimated_size_uncompressed, 100 * 42 * 2);
 
-        // The no-measurement fallback keeps the formula estimates.
+        // The no-measurement fallback keeps the formula estimates + the named
+        // rough compression ratio (no bare magic constant).
         let fallback = bucket_zoom(&data, 10, 0, None);
         assert_eq!(fallback.estimated_size_uncompressed, 100 * 150);
-        assert_eq!(fallback.estimated_size_compressed, 100 * 150 / 3);
+        assert_eq!(
+            fallback.estimated_size_compressed,
+            (100.0 * 150.0 / FALLBACK_ZSTD_RATIO).round() as usize,
+        );
     }
 
     #[test]

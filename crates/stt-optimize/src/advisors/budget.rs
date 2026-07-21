@@ -112,6 +112,7 @@ fn oversized_tile_advice(result: &AnalysisResult) -> Option<Advice> {
             worst_features, OVERSIZED_TILE_FEATURES
         )),
         lossy: true,
+        suggestion_only: false,
         confidence: AdviceConfidence::Medium,
     })
 }
@@ -154,6 +155,7 @@ fn summary_tier_advice(result: &AnalysisResult) -> Option<Advice> {
             overview_zoom, overview.avg_features_per_tile
         )),
         lossy: false,
+        suggestion_only: false,
         confidence: AdviceConfidence::Medium,
     })
 }
@@ -161,7 +163,10 @@ fn summary_tier_advice(result: &AnalysisResult) -> Option<Advice> {
 /// `--min-zoom-field` LOD floor when one hotspot holds most of the data AND
 /// the sample carries a plausible class/rank column to key the floor on.
 /// Changes zoom placement, not data retention — but a feature is invisible at
-/// zooms below its floor, so the `why` says so.
+/// zooms below its floor, so the `why` says so. Always suggestion-only: it is
+/// a semantic lever (same policy as stt-build `--auto`), and on a categorical
+/// candidate the flag as emitted is a silent no-op until the user bakes a
+/// numeric rank column.
 fn hotspot_lod_advice(result: &AnalysisResult, data: &LoadedData) -> Option<Advice> {
     let top = result.spatial.hotspots.first()?;
     let total = result.feature_count.max(1);
@@ -199,6 +204,7 @@ fn hotspot_lod_advice(result: &AnalysisResult, data: &LoadedData) -> Option<Advi
         why,
         projected: None,
         lossy: false,
+        suggestion_only: true,
         confidence: AdviceConfidence::Low,
     })
 }
@@ -616,6 +622,9 @@ mod tests {
             .expect("LOD-floor advice for hotspot concentration");
         assert_eq!(lod.value.as_deref(), Some("road_class"));
         assert!(!lod.lossy);
+        // Semantic lever: surfaced, never auto-applied (same policy as
+        // stt-build --auto).
+        assert!(lod.suggestion_only);
         assert_eq!(lod.confidence, AdviceConfidence::Low);
         // Cites the hotspot share and calls out the visibility tradeoff.
         assert!(lod.why.contains("60%"), "why: {}", lod.why);
@@ -651,12 +660,15 @@ mod tests {
             .find(|a| a.flag == "--min-zoom-field")
             .expect("LOD-floor advice");
         assert_eq!(lod.value.as_deref(), Some("category"));
-        // The flag takes a numeric property; a string column must say so.
+        // The flag takes a numeric property; a string column must say so —
+        // and the advice must be suggestion-only, because as emitted the flag
+        // is a silent no-op until the user bakes a numeric rank column.
         assert!(
             lod.why.to_lowercase().contains("numeric"),
             "why: {}",
             lod.why
         );
+        assert!(lod.suggestion_only, "categorical --min-zoom-field must not auto-apply");
     }
 
     #[test]

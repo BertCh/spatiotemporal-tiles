@@ -540,7 +540,11 @@ def main() -> int:
     bucket = f"{args.step_min}m"
     build(field_pq, base.with_name(base.name + "-field"), args, end_time=True, bucket=bucket)
     build(cells_pq, base.with_name(base.name + "-cells"), args, end_time=False, bucket=bucket)
-    build(tracks_pq, base.with_name(base.name + "-tracks"), args, end_time=True, bucket=bucket)
+    # Tracks get a COARSER bucket than the scan cadence: they render with a
+    # 60-min trail, so the loader keeps a 2-h window resident — at 10m buckets
+    # that was ~12 buckets × every visible cell (~140 sublayers/draw calls);
+    # 1h buckets cut that ~4×.
+    build(tracks_pq, base.with_name(base.name + "-tracks"), args, end_time=True, bucket="1h")
     print(f"\n✅ Built {base.name}-field / -cells / -tracks")
     return 0
 

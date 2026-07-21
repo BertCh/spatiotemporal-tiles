@@ -106,6 +106,7 @@ fn coords_advice(
         why,
         projected: Some(projected_shrink(shrink)),
         lossy: true,
+        suggestion_only: false,
         confidence: confidence_for(shrink),
     }))
 }
@@ -168,6 +169,7 @@ fn attrs_advice(data: &LoadedData, baseline: &MeasuredEncoding) -> Result<Option
         why,
         projected: Some(projected_shrink(shrink)),
         lossy: true,
+        suggestion_only: false,
         confidence: confidence_for(shrink),
     }))
 }
@@ -383,11 +385,11 @@ mod tests {
 
     #[test]
     fn tiny_sample_produces_no_advice() {
-        let data = loaded(point_sample(30, true));
+        let data = loaded(point_sample(20, true));
         let result = analysis_result(&data, 14);
         assert!(
             result.measured.is_none(),
-            "under 50 features must not measure"
+            "under MIN_MEASURE_FEATURES must not measure"
         );
         let advice = advise(&result, &data).unwrap();
         assert!(

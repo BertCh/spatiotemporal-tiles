@@ -102,6 +102,7 @@ fn advise_temporal_lod(result: &AnalysisResult) -> Option<Advice> {
             coarsest_buckets, coarsest_label, bucket_count
         )),
         lossy: false,
+        suggestion_only: false,
         confidence: AdviceConfidence::Medium,
     })
 }
@@ -165,6 +166,7 @@ fn advise_adaptive_temporal(result: &AnalysisResult) -> Option<Advice> {
         ),
         projected: None,
         lossy: false,
+        suggestion_only: false,
         confidence,
     })
 }

@@ -227,10 +227,20 @@ pub fn build_summary_tier<W: TileWriter>(
                     // cell_id/centroid, partial counts) across adjacent tiles.
                     // Owning by centroid keeps every feature of a cell in one
                     // tile → a single row with the full aggregate.
+                    //
+                    // A COARSE cell's centroid can sit poleward of Web-
+                    // Mercator's ±85.0511° even when every feature inside it
+                    // is at a projectable latitude (res-0 edges are ~1100 km),
+                    // so clamp the ANCHOR into range instead of dropping the
+                    // features — the cell id (and therefore its drawn
+                    // centroid) stays true; only the owning tile snaps to the
+                    // polar edge row. Features whose own lat/lon were invalid
+                    // never got here (LatLng::new above).
                     let ll: LatLng = cell.into();
-                    let (tx, ty) = match projection::lonlat_to_tile(ll.lng(), ll.lat(), zoom) {
+                    let anchor_lat = ll.lat().clamp(-85.0511, 85.0511);
+                    let (tx, ty) = match projection::lonlat_to_tile(ll.lng(), anchor_lat, zoom) {
                         Ok(xy) => xy,
-                        Err(_) => continue,
+                        Err(_) => continue, // non-finite centroid only
                     };
                     (tx, ty, cell.into())
                 }

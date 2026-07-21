@@ -50,6 +50,14 @@ pub struct OrderAuditReport {
     /// The ordering the archive was built with (`manifest.blobOrdering`);
     /// `None` for pre-2026-07 archives that don't record it.
     pub current: Option<String>,
+    /// Set when `recommended == "spatial"` on a dataset spanning multiple time
+    /// buckets: the cost ranking optimizes range-read cost (scrub + pan) but
+    /// does NOT model time-PLAYBACK buffering, and `spatial` scatters each
+    /// bucket's tiles across the pack — which can stall a player's
+    /// buffered-range gate. `None` when spatial isn't recommended or the dataset
+    /// is single-bucket (no playback dimension to stall).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playback_caveat: Option<String>,
 }
 
 /// Audit an opened archive's blob ordering.
@@ -125,15 +133,55 @@ pub fn order_audit(tileset: &PackedTileset) -> Result<OrderAuditReport> {
         BlobOrdering::choose(space_bits, time_bits)
     };
 
+    let recommended_str = recommended.as_str().to_string();
+
+    // `spatial` minimizes range-read COST (scrub + pan) but scatters each time
+    // bucket's tiles across the pack, so a time-window (playback) read fetches
+    // many small non-contiguous ranges and can stall the player's buffered-range
+    // gate. The cost model above does not weigh that playback-buffering axis, so
+    // flag it whenever spatial wins on a dataset that actually spans multiple
+    // time buckets (a single-bucket dataset has no playback dimension to stall).
+    let distinct_buckets = {
+        let mut tbs: Vec<i64> = samples.iter().map(|s| s.tb).collect();
+        tbs.sort_unstable();
+        tbs.dedup();
+        tbs.len()
+    };
+    let playback_caveat = playback_caveat_for(&recommended_str, distinct_buckets);
+
     Ok(OrderAuditReport {
         native_tiles: samples.len(),
         coalesce_gap_bytes: opts.coalesce_gap_bytes,
         pack_bytes: opts.pack_bytes,
         orderings,
-        recommended: recommended.as_str().to_string(),
+        recommended: recommended_str,
         auto_choice: auto_choice.as_str().to_string(),
         current: tileset.manifest().blob_ordering.clone(),
+        playback_caveat,
     })
+}
+
+/// The playback caveat for a recommendation, if warranted. `spatial` minimizes
+/// range-read cost but scatters each time bucket's tiles across the pack, so a
+/// time-window (playback) read fetches many small non-contiguous ranges and can
+/// stall the player's buffered-range gate. Fires only when spatial is the
+/// recommendation AND the dataset spans multiple time buckets (a single-bucket
+/// dataset has no playback dimension to stall). Kept as a pure helper so the
+/// policy is unit-testable without coercing the cost model into a spatial win.
+/// Shared with the pre-build layout advisor (`advisors::layout`) so both the
+/// post-build audit and the pre-build recommendation word the tension identically.
+pub(crate) fn playback_caveat_for(recommended: &str, distinct_buckets: usize) -> Option<String> {
+    if recommended == "spatial" && distinct_buckets > 1 {
+        Some(format!(
+            "`spatial` is cheapest for range-reads but is NOT playback-optimal: it scatters each time \
+             bucket's tiles across the pack, so time-window (playback) reads fetch many small \
+             non-contiguous ranges and can stall the player's buffered-range gate. This dataset spans \
+             {distinct_buckets} time buckets — if it drives time PLAYBACK (not just static scrub/pan), \
+             prefer `--blob-ordering time-major`. The cost ranking here does not model playback buffering."
+        ))
+    } else {
+        None
+    }
 }
 
 fn mib(bytes: u64) -> String {
@@ -200,6 +248,10 @@ pub fn format_text(r: &OrderAuditReport) -> String {
             let _ = writeln!(s, "  current     : not recorded (pre-2026-07 archive)");
         }
     }
+    if let Some(caveat) = &r.playback_caveat {
+        let _ = writeln!(s);
+        let _ = writeln!(s, "  ⚠ playback  : {caveat}");
+    }
     s
 }
 
@@ -256,5 +308,34 @@ mod tests {
         assert!(matches!(current.as_str(), "spatial" | "time-major" | "hilbert3" | "morton3"));
         assert!(matches!(r.auto_choice.as_str(), "spatial" | "time-major" | "hilbert3" | "morton3"));
         assert!(format_text(&r).contains("recommended :"));
+    }
+
+    #[test]
+    fn playback_caveat_fires_only_for_spatial_over_multiple_buckets() {
+        // Spatial + many buckets → warn, and name the safer ordering.
+        let c = playback_caveat_for("spatial", 24).expect("spatial+multi-bucket warns");
+        assert!(c.contains("time-major"), "{c}");
+        assert!(c.contains("24 time buckets"), "{c}");
+        // Single bucket → no playback dimension → no caveat.
+        assert!(playback_caveat_for("spatial", 1).is_none());
+        // A playback-friendly ordering → no caveat even across many buckets.
+        assert!(playback_caveat_for("time-major", 24).is_none());
+        assert!(playback_caveat_for("hilbert3", 99).is_none());
+    }
+
+    #[test]
+    fn format_text_surfaces_the_playback_caveat() {
+        let r = OrderAuditReport {
+            native_tiles: 10,
+            coalesce_gap_bytes: 1 << 20,
+            pack_bytes: 1 << 20,
+            orderings: vec![],
+            recommended: "spatial".to_string(),
+            auto_choice: "spatial".to_string(),
+            current: None,
+            playback_caveat: Some("watch out".to_string()),
+        };
+        assert!(format_text(&r).contains("playback"));
+        assert!(format_text(&r).contains("watch out"));
     }
 }

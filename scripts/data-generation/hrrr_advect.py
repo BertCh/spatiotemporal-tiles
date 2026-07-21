@@ -1,25 +1,34 @@
 #!/usr/bin/env python3
-"""Advect virtual particles through NOAA HRRR 10 m wind → STT streamline ribbons.
+"""Advect virtual particles through NOAA HRRR wind → STT streamline ribbons.
 
 The wind member of the weather suite — the atmospheric analog of ecco_advect.py
-(which does the same for ocean currents). It reads HRRR's 10 m U/V wind for every
-hour of a window, seeds a cloud of massless particles over CONUS, integrates each
-through the *time-varying* wind with 4th-order Runge–Kutta, and emits every
-particle path as one LineString carrying per-vertex timestamps and a per-vertex
-wind-speed value — the exact `trips` shape the showcase renders, so the trips
-renderer, time scrubber, and speed gradient all work unchanged (earth.nullschool
-look via ribbons; no GPU particle tier).
+(which does the same for ocean currents). It reads HRRR U/V wind at a chosen
+level for every hour of a window, seeds a cloud of massless particles over
+CONUS, integrates each through the *time-varying* wind with 4th-order
+Runge–Kutta, and emits every particle path as one LineString carrying
+per-vertex timestamps and a per-vertex wind-speed value — the exact `trips`
+shape the showcase renders, so the trips renderer, time scrubber, and speed
+gradient all work unchanged (earth.nullschool look via ribbons; no GPU
+particle tier).
 
-Source: HRRR (High-Resolution Rapid Refresh) surface files on the anonymous
+`--level` picks the atmospheric layer (default **500mb**, the storm STEERING
+level): convective systems move with the mid-tropospheric flow, not the 10 m
+surface wind, so 500 mb streamlines visually track MRMS storm motion in the
+weather-suite composite while `--level 10m` runs slower and rotated relative
+to the cells. Pressure levels read the wrfprsf00 pressure file; `10m` reads
+the wrfsfcf00 surface file.
+
+Source: HRRR (High-Resolution Rapid Refresh) on the anonymous
 `noaa-hrrr-bdp-pds` S3 bucket, GRIB2, 3 km CONUS, hourly:
 
-    hrrr.<YYYYMMDD>/conus/hrrr.t<HH>z.wrfsfcf00.grib2
+    hrrr.<YYYYMMDD>/conus/hrrr.t<HH>z.wrfsfcf00.grib2   (10 m)
+    hrrr.<YYYYMMDD>/conus/hrrr.t<HH>z.wrfprsf00.grib2   (pressure levels)
 
 HRRR is on a Lambert-Conformal grid, so for each hour we byte-range-subset ONLY
-the `UGRD`/`VGRD` 10 m messages (~5 MB, via the `.idx` sidecar — no 100 MB full
-download), read them with cfgrib, and regrid the native LCC field onto one common
-regular lat/lon grid (scipy) so the ECCO bilinear sampler + advection core apply
-unchanged.
+the two `UGRD`/`VGRD` messages for the level (~1-5 MB, via the `.idx` sidecar —
+no full-file download), read them with cfgrib, and regrid the native LCC field
+onto one common regular lat/lon grid (scipy) so the ECCO bilinear sampler +
+advection core apply unchanged.
 
 Pipeline:  HRRR GRIB2 (.idx subset)  →  regrid  →  RK4 advection  →  GeoParquet  →  stt-build
 
@@ -61,15 +70,28 @@ def parse_when(spec: str) -> datetime:
     return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-# ── HRRR download: byte-range subset of 10 m U/V via the .idx sidecar ─────────
-def hrrr_key(hour: datetime) -> str:
-    return f"hrrr.{hour:%Y%m%d}/conus/hrrr.t{hour:%H}z.wrfsfcf00.grib2"
+# ── HRRR download: byte-range subset of U/V at one level via the .idx sidecar ──
+def level_spec(level: str) -> tuple[str, str, str]:
+    """(file suffix, .idx level tag, cache tag) for a `--level` value.
+    `10m` lives in the surface file; pressure levels (e.g. `500mb`) in the
+    pressure file, whose .idx tags them like "500 mb"."""
+    if level == "10m":
+        return "wrfsfcf00", "10 m above ground", "10m"
+    if level.endswith("mb") and level[:-2].isdigit():
+        return "wrfprsf00", f"{level[:-2]} mb", level
+    sys.exit(f"--level must be '10m' or '<N>mb' (e.g. 500mb); got {level!r}")
 
 
-def fetch_wind_subset(hour: datetime, cache: Path, retries: int = 3) -> Path | None:
-    """Range-GET just the UGRD+VGRD 10 m messages for one hour (~5 MB)."""
-    key = hrrr_key(hour)
-    out = cache / f"hrrr_10mwind_{hour:%Y%m%d_%H}z.grib2"
+def hrrr_key(hour: datetime, level: str) -> str:
+    suffix, _, _ = level_spec(level)
+    return f"hrrr.{hour:%Y%m%d}/conus/hrrr.t{hour:%H}z.{suffix}.grib2"
+
+
+def fetch_wind_subset(hour: datetime, cache: Path, level: str, retries: int = 3) -> Path | None:
+    """Range-GET just the UGRD+VGRD messages at `level` for one hour (~1-5 MB)."""
+    key = hrrr_key(hour, level)
+    _, idx_tag, cache_tag = level_spec(level)
+    out = cache / f"hrrr_{cache_tag}wind_{hour:%Y%m%d_%H}z.grib2"
     if out.exists() and out.stat().st_size > 0:
         return out
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -78,10 +100,10 @@ def fetch_wind_subset(hour: datetime, cache: Path, retries: int = 3) -> Path | N
             idx = urlopen(f"{BASE}/{key}.idx", timeout=60).read().decode()
             lines = [ln.split(":") for ln in idx.splitlines() if ln]
             offs = {int(f[0]): int(f[1]) for f in lines if len(f) > 1}
-            # Messages named UGRD / VGRD at "10 m above ground".
+            # Messages named UGRD / VGRD at the level's .idx tag.
             u_msg = v_msg = None
             for f in lines:
-                if len(f) > 4 and f[4] == "10 m above ground":
+                if len(f) > 4 and f[4] == idx_tag:
                     if f[3] == "UGRD":
                         u_msg = int(f[0])
                     elif f[3] == "VGRD":
@@ -103,13 +125,15 @@ def fetch_wind_subset(hour: datetime, cache: Path, retries: int = 3) -> Path | N
     return None
 
 
-def load_hrrr_wind(start, end, bounds, grid_step, cache, workers, skip_fetch, native_stride):
+def load_hrrr_wind(start, end, bounds, grid_step, cache, workers, skip_fetch,
+                   native_stride, level):
     """Return (times_ms, lats, lons, U, V): U/V are (T, ny, nx) on a regular
     lat/lon grid over `bounds` at ~grid_step degrees; NaN outside the HRRR domain."""
     import xarray as xr
     from scipy.interpolate import LinearNDInterpolator
     from scipy.spatial import Delaunay
 
+    _, _, cache_tag = level_spec(level)
     hours = []
     h = start.replace(minute=0, second=0, microsecond=0)
     while h <= end:
@@ -117,10 +141,10 @@ def load_hrrr_wind(start, end, bounds, grid_step, cache, workers, skip_fetch, na
         h += timedelta(hours=1)
 
     if not skip_fetch:
-        print(f"Fetching {len(hours)} hourly HRRR 10 m wind subsets → {cache} …")
+        print(f"Fetching {len(hours)} hourly HRRR {level} wind subsets → {cache} …")
         with ThreadPoolExecutor(max_workers=workers) as ex:
             done = 0
-            for _ in ex.map(lambda hh: fetch_wind_subset(hh, cache), hours):
+            for _ in ex.map(lambda hh: fetch_wind_subset(hh, cache, level), hours):
                 done += 1
                 if done % 12 == 0 or done == len(hours):
                     print(f"  fetched {done}/{len(hours)}")
@@ -133,13 +157,16 @@ def load_hrrr_wind(start, end, bounds, grid_step, cache, workers, skip_fetch, na
     times, U, V = [], [], []
     tri = None
     for hh in hours:
-        p = cache / f"hrrr_10mwind_{hh:%Y%m%d_%H}z.grib2"
+        p = cache / f"hrrr_{cache_tag}wind_{hh:%Y%m%d_%H}z.grib2"
         if not p.exists():
             continue
         try:
             ds = xr.open_dataset(p, engine="cfgrib", backend_kwargs={"indexpath": ""})
-            u = ds["u10"].values.astype("float64")
-            v = ds["v10"].values.astype("float64")
+            # Surface subsets decode as u10/v10; pressure-level subsets as u/v.
+            u_name = "u10" if "u10" in ds else "u"
+            v_name = "v10" if "v10" in ds else "v"
+            u = ds[u_name].values.astype("float64")
+            v = ds[v_name].values.astype("float64")
             glat = ds["latitude"].values.astype("float64")
             glon = ((ds["longitude"].values.astype("float64") + 180.0) % 360.0) - 180.0
             ds.close()
@@ -370,10 +397,23 @@ def main() -> int:
     ap.add_argument("--bounds", default=",".join(str(x) for x in CONUS))
     ap.add_argument("--grid-step", type=float, default=0.08, help="regrid target step (deg)")
     ap.add_argument("--native-stride", type=int, default=3, help="subsample native HRRR points")
-    ap.add_argument("--particles", type=int, default=24000)
-    ap.add_argument("--step-hours", type=float, default=1.0, help="output vertex cadence (h)")
+    # 500 mb = the storm STEERING flow — streamlines visually track MRMS cell
+    # motion in the composite; the 10 m surface wind runs slower and rotated
+    # relative to the storms (it reads as "out of sync").
+    ap.add_argument("--level", default="500mb",
+                    help="wind level: '10m' (surface file) or '<N>mb' (pressure file)")
+    # Defaults balance render perf against ribbon smoothness on the
+    # continental demo: resident GPU load scales with
+    # particles × (window / step-hours), and the original 24k-particle /
+    # 1h-step 10 m build left the solo demo GPU-bound (~33fps). The vertex
+    # cadence is the SMOOTHNESS knob: 500 mb flow moves 100-180 km/h, so
+    # 30-min segments still read faceted at continental zoom — 15-min vertices
+    # (~30-45 km, ~10 px) curve properly, paid for by trimming the particle
+    # count.
+    ap.add_argument("--particles", type=int, default=10000)
+    ap.add_argument("--step-hours", type=float, default=0.25, help="output vertex cadence (h)")
     ap.add_argument("--substeps", type=int, default=4, help="RK4 substeps per output step")
-    ap.add_argument("--lifetime-hours", type=float, default=12.0,
+    ap.add_argument("--lifetime-hours", type=float, default=8.0,
                     help="particle lifetime before retire+respawn")
     ap.add_argument("--min-points", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
@@ -381,7 +421,11 @@ def main() -> int:
     ap.add_argument("--out", type=Path, required=True, help="output .stt (or .parquet)")
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--max-zoom", type=int, default=6)
-    ap.add_argument("--temporal-bucket", default="1h")
+    # 2h, NOT the 1h field cadence: streamlines render with a 90-min trail, so
+    # the loader keeps a ~3h window resident either way — 2h buckets halve the
+    # tile/sublayer count (and per-bucket fragment splits) for the same
+    # resident geometry.
+    ap.add_argument("--temporal-bucket", default="2h")
     ap.add_argument("--skip-fetch", action="store_true")
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--stt-build", default=str(
@@ -396,7 +440,7 @@ def main() -> int:
 
     times_ms, lats, lons, U, V = load_hrrr_wind(
         start, end, bounds, args.grid_step, args.cache, args.workers,
-        args.skip_fetch, args.native_stride)
+        args.skip_fetch, args.native_stride, args.level)
     tracks = advect(times_ms, lats, lons, U, V, args, rng, bounds)
 
     # Parquet intermediate lives in the cache dir, not next to the served archive.

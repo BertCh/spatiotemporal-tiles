@@ -41,11 +41,15 @@ fn style_hints_flow_into_the_packed_manifest() {
         .map(|i| wkb_point(-120.0 + i as f64 * 0.01, 35.0 + i as f64 * 0.01))
         .collect();
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(BinaryArray::from_iter_values(wkbs.iter().map(|b| b.as_slice()))),
-        Arc::new(Int64Array::from_iter_values(
-            (0..n).map(|i| 1_700_000_000_000i64 + (i as i64 * 4 * hour) / n as i64),
+        Arc::new(BinaryArray::from_iter_values(
+            wkbs.iter().map(|b| b.as_slice()),
         )),
-        Arc::new(Float64Array::from_iter_values((0..n).map(|i| i as f64 / 10.0))),
+        Arc::new(Int64Array::from_iter_values((0..n).map(|i| {
+            1_700_000_000_000i64 + (i as i64 * 4 * hour) / n as i64
+        }))),
+        Arc::new(Float64Array::from_iter_values(
+            (0..n).map(|i| i as f64 / 10.0),
+        )),
         Arc::new(StringArray::from_iter_values(
             (0..n).map(|i| format!("class-{}", i % 7)),
         )),
@@ -69,7 +73,7 @@ fn style_hints_flow_into_the_packed_manifest() {
     .unwrap();
     let (bounds, time_range) = calculate_bounds(&features).unwrap();
     let temporal_bucket_ms = hour as u64;
-    let hints = compute_style_hints(&features, &time_range, temporal_bucket_ms)
+    let hints = compute_style_hints(&features, &time_range, temporal_bucket_ms, true)
         .expect("non-empty features must profile");
 
     let config = TileConfig {
@@ -82,12 +86,9 @@ fn style_hints_flow_into_the_packed_manifest() {
     assert!(!tiles.is_empty());
 
     let out_dir = dir.path().join("packed");
-    let mut writer = stt_core::PackWriter::create(
-        &out_dir,
-        stt_core::BlobOrdering::Auto,
-        64 * 1024 * 1024,
-    )
-    .unwrap();
+    let mut writer =
+        stt_core::PackWriter::create(&out_dir, stt_core::BlobOrdering::Auto, 64 * 1024 * 1024)
+            .unwrap();
     for tile in &tiles {
         writer.write_tile(tile).unwrap();
     }
@@ -100,12 +101,13 @@ fn style_hints_flow_into_the_packed_manifest() {
     writer.finalize(&metadata).unwrap();
 
     // Metadata flows into manifest.json verbatim — assert the wire shape there.
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(out_dir.join("manifest.json")).unwrap(),
-    )
-    .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out_dir.join("manifest.json")).unwrap()).unwrap();
     let sh = &manifest["metadata"]["style_hints"];
-    assert!(sh.is_object(), "style_hints missing from manifest metadata: {manifest}");
+    assert!(
+        sh.is_object(),
+        "style_hints missing from manifest metadata: {manifest}"
+    );
     assert_eq!(sh["version"], 1);
     assert_eq!(sh["layer_hint"], "points");
     // 4 hour-buckets -> sqrt(4)=2 -> clamps up to 20.

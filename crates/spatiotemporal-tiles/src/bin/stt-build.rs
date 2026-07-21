@@ -400,15 +400,16 @@ struct Args {
     #[arg(long)]
     heatmap_class: Option<String>,
 
-    /// Bake per-property "style hints" into the archive metadata
-    /// (`style_hints`): numeric percentiles (p50/p90/p95/p97/p99) plus a
-    /// suggested color domain [min, p97] (each endpoint rounded outward to 2
-    /// significant figures), categorical distinct-value counts, a suggested
-    /// playback duration, and a layer-kind hint. Hints are DEFAULTS — the
-    /// renderer/user can always override them. Values are sampled at a
-    /// deterministic stride capped at ~250k values per property (memory
-    /// guard). In-memory pipeline only: skipped with a warning under
-    /// --streaming.
+    /// Bake the FULL per-property "style hints" profile into the archive
+    /// metadata (`style_hints`): numeric percentiles (p50/p90/p95/p97/p99) plus
+    /// a suggested color domain [min, p97] (each endpoint rounded outward to 2
+    /// significant figures) and categorical distinct-value counts. Hints are
+    /// DEFAULTS — the renderer/user can always override them. Values are sampled
+    /// at a deterministic stride capped at ~250k values per property (memory
+    /// guard). NOTE: the cheap signals — the layer-kind hint and suggested
+    /// playback duration — are already baked on every non-streaming build
+    /// WITHOUT this flag; this flag adds the expensive per-property profile.
+    /// In-memory pipeline only: skipped with a warning under --streaming.
     #[arg(long)]
     style_hints: bool,
 
@@ -1323,30 +1324,36 @@ fn main() -> Result<()> {
         );
         metadata = metadata.with_heatmap_domain(domain);
     }
-    if args.style_hints {
-        // Mirrors --temporal-lod's pipeline gate: hints need the loaded
-        // feature slice, so only the in-memory path computes them.
-        if args.streaming {
+    // Style hints need the loaded feature slice (like --temporal-lod), so only
+    // the in-memory pipeline computes them. The cheap signals — layer_hint +
+    // suggested playback — are baked on EVERY non-streaming build so view-time
+    // layer inference works without opting in; `--style-hints` additionally
+    // bakes the expensive per-property percentile/cardinality profile.
+    if args.streaming {
+        if args.style_hints {
             warn!(
                 "--style-hints ignored with --streaming: the style-hints profiler \
                  needs the in-memory pipeline. Re-run without --streaming to bake hints."
             );
-        } else if let Some(hints) = stt_build::style_hints::compute_style_hints(
-            &features,
-            &time_range,
-            temporal_bucket_ms,
-        ) {
-            info!(
-                "Style hints: {} properties profiled, layer hint {}, suggested playback {}",
-                hints.properties.len(),
-                hints.layer_hint.as_deref().unwrap_or("(none)"),
-                hints
-                    .suggested_playback_seconds
-                    .map(|s| format!("{s}s"))
-                    .unwrap_or_else(|| "(none)".to_string()),
-            );
-            metadata = metadata.with_style_hints(hints);
         }
+        // A streaming build carries no in-memory feature slice, so it emits
+        // neither the layer hint nor the property profile (documented limitation).
+    } else if let Some(hints) = stt_build::style_hints::compute_style_hints(
+        &features,
+        &time_range,
+        temporal_bucket_ms,
+        args.style_hints, // full percentile/cardinality profile only when requested
+    ) {
+        info!(
+            "Style hints: {} properties profiled, layer hint {}, suggested playback {}",
+            hints.properties.len(),
+            hints.layer_hint.as_deref().unwrap_or("(none)"),
+            hints
+                .suggested_playback_seconds
+                .map(|s| format!("{s}s"))
+                .unwrap_or_else(|| "(none)".to_string()),
+        );
+        metadata = metadata.with_style_hints(hints);
     }
 
     let manifest = writer.finalize(&metadata)?;
