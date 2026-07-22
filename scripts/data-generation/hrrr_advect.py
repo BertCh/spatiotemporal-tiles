@@ -343,7 +343,15 @@ def advect(times_ms, lats, lons, U, V, args, rng, bounds):
 
 
 # ── GeoParquet (trips) + stt-build ────────────────────────────────────────────
-def write_geoparquet(tracks, out_path: Path):
+def write_geoparquet(tracks, out_path: Path, with_values: bool = True):
+    """Write the advected tracks as a `trips` GeoParquet.
+
+    `with_values=False` (the `--no-values` build) omits the per-vertex
+    `vertex_values` speed column: a constant-color DOT field
+    (`AnimatedTripHeadsLayer`, which reads only positions + per-vertex times)
+    never touches it, and it is the second-largest per-vertex column — dropping
+    it trims the archive for a background particle field with no visible loss.
+    """
     import pyarrow as pa
     import pyarrow.parquet as pq
     from shapely import wkb
@@ -358,22 +366,26 @@ def write_geoparquet(tracks, out_path: Path):
         t = [int(x) for x in tr["t"]]
         ts.append(t[0]); ets.append(t[-1]); vts.append(t)
         sp = [float(x) if x == x else float("nan") for x in tr["v"]]
-        vvals.append([np.float32(x) for x in sp])
+        if with_values:
+            vvals.append([np.float32(x) for x in sp])
         finite = [x for x in sp if x == x]
         speed.append(float(np.mean(finite)) if finite else float("nan"))
         mid = coords[len(coords) // 2]
         region.append(region_of(mid[0]))
-    tbl = pa.table({
+    cols = {
         "geometry": pa.array(geom, type=pa.binary()),
         "timestamp": pa.array(ts, type=pa.int64()),
         "end_timestamp": pa.array(ets, type=pa.int64()),
         "vertex_timestamps": pa.array(vts, type=pa.list_(pa.int64())),
-        "vertex_values": pa.array(vvals, type=pa.list_(pa.float32())),
         "speed": pa.array(speed, type=pa.float64()),
         "region": pa.array(region, type=pa.string()),
-    })
+    }
+    if with_values:
+        cols["vertex_values"] = pa.array(vvals, type=pa.list_(pa.float32()))
+    tbl = pa.table(cols)
     pq.write_table(tbl, out_path, compression="snappy")
-    print(f"Wrote {tbl.num_rows} streamlines → {out_path}")
+    print(f"Wrote {tbl.num_rows} streamlines → {out_path}"
+          f"{'' if with_values else ' (no per-vertex values)'}")
     return tbl.num_rows
 
 
@@ -416,6 +428,9 @@ def main() -> int:
     ap.add_argument("--lifetime-hours", type=float, default=8.0,
                     help="particle lifetime before retire+respawn")
     ap.add_argument("--min-points", type=int, default=4)
+    ap.add_argument("--no-values", action="store_true",
+                    help="omit the per-vertex speed column — leaner archive for "
+                         "a constant-color head-dot particle field")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--cache", type=Path, default=Path("data/hrrr"))
     ap.add_argument("--out", type=Path, required=True, help="output .stt (or .parquet)")
@@ -449,7 +464,7 @@ def main() -> int:
     else:
         args.cache.mkdir(parents=True, exist_ok=True)
         pq_path = args.cache / (args.out.name + ".parquet")
-    write_geoparquet(tracks, pq_path)
+    write_geoparquet(tracks, pq_path, with_values=not args.no_values)
     if args.skip_build or args.out.suffix == ".parquet":
         print(f"\nGeoParquet only. Build with stt-build --simplify --temporal-bucket "
               f"{args.temporal_bucket} --blob-ordering time-major.")
