@@ -855,6 +855,13 @@ fn place_polygon<'a>(
 
     let rep_tile = projection::lonlat_to_tile(feature.lon, feature.lat, zoom).ok();
 
+    // Per-tile polygon simplification (A2), the fill parallel of the line path.
+    // Gated strictly BELOW `simplify_max_zoom` so the max-tiled-zoom tier stays
+    // lossless / byte-identical (watertight A1 seams depend on it). Applied per
+    // tile AFTER the antimeridian split (`work` already split) AND AFTER the
+    // Sutherland–Hodgman clip inside `emit` — never before.
+    let simplify_here = clip_config.simplify && zoom < clip_config.simplify_max_zoom;
+
     // Clip a working polygon set to the tile(s) and map surviving pieces to
     // per-tile `Derived` features — the shared tail for BOTH the non-crossing
     // path (`work = polygons`) and the crossing path (`work = split pieces`).
@@ -897,6 +904,17 @@ fn place_polygon<'a>(
         pieces
             .into_iter()
             .map(|((x, y), mut polys)| {
+                // Simplify each surviving per-tile polygon (topology-preserving),
+                // AFTER the clip. No-op above the gate (max tier stays lossless).
+                if simplify_here {
+                    for rings in polys.iter_mut() {
+                        *rings = crate::simplify::simplify_polygon_rings_for_zoom(
+                            rings,
+                            zoom,
+                            clip_config.simplify_max_zoom,
+                        );
+                    }
+                }
                 let geometry = if !multi && polys.len() == 1 {
                     geojson::Value::Polygon(polys.pop().unwrap())
                 } else {
@@ -972,13 +990,20 @@ fn place_polygon<'a>(
 
     // Non-crossing fast path: a polygon fully inside its representative tile's
     // rect takes the legacy single placement unchanged (byte-identical output).
-    if let Some((fx, fy)) = rep_tile {
-        // Same rect as the sweep below (polygon_buffer_degrees), so the two
-        // paths agree on containment.
-        let (bl, bb, br, bt) =
-            crate::clip::buffered_tile_bounds(fx, fy, zoom, clip_config.polygon_buffer_degrees);
-        if min_lon >= bl && max_lon <= br && min_lat >= bb && max_lat <= bt {
-            return vec![(fx, fy, TileFeature::Original(feature))];
+    // Skipped when simplifying at THIS zoom: a contained polygon must still be
+    // simplified, which only happens on the clip path (`emit`) — clipping a
+    // fully-inside ring is an identity (Sutherland–Hodgman leaves it unchanged),
+    // so it then simplifies exactly like any spanning piece. The fast path stays
+    // in force for the lossless max tier, keeping that byte-identical.
+    if !simplify_here {
+        if let Some((fx, fy)) = rep_tile {
+            // Same rect as the sweep below (polygon_buffer_degrees), so the two
+            // paths agree on containment.
+            let (bl, bb, br, bt) =
+                crate::clip::buffered_tile_bounds(fx, fy, zoom, clip_config.polygon_buffer_degrees);
+            if min_lon >= bl && max_lon <= br && min_lat >= bb && max_lat <= bt {
+                return vec![(fx, fy, TileFeature::Original(feature))];
+            }
         }
     }
     emit(polygons)
@@ -3294,5 +3319,184 @@ mod tests {
             sum += w[0][0] * w[1][1] - w[1][0] * w[0][1];
         }
         sum / 2.0
+    }
+
+    // ------------------------------------------------------------------
+    // Per-zoom polygon simplification (A2)
+    // ------------------------------------------------------------------
+
+    /// A dense CCW circle ring, closed, sampled `n` times around `(cx, cy)`.
+    fn dense_circle_ring(cx: f64, cy: f64, r: f64, n: usize) -> Vec<Vec<f64>> {
+        use std::f64::consts::PI;
+        let mut ring: Vec<Vec<f64>> = Vec::with_capacity(n + 1);
+        for i in 0..n {
+            let theta = 2.0 * PI * (i as f64 / n as f64);
+            ring.push(vec![cx + r * theta.cos(), cy + r * theta.sin()]);
+        }
+        ring.push(ring[0].clone());
+        ring
+    }
+
+    /// Total polygon vertices across every polygon feature/ring in every tile.
+    fn total_polygon_vertices(tiles: &[GeneratedTile]) -> usize {
+        use stt_core::arrow_tile::GeometryColumn;
+        let mut n = 0;
+        for tile in tiles {
+            for layer in &tile.layers {
+                if let GeometryColumn::Polygon(features) = &layer.geometry {
+                    for rings in features {
+                        for ring in rings {
+                            n += ring.len();
+                        }
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    fn poly_config(min_zoom: u8, max_zoom: u8, simplify: bool, simplify_max_zoom: u8) -> TileConfig {
+        TileConfig {
+            min_zoom,
+            max_zoom,
+            layer_name: "areas".to_string(),
+            temporal_bucket_ms: 3_600_000,
+            clip_trajectories: false,
+            simplify,
+            simplify_max_zoom,
+            ..TileConfig::default()
+        }
+    }
+
+    /// A dense polygon that fits inside a SINGLE z8 tile — so clipping is an
+    /// identity and only simplification can change the vertex count. Centre
+    /// (2.0, 2.0) with r=0.02 lands wholly inside z8 tile (129, 126).
+    fn dense_single_tile_polygon() -> ParsedFeature {
+        polygon_feature(
+            vec![dense_circle_ring(2.0, 2.0, 0.02, 240)],
+            1_700_000_000_000,
+        )
+    }
+
+    #[test]
+    fn polygon_max_tier_lossless_with_simplify_on() {
+        // At the max-tiled-zoom tier (zoom == simplify_max_zoom), turning
+        // simplification ON must NOT change a single byte of geometry vs OFF.
+        let feat = dense_single_tile_polygon();
+        let z = 8u8;
+
+        let on = generate_tiles(&[feat.clone()], &poly_config(z, z, true, z), 1).unwrap();
+        let off = generate_tiles(&[feat], &poly_config(z, z, false, z), 1).unwrap();
+
+        assert_eq!(on.len(), 1, "polygon should sit in exactly one z8 tile");
+        assert_eq!(off.len(), 1);
+        let geom = |tiles: &[GeneratedTile]| {
+            use stt_core::arrow_tile::GeometryColumn;
+            let GeometryColumn::Polygon(f) = &tiles[0].layers[0].geometry else {
+                panic!("expected polygon geometry");
+            };
+            f.clone()
+        };
+        assert_eq!(
+            geom(&on),
+            geom(&off),
+            "max-tier geometry must be byte-identical with simplify on vs off"
+        );
+    }
+
+    #[test]
+    fn polygon_simplifies_below_max_tier() {
+        // Below simplify_max_zoom the same single-tile polygon is simplified:
+        // fewer vertices, feature still present, rings still valid. clip is an
+        // identity here, so the drop is purely simplification.
+        let feat = dense_single_tile_polygon();
+        let z = 8u8;
+
+        let simp = generate_tiles(&[feat.clone()], &poly_config(z, z, true, 14), 1).unwrap();
+        let full = generate_tiles(&[feat], &poly_config(z, z, false, 14), 1).unwrap();
+
+        assert_eq!(simp.len(), 1, "feature must not be dropped");
+        assert_eq!(simp[0].feature_count(), 1, "the polygon feature survives");
+        let simp_v = total_polygon_vertices(&simp);
+        let full_v = total_polygon_vertices(&full);
+        assert!(
+            simp_v < full_v,
+            "expected vertex reduction at z8: {simp_v} !< {full_v}"
+        );
+        for tile in &simp {
+            assert_valid_polygon_rings(tile);
+        }
+    }
+
+    #[test]
+    fn polygon_simplify_keeps_hole_and_winding_through_tiler() {
+        // A dense holed polygon inside one z8 tile keeps its hole and winding
+        // after simplification (exterior CCW, hole CW), rings valid, and the
+        // vertex count drops.
+        use stt_core::arrow_tile::GeometryColumn;
+        let mut exterior = dense_circle_ring(2.0, 2.0, 0.03, 240);
+        // Inner hole must wind CW (opposite the exterior) — reverse a CCW ring.
+        let mut hole = dense_circle_ring(2.0, 2.0, 0.012, 200);
+        hole.reverse();
+        exterior.shrink_to_fit();
+        hole.shrink_to_fit();
+        let feat = polygon_feature(vec![exterior, hole], 1_700_000_000_000);
+        let z = 8u8;
+
+        let simp = generate_tiles(&[feat.clone()], &poly_config(z, z, true, 14), 1).unwrap();
+        let full = generate_tiles(&[feat], &poly_config(z, z, false, 14), 1).unwrap();
+        assert_eq!(simp.len(), 1);
+        assert!(total_polygon_vertices(&simp) < total_polygon_vertices(&full));
+
+        for tile in &simp {
+            assert_valid_polygon_rings(tile);
+            let GeometryColumn::Polygon(features) = &tile.layers[0].geometry else {
+                panic!("expected polygon geometry");
+            };
+            for rings in features {
+                assert_eq!(rings.len(), 2, "hole retained through simplification");
+                assert!(ring_signed_area(&rings[0]) > 0.0, "exterior must stay CCW");
+                assert!(ring_signed_area(&rings[1]) < 0.0, "hole must stay CW");
+            }
+        }
+    }
+
+    /// Regression: the pre-existing antimeridian split tests must stay green
+    /// even with simplification enabled — the split runs BEFORE simplify, so a
+    /// dateline polygon still lands, valid, on both sides at a simplified zoom.
+    #[test]
+    fn antimeridian_split_holds_with_simplify_enabled() {
+        let crossing_ring = vec![
+            vec![177.0, 10.0],
+            vec![-177.0, 10.0],
+            vec![-177.0, 20.0],
+            vec![177.0, 20.0],
+            vec![177.0, 10.0],
+        ];
+        let config = poly_config(2, 6, true, 14);
+        let feat = polygon_feature(vec![crossing_ring], 1_700_000_000_000);
+
+        let mut writer = CaptureWriter(Vec::new());
+        let stats =
+            generate_tiles_streaming(std::slice::from_ref(&feat), &config, &mut writer, 1).unwrap();
+        assert_eq!(
+            stats.antimeridian_fallbacks, 0,
+            "dateline polygon must still split (not dead-letter) with simplify on"
+        );
+
+        let tiles = generate_tiles(&[feat], &config, 1).unwrap();
+        assert!(!tiles.is_empty());
+        let z = 6u8;
+        let west_col = projection::lonlat_to_tile(178.0, 15.0, z).unwrap().0;
+        let east_col = projection::lonlat_to_tile(-178.0, 15.0, z).unwrap().0;
+        let cols: std::collections::BTreeSet<u32> =
+            tiles.iter().filter(|t| t.id.z == z).map(|t| t.id.x).collect();
+        assert!(
+            cols.contains(&west_col) && cols.contains(&east_col),
+            "split must reach both dateline columns even with simplify on"
+        );
+        for tile in &tiles {
+            assert_valid_polygon_rings(tile);
+        }
     }
 }

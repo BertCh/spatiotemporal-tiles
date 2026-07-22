@@ -87,36 +87,53 @@ def hrrr_key(hour: datetime, level: str) -> str:
     return f"hrrr.{hour:%Y%m%d}/conus/hrrr.t{hour:%H}z.{suffix}.grib2"
 
 
-def fetch_wind_subset(hour: datetime, cache: Path, level: str, retries: int = 3) -> Path | None:
-    """Range-GET just the UGRD+VGRD messages at `level` for one hour (~1-5 MB)."""
+def cache_path(cache: Path, cache_tag: str, hour: datetime, want_temp: bool) -> Path:
+    """Cache filename for one hour's subset. The `windtmp` variant is kept
+    SEPARATE from `wind` so a temperature build never reuses a wind-only cache
+    (and vice-versa)."""
+    suffix = "windtmp" if want_temp else "wind"
+    return cache / f"hrrr_{cache_tag}{suffix}_{hour:%Y%m%d_%H}z.grib2"
+
+
+def fetch_wind_subset(hour: datetime, cache: Path, level: str,
+                      want_temp: bool = False, retries: int = 3) -> Path | None:
+    """Range-GET the UGRD+VGRD (and, when `want_temp`, TMP) messages at `level`
+    for one hour, concatenated into one GRIB2 (~1-5 MB). Temperature rides in
+    the SAME pressure/surface file as the wind, so it adds one more message to
+    the byte-range subset — never a second file download."""
     key = hrrr_key(hour, level)
     _, idx_tag, cache_tag = level_spec(level)
-    out = cache / f"hrrr_{cache_tag}wind_{hour:%Y%m%d_%H}z.grib2"
+    out = cache_path(cache, cache_tag, hour, want_temp)
     if out.exists() and out.stat().st_size > 0:
         return out
     out.parent.mkdir(parents=True, exist_ok=True)
+    wanted = ("UGRD", "VGRD", "TMP") if want_temp else ("UGRD", "VGRD")
     for attempt in range(retries):
         try:
             idx = urlopen(f"{BASE}/{key}.idx", timeout=60).read().decode()
             lines = [ln.split(":") for ln in idx.splitlines() if ln]
             offs = {int(f[0]): int(f[1]) for f in lines if len(f) > 1}
-            # Messages named UGRD / VGRD at the level's .idx tag.
-            u_msg = v_msg = None
+            # Message number for each wanted variable at the level's .idx tag.
+            msg: dict[str, int] = {}
             for f in lines:
-                if len(f) > 4 and f[4] == idx_tag:
-                    if f[3] == "UGRD":
-                        u_msg = int(f[0])
-                    elif f[3] == "VGRD":
-                        v_msg = int(f[0])
-            if u_msg is None or v_msg is None:
+                if len(f) > 4 and f[4] == idx_tag and f[3] in wanted:
+                    msg[f[3]] = int(f[0])
+            if any(v not in msg for v in wanted):
                 return None
-            lo = min(offs[u_msg], offs[v_msg])
-            end_msg = max(u_msg, v_msg) + 1
-            hi = offs.get(end_msg)  # None → to EOF
-            rng = f"bytes={lo}-" + ("" if hi is None else str(hi - 1))
-            data = urlopen(Request(f"{BASE}/{key}", headers={"Range": rng}), timeout=120).read()
+            # One range-GET per message (messages need not be adjacent in the
+            # file). GRIB2 is self-delimiting, so concatenating the messages in
+            # any order yields a valid multi-message file cfgrib can read.
+            chunks = []
+            for v in wanted:
+                m = msg[v]
+                lo = offs[m]
+                hi = offs.get(m + 1)  # None → to EOF (last message in the .idx)
+                rng = f"bytes={lo}-" + ("" if hi is None else str(hi - 1))
+                chunks.append(urlopen(
+                    Request(f"{BASE}/{key}", headers={"Range": rng}),
+                    timeout=120).read())
             tmp = out.with_suffix(".tmp")
-            tmp.write_bytes(data)
+            tmp.write_bytes(b"".join(chunks))
             tmp.rename(out)
             return out
         except Exception:
@@ -126,9 +143,12 @@ def fetch_wind_subset(hour: datetime, cache: Path, level: str, retries: int = 3)
 
 
 def load_hrrr_wind(start, end, bounds, grid_step, cache, workers, skip_fetch,
-                   native_stride, level):
-    """Return (times_ms, lats, lons, U, V): U/V are (T, ny, nx) on a regular
-    lat/lon grid over `bounds` at ~grid_step degrees; NaN outside the HRRR domain."""
+                   native_stride, level, want_temp=False):
+    """Return (times_ms, lats, lons, U, V, T): U/V are (T, ny, nx) on a regular
+    lat/lon grid over `bounds` at ~grid_step degrees; NaN outside the HRRR
+    domain. `T` is the matching air-temperature field in °C when `want_temp`,
+    else None — sampled from the SAME GRIB file/level as the wind, so it shares
+    the wind's exact 3 km / hourly spatial-temporal resolution by construction."""
     import xarray as xr
     from scipy.interpolate import LinearNDInterpolator
     from scipy.spatial import Delaunay
@@ -141,10 +161,11 @@ def load_hrrr_wind(start, end, bounds, grid_step, cache, workers, skip_fetch,
         h += timedelta(hours=1)
 
     if not skip_fetch:
-        print(f"Fetching {len(hours)} hourly HRRR {level} wind subsets → {cache} …")
+        kind = "wind+temp" if want_temp else "wind"
+        print(f"Fetching {len(hours)} hourly HRRR {level} {kind} subsets → {cache} …")
         with ThreadPoolExecutor(max_workers=workers) as ex:
             done = 0
-            for _ in ex.map(lambda hh: fetch_wind_subset(hh, cache, level), hours):
+            for _ in ex.map(lambda hh: fetch_wind_subset(hh, cache, level, want_temp), hours):
                 done += 1
                 if done % 12 == 0 or done == len(hours):
                     print(f"  fetched {done}/{len(hours)}")
@@ -154,10 +175,10 @@ def load_hrrr_wind(start, end, bounds, grid_step, cache, workers, skip_fetch,
     lats = np.arange(min_lat, max_lat + 1e-9, grid_step)
     LON, LAT = np.meshgrid(lons, lats)
 
-    times, U, V = [], [], []
+    times, U, V, T = [], [], [], []
     tri = None
     for hh in hours:
-        p = cache / f"hrrr_{cache_tag}wind_{hh:%Y%m%d_%H}z.grib2"
+        p = cache_path(cache, cache_tag, hh, want_temp)
         if not p.exists():
             continue
         try:
@@ -167,6 +188,12 @@ def load_hrrr_wind(start, end, bounds, grid_step, cache, workers, skip_fetch,
             v_name = "v10" if "v10" in ds else "v"
             u = ds[u_name].values.astype("float64")
             v = ds[v_name].values.astype("float64")
+            # Temperature: pressure-level TMP decodes as `t`, 2 m surface as `t2m`.
+            tK = None
+            if want_temp:
+                t_name = "t" if "t" in ds else ("t2m" if "t2m" in ds else None)
+                if t_name is not None:
+                    tK = ds[t_name].values.astype("float64")
             glat = ds["latitude"].values.astype("float64")
             glon = ((ds["longitude"].values.astype("float64") + 180.0) % 360.0) - 180.0
             ds.close()
@@ -182,13 +209,21 @@ def load_hrrr_wind(start, end, bounds, grid_step, cache, workers, skip_fetch,
         iv = LinearNDInterpolator(tri, v.ravel()[sub])
         U.append(iu(LON, LAT).astype("float32"))
         V.append(iv(LON, LAT).astype("float32"))
+        if want_temp:
+            if tK is not None:
+                it = LinearNDInterpolator(tri, tK.ravel()[sub] - 273.15)  # K → °C
+                T.append(it(LON, LAT).astype("float32"))
+            else:
+                print(f"    ⚠️  {p.name}: no TMP message — filling NaN")
+                T.append(np.full(LON.shape, np.nan, dtype="float32"))
         times.append(int(hh.timestamp() * 1000))
 
     if len(times) < 2:
         sys.exit("Need ≥2 hourly HRRR frames to advect; check the window/cache.")
-    print(f"  loaded {len(times)} frames on a {len(lats)}×{len(lons)} regular grid")
+    print(f"  loaded {len(times)} frames on a {len(lats)}×{len(lons)} regular grid"
+          f"{' (with air temperature)' if want_temp else ''}")
     return (np.array(times, dtype="int64"), lats, lons,
-            np.stack(U), np.stack(V))
+            np.stack(U), np.stack(V), np.stack(T) if want_temp else None)
 
 
 # ── Bilinear sampler over a REGIONAL regular grid (NaN outside; no wrap) ───────
@@ -256,7 +291,7 @@ def region_of(lon):
 
 
 # ── RK4 advection (adapted from ecco_advect.py; hours instead of days) ─────────
-def advect(times_ms, lats, lons, U, V, args, rng, bounds):
+def advect(times_ms, lats, lons, U, V, args, rng, bounds, T=None):
     field = RegionalField(lats, lons)
     t_start, t_end = int(times_ms[0]), int(times_ms[-1])
     step_ms = int(args.step_hours * MS_PER_HOUR)
@@ -271,6 +306,15 @@ def advect(times_ms, lats, lons, U, V, args, rng, bounds):
     ta = [[plat[i]] for i in range(n)]
     tt = [[t_start] for _ in range(n)]
     tv = [[np.nan] for _ in range(n)]
+    # Per-vertex air temperature (°C), sampled alongside the wind. Seeded with
+    # the ACTUAL temperature at the spawn point (not NaN) so a freshly-born
+    # dot is already colored — no gray flash at particle birth.
+    if T is not None:
+        T0, _ = time_slabs(times_ms, t_start, T, T)
+        tc0, _ = field.sample(T0, T0, plon, plat)
+        tc = [[float(tc0[i])] for i in range(n)]
+    else:
+        tc = None
     finished: list[dict] = []
 
     def deriv(lon, lat, t_ms):
@@ -291,7 +335,10 @@ def advect(times_ms, lats, lons, U, V, args, rng, bounds):
 
     def emit(i):
         if len(tl[i]) >= args.min_points:
-            finished.append({"lon": tl[i], "lat": ta[i], "t": tt[i], "v": tv[i]})
+            rec = {"lon": tl[i], "lat": ta[i], "t": tt[i], "v": tv[i]}
+            if tc is not None:
+                rec["temp"] = tc[i]
+            finished.append(rec)
 
     t_ms = float(t_start)
     n_emit = 0
@@ -315,11 +362,16 @@ def advect(times_ms, lats, lons, U, V, args, rng, bounds):
         e_fld, n_fld = time_slabs(times_ms, out_t, U, V)
         e_all, n_all = field.sample(e_fld, n_fld, plon, plat)
         sp_all = np.hypot(e_all, n_all)
+        if tc is not None:
+            T_slab, _ = time_slabs(times_ms, out_t, T, T)
+            tc_all, _ = field.sample(T_slab, T_slab, plon, plat)
         retire = stuck | (t_ms >= death) | np.isnan(sp_all)
 
         for i in np.where(~retire)[0]:
             tl[i].append(float(plon[i])); ta[i].append(float(plat[i]))
             tt[i].append(out_t); tv[i].append(float(sp_all[i]))
+            if tc is not None:
+                tc[i].append(float(tc_all[i]))
 
         ret = np.where(retire)[0]
         for i in ret:
@@ -329,9 +381,14 @@ def advect(times_ms, lats, lons, U, V, args, rng, bounds):
             nlon, nlat = seed_particles(field, u0, v0, len(ret), rng, bounds)
             plon[ret], plat[ret] = nlon, nlat
             death[ret] = t_ms + rng.uniform(0.5, 1.0, size=len(ret)) * lifetime_ms
+            if tc is not None:
+                Tr, _ = time_slabs(times_ms, out_t, T, T)
+                tcr, _ = field.sample(Tr, Tr, nlon, nlat)
             for j, i in enumerate(ret):
                 tl[i] = [float(nlon[j])]; ta[i] = [float(nlat[j])]
                 tt[i] = [out_t]; tv[i] = [np.nan]
+                if tc is not None:
+                    tc[i] = [float(tcr[j])]
 
         if n_steps and (s + 1) % max(1, n_steps // 10) == 0:
             print(f"  step {s+1}/{n_steps}  emitted={n_emit}")
@@ -343,14 +400,20 @@ def advect(times_ms, lats, lons, U, V, args, rng, bounds):
 
 
 # ── GeoParquet (trips) + stt-build ────────────────────────────────────────────
-def write_geoparquet(tracks, out_path: Path, with_values: bool = True):
+def write_geoparquet(tracks, out_path: Path, with_values: bool = True,
+                     color_by: str = "speed"):
     """Write the advected tracks as a `trips` GeoParquet.
 
     `with_values=False` (the `--no-values` build) omits the per-vertex
-    `vertex_values` speed column: a constant-color DOT field
+    `vertex_values` column: a constant-color DOT field
     (`AnimatedTripHeadsLayer`, which reads only positions + per-vertex times)
     never touches it, and it is the second-largest per-vertex column — dropping
     it trims the archive for a background particle field with no visible loss.
+
+    `color_by` selects what that per-vertex `vertex_values` column CARRIES:
+    `'speed'` (wind speed, m/s — the streamline gradient) or `'temp'` (500 mb
+    air temperature, °C — colors the drift-dot field by the air each particle
+    rides). The per-track `speed`/`region` scalars are written regardless.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -367,7 +430,18 @@ def write_geoparquet(tracks, out_path: Path, with_values: bool = True):
         ts.append(t[0]); ets.append(t[-1]); vts.append(t)
         sp = [float(x) if x == x else float("nan") for x in tr["v"]]
         if with_values:
-            vvals.append([np.float32(x) for x in sp])
+            if color_by == "temp":
+                # Temperature varies SMOOTHLY along a path, so quantizing to
+                # 0.5 °C cuts entropy and shrinks the packed vertex_value column
+                # (better zstd) with no visible banding at the dot scale — a
+                # byte lever, not feature thinning.
+                src = tr.get("temp", sp)
+                vvals.append([
+                    np.float32(round(x * 2.0) / 2.0) if x == x else np.float32("nan")
+                    for x in src
+                ])
+            else:
+                vvals.append([np.float32(x) for x in sp])
         finite = [x for x in sp if x == x]
         speed.append(float(np.mean(finite)) if finite else float("nan"))
         mid = coords[len(coords) // 2]
@@ -429,8 +503,13 @@ def main() -> int:
                     help="particle lifetime before retire+respawn")
     ap.add_argument("--min-points", type=int, default=4)
     ap.add_argument("--no-values", action="store_true",
-                    help="omit the per-vertex speed column — leaner archive for "
+                    help="omit the per-vertex value column — leaner archive for "
                          "a constant-color head-dot particle field")
+    ap.add_argument("--color-by", choices=["speed", "temp"], default="speed",
+                    help="per-vertex scalar written to vertex_values: 'speed' "
+                         "(wind speed m/s, the streamline gradient) or 'temp' "
+                         "(air temperature °C at --level, sampled from the SAME "
+                         "HRRR file — colors the drift-dot field by temperature)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--cache", type=Path, default=Path("data/hrrr"))
     ap.add_argument("--out", type=Path, required=True, help="output .stt (or .parquet)")
@@ -450,13 +529,16 @@ def main() -> int:
     start, end = parse_when(args.start), parse_when(args.end)
     if end <= start:
         sys.exit("--end must be after --start")
+    if args.color_by == "temp" and args.no_values:
+        sys.exit("--color-by temp needs the per-vertex column; drop --no-values.")
     bounds = parse_bounds(args.bounds)
     rng = np.random.default_rng(args.seed)
 
-    times_ms, lats, lons, U, V = load_hrrr_wind(
+    want_temp = args.color_by == "temp"
+    times_ms, lats, lons, U, V, T = load_hrrr_wind(
         start, end, bounds, args.grid_step, args.cache, args.workers,
-        args.skip_fetch, args.native_stride, args.level)
-    tracks = advect(times_ms, lats, lons, U, V, args, rng, bounds)
+        args.skip_fetch, args.native_stride, args.level, want_temp=want_temp)
+    tracks = advect(times_ms, lats, lons, U, V, args, rng, bounds, T=T)
 
     # Parquet intermediate lives in the cache dir, not next to the served archive.
     if args.out.suffix == ".parquet":
@@ -464,7 +546,8 @@ def main() -> int:
     else:
         args.cache.mkdir(parents=True, exist_ok=True)
         pq_path = args.cache / (args.out.name + ".parquet")
-    write_geoparquet(tracks, pq_path, with_values=not args.no_values)
+    write_geoparquet(tracks, pq_path, with_values=not args.no_values,
+                     color_by=args.color_by)
     if args.skip_build or args.out.suffix == ".parquet":
         print(f"\nGeoParquet only. Build with stt-build --simplify --temporal-bucket "
               f"{args.temporal_bucket} --blob-ordering time-major.")
