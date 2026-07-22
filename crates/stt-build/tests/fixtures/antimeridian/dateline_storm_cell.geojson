@@ -1,0 +1,23 @@
+{
+  "type": "Feature",
+  "properties": { "name": "Dateline storm cell with an eye (seam-straddling hole)" },
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [176.0, 20.0],
+        [-176.0, 20.0],
+        [-176.0, 30.0],
+        [176.0, 30.0],
+        [176.0, 20.0]
+      ],
+      [
+        [178.0, 23.0],
+        [178.0, 27.0],
+        [-178.0, 27.0],
+        [-178.0, 23.0],
+        [178.0, 23.0]
+      ]
+    ]
+  }
+}

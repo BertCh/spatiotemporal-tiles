@@ -1,0 +1,5 @@
+# Re-include the A1 antimeridian test corpus. The repository-root .gitignore
+# has a blanket `*.geojson` rule (meant to keep bulky downloaded datasets out of
+# the tree); these three files are small, hand-authored test inputs that
+# `tests/antimeridian_polygon.rs` loads, so they MUST be tracked.
+!*.geojson

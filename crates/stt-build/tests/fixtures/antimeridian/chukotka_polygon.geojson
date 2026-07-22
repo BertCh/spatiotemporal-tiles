@@ -1,0 +1,16 @@
+{
+  "type": "Feature",
+  "properties": { "name": "Chukotka (stylized, antimeridian-straddling; vertex 0 on the -180 side)" },
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [-175.0, 64.0],
+        [178.0, 64.0],
+        [178.0, 70.0],
+        [-175.0, 70.0],
+        [-175.0, 64.0]
+      ]
+    ]
+  }
+}

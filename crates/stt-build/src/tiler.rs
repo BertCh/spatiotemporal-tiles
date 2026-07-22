@@ -75,9 +75,13 @@ pub struct TileStats {
     /// Counted per (feature, zoom) placement attempt and reported once at the
     /// end of the build — never silently, never into tile (0, 0).
     pub dropped_invalid_coords: usize,
-    /// Features placed whole into a single tile because their bbox spans more
-    /// than 180° of longitude (antimeridian-crossing; wrap-aware polygon
-    /// clipping is a documented limitation). Counted per (feature, zoom).
+    /// Features placed whole into a single tile because their
+    /// antimeridian-crossing rings could not be split — pathological
+    /// unsplittable / pole-enclosing rings only (an unwrapped exterior with no
+    /// single ±180 seam strictly inside its span). Real dateline data (Fiji,
+    /// Chukotka, storm cells) splits cleanly across both hemispheres, so this is
+    /// EXPECTED to be 0; a non-zero count flags a degenerate source ring, never
+    /// a routine crossing. Counted per (feature, zoom).
     pub antimeridian_fallbacks: usize,
 }
 
@@ -286,7 +290,10 @@ struct PlacementCounters {
     /// tile as phantom features). Counted per (feature, zoom).
     invalid_coords: AtomicUsize,
     /// Features that fell back to legacy whole-feature single-tile placement
-    /// because their bbox spans more than 180° of longitude.
+    /// because their antimeridian-crossing rings were unsplittable
+    /// (pole-enclosing / degenerate — no unique ±180 seam). The should-be-0
+    /// safety net for the split-then-reuse polygon clipper; expected 0 on real
+    /// data.
     antimeridian_fallback: AtomicUsize,
 }
 
@@ -304,8 +311,9 @@ impl PlacementCounters {
         if anti > 0 {
             tracing::warn!(
                 "{anti} feature placement(s) (per feature × zoom) used whole-feature \
-                 single-tile fallback because their bbox spans >180° of longitude \
-                 (antimeridian-crossing clipping is a documented limitation)"
+                 single-tile fallback: their antimeridian-crossing rings were \
+                 unsplittable (pole-enclosing or degenerate — no unique ±180 seam). \
+                 Expected 0 on real data; inspect the source geometry"
             );
         }
     }
@@ -796,8 +804,12 @@ fn place_multipoint<'a>(
 /// per-tile piece wherever anything survives. Holes are preserved (rings
 /// clip independently). Fast path: a polygon fully inside its
 /// representative tile's rect takes the legacy single placement unchanged
-/// (byte-identical output). Antimeridian-crossing bboxes (>180° of
-/// longitude) fall back to legacy placement and are counted.
+/// (byte-identical output). Antimeridian-crossing rings (any edge with
+/// `|Δlon| > 180°`) are first SPLIT into per-hemisphere pieces
+/// (`clip::split_polygon_at_antimeridian`) and then clipped like any other
+/// polygon, so a dateline feature lands — clipped — on BOTH sides of ±180.
+/// Only a pathological unsplittable ring (pole-enclosing / no unique ±180
+/// seam) falls back to legacy whole-feature placement and is counted.
 /// `target` restricts the sweep to one tile (the stt-serve per-request
 /// path); the piece emitted for that tile is byte-identical to the full
 /// sweep's.
@@ -829,13 +841,137 @@ fn place_polygon<'a>(
         // (an unprojectable point is dropped + counted there).
         return place_whole_feature(feature, zoom, counters);
     }
-    if max_lon - min_lon > 180.0 {
-        counters
-            .antimeridian_fallback
-            .fetch_add(1, Ordering::Relaxed);
-        return place_whole_feature(feature, zoom, counters);
-    }
+    // Antimeridian split-then-reuse: a ring with any edge whose consecutive
+    // vertices differ by more than 180° of longitude straddles the dateline.
+    // Rings are closed, so `windows(2)` covers the closing edge too. This is a
+    // per-EDGE test (the same signal the polyline splitter uses), not the old
+    // whole-feature `bbox > 180°` test: a polygon that merely spans a wide (but
+    // < 360°) longitude range WITHOUT any wrapping edge genuinely occupies those
+    // columns and clips normally.
+    let crosses = polygons.iter().flatten().any(|ring| {
+        ring.windows(2)
+            .any(|w| w[0].len() >= 2 && w[1].len() >= 2 && (w[1][0] - w[0][0]).abs() > 180.0)
+    });
+
     let rep_tile = projection::lonlat_to_tile(feature.lon, feature.lat, zoom).ok();
+
+    // Clip a working polygon set to the tile(s) and map surviving pieces to
+    // per-tile `Derived` features — the shared tail for BOTH the non-crossing
+    // path (`work = polygons`) and the crossing path (`work = split pieces`).
+    // Passing `work` (not `polygons`) through the empty-handling target re-run
+    // keeps the single-tile serve path byte-identical to the full sweep.
+    let emit = |work: &[crate::clip::PolygonRings]| -> Vec<(u32, u32, TileFeature<'a>)> {
+        let pieces = crate::clip::clip_polygons_to_tiles(
+            work,
+            zoom,
+            clip_config.polygon_buffer_degrees,
+            target,
+        );
+        if pieces.is_empty() {
+            // Nothing survived clipping (sliver thinner than the clipper keeps):
+            // keep the legacy placement rather than dropping the feature. Under a
+            // target restriction "empty" only means empty-at-target: the legacy
+            // fallback lands at the representative tile, so it applies only when
+            // the target IS that tile AND the UNRESTRICTED sweep is also empty
+            // (else the full build placed pieces elsewhere and nothing at all at
+            // the representative tile).
+            return match target {
+                None => place_whole_feature(feature, zoom, counters),
+                Some(t) if rep_tile == Some(t) => {
+                    if crate::clip::clip_polygons_to_tiles(
+                        work,
+                        zoom,
+                        clip_config.polygon_buffer_degrees,
+                        None,
+                    )
+                    .is_empty()
+                    {
+                        place_whole_feature(feature, zoom, counters)
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Some(_) => Vec::new(),
+            };
+        }
+        pieces
+            .into_iter()
+            .map(|((x, y), mut polys)| {
+                let geometry = if !multi && polys.len() == 1 {
+                    geojson::Value::Polygon(polys.pop().unwrap())
+                } else {
+                    geojson::Value::MultiPolygon(polys)
+                };
+                (
+                    x,
+                    y,
+                    TileFeature::Derived(ParsedFeature {
+                        geojson: geojson::Feature {
+                            bbox: None,
+                            geometry: Some(geojson::Geometry::new(geometry)),
+                            id: feature.geojson.id.clone(),
+                            properties: None,
+                            foreign_members: None,
+                        },
+                        shared_properties: feature.shared_properties.clone(),
+                        timestamp: feature.timestamp,
+                        end_timestamp: feature.end_timestamp,
+                        vertex_timestamps: None,
+                        vertex_values: None,
+                        vertex_value_matrix: None,
+                        // Parent's representative point, so id-less pieces hash
+                        // to the SAME synthetic feature id in every tile.
+                        lon: feature.lon,
+                        lat: feature.lat,
+                    }),
+                )
+            })
+            .collect()
+    };
+
+    if crosses {
+        // Split only the parts that ACTUALLY cross; pass non-crossing parts
+        // through unchanged, then clip the working set like any other polygon
+        // (NO fast-path — a crossing feature can't be tile-contained). `crosses`
+        // is feature-wide, but a MultiPolygon can mix a crossing part (e.g. the
+        // Aleutians straddling ±180) with ordinary parts (CONUS) — flat-mapping
+        // the splitter over EVERY part would DROP the non-crossers, because
+        // `split_polygon_at_antimeridian` returns empty for a part with no
+        // dateline seam. A crossing part that is itself unsplittable
+        // (pole-enclosing / degenerate → empty split) dead-letters the WHOLE
+        // feature to the legacy whole-feature placement, which keeps every part
+        // and counts the fallback — never a silent drop.
+        let mut work: Vec<crate::clip::PolygonRings> = Vec::with_capacity(polygons.len());
+        for part in polygons {
+            let part_crosses = part.iter().any(|ring| {
+                ring.windows(2).any(|w| {
+                    w[0].len() >= 2 && w[1].len() >= 2 && (w[1][0] - w[0][0]).abs() > 180.0
+                })
+            });
+            if part_crosses {
+                let pieces = crate::clip::split_polygon_at_antimeridian(part);
+                if pieces.is_empty() {
+                    counters
+                        .antimeridian_fallback
+                        .fetch_add(1, Ordering::Relaxed);
+                    return place_whole_feature(feature, zoom, counters);
+                }
+                work.extend(pieces);
+            } else {
+                work.push(part.clone());
+            }
+        }
+        if work.is_empty() {
+            counters
+                .antimeridian_fallback
+                .fetch_add(1, Ordering::Relaxed);
+            return place_whole_feature(feature, zoom, counters);
+        }
+        return emit(&work);
+    }
+
+    // Non-crossing fast path: a polygon fully inside its representative tile's
+    // rect takes the legacy single placement unchanged (byte-identical output).
     if let Some((fx, fy)) = rep_tile {
         // Same rect as the sweep below (polygon_buffer_degrees), so the two
         // paths agree on containment.
@@ -845,72 +981,7 @@ fn place_polygon<'a>(
             return vec![(fx, fy, TileFeature::Original(feature))];
         }
     }
-    let pieces = crate::clip::clip_polygons_to_tiles(
-        polygons,
-        zoom,
-        clip_config.polygon_buffer_degrees,
-        target,
-    );
-    if pieces.is_empty() {
-        // Nothing survived clipping (sliver thinner than the clipper keeps):
-        // keep the legacy placement rather than dropping the feature. Under a
-        // target restriction "empty" only means empty-at-target: the legacy
-        // fallback lands at the representative tile, so it applies only when
-        // the target IS that tile AND the UNRESTRICTED sweep is also empty
-        // (else the full build placed pieces elsewhere and nothing at all at
-        // the representative tile).
-        return match target {
-            None => place_whole_feature(feature, zoom, counters),
-            Some(t) if rep_tile == Some(t) => {
-                if crate::clip::clip_polygons_to_tiles(
-                    polygons,
-                    zoom,
-                    clip_config.polygon_buffer_degrees,
-                    None,
-                )
-                .is_empty()
-                {
-                    place_whole_feature(feature, zoom, counters)
-                } else {
-                    Vec::new()
-                }
-            }
-            Some(_) => Vec::new(),
-        };
-    }
-    pieces
-        .into_iter()
-        .map(|((x, y), mut polys)| {
-            let geometry = if !multi && polys.len() == 1 {
-                geojson::Value::Polygon(polys.pop().unwrap())
-            } else {
-                geojson::Value::MultiPolygon(polys)
-            };
-            (
-                x,
-                y,
-                TileFeature::Derived(ParsedFeature {
-                    geojson: geojson::Feature {
-                        bbox: None,
-                        geometry: Some(geojson::Geometry::new(geometry)),
-                        id: feature.geojson.id.clone(),
-                        properties: None,
-                        foreign_members: None,
-                    },
-                    shared_properties: feature.shared_properties.clone(),
-                    timestamp: feature.timestamp,
-                    end_timestamp: feature.end_timestamp,
-                    vertex_timestamps: None,
-                    vertex_values: None,
-                    vertex_value_matrix: None,
-                    // Parent's representative point, so id-less pieces hash
-                    // to the SAME synthetic feature id in every tile.
-                    lon: feature.lon,
-                    lat: feature.lat,
-                }),
-            )
-        })
-        .collect()
+    emit(polygons)
 }
 
 /// Clip a (Multi)LineString across the tiles it traverses.
@@ -3024,30 +3095,24 @@ mod tests {
         }
     }
 
-    /// Antimeridian-crossing polygons (bbox wider than 180°) fall back to the
-    /// legacy single-tile placement AT THE REPRESENTATIVE POINT and are counted
-    /// once per (feature, zoom) — a documented limitation, NOT silent smearing
-    /// across the whole world.
-    ///
-    /// This pins the CURRENT contract, which is a fallback, not correct
-    /// wrap-aware SPLITTING: unlike the trajectory clipper (which splits a
-    /// polyline at |Δlon|>180° — see `clip::test_clip_trajectory_splits_at_
-    /// antimeridian`), `place_polygon` has NO wrap-aware split for polygon rings
-    /// and `clip_polygons_to_tiles` explicitly refuses a >180° bbox. Correct
-    /// splitting is a FEATURE gap, not a test gap; the guarantee here is only
-    /// that the polygon is filed into ONE tile (the first-vertex tile), never
-    /// smeared across the tile columns its clamped-lon bbox nominally spans.
+    /// A dateline-crossing polygon SPLITS (split-then-reuse) and lands —
+    /// clipped, with valid rings — on BOTH sides of ±180 across the zoom range,
+    /// with ZERO antimeridian fallbacks and NO single-tile smear / world span.
+    /// This replaces the retired single-tile-fallback pin (`place_polygon` now
+    /// splits crossing rings instead of dead-lettering them).
     #[test]
-    fn antimeridian_polygon_falls_back_to_single_tile_and_is_counted() {
-        // `polygon_feature` sets the representative point to the exterior ring's
-        // FIRST vertex — `(min_lon, min_lat)` for `square_ring`, i.e. the SW
-        // corner (-179.9, 10.0). The fallback (`place_whole_feature`) files the
-        // whole polygon into that point's tile.
-        let feat = polygon_feature(
-            vec![square_ring(-179.9, 10.0, 179.9, 20.0)],
-            1_700_000_000_000,
-        );
-        let (min_zoom, max_zoom) = (2u8, 5u8);
+    fn antimeridian_polygon_splits_across_dateline_no_fallback() {
+        // Fiji-like square straddling +180: raw lon 177 → -177, lat 10 → 20.
+        let crossing_ring = || {
+            vec![
+                vec![177.0, 10.0],
+                vec![-177.0, 10.0],
+                vec![-177.0, 20.0],
+                vec![177.0, 20.0],
+                vec![177.0, 10.0],
+            ]
+        };
+        let (min_zoom, max_zoom) = (2u8, 6u8);
         let config = TileConfig {
             min_zoom,
             max_zoom,
@@ -3056,33 +3121,178 @@ mod tests {
             clip_trajectories: false,
             ..TileConfig::default()
         };
-        let mut writer = CaptureWriter(Vec::new());
-        let stats = generate_tiles_streaming(&[feat], &config, &mut writer, 1).unwrap();
 
-        let num_zooms = (max_zoom - min_zoom + 1) as usize;
-        // Counted once per (feature, zoom) — never silent.
-        assert_eq!(stats.antimeridian_fallbacks, num_zooms);
-        // EXACTLY one tile per zoom is the anti-smear guarantee: at zoom 5 a
-        // straight Sutherland–Hodgman sweep in clamped-lon space would file the
-        // polygon into many of the 32 columns instead of the single fallback.
+        // Stats path: zero fallbacks anywhere in the zoom range (the campaign
+        // gate — a healthy dateline corpus never dead-letters).
+        let mut writer = CaptureWriter(Vec::new());
+        let stats = generate_tiles_streaming(
+            &[polygon_feature(vec![crossing_ring()], 1_700_000_000_000)],
+            &config,
+            &mut writer,
+            1,
+        )
+        .unwrap();
         assert_eq!(
-            writer.0.len(),
-            num_zooms,
-            "polygon smeared across multiple tiles instead of the single fallback tile"
+            stats.antimeridian_fallbacks, 0,
+            "dateline polygon must split, never fall back"
         );
-        for (z, x, y, count) in &writer.0 {
-            assert_eq!(*count, 1, "phantom copy leaked into z{z}/{x}/{y}");
-            // The one written tile is the representative point's (first-vertex) tile.
-            let (ex, ey) = projection::lonlat_to_tile(-179.9, 10.0, *z).unwrap();
-            assert_eq!(
-                (*x, *y),
-                (ex, ey),
-                "fallback must land in the representative point's tile at z{z}"
-            );
+
+        // Geometry path: every emitted ring is valid (closed, in-buffered-bounds).
+        let tiles = generate_tiles(
+            &[polygon_feature(vec![crossing_ring()], 1_700_000_000_000)],
+            &config,
+            1,
+        )
+        .unwrap();
+        assert!(!tiles.is_empty());
+        for tile in &tiles {
+            assert_valid_polygon_rings(tile);
         }
-        // One tile at each distinct zoom in range (none skipped, none doubled).
-        let mut zooms: Vec<u8> = writer.0.iter().map(|t| t.0).collect();
-        zooms.sort_unstable();
-        assert_eq!(zooms, (min_zoom..=max_zoom).collect::<Vec<_>>());
+
+        // At the deepest zoom the two pieces land in OPPOSITE-edge columns
+        // (west near +180, east near -180) and NOT the interior around lon 0 —
+        // proof of a real split, not a single-tile smear or a world span.
+        let z = max_zoom;
+        let west_col = projection::lonlat_to_tile(178.0, 15.0, z).unwrap().0;
+        let east_col = projection::lonlat_to_tile(-178.0, 15.0, z).unwrap().0;
+        let mid_col = projection::lonlat_to_tile(0.0, 15.0, z).unwrap().0;
+        let cols: std::collections::BTreeSet<u32> =
+            tiles.iter().filter(|t| t.id.z == z).map(|t| t.id.x).collect();
+        assert!(
+            west_col != east_col,
+            "test setup: hemispheres must differ in column"
+        );
+        assert!(
+            cols.contains(&west_col),
+            "expected the west (+180) column {west_col} in {cols:?}"
+        );
+        assert!(
+            cols.contains(&east_col),
+            "expected the east (-180) column {east_col} in {cols:?}"
+        );
+        assert!(
+            !cols.contains(&mid_col),
+            "polygon smeared into the interior column {mid_col} (world span)"
+        );
+
+        // CCW exterior / CW holes on the split pieces survive per-tile clipping
+        // (Sutherland–Hodgman preserves winding).
+        for tile in &tiles {
+            for layer in &tile.layers {
+                let stt_core::arrow_tile::GeometryColumn::Polygon(features) = &layer.geometry else {
+                    panic!("expected polygon geometry");
+                };
+                for rings in features {
+                    for (i, ring) in rings.iter().enumerate() {
+                        let area = ring_signed_area(ring);
+                        // Skip seam-degenerate slivers (a fragment reduced to a
+                        // near-zero-area strip against a tile edge).
+                        if area.abs() <= 1e-12 {
+                            continue;
+                        }
+                        if i == 0 {
+                            assert!(area > 0.0, "exterior must be CCW in {:?}", tile.id);
+                        } else {
+                            assert!(area < 0.0, "hole must be CW in {:?}", tile.id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn antimeridian_multipolygon_keeps_noncrossing_part() {
+        // Regression (Wave-2 A1 review): a MultiPolygon with ONE dateline-crossing
+        // part (Fiji-like, 177 → -177) plus one ordinary NON-crossing part near
+        // lon 0 must keep BOTH — the crossing part splits across the dateline
+        // while the non-crossing part still tiles at its own interior column.
+        // The feature-wide `crosses` flag used to route the whole feature through
+        // the splitter, which flat-mapped over every part and silently dropped the
+        // non-crosser (a USA MultiPolygon would lose CONUS when the Aleutians cross
+        // ±180). Now each part is routed independently.
+        let crossing_part = vec![vec![
+            vec![177.0, 10.0],
+            vec![-177.0, 10.0],
+            vec![-177.0, 20.0],
+            vec![177.0, 20.0],
+            vec![177.0, 10.0],
+        ]];
+        let noncrossing_part = vec![vec![
+            vec![-2.0, 10.0],
+            vec![2.0, 10.0],
+            vec![2.0, 20.0],
+            vec![-2.0, 20.0],
+            vec![-2.0, 10.0],
+        ]];
+        let feature = ParsedFeature {
+            geojson: Feature {
+                bbox: None,
+                geometry: Some(Geometry::new(GeomValue::MultiPolygon(vec![
+                    crossing_part,
+                    noncrossing_part,
+                ]))),
+                id: None,
+                properties: None,
+                foreign_members: None,
+            },
+            shared_properties: None,
+            timestamp: 1_700_000_000_000,
+            end_timestamp: None,
+            vertex_timestamps: None,
+            vertex_values: None,
+            vertex_value_matrix: None,
+            lon: 0.0,
+            lat: 15.0,
+        };
+
+        let (min_zoom, max_zoom) = (2u8, 6u8);
+        let config = TileConfig {
+            min_zoom,
+            max_zoom,
+            layer_name: "areas".to_string(),
+            temporal_bucket_ms: 3_600_000,
+            clip_trajectories: false,
+            ..TileConfig::default()
+        };
+
+        let mut writer = CaptureWriter(Vec::new());
+        let stats =
+            generate_tiles_streaming(std::slice::from_ref(&feature), &config, &mut writer, 1)
+                .unwrap();
+        assert_eq!(
+            stats.antimeridian_fallbacks, 0,
+            "mixed MultiPolygon must split the crossing part, not dead-letter"
+        );
+
+        let tiles = generate_tiles(std::slice::from_ref(&feature), &config, 1).unwrap();
+        let z = max_zoom;
+        let west_col = projection::lonlat_to_tile(178.0, 15.0, z).unwrap().0;
+        let east_col = projection::lonlat_to_tile(-178.0, 15.0, z).unwrap().0;
+        let mid_col = projection::lonlat_to_tile(0.0, 15.0, z).unwrap().0;
+        let cols: std::collections::BTreeSet<u32> =
+            tiles.iter().filter(|t| t.id.z == z).map(|t| t.id.x).collect();
+        // The crossing part still splits to BOTH dateline edges …
+        assert!(
+            cols.contains(&west_col) && cols.contains(&east_col),
+            "crossing part must reach both dateline columns ({west_col},{east_col}) in {cols:?}"
+        );
+        // … AND the non-crossing part is preserved at its own interior column.
+        assert!(
+            cols.contains(&mid_col),
+            "non-crossing MultiPolygon part near lon 0 (col {mid_col}) was dropped; got {cols:?}"
+        );
+        for tile in &tiles {
+            assert_valid_polygon_rings(tile);
+        }
+    }
+
+    /// Signed shoelace area of a closed `[[lon, lat], …]` ring (positive = CCW).
+    fn ring_signed_area(ring: &[[f64; 2]]) -> f64 {
+        let mut sum = 0.0;
+        for w in ring.windows(2) {
+            sum += w[0][0] * w[1][1] - w[1][0] * w[0][1];
+        }
+        sum / 2.0
     }
 }

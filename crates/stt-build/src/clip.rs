@@ -1044,9 +1044,13 @@ fn sutherland_hodgman_ring(ring: &[Vec<f64>], bounds: &TileBounds) -> Vec<Vec<f6
 /// dropped while the surviving exterior is kept, preserving hole structure.
 ///
 /// Tiles are emitted in ascending `(x, y)` order — deterministic, no hashing.
-/// Caller is responsible for the antimeridian heuristic (bbox wider than 180°
-/// must NOT reach this function — a straight sweep in clamped lon space would
-/// smear the polygon across the whole world).
+/// Caller is responsible for the antimeridian split: NO ring reaching this
+/// function may contain an edge with `|Δlon| > 180°` (such an edge sweeps a
+/// straight line the long way across clamped-lon space and would smear the
+/// polygon across the whole world). `place_polygon` splits crossing rings first
+/// via [`split_polygon_at_antimeridian`], so every piece it passes here is
+/// seam-free. A polygon that merely spans a wide (but < 360°) longitude range
+/// WITHOUT any wrapping edge is fine — it genuinely occupies those columns.
 pub(crate) fn clip_polygons_to_tiles(
     polygons: &[PolygonRings],
     zoom: u8,
@@ -1152,6 +1156,253 @@ pub(crate) fn clip_polygons_to_tiles(
         }
     }
     out
+}
+
+/// Sentinel longitude/latitude magnitude for the meridian-only clip bounds in
+/// [`split_polygon_at_antimeridian`]. It vastly exceeds any real UNWRAPPED
+/// coordinate (unwrapped lon stays within roughly ±540° for real data, lat
+/// within ±90°), so the three non-cutting half-planes of the seam clip are
+/// no-ops and only the `x = S` plane actually cuts.
+const ANTIMERIDIAN_SENTINEL: f64 = 1e9;
+
+/// Unwrap a closed GeoJSON ring into a CONTINUOUS longitude frame: drop the
+/// closing duplicate, then walk the vertices carrying a running ±360° offset
+/// (subtract 360 across an edge with `Δlon > 180`, add 360 across `Δlon <
+/// -180` — the same seam signal the polyline splitter uses at
+/// `clip_trajectory`) and emit `(lon + offset, lat)`. Shifting (not cutting)
+/// means no unwrapped edge ever jumps the ±180 seam.
+///
+/// Returns `None` for a ring with fewer than 3 distinct vertices OR one whose
+/// longitude winding does not return to zero around the closing edge — an
+/// unbalanced ring encircles a pole (or self-winds) and cannot be split by a
+/// single seam. The caller dead-letters those.
+fn unwrap_ring(ring: &[Vec<f64>]) -> Option<Vec<(f64, f64)>> {
+    let mut src: Vec<(f64, f64)> = ring
+        .iter()
+        .filter(|c| c.len() >= 2)
+        .map(|c| (c[0], c[1]))
+        .collect();
+    // Drop the GeoJSON closing duplicate (first == last).
+    if src.len() >= 2 && src.first() == src.last() {
+        src.pop();
+    }
+    if src.len() < 3 {
+        return None;
+    }
+
+    let mut out: Vec<(f64, f64)> = Vec::with_capacity(src.len());
+    let mut offset = 0.0_f64;
+    for i in 0..src.len() {
+        if i > 0 {
+            let dlon = src[i].0 - src[i - 1].0;
+            if dlon > 180.0 {
+                offset -= 360.0;
+            } else if dlon < -180.0 {
+                offset += 360.0;
+            }
+        }
+        out.push((src[i].0 + offset, src[i].1));
+    }
+    // Closing edge (last raw → first raw): a well-formed, non-pole-enclosing
+    // ring winds a net zero in longitude, so the offset returns to 0 here.
+    let dclose = src[0].0 - src[src.len() - 1].0;
+    if dclose > 180.0 {
+        offset -= 360.0;
+    } else if dclose < -180.0 {
+        offset += 360.0;
+    }
+    if offset.abs() > 180.0 {
+        return None; // unbalanced ⇒ pole-enclosing / self-winding
+    }
+    Some(out)
+}
+
+/// Re-close an unwrapped point list into a GeoJSON-shaped ring (`[[x, y], …]`,
+/// first vertex pushed again as the closing duplicate) for
+/// [`sutherland_hodgman_ring`], which drops the duplicate itself.
+fn closed_ring_from_pts(pts: &[(f64, f64)]) -> Vec<Vec<f64>> {
+    let mut r: Vec<Vec<f64>> = pts.iter().map(|(x, y)| vec![*x, *y]).collect();
+    if let Some(first) = r.first().cloned() {
+        r.push(first);
+    }
+    r
+}
+
+/// The unique odd multiple of 180 (`… -540, -180, 180, 540 …`, i.e. the wrapped
+/// dateline in the unwrapped frame) strictly inside `(lo, hi)`, or `None` when
+/// the span is ≥360° (pole-enclosing / degenerate) or contains no seam.
+fn unique_seam_meridian(lo: f64, hi: f64) -> Option<f64> {
+    let splittable = lo.is_finite() && hi.is_finite() && lo < hi && (hi - lo) < 360.0;
+    if !splittable {
+        return None;
+    }
+    // Odd multiples of 180 are `360k + 180`. The smallest one strictly greater
+    // than `lo` is the only candidate (the span is < 360° wide, so at most one
+    // fits). Keep it iff it is also strictly less than `hi`.
+    let k = ((lo - 180.0) / 360.0).floor() as i64 + 1;
+    let seam = 360.0 * k as f64 + 180.0;
+    if seam > lo && seam < hi {
+        Some(seam)
+    } else {
+        None
+    }
+}
+
+/// Signed shoelace area of a closed ring (positive = CCW in lon/lat).
+fn signed_ring_area(ring: &[Vec<f64>]) -> f64 {
+    let mut sum = 0.0;
+    for w in ring.windows(2) {
+        if w[0].len() >= 2 && w[1].len() >= 2 {
+            sum += w[0][0] * w[1][1] - w[1][0] * w[0][1];
+        }
+    }
+    sum / 2.0
+}
+
+/// Split a polygon that crosses the antimeridian into up to two per-hemisphere
+/// polygons ("split-then-reuse"): unwrap each ring into a continuous longitude
+/// frame, cut at the single ±180 seam by reusing [`sutherland_hodgman_ring`]
+/// VERBATIM once per side, then normalize each side back into `[-180, 180]` by a
+/// single uniform `k·360` translation (area + winding preserved). Returns
+/// `[west, east]` (west — the `x ≤ S` side — before east; each present only when
+/// its exterior survives; holes in input order).
+///
+/// West (`max_lon = S`) and east (`min_lon = S`) cut the SAME unwrapped edge
+/// with the SAME `t = (S − prev.x)/(cur.x − prev.x)`, so the two sides emit
+/// BIT-IDENTICAL seam latitudes — watertight for free. A vertex exactly on `S`
+/// is inside for both sides.
+///
+/// Returns EMPTY for a genuinely unsplittable ring: an unwrapped exterior that
+/// spans ≥360° (pole-enclosing) or is otherwise degenerate, so there is not
+/// exactly one seam strictly inside its span. The caller dead-letters + counts
+/// these (`antimeridian_fallbacks`); expected 0 on real data.
+///
+/// SIMPLIFY ORDERING (why `stt_core::geometry::simplify_polygon` is NOT wired):
+/// a simplification pass MUST run AFTER this split AND after the per-tile clip,
+/// and only BELOW the max tiled zoom (the max-zoom tier stays lossless).
+/// Simplifying a ring before splitting would move vertices off the seam and
+/// destroy the bit-identical watertight cut this function depends on.
+pub(crate) fn split_polygon_at_antimeridian(poly: &PolygonRings) -> Vec<PolygonRings> {
+    let Some(exterior_raw) = poly.first() else {
+        return Vec::new();
+    };
+    let Some(ext) = unwrap_ring(exterior_raw) else {
+        return Vec::new();
+    };
+
+    // Exterior unwrapped lon-bbox + its continuous frame centre.
+    let (xlo, xhi) = ext
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+    let ec = (xlo + xhi) / 2.0;
+
+    // The single seam meridian; bail (dead-letter) if the span is unsplittable.
+    let Some(seam) = unique_seam_meridian(xlo, xhi) else {
+        return Vec::new();
+    };
+
+    // Unwrap each hole independently, then translate it by a whole multiple of
+    // 360 so it shares the exterior's continuous frame.
+    let mut rings_unwrapped: Vec<Vec<(f64, f64)>> = Vec::with_capacity(poly.len());
+    rings_unwrapped.push(ext);
+    for hole_raw in &poly[1..] {
+        let Some(hole) = unwrap_ring(hole_raw) else {
+            continue; // vanished / degenerate / self-winding hole
+        };
+        let (hlo, hhi) = hole
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+        let hc = (hlo + hhi) / 2.0;
+        let shift = ((ec - hc) / 360.0).round() * 360.0;
+        rings_unwrapped.push(hole.iter().map(|(x, y)| (x + shift, *y)).collect());
+    }
+
+    // Meridian-only clip bounds: only the `x = S` half-plane cuts; the other
+    // three are sentinel-wide no-ops.
+    let west_bounds = TileBounds {
+        min_lon: -ANTIMERIDIAN_SENTINEL,
+        max_lon: seam,
+        min_lat: -ANTIMERIDIAN_SENTINEL,
+        max_lat: ANTIMERIDIAN_SENTINEL,
+    };
+    let east_bounds = TileBounds {
+        min_lon: seam,
+        max_lon: ANTIMERIDIAN_SENTINEL,
+        min_lat: -ANTIMERIDIAN_SENTINEL,
+        max_lat: ANTIMERIDIAN_SENTINEL,
+    };
+
+    // Cut one side: exterior first (drop the whole side if it clips empty),
+    // then each surviving hole (same drop-vanished-hole rule the tiler uses).
+    let cut_side = |bounds: &TileBounds| -> Option<PolygonRings> {
+        let ext_clip = sutherland_hodgman_ring(&closed_ring_from_pts(&rings_unwrapped[0]), bounds);
+        if ext_clip.is_empty() {
+            return None;
+        }
+        let mut side: PolygonRings = vec![ext_clip];
+        for hole in &rings_unwrapped[1..] {
+            let hole_clip = sutherland_hodgman_ring(&closed_ring_from_pts(hole), bounds);
+            if !hole_clip.is_empty() {
+                side.push(hole_clip);
+            }
+        }
+        Some(side)
+    };
+
+    let mut out: Vec<PolygonRings> = Vec::new();
+    for bounds in [&west_bounds, &east_bounds] {
+        if let Some(mut side) = cut_side(bounds) {
+            normalize_side_into_range(&mut side);
+            fix_winding(&mut side);
+            out.push(side);
+        }
+    }
+    out
+}
+
+/// Normalize one split side back into `[-180, 180]` by a single uniform `k·360`
+/// shift keyed on the side EXTERIOR's bbox centre, applied to the exterior AND
+/// every hole by the SAME `k` — a pure translation, so area and winding are
+/// untouched and the exterior/hole nesting is preserved.
+fn normalize_side_into_range(side: &mut PolygonRings) {
+    let Some(exterior) = side.first() else {
+        return;
+    };
+    let (lo, hi) = exterior
+        .iter()
+        .filter(|c| c.len() >= 2)
+        .fold((f64::MAX, f64::MIN), |(lo, hi), c| {
+            (lo.min(c[0]), hi.max(c[0]))
+        });
+    if !(lo.is_finite() && hi.is_finite()) {
+        return;
+    }
+    let k = ((lo + hi) / 2.0 / 360.0).round();
+    if k == 0.0 {
+        return;
+    }
+    let shift = -k * 360.0;
+    for ring in side.iter_mut() {
+        for c in ring.iter_mut() {
+            if !c.is_empty() {
+                c[0] += shift;
+            }
+        }
+    }
+}
+
+/// Winding guard for the split path ONLY (keeps the non-crossing path
+/// byte-identical): force the exterior CCW (positive shoelace) and every hole
+/// CW (negative), reversing in place where the sign is wrong. Rings stay closed
+/// (reversing a `[a … a]` ring keeps `first == last`).
+fn fix_winding(side: &mut PolygonRings) {
+    for (i, ring) in side.iter_mut().enumerate() {
+        let area = signed_ring_area(ring);
+        let want_positive = i == 0; // exterior CCW; holes CW
+        if area.abs() > 0.0 && (area > 0.0) != want_positive {
+            ring.reverse();
+        }
+    }
 }
 
 /// Check if a feature is a LineString with duration (trajectory)
@@ -1648,6 +1899,210 @@ mod tests {
         assert_eq!(&restricted[0].1, &pieces.iter().find(|(t, _)| *t == (512, 511)).unwrap().1);
         // A target outside the bbox sweeps nothing.
         assert!(clip_polygons_to_tiles(&polys, zoom, 0.0, Some((0, 0))).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Antimeridian polygon splitting (A1)
+    // ------------------------------------------------------------------
+
+    fn poly_from(rings: &[&[(f64, f64)]]) -> PolygonRings {
+        rings.iter().map(|r| closed_ring(r)).collect()
+    }
+
+    /// Absolute planar area of a ring in its own (unwrapped) continuous frame.
+    fn unwrapped_area(ring: &[Vec<f64>]) -> f64 {
+        let pts = unwrap_ring(ring).expect("ring must unwrap");
+        signed_ring_area(&closed_ring_from_pts(&pts)).abs()
+    }
+
+    #[test]
+    fn unique_seam_meridian_rejects_wide_and_empty_spans() {
+        assert_eq!(unique_seam_meridian(177.0, 183.0), Some(180.0));
+        assert_eq!(unique_seam_meridian(-185.0, -175.0), Some(-180.0));
+        // ≥360° span (pole-enclosing / degenerate) has no unique seam.
+        assert_eq!(unique_seam_meridian(0.0, 400.0), None);
+        // No odd-180 multiple strictly inside.
+        assert_eq!(unique_seam_meridian(10.0, 170.0), None);
+    }
+
+    #[test]
+    fn split_polygon_square_straddling_plus_180() {
+        // Fiji-like square: raw lon 177 → -177 (crosses +180), lat 10 → 20.
+        let poly = poly_from(&[&[(177.0, 10.0), (-177.0, 10.0), (-177.0, 20.0), (177.0, 20.0)]]);
+        let pieces = split_polygon_at_antimeridian(&poly);
+        assert_eq!(pieces.len(), 2, "must split into west + east, got {pieces:?}");
+        for piece in &pieces {
+            assert_eq!(piece.len(), 1, "single exterior, no holes");
+            let ext = &piece[0];
+            assert_eq!(ext.first(), ext.last(), "ring must stay closed");
+            for c in ext {
+                assert!((-180.0..=180.0).contains(&c[0]), "lon {} out of range", c[0]);
+            }
+            assert!(
+                signed_ring_area(ext) > 0.0,
+                "exterior must be CCW (positive area): {ext:?}"
+            );
+            // No wrap edge survives.
+            for w in ext.windows(2) {
+                assert!(
+                    (w[1][0] - w[0][0]).abs() <= 180.0,
+                    "surviving |Δlon|>180 edge in {ext:?}"
+                );
+            }
+        }
+        // West piece hugs +180, east piece hugs -180.
+        assert!(
+            pieces[0][0].iter().any(|c| (c[0] - 180.0).abs() < 1e-12),
+            "west piece must touch the +180 seam: {:?}",
+            pieces[0][0]
+        );
+        assert!(
+            pieces[1][0].iter().any(|c| (c[0] + 180.0).abs() < 1e-12),
+            "east piece must touch the -180 seam: {:?}",
+            pieces[1][0]
+        );
+        // Planar area conserved (6°×10° = 60, split 3+3 in lon).
+        let orig = unwrapped_area(&poly[0]);
+        let sum: f64 = pieces.iter().map(|p| signed_ring_area(&p[0]).abs()).sum();
+        assert!((orig - 60.0).abs() < 1e-9, "orig area {orig} != 60");
+        assert!((orig - sum).abs() < 1e-9, "area not conserved: {orig} vs {sum}");
+    }
+
+    #[test]
+    fn split_polygon_square_straddling_minus_180_chukotka() {
+        // Crosses -180: raw lon -178 → 178, vertex 0 on the NEGATIVE side.
+        let poly = poly_from(&[&[(-178.0, 10.0), (178.0, 10.0), (178.0, 20.0), (-178.0, 20.0)]]);
+        let pieces = split_polygon_at_antimeridian(&poly);
+        assert_eq!(pieces.len(), 2);
+        let (mut touches_plus, mut touches_minus) = (false, false);
+        for piece in &pieces {
+            let ext = &piece[0];
+            assert_eq!(ext.first(), ext.last());
+            assert!(signed_ring_area(ext) > 0.0, "exterior CCW");
+            for c in ext {
+                assert!((-180.0..=180.0).contains(&c[0]));
+            }
+            for w in ext.windows(2) {
+                assert!((w[1][0] - w[0][0]).abs() <= 180.0);
+            }
+            if ext.iter().any(|c| (c[0] - 180.0).abs() < 1e-12) {
+                touches_plus = true;
+            }
+            if ext.iter().any(|c| (c[0] + 180.0).abs() < 1e-12) {
+                touches_minus = true;
+            }
+        }
+        assert!(
+            touches_plus && touches_minus,
+            "pieces must land on BOTH sides of the dateline"
+        );
+        let orig = unwrapped_area(&poly[0]);
+        let sum: f64 = pieces.iter().map(|p| signed_ring_area(&p[0]).abs()).sum();
+        assert!((orig - sum).abs() < 1e-9, "area not conserved: {orig} vs {sum}");
+    }
+
+    #[test]
+    fn split_polygon_straddling_hole_retained_cw_both_sides() {
+        // Exterior straddles +180 (177 → -177); a centred hole ALSO straddles
+        // it (178 → -178), so it splits and nests into BOTH hemispheres, CW,
+        // tangent to the seam.
+        let poly = poly_from(&[
+            &[(177.0, 10.0), (-177.0, 10.0), (-177.0, 20.0), (177.0, 20.0)],
+            &[(178.0, 13.0), (-178.0, 13.0), (-178.0, 17.0), (178.0, 17.0)],
+        ]);
+        let pieces = split_polygon_at_antimeridian(&poly);
+        assert_eq!(pieces.len(), 2);
+        for piece in &pieces {
+            assert_eq!(piece.len(), 2, "each side keeps exterior + hole: {piece:?}");
+            assert!(signed_ring_area(&piece[0]) > 0.0, "exterior CCW");
+            assert!(
+                signed_ring_area(&piece[1]) < 0.0,
+                "hole must be CW (negative area): {:?}",
+                piece[1]
+            );
+            for ring in piece {
+                assert_eq!(ring.first(), ring.last());
+                for c in ring {
+                    assert!((-180.0..=180.0).contains(&c[0]));
+                }
+            }
+            // Seam-tangent hole: a hole vertex lies exactly on the ±180 meridian
+            // (accepted artifact — tolerated, not an OGC-simplicity failure).
+            assert!(
+                piece[1].iter().any(|c| (c[0].abs() - 180.0).abs() < 1e-12),
+                "straddling hole must be tangent to the seam: {:?}",
+                piece[1]
+            );
+        }
+        // Net (shell − hole) area conserved across the split: 60 − 16 = 44.
+        let orig = unwrapped_area(&poly[0]) - unwrapped_area(&poly[1]);
+        let sum: f64 = pieces
+            .iter()
+            .map(|p| signed_ring_area(&p[0]).abs() - signed_ring_area(&p[1]).abs())
+            .sum();
+        assert!((orig - 44.0).abs() < 1e-9, "net orig area {orig} != 44");
+        assert!((orig - sum).abs() < 1e-9, "holed area not conserved: {orig} vs {sum}");
+    }
+
+    #[test]
+    fn split_polygon_hole_within_one_hemisphere_stays_there() {
+        // Exterior straddles +180; the hole is entirely on the WEST side (raw
+        // 178..179, unwrapped < seam=180): only the west piece keeps it, and the
+        // vanished east hole is dropped (drop-vanished-hole rule).
+        let poly = poly_from(&[
+            &[(177.0, 10.0), (-177.0, 10.0), (-177.0, 20.0), (177.0, 20.0)],
+            &[(178.0, 13.0), (179.0, 13.0), (179.0, 17.0), (178.0, 17.0)],
+        ]);
+        let pieces = split_polygon_at_antimeridian(&poly);
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[0].len(), 2, "west keeps exterior + the hole");
+        assert_eq!(pieces[1].len(), 1, "east has no hole (clipped empty)");
+        assert!(signed_ring_area(&pieces[0][1]) < 0.0, "retained hole must be CW");
+    }
+
+    #[test]
+    fn split_polygon_seam_latitudes_are_bit_identical() {
+        // The west (+180) and east (-180) pieces cut the SAME unwrapped edges
+        // with the SAME t, so their seam-vertex LATITUDES match bit-for-bit
+        // (mirrors the watertight-seam pin in
+        // clip_polygons_to_tiles_covers_and_preserves_holes). Slanted seam edges
+        // make the interpolated latitudes non-round.
+        let poly = poly_from(&[&[
+            (176.0, 10.0),
+            (-176.0, 14.0),
+            (-176.0, 26.0),
+            (176.0, 22.0),
+        ]]);
+        let pieces = split_polygon_at_antimeridian(&poly);
+        assert_eq!(pieces.len(), 2);
+        let seam_lats = |ring: &[Vec<f64>], seam_lon: f64| -> Vec<u64> {
+            let mut v: Vec<u64> = ring
+                .iter()
+                .filter(|c| (c[0] - seam_lon).abs() < 1e-12)
+                .map(|c| c[1].to_bits())
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let west = seam_lats(&pieces[0][0], 180.0);
+        let east = seam_lats(&pieces[1][0], -180.0);
+        assert!(!west.is_empty(), "west must touch the seam");
+        assert_eq!(
+            west, east,
+            "seam latitudes must be bit-identical across ±180"
+        );
+    }
+
+    #[test]
+    fn split_polygon_pole_enclosing_returns_empty() {
+        // A ring circling the north pole: lon 0 → 90 → 180 → -90 winds a net
+        // +360° in longitude, so it is unsplittable and dead-letters (empty).
+        let poly = poly_from(&[&[(0.0, 85.0), (90.0, 85.0), (180.0, 85.0), (-90.0, 85.0)]]);
+        assert!(
+            split_polygon_at_antimeridian(&poly).is_empty(),
+            "pole-enclosing ring must not split"
+        );
     }
 
     #[test]
