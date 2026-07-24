@@ -286,6 +286,25 @@ sync_tree() {
     --filter "- **" \
     "${src}" "${dst}"
 
+  # Cosmos-Drive-Dreams "/worlds" bundle sidecars (type:'worlds'): the
+  # scenario index `worlds.json` at the bundle root plus the per-scenario
+  # Cosmos videos under `videos/`. Like the AV sidecars these are NOT
+  # content-addressed (stable filenames whose bytes change on a re-generate),
+  # so they ride the mutable/short-TTL regime — a re-upload must never serve a
+  # stale world index or the wrong video. The hero LiDAR under `heroes/*/lidar/`
+  # is packed (manifest/index/packs) and already rides the immutable+manifest
+  # passes above, so it needs no rule here. No-op for every non-worlds dataset.
+  # (Videos are large; if 60 s revalidation becomes a cost, give `videos/**` a
+  # dedicated longer-TTL header — they change far less often than worlds.json.)
+  echo ">> [worlds]    ${src} (worlds.json + videos/) -> ${dst}"
+  rclone copy "${COMMON_FLAGS[@]}" ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
+    "${LICENSE_EXCLUDE_FLAGS[@]}" \
+    --header-upload "${MANIFEST_HEADER}" \
+    --filter "+ worlds.json" --filter "+ **/worlds.json" \
+    --filter "+ videos/**" --filter "+ **/videos/**" \
+    --filter "- **" \
+    "${src}" "${dst}"
+
   if [[ "${PRUNE}" -eq 1 ]]; then
     prune_tree "${src}" "${dst}" "${grace_refs}"
   else
