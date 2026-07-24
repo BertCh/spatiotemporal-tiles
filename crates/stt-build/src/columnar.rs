@@ -12,6 +12,7 @@ use std::sync::Arc;
 use stt_core::arrow_tile::{
     tessellate_polygon, ColumnarLayer, Coord, GeometryColumn, PropertyColumn,
 };
+use stt_core::projection::haversine_distance;
 use stt_core::types::GeometryType;
 
 /// Opt-in user-property selection (tippecanoe `--exclude`/`--include`/
@@ -737,16 +738,6 @@ fn interpolate_vertex_times(coords: &[Coord], start: u64, end: u64) -> Vec<i64> 
         .iter()
         .map(|d| start as i64 + (d / total * duration) as i64)
         .collect()
-}
-
-/// Haversine distance in metres.
-fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const EARTH_RADIUS: f64 = 6_371_000.0;
-    let dlat = (lat2 - lat1).to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-    let a = (dlat / 2.0).sin().powi(2)
-        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
-    EARTH_RADIUS * 2.0 * a.sqrt().asin()
 }
 
 // ----------------------------------------------------------------------------

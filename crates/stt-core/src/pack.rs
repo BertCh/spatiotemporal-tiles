@@ -526,11 +526,19 @@ pub struct PackWriter {
     /// [`with_format_version`](Self::with_format_version).
     format_version: u32,
     /// v2 schema-template sink: the encoder records each layer's stripped
-    /// schema prefix here (wire it via [`template_collector`]
-    /// (Self::template_collector) → [`crate::arrow_tile::EncoderConfig::
-    /// template_collector`] / [`crate::arrow_tile::set_template_collector`]);
-    /// finalize publishes the snapshot as `manifest.schemas`.
+    /// schema prefix here (wired automatically by
+    /// [`encoder_config`](Self::encoder_config) → [`crate::arrow_tile::
+    /// EncoderConfig::template_collector`]); finalize publishes the snapshot
+    /// as `manifest.schemas`.
     templates: Arc<TemplateCollector>,
+    /// Quantization / vector-grouping / elevation-fold settings the payloads
+    /// written to THIS writer are encoded with (see
+    /// [`with_encoder_config`](Self::with_encoder_config)). The frame version
+    /// and template sink are NOT taken from here — `encoder_config()` always
+    /// overrides them with the writer's own, so a dataset's frames and its
+    /// manifest can never disagree (design §1 ★F6). Default = the plain
+    /// encoder, byte-identical to a build that sets nothing.
+    encoder: crate::arrow_tile::EncoderConfig,
     /// In-memory budget (bytes) for buffered UNCOMPRESSED tile payloads.
     /// `0` (the default) = unlimited — every payload stays in RAM until
     /// finalize, the legacy behaviour. Non-zero: once buffered payload bytes
@@ -569,6 +577,7 @@ impl PackWriter {
             measured_ordering: false,
             format_version: PACKED_FORMAT_VERSION,
             templates: Arc::new(TemplateCollector::new()),
+            encoder: crate::arrow_tile::EncoderConfig::default(),
             memory_budget: 0,
             pending_payload_bytes: 0,
             spill: None,
@@ -632,13 +641,42 @@ impl PackWriter {
         self.format_version
     }
 
-    /// The writer's schema-template sink for a v2 build. Install it on the
-    /// encoder ([`crate::arrow_tile::EncoderConfig::template_collector`], or
-    /// process-wide via [`crate::arrow_tile::set_template_collector`]) so
-    /// every template a v2 frame references ends up in `manifest.schemas` at
+    /// The writer's schema-template sink for a v2 build. Normally taken care
+    /// of by [`encoder_config`](Self::encoder_config), which installs it on
+    /// [`crate::arrow_tile::EncoderConfig::template_collector`] so every
+    /// template a v2 frame references ends up in `manifest.schemas` at
     /// [`finalize`](Self::finalize). Unused (and empty) under v1.
     pub fn template_collector(&self) -> Arc<TemplateCollector> {
         Arc::clone(&self.templates)
+    }
+
+    /// Declare the encoder settings (coordinate + attribute quantization,
+    /// vector grouping, point-elevation fold, vertex-time precision) the tile
+    /// payloads handed to this writer are produced with, so an encode driver
+    /// can recover them from the writer alone via
+    /// [`encoder_config`](Self::encoder_config) instead of reaching for
+    /// process-wide state. The `format_version` / `template_collector` fields
+    /// of `cfg` are ignored — the writer's own always win.
+    pub fn with_encoder_config(mut self, cfg: crate::arrow_tile::EncoderConfig) -> Self {
+        self.encoder = cfg;
+        self
+    }
+
+    /// The config a payload for THIS writer must be encoded with: the settings
+    /// from [`with_encoder_config`](Self::with_encoder_config), with the frame
+    /// version and template sink forced to the writer's own.
+    ///
+    /// That override is the single coupling point keeping a dataset's frames
+    /// and its manifest declaration in lockstep — mixed versions are a reader
+    /// hard error (packed-v2 design §1 ★F6), and a v2 frame whose templates
+    /// were never recorded fails template resolution at read time.
+    pub fn encoder_config(&self) -> crate::arrow_tile::EncoderConfig {
+        crate::arrow_tile::EncoderConfig {
+            format_version: self.format_version,
+            template_collector: (self.format_version == PACKED_FORMAT_VERSION_V2)
+                .then(|| self.template_collector()),
+            ..self.encoder.clone()
+        }
     }
 
     /// Opt into a **paged** directory: the `.sttd` becomes a root page + leaf
@@ -776,6 +814,8 @@ impl PackWriter {
             measured_ordering,
             format_version,
             templates,
+            // Encode-time only — finalize just stores what was handed to it.
+            encoder: _,
             memory_budget,
             pending_payload_bytes: _,
             spill,

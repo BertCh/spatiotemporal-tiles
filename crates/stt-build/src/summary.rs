@@ -228,17 +228,18 @@ pub fn build_summary_tier<W: TileWriter>(
                     // Owning by centroid keeps every feature of a cell in one
                     // tile → a single row with the full aggregate.
                     //
-                    // A COARSE cell's centroid can sit poleward of Web-
-                    // Mercator's ±85.0511° even when every feature inside it
-                    // is at a projectable latitude (res-0 edges are ~1100 km),
-                    // so clamp the ANCHOR into range instead of dropping the
-                    // features — the cell id (and therefore its drawn
-                    // centroid) stays true; only the owning tile snaps to the
-                    // polar edge row. Features whose own lat/lon were invalid
-                    // never got here (LatLng::new above).
+                    // A COARSE cell's centroid can sit poleward of
+                    // ±[`MERCATOR_MAX_LAT`] even when every feature inside it
+                    // is at a projectable latitude (res-0 edges are ~1100 km).
+                    // `lonlat_to_tile` clamps rather than rejects, so the cell
+                    // id (and therefore its drawn centroid) stays true and only
+                    // the owning tile snaps to the polar edge row — the anchor
+                    // is NOT pre-clamped here, because a second clamp at a
+                    // second literal is exactly how the native and summary
+                    // tiers came to disagree about the limit. Features whose own
+                    // lat/lon were invalid never got here (LatLng::new above).
                     let ll: LatLng = cell.into();
-                    let anchor_lat = ll.lat().clamp(-85.0511, 85.0511);
-                    let (tx, ty) = match projection::lonlat_to_tile(ll.lng(), anchor_lat, zoom) {
+                    let (tx, ty) = match projection::lonlat_to_tile(ll.lng(), ll.lat(), zoom) {
                         Ok(xy) => xy,
                         Err(_) => continue, // non-finite centroid only
                     };

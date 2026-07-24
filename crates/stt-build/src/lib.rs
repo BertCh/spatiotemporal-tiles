@@ -30,6 +30,9 @@ pub mod input;
 pub mod postgres_input;
 pub mod quadbin;
 pub mod simplify;
+/// STAC Item emission (`stt-build --stac`): the discovery-layer sidecar,
+/// derived mechanically from a finished manifest (packed-format spec §10.3).
+pub mod stac;
 /// Build-time `style_hints` collection (`--style-hints`): bounded per-property
 /// value sampling + layer-kind counting over the loaded features, feeding the
 /// generic profiler in `stt_optimize::analysis::properties`.

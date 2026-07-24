@@ -1,0 +1,49 @@
+[package]
+name = "stt-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "WebAssembly decoder for the SpatioTemporal Tiles packed format"
+readme = "README.md"
+keywords = ["tiles", "spatiotemporal", "geospatial", "wasm", "arrow"]
+categories = ["science::geo", "wasm"]
+exclude = ["/tests"]
+# Not published yet. The crates.io half is cheap (it is a normal lib crate),
+# but the value of this crate is the npm/PyPI artifact, and neither the
+# wasm-pack packaging nor a version-skew policy against @poopdeck.gl/core is
+# settled. Publishing the Rust crate first would freeze a name and an API we
+# would want to move. See docs/guides/wasm.md §"What this does not do yet".
+publish = false
+
+[lib]
+name = "stt_wasm"
+path = "src/lib.rs"
+# `cdylib` is the wasm artifact wasm-bindgen post-processes; `rlib` keeps the
+# crate usable as a normal Rust dependency and — the reason it is not
+# cdylib-only — lets `tests/` link it, so the wasm-facing API is covered by a
+# native `cargo test` instead of needing a browser runner.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The whole point: this crate adds NO decoding logic of its own. Every byte is
+# parsed by the same stt-core code paths the CLI uses.
+stt-core = { path = "../stt-core", version = "0.5.0" }
+arrow = { workspace = true }
+serde_json.workspace = true
+# Manifest schema templates ride the manifest base64-encoded and are validated
+# by blake3-128 before use (packed spec §3.2). stt-core keeps its own decoder
+# private, so the two hashes below reproduce it — `open_parity` in
+# tests/decode_roundtrip.rs pins the reproduction against the real reader.
+base64 = "0.22"
+blake3.workspace = true
+crc32c.workspace = true
+# Unconditional (not target-gated) so the exported façade type-checks and runs
+# on the host too — that is what makes the native test meaningful.
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+tempfile = "3.10"

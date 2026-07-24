@@ -295,6 +295,11 @@ struct PlacementCounters {
     /// Placements dropped because the position could not be projected
     /// (previously `unwrap_or((0, 0))` filed these into the top-left world
     /// tile as phantom features). Counted per (feature, zoom).
+    ///
+    /// A POLAR latitude is not one of these: it is clamped to
+    /// `stt_core::projection::MERCATOR_MAX_LAT` and kept, the same as in the
+    /// summary tier — only non-finite coordinates and out-of-range longitude
+    /// land here.
     invalid_coords: AtomicUsize,
     /// Features that fell back to legacy whole-feature single-tile placement
     /// because their antimeridian-crossing rings were unsplittable
@@ -310,8 +315,9 @@ impl PlacementCounters {
         if invalid > 0 {
             tracing::warn!(
                 "dropped {invalid} feature placement(s) (per feature × zoom) with \
-                 coordinates outside the Web-Mercator domain (lon∉[-180,180], \
-                 |lat|>85.0511, or non-finite) — NOT written to any tile"
+                 coordinates outside the Web-Mercator domain (lon∉[-180,180] or \
+                 non-finite) — NOT written to any tile. Polar latitudes are NOT \
+                 counted here: they clamp to the Mercator limit and are kept"
             );
         }
         let anti = self.antimeridian_fallback.load(Ordering::Relaxed);
@@ -1666,21 +1672,6 @@ fn apply_tile_budget(budget: &TileBudget, id: TileId, features: &[TileFeature]) 
     keep
 }
 
-/// The encoder config a [`stt_core::PackWriter`] sink encodes with: the frame
-/// version + template sink come FROM THE WRITER (its `--format-version`
-/// selection and schema-template collector), layered over the process-wide
-/// encoder globals — the single coupling point that keeps a dataset's frames
-/// and manifest declaration in lockstep (mixed versions are a reader hard
-/// error, packed-v2 design §1 ★F6).
-fn pack_encoder_config(writer: &stt_core::PackWriter) -> stt_core::arrow_tile::EncoderConfig {
-    stt_core::arrow_tile::EncoderConfig {
-        format_version: writer.format_version(),
-        template_collector: (writer.format_version() == stt_core::pack::PACKED_FORMAT_VERSION_V2)
-            .then(|| writer.template_collector()),
-        ..stt_core::arrow_tile::EncoderConfig::from_globals()
-    }
-}
-
 /// Tiles per parallel-encode batch: enough to keep every worker busy, small
 /// enough that the batch's encoded (uncompressed) payloads are a bounded,
 /// transient allocation.
@@ -1711,7 +1702,7 @@ fn encode_and_add_tiles(
     tiles: &[(&GeneratedTile, Option<u64>)],
     mut on_written: impl FnMut(),
 ) -> Result<()> {
-    let encoder = pack_encoder_config(writer);
+    let encoder = writer.encoder_config();
     let budget = writer.memory_budget();
     let byte_cap: u64 = if budget > 0 {
         (budget / 4).max(1)
@@ -1782,11 +1773,13 @@ pub fn write_tiles_parallel(
 /// Identical mapping to the `ArchiveWriter` impl above —
 /// `PackWriter` shares the same `add_tile_full` contract; it just buffers the
 /// tiles and cuts them into content-addressed packs at finalize. Payloads are
-/// encoded with [`pack_encoder_config`] (frame version follows the writer).
+/// encoded with [`stt_core::PackWriter::encoder_config`] — the writer carries
+/// the resolved `--quantize-* / --vector-group / --point-elevation-column`
+/// settings plus its own frame version and template sink, so no encode path
+/// here reads process-wide state.
 impl TileWriter for stt_core::PackWriter {
     fn write_tile(&mut self, tile: &GeneratedTile) -> Result<()> {
-        let payload =
-            stt_core::arrow_tile::encode_tile_with(&tile.layers, &pack_encoder_config(self))?;
+        let payload = stt_core::arrow_tile::encode_tile_with(&tile.layers, &self.encoder_config())?;
         self.add_tile_full(
             &tile.id,
             tile.time_start,
@@ -1823,8 +1816,7 @@ impl LodTileWriter for stt_core::PackWriter {
         tile: &GeneratedTile,
         temporal_bucket_ms: Option<u64>,
     ) -> Result<()> {
-        let payload =
-            stt_core::arrow_tile::encode_tile_with(&tile.layers, &pack_encoder_config(self))?;
+        let payload = stt_core::arrow_tile::encode_tile_with(&tile.layers, &self.encoder_config())?;
         self.add_tile_full(
             &tile.id,
             tile.time_start,
@@ -3099,12 +3091,65 @@ mod tests {
         }
     }
 
-    /// T1.2: a feature whose latitude lies beyond the Web-Mercator clamp is
-    /// DROPPED and COUNTED — it never lands in tile (0, 0) as a phantom.
+    /// A latitude beyond the Web-Mercator limit is CLAMPED into the edge tile
+    /// row and KEPT — never dropped.
+    ///
+    /// The summary tier has always clamped-and-kept such a feature while the
+    /// native tier dropped it, so one dataset answered "does this feature
+    /// exist?" two different ways depending on which tier you asked. Both tiers
+    /// now clamp to the single `stt_core::projection::MERCATOR_MAX_LAT`.
+    #[test]
+    fn polar_latitudes_are_clamped_into_the_edge_row_not_dropped() {
+        let sf = point(-122.4194, 37.7749, 1_700_000_000_000);
+        // Far beyond the limit, and beyond the ~3 m band between the old
+        // rounded native limit and the old Quadbin one.
+        let polar = point(0.0, 89.9, 1_700_000_000_000);
+        let config = TileConfig {
+            min_zoom: 2,
+            max_zoom: 5,
+            layer_name: "default".to_string(),
+            temporal_bucket_ms: 3_600_000,
+            clip_trajectories: false,
+            ..TileConfig::default()
+        };
+        let mut writer = CaptureWriter(Vec::new());
+        let stats = generate_tiles_streaming(&[sf, polar], &config, &mut writer, 1).unwrap();
+        assert_eq!(
+            stats.dropped_invalid_coords, 0,
+            "a polar latitude is projectable (clamped), not invalid"
+        );
+        assert_eq!(
+            writer.0.len(),
+            8,
+            "two features × zooms 2..=5, each in its own tile"
+        );
+        for z in 2u8..=5 {
+            let n = 1u32 << z;
+            let edge: Vec<_> = writer
+                .0
+                .iter()
+                .filter(|(tz, _, y, _)| *tz == z && *y == 0)
+                .collect();
+            assert_eq!(
+                edge.len(),
+                1,
+                "z{z}: exactly one tile in the polar edge row"
+            );
+            assert_eq!(
+                (edge[0].1, edge[0].3),
+                (n / 2, 1),
+                "z{z}: the clamped feature owns the lon-0 column of row 0"
+            );
+        }
+    }
+
+    /// T1.2: a feature whose coordinates cannot be projected AT ALL (here an
+    /// out-of-range longitude) is DROPPED and COUNTED — it never lands in tile
+    /// (0, 0) as a phantom.
     #[test]
     fn invalid_coordinates_are_dropped_and_counted() {
         let good = point(-122.4194, 37.7749, 1_700_000_000_000);
-        let bad = point(0.0, 89.9, 1_700_000_000_000); // beyond ±85.0511
+        let bad = point(200.0, 10.0, 1_700_000_000_000); // lon outside [-180, 180]
         let config = TileConfig {
             min_zoom: 0,
             max_zoom: 5,

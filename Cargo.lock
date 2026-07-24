@@ -3388,6 +3388,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "stt-wasm"
+version = "0.5.0"
+dependencies = [
+ "arrow 59.0.0",
+ "base64",
+ "blake3",
+ "crc32c",
+ "serde_json",
+ "stt-core",
+ "tempfile",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

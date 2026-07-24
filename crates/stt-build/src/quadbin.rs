@@ -22,9 +22,7 @@
 //!               cells stay distinct as fixed-width integers).
 //! ```
 
-/// The clamp the Web-Mercator projection imposes on latitude — beyond this the
-/// `tan`/`asinh` mapping diverges. Matches the slippy-map / OSM limit.
-const MERCATOR_LAT_LIMIT: f64 = 85.051_128_78;
+use stt_core::projection::MERCATOR_MAX_LAT;
 
 /// Header bits (`0b100` at bits 62..60) OR'd with the "tile" mode bit (bit 59):
 /// `0x4800000000000000`. Every encoded Quadbin carries this constant prefix.
@@ -32,13 +30,13 @@ const QUADBIN_HEADER: u64 = 0x4800_0000_0000_0000;
 
 /// Convert WGS84 lon/lat to standard Web-Mercator XYZ tile coordinates at
 /// `z`. This is the same slippy-map tiling used everywhere else in the
-/// pipeline (cf. [`stt_core::projection::lonlat_to_tile`]) but the latitude is
-/// clamped to the Mercator limit rather than rejected, so an aggregate cell is
-/// always assigned even for a feature sitting exactly at the pole.
+/// pipeline (cf. [`stt_core::projection::lonlat_to_tile`], which clamps to the
+/// same [`MERCATOR_MAX_LAT`]), so an aggregate cell is always assigned even for
+/// a feature sitting exactly at the pole.
 pub fn lonlat_to_tile(lon: f64, lat: f64, z: u8) -> (u32, u32) {
     let n = 1u64 << z;
     let n_f = n as f64;
-    let lat = lat.clamp(-MERCATOR_LAT_LIMIT, MERCATOR_LAT_LIMIT);
+    let lat = lat.clamp(-MERCATOR_MAX_LAT, MERCATOR_MAX_LAT);
     let lon = lon.clamp(-180.0, 180.0);
 
     let x = ((lon + 180.0) / 360.0 * n_f).floor();

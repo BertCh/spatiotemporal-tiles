@@ -15,6 +15,12 @@ impl Default for BoundingBox {
     fn default() -> Self {
         Self {
             min_lon: -180.0,
+            // NOT `projection::MERCATOR_MAX_LAT`, deliberately. This is a
+            // SERIALIZED datum — it lands in `manifest.json` verbatim whenever a
+            // build doesn't compute bounds, and the golden fixtures pin those
+            // bytes. It is a "whole world" placeholder, not a projection clamp,
+            // so unifying it with the real limit would churn every such manifest
+            // (and break the byte-stability pins) for no correctness gain.
             min_lat: -85.0511,
             max_lon: 180.0,
             max_lat: 85.0511,

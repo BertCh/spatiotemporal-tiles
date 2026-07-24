@@ -422,6 +422,19 @@ struct Args {
     #[arg(long)]
     style_hints: bool,
 
+    /// Also write a STAC Item (`stac.json`) beside the manifest, so the dataset
+    /// is discoverable by any STAC catalog, browser or `pystac` reader without
+    /// them understanding the STT format at all (STAC catalogs assets; it does
+    /// not constrain their format — packed-format spec §10.3).
+    ///
+    /// Everything in the Item is derived from the finished manifest — bbox and
+    /// geometry from the dataset bounds, `start_datetime`/`end_datetime` from
+    /// the time range, tile/feature counts and zoom range as `stt:` properties
+    /// — and the single asset href is RELATIVE (`./manifest.json`), so the pair
+    /// stays valid wherever the directory is published.
+    #[arg(long)]
+    stac: bool,
+
     /// Ceiling (ms) on the per-vertex time quantization step. Vertex
     /// timestamps ride a compact u16-delta encoding whose step is derived
     /// from each tile layer's temporal span; a layer that would need a step
@@ -894,12 +907,13 @@ fn main() -> Result<()> {
         info!("Publish build: zstd-{}", args.zstd_level);
     }
 
-    // Process-wide encoder settings (vertex-time precision, coordinate +
-    // numeric-attribute quantization, vector grouping, point-elevation fold) are
-    // globals on `stt_core::arrow_tile` read at encode time by both the
-    // in-memory and streaming builders. Parsed + installed via the shared
-    // `build_options` module so a live `stt-serve` configures the encoder
-    // byte-identically. Set once, before any tile is encoded.
+    // Encoder settings (vertex-time precision, coordinate + numeric-attribute
+    // quantization, vector grouping, point-elevation fold). Parsed by the shared
+    // `build_options` module — the same one `stt-serve` uses, so a served tile
+    // is byte-identical to this build's — into an EXPLICIT `EncoderConfig` that
+    // is handed to the pack writer below and reaches every encode as an
+    // argument. Nothing process-wide is mutated: two datasets built in one
+    // process (or served concurrently) cannot inherit each other's settings.
     let encoder_settings = EncoderSettings {
         vertex_time_precision: Some(args.vertex_time_precision),
         quantize_coords_m: args.quantize_coords,
@@ -908,7 +922,8 @@ fn main() -> Result<()> {
         vector_group: args.vector_group.clone(),
         point_elevation_column: args.point_elevation_column.clone(),
     };
-    let enabled = encoder_settings.apply()?;
+    let encoder_config = encoder_settings.resolve()?;
+    let enabled = encoder_settings.enabled_summary()?;
     if !enabled.is_empty() {
         info!("Encoder settings ENABLED: {}", enabled.join(", "));
     }
@@ -1110,7 +1125,11 @@ fn main() -> Result<()> {
         .with_zstd_level(args.zstd_level)
         .with_capabilities(manifest_capabilities)
         .with_measured_ordering(measured_ordering)
-        .with_memory_budget(args.pack_memory_budget.saturating_mul(1024 * 1024));
+        .with_memory_budget(args.pack_memory_budget.saturating_mul(1024 * 1024))
+        // Every tile-writing path below (streaming, batched, LOD, summary) pulls
+        // its `EncoderConfig` back off the writer, so the resolved flags travel
+        // with the sink instead of through process-wide state.
+        .with_encoder_config(encoder_config);
     if args.pack_memory_budget > 0 {
         info!(
             "Pack-writer memory budget: {} MiB (payloads beyond it spill to a temp \
@@ -1374,6 +1393,22 @@ fn main() -> Result<()> {
     }
 
     let manifest = writer.finalize(&metadata)?;
+
+    // Step 5b: the STAC Item sidecar. Written from the FINALIZED manifest, not
+    // from `metadata`: finalize derives `tile_count`/`feature_count` from the
+    // directory it just wrote, so an Item built from the pre-finalize metadata
+    // would publish counts the dataset does not have.
+    if args.stac {
+        let stac_path = out_dir.join("stac.json");
+        std::fs::write(
+            &stac_path,
+            stt_build::stac::stac_item_bytes(&manifest, &out_dir),
+        )?;
+        info!(
+            "STAC Item written to {} (asset href is relative: ./manifest.json)",
+            stac_path.display()
+        );
+    }
 
     // Step 6: Write metadata JSON if requested
     if let Some(metadata_path) = args.metadata_output {

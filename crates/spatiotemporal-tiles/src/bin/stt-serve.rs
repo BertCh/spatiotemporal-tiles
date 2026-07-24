@@ -1490,6 +1490,34 @@ async fn build_dataset_state(args: &Args) -> Result<(String, ServerState)> {
     ))
 }
 
+/// The multi-dataset route table (`--config` mode): a catalog plus per-dataset
+/// metadata/tile routes under `/{dataset}/…`.
+///
+/// Extracted from `main` so the route table can be built without a running
+/// process. `docs/spec/stt-serve-protocol.md` is a published WIRE contract
+/// (paths, status codes, headers) — while the only way to obtain a `Router` was
+/// to run `main`, nothing could pin any of it, and the handler unit tests below
+/// exercise arithmetic that no route has to be wired to.
+fn multi_dataset_router(registry: Arc<Registry>) -> Router {
+    Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/datasets", get(datasets_handler))
+        .route("/:dataset/metadata.json", get(metadata_handler_multi))
+        .route("/:dataset/tiles/:z/:x/:y/:t", get(tile_handler_multi))
+        .with_state(registry)
+}
+
+/// The single-dataset route table (no `--config`): the same handlers at the
+/// process root, backward-compatible. There is deliberately no `/datasets`
+/// here — a single-dataset process has nothing to catalog (protocol §3.3).
+fn single_dataset_router(state: Arc<ServerState>) -> Router {
+    Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/metadata.json", get(metadata_handler))
+        .route("/tiles/:z/:x/:y/:t", get(tile_handler))
+        .with_state(state)
+}
+
 /// Bind + serve `app` with graceful ctrl-c shutdown.
 async fn run_server(app: Router, bind: std::net::SocketAddr) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind)
@@ -1549,13 +1577,7 @@ async fn main() -> Result<()> {
             datasets.insert(name, Arc::new(state));
         }
         let n = datasets.len();
-        let registry = Arc::new(Registry { datasets });
-        let app = Router::new()
-            .route("/health", get(|| async { "ok" }))
-            .route("/datasets", get(datasets_handler))
-            .route("/:dataset/metadata.json", get(metadata_handler_multi))
-            .route("/:dataset/tiles/:z/:x/:y/:t", get(tile_handler_multi))
-            .with_state(registry);
+        let app = multi_dataset_router(Arc::new(Registry { datasets }));
         tracing::info!(
             "stt-serve listening on http://{} — {n} dataset(s): GET /{{dataset}}/tiles/{{z}}/{{x}}/{{y}}/{{t}}.stt, GET /datasets",
             args.bind
@@ -1565,12 +1587,7 @@ async fn main() -> Result<()> {
 
     // Single-dataset mode: root routes, backward-compatible.
     let (_name, state) = build_dataset_state(&args).await?;
-    let state = Arc::new(state);
-    let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route("/metadata.json", get(metadata_handler))
-        .route("/tiles/:z/:x/:y/:t", get(tile_handler))
-        .with_state(state);
+    let app = single_dataset_router(Arc::new(state));
     tracing::info!(
         "stt-serve listening on http://{} — GET /tiles/{{z}}/{{x}}/{{y}}/{{t}}.stt",
         args.bind
@@ -1794,5 +1811,529 @@ mod tests {
             "flags missing from the `stt-serve` section of docs/api/cli-reference.md \
              (document them before shipping): {missing:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Route tests — the published wire contract.
+    //
+    // Every test above this line exercises a pure function. None of them proves
+    // that a path is routed at all, that a status code is the one
+    // `docs/spec/stt-serve-protocol.md` printed, or that a documented response
+    // header is emitted — a whole 436-line published protocol rested on code no
+    // test could reach, because a `Router` only existed inside `main`. These
+    // build the real route tables (`single_dataset_router` /
+    // `multi_dataset_router`, the exact ones `main` serves), bind them on an
+    // ephemeral loopback port, and assert on the bytes a client sees.
+    //
+    // Why a real socket rather than driving the `Router` as a `tower::Service`:
+    // `tower` is not a declared dependency of this crate (it arrives only
+    // transitively, under axum) and axum 0.7 re-exports neither `tower` nor
+    // `ServiceExt`, so `oneshot` is unreachable here without a manifest change.
+    // Binding `127.0.0.1:0` needs nothing but the `tokio` this binary already
+    // links — and it pins the actual status line and headers, which is what the
+    // spec documents.
+    //
+    // Postgres-gated because the state needs a `Backend`, and only the Postgres
+    // pool can be constructed without touching a database (see
+    // `unreachable_backend`). A DuckDB-only build compiles these out; the
+    // default feature set (and therefore CI) has `serve-postgres`.
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "serve-postgres")]
+    mod routes {
+        use super::*;
+        use std::net::SocketAddr;
+
+        /// A backend for route tests: a Postgres pool aimed at a port nothing
+        /// listens on.
+        ///
+        /// `deadpool` opens no connection until `pool.get()`, and no route
+        /// exercised below reaches `build_tile` — each is either answered from
+        /// startup state (`/metadata.json`, `/datasets`) or rejected by the
+        /// parameter guards first. So an unreachable address keeps these tests
+        /// hermetic AND makes an accidental source query fail loudly instead of
+        /// quietly depending on whatever Postgres happens to be running.
+        fn unreachable_backend() -> Backend {
+            let pg_config: tokio_postgres::Config =
+                "host=127.0.0.1 port=1 user=stt dbname=stt".parse().unwrap();
+            let mgr = Manager::from_config(
+                pg_config,
+                NoTls,
+                ManagerConfig {
+                    recycling_method: RecyclingMethod::Fast,
+                },
+            );
+            Backend::Postgres(PgPool::builder(mgr).max_size(1).build().unwrap())
+        }
+
+        /// One dataset's state, wired the way `build_dataset_state` wires it
+        /// minus the live source: the REAL `build_config` resolves the
+        /// `TileConfig` + `EncoderConfig` from CLI args, and the REAL
+        /// `metadata_json` builds the §4 descriptor, so these tests pin the
+        /// shipped builders rather than a hand-rolled stand-in.
+        fn test_state(name: &str, extra_args: &[&str]) -> ServerState {
+            let mut argv = vec!["stt-serve", "--table", "obs"];
+            argv.extend_from_slice(extra_args);
+            let args = Args::parse_from(argv);
+            let bucket_ms = build_options::parse_duration(&args.temporal_bucket).unwrap();
+            let (config, encoder) = build_config(&args, bucket_ms).expect("build_config");
+            let metadata = metadata_json(
+                name,
+                &args,
+                bucket_ms,
+                "stt-postgis-dynamic",
+                Some(-10.0),
+                Some(-20.0),
+                Some(10.0),
+                Some(20.0),
+                Some(0),
+                Some(1_000),
+                7,
+                None,
+            )
+            .expect("metadata_json");
+            ServerState {
+                backend: unreachable_backend(),
+                source: "obs".into(),
+                geom_column: args.geom_column.clone(),
+                source_srid: args.source_srid,
+                time_field: args.time_field.clone(),
+                end_time_field: args.end_time_field.clone(),
+                time_format: args.time_format,
+                config,
+                encoder,
+                metadata,
+            }
+        }
+
+        fn registry_of(states: Vec<(&str, ServerState)>) -> Arc<Registry> {
+            Arc::new(Registry {
+                datasets: states
+                    .into_iter()
+                    .map(|(n, s)| (n.to_string(), Arc::new(s)))
+                    .collect(),
+            })
+        }
+
+        /// Bind `app` on an ephemeral loopback port and return its address. The
+        /// server task is dropped with the test's runtime.
+        async fn spawn_app(app: Router) -> SocketAddr {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind ephemeral port");
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            addr
+        }
+
+        struct HttpReply {
+            status: u16,
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+        }
+
+        impl HttpReply {
+            fn header(&self, name: &str) -> Option<&str> {
+                self.headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.as_str())
+            }
+            fn text(&self) -> String {
+                String::from_utf8_lossy(&self.body).into_owned()
+            }
+            fn json(&self) -> serde_json::Value {
+                serde_json::from_slice(&self.body)
+                    .unwrap_or_else(|e| panic!("body is not JSON ({e}): {}", self.text()))
+            }
+        }
+
+        /// One blocking HTTP/1.1 request, parsed into status + headers + body.
+        /// `Connection: close` makes the server end the body at EOF, so this
+        /// needs no content-length or chunked bookkeeping.
+        fn blocking_request(addr: SocketAddr, method: &str, path: &str) -> HttpReply {
+            use std::io::{Read, Write};
+            let mut sock = std::net::TcpStream::connect(addr).expect("connect");
+            write!(
+                sock,
+                "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write request");
+            let mut raw = Vec::new();
+            sock.read_to_end(&mut raw).expect("read response");
+            let split = raw
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("response has a header terminator");
+            let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+            let body = raw[split + 4..].to_vec();
+            let mut lines = head.split("\r\n");
+            let status_line = lines.next().expect("status line");
+            let status: u16 = status_line
+                .split_whitespace()
+                .nth(1)
+                .expect("status code")
+                .parse()
+                .expect("numeric status");
+            let headers = lines
+                .filter_map(|l| {
+                    l.split_once(": ")
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                .collect();
+            HttpReply {
+                status,
+                headers,
+                body,
+            }
+        }
+
+        /// `blocking_request` off the reactor — the server task needs the
+        /// runtime while the client blocks.
+        async fn request(addr: SocketAddr, method: &str, path: &str) -> HttpReply {
+            let (method, path) = (method.to_string(), path.to_string());
+            tokio::task::spawn_blocking(move || blocking_request(addr, &method, &path))
+                .await
+                .expect("client task")
+        }
+
+        async fn get(addr: SocketAddr, path: &str) -> HttpReply {
+            request(addr, "GET", path).await
+        }
+
+        /// §3.1 — `/health` is 200 `ok` in BOTH modes. It is the one route with
+        /// no dataset behind it, so a mode that dropped it would still look
+        /// healthy in every other test here while failing every liveness probe.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn health_is_present_in_both_modes() {
+            let single = spawn_app(single_dataset_router(Arc::new(test_state("obs", &[])))).await;
+            let reply = get(single, "/health").await;
+            assert_eq!(reply.status, 200);
+            assert_eq!(reply.text(), "ok");
+
+            let multi = spawn_app(multi_dataset_router(registry_of(vec![(
+                "obs",
+                test_state("obs", &[]),
+            )])))
+            .await;
+            let reply = get(multi, "/health").await;
+            assert_eq!(reply.status, 200);
+            assert_eq!(reply.text(), "ok");
+        }
+
+        /// §3.2 + §4 — the single-dataset descriptor: 200, JSON content type,
+        /// and every key the spec's field reference marks "always present".
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn metadata_route_returns_the_documented_descriptor() {
+            let addr = spawn_app(single_dataset_router(Arc::new(test_state(
+                "obs",
+                &[
+                    "--min-zoom",
+                    "2",
+                    "--max-zoom",
+                    "10",
+                    "--temporal-bucket",
+                    "6h",
+                ],
+            ))))
+            .await;
+            let reply = get(addr, "/metadata.json").await;
+            assert_eq!(reply.status, 200);
+            assert_eq!(
+                reply.header("content-type"),
+                Some("application/json"),
+                "headers: {:?}",
+                reply.headers
+            );
+            let meta = reply.json();
+            for key in [
+                "format",
+                "name",
+                "boundingBox",
+                "timeRange",
+                "minZoom",
+                "maxZoom",
+                "temporalBucketMs",
+                "featureCount",
+                "tileUrlTemplate",
+            ] {
+                assert!(meta.get(key).is_some(), "missing '{key}' in {meta}");
+            }
+            assert_eq!(meta["name"], "obs");
+            assert_eq!(meta["minZoom"], 2);
+            assert_eq!(meta["maxZoom"], 10);
+            assert_eq!(meta["temporalBucketMs"], 6 * 3_600_000u64);
+            // Absent (not null) when neither heatmap flag is set.
+            assert!(meta.get("heatmapDomain").is_none(), "{meta}");
+        }
+
+        /// §2/§3 — the two modes serve DISJOINT route tables. Multi-dataset
+        /// namespaces everything under `/{dataset}` and adds `/datasets`;
+        /// single-dataset serves at the root and has no catalog. Getting this
+        /// backwards would silently 404 every client of one mode.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_two_modes_serve_disjoint_route_tables() {
+            let multi = spawn_app(multi_dataset_router(registry_of(vec![(
+                "obs",
+                test_state("obs", &[]),
+            )])))
+            .await;
+            assert_eq!(get(multi, "/obs/metadata.json").await.status, 200);
+            assert_eq!(
+                get(multi, "/metadata.json").await.status,
+                404,
+                "multi-dataset mode must NOT serve a root descriptor"
+            );
+            assert_eq!(get(multi, "/datasets").await.status, 200);
+
+            let single = spawn_app(single_dataset_router(Arc::new(test_state("obs", &[])))).await;
+            assert_eq!(get(single, "/metadata.json").await.status, 200);
+            assert_eq!(
+                get(single, "/datasets").await.status,
+                404,
+                "single-dataset mode has nothing to catalog (§3.3)"
+            );
+            assert_eq!(
+                get(single, "/obs/metadata.json").await.status,
+                404,
+                "single-dataset mode must NOT accept a dataset prefix"
+            );
+        }
+
+        /// §3.2/§3.4.5 — an unknown `{dataset}` is 404 with the named body, on
+        /// BOTH the metadata and tile routes. A generic framework 404 would
+        /// leave an operator unable to tell a typo'd dataset from a typo'd path.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn unknown_dataset_is_404_naming_the_dataset() {
+            let addr = spawn_app(multi_dataset_router(registry_of(vec![(
+                "obs",
+                test_state("obs", &[]),
+            )])))
+            .await;
+            let reply = get(addr, "/nope/metadata.json").await;
+            assert_eq!(reply.status, 404);
+            assert_eq!(reply.text(), "unknown dataset 'nope'");
+
+            let reply = get(addr, "/nope/tiles/5/1/1/0.stt").await;
+            assert_eq!(reply.status, 404);
+            assert_eq!(reply.text(), "unknown dataset 'nope'");
+        }
+
+        /// §3.3 — the catalog lists every dataset, sorted by name, each with the
+        /// same descriptor its own `/metadata.json` returns.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn datasets_catalog_is_sorted_and_carries_each_descriptor() {
+            let addr = spawn_app(multi_dataset_router(registry_of(vec![
+                ("trips", test_state("trips", &["--temporal-bucket", "1d"])),
+                ("obs", test_state("obs", &["--temporal-bucket", "1h"])),
+            ])))
+            .await;
+            let reply = get(addr, "/datasets").await;
+            assert_eq!(reply.status, 200);
+            let body = reply.json();
+            let names: Vec<&str> = body["datasets"]
+                .as_array()
+                .expect("datasets array")
+                .iter()
+                .map(|d| d["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, ["obs", "trips"], "entries are sorted by name");
+            assert_eq!(
+                body["datasets"][0]["metadata"],
+                get(addr, "/obs/metadata.json").await.json(),
+                "a catalog entry must carry the same object /metadata.json returns"
+            );
+        }
+
+        /// §3.4.5 — an out-of-grid tile address is 400 with the documented body.
+        ///
+        /// (This is the protocol's "bad range" rejection. `stt-serve` implements
+        /// no HTTP `Range` semantics at all — no `Accept-Ranges`, no `206`, no
+        /// `416`; one request returns one whole tile — so the coordinate guard
+        /// is the only range rejection there is to pin.)
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn out_of_grid_tile_address_is_400() {
+            let addr = spawn_app(single_dataset_router(Arc::new(test_state("obs", &[])))).await;
+            const BODY: &str = "tile out of range: need z <= 31 and x, y < 2^z";
+
+            // x beyond the 2^5 grid.
+            let reply = get(addr, "/tiles/5/9999/1/0.stt").await;
+            assert_eq!(reply.status, 400);
+            assert_eq!(reply.text(), BODY);
+
+            // z beyond 31 (where 1u64 << z and the u32 x/y space give out).
+            let reply = get(addr, "/tiles/32/0/0/0.stt").await;
+            assert_eq!(reply.status, 400);
+            assert_eq!(reply.text(), BODY);
+
+            // A range response was never on offer — assert it isn't advertised.
+            let ok = get(addr, "/metadata.json").await;
+            assert!(
+                ok.header("accept-ranges").is_none(),
+                "headers: {:?}",
+                ok.headers
+            );
+        }
+
+        /// §3.4 — `t` must parse as an integer after the optional `.stt` suffix
+        /// is stripped; anything else is the handler's own 400, distinct from
+        /// axum's path-extraction 400 for a non-numeric `z`.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn unparseable_t_and_z_are_both_400() {
+            let addr = spawn_app(single_dataset_router(Arc::new(test_state("obs", &[])))).await;
+
+            let reply = get(addr, "/tiles/5/1/1/not-a-time.stt").await;
+            assert_eq!(reply.status, 400);
+            assert_eq!(reply.text(), "t must be an integer (ms since epoch)");
+
+            // Typed path extraction rejects a non-numeric zoom before the
+            // handler runs — same status, framework-generated body.
+            let reply = get(addr, "/tiles/abc/1/1/0.stt").await;
+            assert_eq!(reply.status, 400, "body: {}", reply.text());
+        }
+
+        /// A zoom outside the dataset's advertised `[min_zoom, max_zoom]` is
+        /// rejected as 404 BEFORE any source query — the guard that stops a
+        /// z=0 request over a global source from becoming a full-table scan.
+        /// The unreachable backend is the proof it never queried: a request
+        /// that reached the pool would hang or 500 instead.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn zoom_outside_served_range_is_404_without_querying() {
+            let addr = spawn_app(single_dataset_router(Arc::new(test_state(
+                "obs",
+                &["--min-zoom", "2", "--max-zoom", "10"],
+            ))))
+            .await;
+            let reply = get(addr, "/tiles/11/1/1/0.stt").await;
+            assert_eq!(reply.status, 404);
+            assert_eq!(reply.text(), "zoom 11 outside served range 2..=10");
+
+            let reply = get(addr, "/tiles/1/1/1/0.stt").await;
+            assert_eq!(reply.status, 404);
+            assert_eq!(reply.text(), "zoom 1 outside served range 2..=10");
+        }
+
+        /// §2 — per-dataset ENCODER ISOLATION, the bug the `ServerState::encoder`
+        /// docstring names: two datasets with different encoder settings served
+        /// from one process must each keep their own.
+        ///
+        /// Resolving one dataset's settings must not disturb another's, and each
+        /// request must encode with ITS dataset's config — which is why the
+        /// config is a field on `ServerState` rather than a process-wide global
+        /// (a global would leave both datasets on whichever was configured last,
+        /// silently serving one dataset's tiles with the other's quantization).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn datasets_do_not_share_encoder_settings() {
+            let quantized = test_state(
+                "quantized",
+                &[
+                    "--quantize-coords",
+                    "1.0",
+                    "--quantize-attrs-auto",
+                    "--temporal-bucket",
+                    "1d",
+                ],
+            );
+            // Built SECOND: under process-wide globals this one's (absent)
+            // settings would be the ones both datasets ended up encoding with.
+            let plain = test_state("plain", &["--temporal-bucket", "1h"]);
+
+            assert_eq!(quantized.encoder.quantize_coords_m, Some(1.0));
+            assert!(quantized.encoder.quantize_attrs_auto);
+            assert_eq!(
+                plain.encoder.quantize_coords_m, None,
+                "the second dataset must not inherit the first's quantization"
+            );
+            assert!(!plain.encoder.quantize_attrs_auto);
+            assert_eq!(quantized.config.temporal_bucket_ms, 86_400_000);
+            assert_eq!(plain.config.temporal_bucket_ms, 3_600_000);
+
+            let registry = registry_of(vec![("quantized", quantized), ("plain", plain)]);
+            // The registry still holds two distinct configs after both exist —
+            // the state a request reads.
+            assert_eq!(
+                registry.datasets["quantized"].encoder.quantize_coords_m,
+                Some(1.0)
+            );
+            assert_eq!(registry.datasets["plain"].encoder.quantize_coords_m, None);
+
+            // …and each route dispatches to its own dataset's state.
+            let addr = spawn_app(multi_dataset_router(registry)).await;
+            let q = get(addr, "/quantized/metadata.json").await.json();
+            let p = get(addr, "/plain/metadata.json").await.json();
+            assert_eq!(q["name"], "quantized");
+            assert_eq!(p["name"], "plain");
+            assert_eq!(q["temporalBucketMs"], 86_400_000u64);
+            assert_eq!(p["temporalBucketMs"], 3_600_000u64);
+        }
+
+        /// §3 — the route table is GET-only, and an unrouted path is a plain
+        /// 404. A write method must come back `405 Method Not Allowed`, not 404
+        /// (which reads as "wrong URL") and certainly not 200: `stt-serve` is a
+        /// read-only view of a live source, and a proxy or client retry loop
+        /// keys off that distinction.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_route_table_is_get_only() {
+            let addr = spawn_app(single_dataset_router(Arc::new(test_state("obs", &[])))).await;
+            assert_eq!(request(addr, "POST", "/metadata.json").await.status, 405);
+            assert_eq!(
+                request(addr, "DELETE", "/tiles/5/1/1/0.stt").await.status,
+                405
+            );
+            assert_eq!(request(addr, "POST", "/health").await.status, 405);
+            // An unrouted path is 404, not 405 — nothing is registered there at
+            // any method.
+            assert_eq!(get(addr, "/not-a-route").await.status, 404);
+        }
+
+        /// §3.4 — the trailing `.stt` is optional: `…/{t}` and `…/{t}.stt` are
+        /// the same request, because the suffix (which `tileUrlTemplate`
+        /// advertises) is stripped before `t` is parsed.
+        ///
+        /// The proof has to be that a SUFFIXED numeric `t` gets PAST the parser,
+        /// so the request must be otherwise valid — in-grid, in-zoom-range. It
+        /// then reaches the source and fails there (§3.4.5's opaque 500) against
+        /// the unreachable pool, which is exactly the signal wanted: `500` means
+        /// "parsed, then queried"; `400` would mean the suffix was treated as
+        /// part of the integer. Asserting only that the two spellings AGREE
+        /// would be vacuous — they agree trivially at any earlier guard.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_stt_suffix_on_t_is_optional() {
+            let addr = spawn_app(single_dataset_router(Arc::new(test_state(
+                "obs",
+                &["--min-zoom", "2", "--max-zoom", "10"],
+            ))))
+            .await;
+            let with = get(addr, "/tiles/5/1/1/1700000000000.stt").await;
+            let without = get(addr, "/tiles/5/1/1/1700000000000").await;
+            assert_eq!(
+                with.status, without.status,
+                "the suffix must not change the outcome"
+            );
+            assert_eq!(with.text(), without.text());
+            assert_eq!(
+                with.status,
+                500,
+                "a suffixed numeric t must reach the source (and fail there \
+                 against the unreachable pool), not be rejected as unparseable; \
+                 body: {}",
+                with.text()
+            );
+            assert_eq!(with.text(), "internal error generating tile");
+
+            // …while a genuinely non-numeric t is still the handler's 400,
+            // suffix or not — the strip is not a blanket "ignore trailing junk".
+            for path in [
+                "/tiles/5/1/1/not-a-time.stt",
+                "/tiles/5/1/1/not-a-time",
+                "/tiles/5/1/1/17ms.stt",
+            ] {
+                let reply = get(addr, path).await;
+                assert_eq!(reply.status, 400, "{path} → {}", reply.text());
+                assert_eq!(reply.text(), "t must be an integer (ms since epoch)");
+            }
+        }
     }
 }

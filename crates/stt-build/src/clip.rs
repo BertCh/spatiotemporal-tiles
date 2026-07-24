@@ -15,6 +15,7 @@ use crate::input::SharedProperties;
 use crate::simplify::{simplify_for_zoom_with, simplify_td_tr_for_zoom_with};
 use geojson::{Feature, Geometry, Value as GeomValue};
 use std::collections::HashSet;
+use stt_core::projection::{haversine_distance, MERCATOR_MAX_LAT};
 
 /// A clipped segment of a trajectory assigned to a specific tile
 #[derive(Debug, Clone)]
@@ -178,11 +179,13 @@ fn compute_bbox(coords: &[(f64, f64, f64)]) -> (f64, f64, f64, f64) {
 /// Convert a WGS84 (lon, lat) point to continuous Web Mercator tile-space
 /// coordinates at `zoom` (the integer floor is the tile index).
 ///
-/// Latitudes outside the Web Mercator usable band are clamped, since the
-/// projection diverges at the poles.
+/// Latitudes outside the Web Mercator usable band are clamped to
+/// [`MERCATOR_MAX_LAT`], since the projection diverges at the poles — the same
+/// clamp `stt_core::projection::lonlat_to_tile` applies, so the tiles this
+/// supercover enumerates are the tiles the placement step actually uses.
 fn lonlat_to_world_tile(lon: f64, lat: f64, zoom: u8) -> (f64, f64) {
     let n = (1u32 << zoom) as f64;
-    let lat = lat.clamp(-85.0511, 85.0511);
+    let lat = lat.clamp(-MERCATOR_MAX_LAT, MERCATOR_MAX_LAT);
     let lon = lon.clamp(-180.0, 180.0);
     let world_x = (lon + 180.0) / 360.0 * n;
     let lat_rad = lat.to_radians();
@@ -470,22 +473,6 @@ pub fn compute_vertex_timestamps(
             }
         })
         .collect()
-}
-
-/// Haversine distance between two points in meters
-fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const EARTH_RADIUS: f64 = 6_371_000.0;
-
-    let lat1_rad = lat1.to_radians();
-    let lat2_rad = lat2.to_radians();
-    let dlat = (lat2 - lat1).to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-
-    let a =
-        (dlat / 2.0).sin().powi(2) + lat1_rad.cos() * lat2_rad.cos() * (dlon / 2.0).sin().powi(2);
-    let c = 2.0 * a.sqrt().asin();
-
-    EARTH_RADIUS * c
 }
 
 /// Clip a trajectory to a specific tile
@@ -1782,8 +1769,8 @@ mod tests {
 
     #[test]
     fn supercover_near_pole_clamps() {
-        // Web Mercator diverges past ±85.0511 — coordinates beyond should be
-        // clamped, not panic or produce garbage tile indices.
+        // Web Mercator diverges past ±MERCATOR_MAX_LAT — coordinates beyond
+        // should be clamped, not panic or produce garbage tile indices.
         let coords = vec![(0.0, 89.0, 0.0), (10.0, 89.5, 0.0)];
         let tiles = tiles_along_trajectory(&coords, 5);
         let n = 1u32 << 5;

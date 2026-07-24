@@ -1,12 +1,14 @@
 [workspace]
-# Only the four PUBLISHED crates. The internal `stt-generate` generator lives at
-# tools/stt-generate with its own `[workspace]` and lockfile — as a member it
+# The four PUBLISHED crates, plus `stt-wasm` (publish = false — the wasm
+# decoder, see docs/guides/wasm.md). The internal `stt-generate` generator lives
+# at tools/stt-generate with its own `[workspace]` and lockfile — as a member it
 # forced its dep tree's MSRV onto every crate here (see `rust-version` below).
 members = [
   "crates/stt-core",
   "crates/stt-build",
   "crates/stt-optimize",
   "crates/spatiotemporal-tiles",
+  "crates/stt-wasm",
 ]
 resolver = "2"
 

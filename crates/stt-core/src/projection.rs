@@ -1,7 +1,10 @@
 //! Coordinate projection utilities
 //!
 //! This module provides standardized coordinate transformations
-//! for accurate Web Mercator projections.
+//! for accurate Web Mercator projections, plus the pipeline's single
+//! [`MERCATOR_MAX_LAT`] and its single [`haversine_distance`] — both were
+//! previously copied per call site, and a copy that drifts is a tier that
+//! disagrees with its neighbours about where (or whether) a feature exists.
 //!
 //! Web Mercator is the ONLY projection the tile pipeline needs — everything
 //! here is closed-form arithmetic with no CRS library behind it. Reprojecting
@@ -12,23 +15,60 @@
 use crate::error::{Error, Result};
 use geo_types::Point;
 
+/// Web Mercator's latitude limit in degrees: `atan(sinh(π))`, the latitude
+/// whose projected `y` is exactly the top edge of the world square. The
+/// projection runs to infinity at the poles, so every slippy-map tiler stops
+/// here.
+///
+/// THE single latitude limit for the whole pipeline, and the whole pipeline
+/// CLAMPS to it rather than rejecting beyond it. Both halves of that sentence
+/// fix a real disagreement: the native tier used to reject at a rounded
+/// `85.0511` while the Quadbin summary tier clamped at `85.051_128_78`, so a
+/// feature in the ~3.2 m band between the two values was aggregated by the
+/// summary tier and absent from the native tier — one dataset answering "does
+/// this feature exist?" two different ways. Clamping (not rejecting) is the
+/// side every other site was already on — the H3 anchor, the Quadbin cell, the
+/// trajectory supercover, and the TS renderer's `MAX_MERCATOR_LAT`
+/// (`packages/core/src/geo/mercator.ts`) — and it honours the no-thinning
+/// rule: a polar feature lands on the world's edge row instead of vanishing.
+///
+/// The full precision matters *because* we clamp — the clamped feature lands
+/// on the world edge itself, where the rounded `85.0511` puts it 3.2 m inside.
+/// The value is `atan(sinh(π))` rounded INWARD, one ulp below the nearest f64,
+/// and that ulp is not fussiness: the nearest f64
+/// (`85.051_128_779_806_604`) projects to `y = -1.1e-16`, and a consumer that
+/// floors to an integer cell and drops negatives (the trajectory supercover in
+/// `stt-build`'s `clip.rs`) then returns NO tiles at all for a polar path. One
+/// ulp inward puts `y` at `+2.2e-16` — still the world edge, but on the inside
+/// of it. It is also bit-for-bit the value the renderer clamps to
+/// (`MAX_MERCATOR_LAT` in `packages/core/src/geo/mercator.ts`), so producer and
+/// consumer agree.
+pub const MERCATOR_MAX_LAT: f64 = 85.051_128_779_806_59;
+
 /// Convert WGS84 lon/lat to Web Mercator tile coordinates
 ///
 /// # Arguments
-/// * `lon` - Longitude in degrees (-180 to 180)
-/// * `lat` - Latitude in degrees (-85.0511 to 85.0511)
+/// * `lon` - Longitude in degrees (-180 to 180; outside is an error)
+/// * `lat` - Latitude in degrees; CLAMPED to ±[`MERCATOR_MAX_LAT`], so a polar
+///   feature lands in the edge tile row rather than being dropped
 /// * `zoom` - Tile zoom level (0-22)
 ///
 /// # Returns
 /// Tuple of (tile_x, tile_y) coordinates
 pub fn lonlat_to_tile(lon: f64, lat: f64, zoom: u8) -> Result<(u32, u32)> {
-    // Validate inputs
+    // Non-finite check FIRST, and separate from the range check below: `f64::
+    // clamp` propagates NaN and `NaN as u32` saturates to 0, so a NaN latitude
+    // would otherwise sail through the clamp and file the feature into tile
+    // (0, 0) as a phantom. Longitude is rejected rather than clamped —
+    // out-of-range longitude is a wrap (an antimeridian problem with its own
+    // splitter), not a projection singularity.
+    if !lon.is_finite() || !lat.is_finite() {
+        return Err(Error::InvalidCoordinates(zoom, 0, 0));
+    }
     if !(-180.0..=180.0).contains(&lon) {
         return Err(Error::InvalidCoordinates(zoom, 0, 0));
     }
-    if !(-85.0511..=85.0511).contains(&lat) {
-        return Err(Error::InvalidCoordinates(zoom, 0, 0));
-    }
+    let lat = lat.clamp(-MERCATOR_MAX_LAT, MERCATOR_MAX_LAT);
 
     let n = 1u32 << zoom;
 
@@ -36,6 +76,10 @@ pub fn lonlat_to_tile(lon: f64, lat: f64, zoom: u8) -> Result<(u32, u32)> {
     // This is the standard used by OpenStreetMap, Google Maps, etc.
     let x = ((lon + 180.0) / 360.0 * n as f64).floor() as u32;
     let lat_rad = lat.to_radians();
+    // At exactly ±MERCATOR_MAX_LAT the world `y` is 0 (or `n`) up to one ulp of
+    // rounding, so this can land a hair outside [0, n). Both guards are
+    // deliberate: the `as u32` cast saturates a negative to 0 (Rust >= 1.45),
+    // and `.min(n - 1)` catches the south edge's `n`.
     let y = ((1.0 - lat_rad.tan().asinh() / std::f64::consts::PI) / 2.0 * n as f64).floor() as u32;
 
     Ok((x.min(n - 1), y.min(n - 1)))
@@ -166,6 +210,25 @@ pub fn tile_coords_to_lonlat(
     Point::new(lon, lat)
 }
 
+/// Great-circle distance between two WGS84 points, in metres (haversine on a
+/// spherical Earth of radius 6 371 km).
+///
+/// The pipeline's ONE copy. It used to be duplicated per call site in
+/// `stt-build` (`clip.rs` + `columnar.rs`); both copies fed *timestamp
+/// interpolation along a path*, so any drift between them would have shifted
+/// where a trip is drawn at a given instant depending only on which code path
+/// built it. Spherical (not ellipsoidal) is deliberate and sufficient: every
+/// consumer uses the value as a RATIO along a path, where the ~0.5% sphere-vs-
+/// WGS84 error cancels.
+pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS: f64 = 6_371_000.0;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+    EARTH_RADIUS * 2.0 * a.sqrt().asin()
+}
+
 /// Calculate tile bounds in WGS84 coordinates
 pub fn tile_bounds(tile_x: u32, tile_y: u32, zoom: u8) -> crate::types::BoundingBox {
     let nw = tile_to_lonlat(tile_x, tile_y, zoom);
@@ -243,5 +306,104 @@ mod tests {
 
         // San Francisco should be within these bounds
         assert!(bounds.contains(-122.4194, 37.7749));
+    }
+
+    /// Continuous Web-Mercator `y` in world-tile units at `zoom` — the value
+    /// `lonlat_to_tile` floors, and the value the trajectory supercover walks.
+    fn world_y(lat: f64, zoom: u8) -> f64 {
+        let n = (1u32 << zoom) as f64;
+        (1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0 * n
+    }
+
+    /// `MERCATOR_MAX_LAT` is `atan(sinh(π))` rounded INWARD — not the rounded
+    /// `85.0511` the pipeline used to carry (3.2 m short, and the exact width
+    /// of the band in which the native and summary tiers disagreed), and not
+    /// the nearest f64 either: that one projects to `y = -1.1e-16`, which a
+    /// consumer that floors and drops negative cells reads as "no tiles".
+    #[test]
+    fn mercator_max_lat_is_the_true_limit_rounded_inward() {
+        let nearest = std::f64::consts::PI.sinh().atan().to_degrees();
+        assert_eq!(
+            MERCATOR_MAX_LAT,
+            f64::from_bits(nearest.to_bits() - 1),
+            "constant must be exactly one ulp inside atan(sinh(pi))"
+        );
+        // The property that one ulp buys, at both ends of the zoom range.
+        for z in [0u8, 20] {
+            assert!(
+                world_y(MERCATOR_MAX_LAT, z) >= 0.0,
+                "z{z}: the clamp must not project outside the world square"
+            );
+            assert!(world_y(-MERCATOR_MAX_LAT, z) <= (1u32 << z) as f64);
+            assert!(
+                world_y(nearest, z) < 0.0,
+                "z{z}: pins WHY we round inward — the nearest f64 goes negative"
+            );
+        }
+        // The rounded value it replaced sat >3 m short of the real limit.
+        assert!((MERCATOR_MAX_LAT - 85.0511) * 111_320.0 > 3.0);
+    }
+
+    /// The clamp boundary, pinned from three sides. Exactly at the limit, a
+    /// hair inside, and far outside all project into the SAME edge tile row —
+    /// nothing is rejected for being polar, which is what keeps the native and
+    /// summary tiers agreeing about which features exist.
+    #[test]
+    fn latitude_is_clamped_at_the_mercator_limit_not_rejected() {
+        for z in [0u8, 1, 6, 14] {
+            let n = 1u32 << z;
+
+            // Exactly the limit → the top row, never out of grid.
+            let (_, y_at) = lonlat_to_tile(0.0, MERCATOR_MAX_LAT, z).expect("limit is projectable");
+            assert_eq!(y_at, 0, "z{z}: lat == +limit must land in row 0");
+
+            // Just inside (one ulp below) → the same row.
+            let inside = MERCATOR_MAX_LAT - f64::EPSILON * MERCATOR_MAX_LAT;
+            let (_, y_in) = lonlat_to_tile(0.0, inside, z).expect("just inside is projectable");
+            assert_eq!(y_in, 0, "z{z}: just inside the limit must land in row 0");
+
+            // Just OUTSIDE, and far outside (the pole): clamped, not dropped.
+            let outside = MERCATOR_MAX_LAT + 1e-9;
+            let (_, y_out) = lonlat_to_tile(0.0, outside, z).expect("beyond the limit is clamped");
+            assert_eq!(y_out, 0, "z{z}: beyond the limit must clamp into row 0");
+            let (_, y_pole) = lonlat_to_tile(0.0, 90.0, z).expect("the pole is clamped");
+            assert_eq!(y_pole, 0, "z{z}: the north pole must clamp into row 0");
+
+            // Same three, mirrored: the south edge is the LAST row, not `n`.
+            let (_, y_s) = lonlat_to_tile(0.0, -MERCATOR_MAX_LAT, z).expect("south limit");
+            assert_eq!(y_s, n - 1, "z{z}: lat == -limit must land in the last row");
+            let (_, y_s_out) = lonlat_to_tile(0.0, -90.0, z).expect("south pole is clamped");
+            assert_eq!(
+                y_s_out,
+                n - 1,
+                "z{z}: the south pole must clamp to the last row"
+            );
+        }
+    }
+
+    /// Clamping must not swallow the genuinely-unprojectable: NaN propagates
+    /// through `f64::clamp` and `NaN as u32` saturates to 0, so without an
+    /// explicit finite check a NaN feature would silently land in tile (0, 0).
+    #[test]
+    fn non_finite_and_out_of_range_longitude_are_still_errors() {
+        assert!(lonlat_to_tile(0.0, f64::NAN, 8).is_err());
+        assert!(lonlat_to_tile(f64::NAN, 0.0, 8).is_err());
+        assert!(lonlat_to_tile(0.0, f64::INFINITY, 8).is_err());
+        assert!(lonlat_to_tile(f64::NEG_INFINITY, 0.0, 8).is_err());
+        assert!(lonlat_to_tile(180.001, 0.0, 8).is_err());
+    }
+
+    #[test]
+    fn haversine_matches_known_distances() {
+        // One degree of latitude at the equator ≈ 111.19 km on this sphere.
+        let d = haversine_distance(0.0, 0.0, 1.0, 0.0);
+        assert!((d - 111_194.9).abs() < 1.0, "1 deg lat = {d} m");
+        // Identical points are exactly zero (the ratio denominators rely on it).
+        assert_eq!(haversine_distance(45.0, -122.0, 45.0, -122.0), 0.0);
+        // Symmetric.
+        assert_eq!(
+            haversine_distance(37.7749, -122.4194, 40.7128, -74.0060),
+            haversine_distance(40.7128, -74.0060, 37.7749, -122.4194)
+        );
     }
 }

@@ -289,6 +289,10 @@ impl Default for Metadata {
             name: String::new(),
             description: String::new(),
             attribution: String::new(),
+            // Same rounded literals as `BoundingBox::default()`, and for the
+            // same reason: a serialized whole-world placeholder pinned by the
+            // golden manifests, NOT the projection clamp
+            // (`projection::MERCATOR_MAX_LAT`).
             bounds: BoundingBox {
                 min_lon: -180.0,
                 min_lat: -85.0511,

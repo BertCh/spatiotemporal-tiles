@@ -136,14 +136,14 @@ pub fn parse_vector_groups(specs: &[String]) -> Result<Vec<VectorGroup>> {
     Ok(groups)
 }
 
-/// Process-wide encoder settings shared by the offline build and the dynamic
-/// server. These map to globals on `stt_core::arrow_tile` that the encoder reads
-/// at tile-encode time (independent of [`crate::tiler::TileConfig`]).
+/// The CLI-shaped encoder flags shared by the offline build and the dynamic
+/// server: the raw, unparsed strings as `clap` collected them (independent of
+/// [`crate::tiler::TileConfig`], which covers tiling rather than encoding).
 ///
-/// Build a value from the CLI flags, then call [`EncoderSettings::apply`] ONCE
-/// before any tile is encoded. `stt-serve` calls it at startup so served tiles
-/// pick up the same quantization / vector-grouping / elevation-fold the offline
-/// build used.
+/// Build a value from the CLI flags, then call [`EncoderSettings::resolve`] to
+/// get the explicit [`stt_core::arrow_tile::EncoderConfig`] every encode takes
+/// as an argument. Both `stt-build` and `stt-serve` go through it, so a served
+/// tile is byte-identical to the offline build's.
 #[derive(Debug, Clone, Default)]
 pub struct EncoderSettings {
     /// `--vertex-time-precision` (ms). `None` keeps the encoder default.
@@ -161,45 +161,42 @@ pub struct EncoderSettings {
 }
 
 impl EncoderSettings {
-    /// Parse the string specs and install every global on
-    /// `stt_core::arrow_tile`. Idempotent for a given input; call once before
-    /// encoding. Returns a short, human-readable list of what was enabled (for
-    /// logging) so callers don't have to re-derive it.
-    pub fn apply(&self) -> Result<Vec<String>> {
+    /// A short, human-readable list of the non-default settings these flags
+    /// turn on (for the build log). Pure — it parses the same specs
+    /// [`resolve`](Self::resolve) does but installs nothing.
+    pub fn enabled_summary(&self) -> Result<Vec<String>> {
         let mut enabled: Vec<String> = Vec::new();
 
         if let Some(p) = self.vertex_time_precision {
-            stt_core::arrow_tile::set_vertex_time_max_step_ms(p);
             if p != stt_core::arrow_tile::DEFAULT_VERTEX_TIME_MAX_STEP_MS {
                 enabled.push(format!("vertex-time-precision={p}ms"));
             }
         }
 
-        stt_core::arrow_tile::set_quantize_coords_m(self.quantize_coords_m)?;
         if self.quantize_coords_m > 0.0 {
             enabled.push(format!("quantize-coords={}m", self.quantize_coords_m));
         }
 
         if !self.quantize_attr.is_empty() {
-            let attrs = parse_quantize_attrs(&self.quantize_attr)?;
-            enabled.push(format!("quantize-attr={attrs:?}"));
-            stt_core::arrow_tile::set_quantize_attrs(attrs);
+            enabled.push(format!(
+                "quantize-attr={:?}",
+                parse_quantize_attrs(&self.quantize_attr)?
+            ));
         }
 
         if self.quantize_attrs_auto {
-            stt_core::arrow_tile::set_quantize_attrs_auto(true);
             enabled.push("quantize-attrs-auto".to_string());
         }
 
         if !self.vector_group.is_empty() {
-            let groups = parse_vector_groups(&self.vector_group)?;
-            enabled.push(format!("vector-groups={}", groups.len()));
-            stt_core::arrow_tile::set_vector_groups(groups);
+            enabled.push(format!(
+                "vector-groups={}",
+                parse_vector_groups(&self.vector_group)?.len()
+            ));
         }
 
         if let Some(col) = self.point_elevation_column.as_deref() {
             if !col.is_empty() {
-                stt_core::arrow_tile::set_point_elevation_column(col);
                 enabled.push(format!("point-elevation-column={col}"));
             }
         }
@@ -209,9 +206,10 @@ impl EncoderSettings {
 
     /// Parse the specs into an explicit [`stt_core::arrow_tile::EncoderConfig`]
     /// WITHOUT touching any process-wide globals — the concurrency- and
-    /// multi-config-safe path a dynamic server uses (each dataset/request encodes
-    /// via [`stt_core::arrow_tile::encode_tile_with`] with its own config, never
-    /// mutating shared state). This is the non-global sibling of [`apply`].
+    /// multi-config-safe path BOTH the offline build and a dynamic server use
+    /// (each dataset/request encodes via
+    /// [`stt_core::arrow_tile::encode_tile_with`] with its own config, never
+    /// mutating shared state).
     pub fn resolve(&self) -> Result<stt_core::arrow_tile::EncoderConfig> {
         // Fail fast at config time, not per-request at encode time: without
         // this, a server boots cleanly on an invalid precision and 500s
@@ -224,12 +222,20 @@ impl EncoderSettings {
             quantize_attrs_auto: self.quantize_attrs_auto,
             vector_groups: parse_vector_groups(&self.vector_group)?,
             point_elevation_column: self.point_elevation_column.clone().unwrap_or_default(),
+            // `.max(1)`: a 0 ceiling would send EVERY layer down the exact
+            // `List<Int64>` fallback (no step can be <= 0), silently costing 4x
+            // the vertex-time bytes instead of meaning "finest possible step".
+            // The retired `set_vertex_time_max_step_ms` global clamped here too
+            // — dropping it would have re-typed the column for
+            // `--vertex-time-precision 0`.
             vertex_time_max_step_ms: self
                 .vertex_time_precision
-                .unwrap_or(stt_core::arrow_tile::DEFAULT_VERTEX_TIME_MAX_STEP_MS),
-            // The concurrently-landed format-v2 fields (`format_version`,
-            // `template_collector`) default to v1 / no-collector so this
-            // no-globals server path stays byte-identical until it opts into v2.
+                .unwrap_or(stt_core::arrow_tile::DEFAULT_VERTEX_TIME_MAX_STEP_MS)
+                .max(1),
+            // The format-v2 fields (`format_version`, `template_collector`)
+            // default to v1 / no-collector; the PACK WRITER overrides both from
+            // its own `--format-version` (`PackWriter::encoder_config`), so
+            // frames can never disagree with the manifest.
             ..stt_core::arrow_tile::EncoderConfig::default()
         })
     }

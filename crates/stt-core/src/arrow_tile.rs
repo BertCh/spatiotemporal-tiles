@@ -886,26 +886,9 @@ const TIME_OFFSET_MS_KEY: &str = "stt:time_offset_ms";
 /// `List<Int64>` shape instead (no thinning).
 pub const DEFAULT_VERTEX_TIME_MAX_STEP_MS: u32 = 1000;
 
-/// Process-wide step ceiling, settable once at startup (e.g. from
-/// `stt-build --vertex-time-precision`). Reads/writes are monotonic-free
-/// config, so `Relaxed` is sufficient.
-static VERTEX_TIME_MAX_STEP_MS: AtomicU32 = AtomicU32::new(DEFAULT_VERTEX_TIME_MAX_STEP_MS);
-
 /// Latch so the "u16-delta ceiling exceeded" warning fires at most once per
 /// process instead of once per tile.
 static VERTEX_TIME_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
-
-/// Override the u16-delta `vertex_time` step ceiling for every subsequent
-/// [`encode_layer`] call. Values below 1 ms clamp to 1 (every layer with a
-/// span beyond u16 milliseconds then takes the exact `List<Int64>` path).
-pub fn set_vertex_time_max_step_ms(ms: u32) {
-    VERTEX_TIME_MAX_STEP_MS.store(ms.max(1), Ordering::Relaxed);
-}
-
-/// The currently configured u16-delta `vertex_time` step ceiling (ms).
-pub fn vertex_time_max_step_ms() -> u32 {
-    VERTEX_TIME_MAX_STEP_MS.load(Ordering::Relaxed)
-}
 
 /// Build-global coordinate quantization precision, in **micrometers** (lets the
 /// `AtomicU32` carry sub-mm..km without a float). `0` = off (Float64 coords).
@@ -1072,62 +1055,22 @@ pub fn point_elevation_column() -> String {
     point_elevation_column_cell().read().unwrap().clone()
 }
 
-/// Build-global layer-frame format version ([`FORMAT_VERSION_V1`] |
-/// [`FORMAT_VERSION_V2`]). Defaults to v1 so every existing globals-path
-/// caller (including `stt-serve`, which must stay v1 per the serve protocol)
-/// is byte-identical to the 0.3.x writer; `stt-build` opts the offline build
-/// into v2 explicitly.
-static FORMAT_VERSION: AtomicU32 = AtomicU32::new(FORMAT_VERSION_V1);
-
-/// Set the build-global frame format version for every subsequent default
-/// [`encode_tile`] call. Errors (storing nothing) on anything but 1 or 2.
-pub fn set_format_version(v: u32) -> Result<()> {
-    if v != FORMAT_VERSION_V1 && v != FORMAT_VERSION_V2 {
-        return Err(Error::Other(format!(
-            "unsupported format version {v} (this writer emits 1 or 2)"
-        )));
-    }
-    FORMAT_VERSION.store(v, Ordering::Relaxed);
-    Ok(())
-}
-
-/// The build-global frame format version.
-pub fn format_version() -> u32 {
-    FORMAT_VERSION.load(Ordering::Relaxed)
-}
-
-/// Build-global template collector for the v2 hash-referencing mode. `None`
-/// (the default) makes a v2 encode self-contained (inline schema sections);
-/// `stt-build` installs the `PackWriter`'s collector here so the offline
-/// globals-path encodes reference templates the manifest will carry.
-fn template_collector_cell() -> &'static RwLock<Option<Arc<TemplateCollector>>> {
-    static A: OnceLock<RwLock<Option<Arc<TemplateCollector>>>> = OnceLock::new();
-    A.get_or_init(|| RwLock::new(None))
-}
-
-/// Install (or clear, with `None`) the build-global [`TemplateCollector`].
-pub fn set_template_collector(collector: Option<Arc<TemplateCollector>>) {
-    *template_collector_cell().write().unwrap() = collector;
-}
-
-/// The current build-global template collector, if any.
-pub fn template_collector() -> Option<Arc<TemplateCollector>> {
-    template_collector_cell().read().unwrap().clone()
-}
-
 /// Resolved, explicit encoder settings — the values the tile encoder reads at
 /// encode time (coordinate + attribute quantization, vector grouping, the
-/// point-elevation fold, vertex-time precision).
+/// point-elevation fold, vertex-time precision, frame version, template sink).
 ///
 /// Historically these lived only in process-wide mutable statics set via the
 /// `set_*` functions above; that made a new encode caller silently inherit
 /// whatever the last `set_*` left behind (the origin of the `stt-serve` parity
-/// bug) and made it impossible to encode two different configurations in one
-/// process (blocking multi-dataset serve + parallel per-config tests). Passing an
-/// `EncoderConfig` explicitly to [`encode_tile_with`]
-/// removes both problems. The globals + the no-arg [`encode_tile`] /
-/// [`encode_layer`] wrappers remain for the one-shot CLI and existing callers;
-/// [`EncoderConfig::from_globals`] snapshots them.
+/// bug, where one dataset's quantization bled into the tiles served for
+/// another) and made it impossible to encode two different configurations in
+/// one process (blocking multi-dataset serve + parallel per-config tests).
+/// Passing an `EncoderConfig` explicitly to [`encode_tile_with`] removes both
+/// problems, and it is how BOTH shipping producers now encode: `stt-build`
+/// carries one on its [`crate::PackWriter`], `stt-serve` one per dataset. The
+/// surviving globals + the no-arg [`encode_tile`] / [`encode_layer`] wrappers
+/// (snapshotted by [`EncoderConfig::from_globals`]) serve only external
+/// one-shot callers; nothing in this workspace's build path mutates them.
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
     /// Fixed-point coordinate quantization ground precision in meters
@@ -1173,8 +1116,14 @@ impl Default for EncoderConfig {
 }
 
 impl EncoderConfig {
-    /// Snapshot the current process-wide encoder globals into an explicit config.
-    /// Used by the no-arg [`encode_tile`] / [`encode_layer`] back-compat wrappers.
+    /// Snapshot the surviving process-wide encoder globals into an explicit
+    /// config. Used by the no-arg [`encode_tile`] / [`encode_layer`]
+    /// back-compat wrappers.
+    ///
+    /// The frame version and template sink are deliberately NOT global: they
+    /// have to match the writer that will store the frame, so they come from
+    /// [`crate::PackWriter::encoder_config`] and default to a self-contained
+    /// v1 frame here.
     pub fn from_globals() -> Self {
         Self {
             quantize_coords_m: quantize_coords_m(),
@@ -1182,9 +1131,7 @@ impl EncoderConfig {
             quantize_attrs_auto: quantize_attrs_auto(),
             vector_groups: vector_groups(),
             point_elevation_column: point_elevation_column(),
-            vertex_time_max_step_ms: vertex_time_max_step_ms(),
-            format_version: format_version(),
-            template_collector: template_collector(),
+            ..Self::default()
         }
     }
 }
@@ -1615,6 +1562,14 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
             ..EncoderConfig::from_globals()
         },
     )
+}
+
+/// [`encode_layer`] with a fully-explicit [`EncoderConfig`] — no process-wide
+/// globals are read. The single-layer sibling of [`encode_tile_with`], and the
+/// entry point a caller should reach for instead of `set_*`-then-`encode_layer`:
+/// that pair is what let one caller's settings leak into the next one's tiles.
+pub fn encode_layer_with(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8>> {
+    encode_layer_cfg(layer, cfg)
 }
 
 /// The single-layer encode implementation, driven entirely by an explicit

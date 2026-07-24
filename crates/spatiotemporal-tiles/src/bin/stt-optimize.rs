@@ -1,7 +1,7 @@
 //! stt-optimize CLI — a thin wrapper around the library in `lib.rs`.
 
 use stt_optimize::{
-    advisors, analysis, diff, doctor, loader, measure, order_audit, recommend, report,
+    advisors, analysis, diff, doctor, export, loader, measure, order_audit, recommend, report,
     PackedTileset,
 };
 
@@ -156,6 +156,57 @@ enum Commands {
         strict: bool,
     },
 
+    /// Export a built packed tileset back out as GeoParquet — whole archive,
+    /// or a bbox / time-range subset
+    Export {
+        /// Packed dataset directory (or its manifest.json)
+        #[arg(short, long)]
+        archive: PathBuf,
+
+        /// Output .parquet path. With several layers and no `--layer` this is
+        /// the stem: each layer lands in `<stem>.<layer>.parquet`.
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Zoom level to export (default: the deepest one present). One export
+        /// is always ONE zoom — the same feature is re-tiled at every level
+        /// with a different simplification tolerance.
+        #[arg(long, value_name = "Z")]
+        zoom: Option<u8>,
+
+        /// Layer to export (default: every layer, one file each)
+        #[arg(long, value_name = "NAME")]
+        layer: Option<String>,
+
+        /// Keep only features intersecting this box, as
+        /// `min_lon,min_lat,max_lon,max_lat`
+        ///
+        /// `allow_hyphen_values`: a western/southern box starts with a minus
+        /// sign, and clap would otherwise read `-73.9,...` as an unknown flag.
+        #[arg(long, value_name = "MINX,MINY,MAXX,MAXY", allow_hyphen_values = true)]
+        bbox: Option<String>,
+
+        /// Keep only features whose time span reaches this instant or later
+        /// (ISO-8601 or Unix ms)
+        #[arg(long, value_name = "TIME", allow_hyphen_values = true)]
+        start: Option<String>,
+
+        /// Keep only features whose time span starts at this instant or
+        /// earlier (ISO-8601 or Unix ms)
+        #[arg(long, value_name = "TIME", allow_hyphen_values = true)]
+        end: Option<String>,
+
+        /// Geometry column typing: `wkb` (default, GeoParquet 1.1 — what every
+        /// deployed reader understands) or `native` (adds Parquet's GEOMETRY
+        /// logical type on the same bytes)
+        #[arg(long, value_name = "ENC", default_value = "wkb")]
+        geometry_encoding: String,
+
+        /// Output format for the run report: "text" or "json"
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+
     /// Audit blob ordering on a built packed tileset: measure per-ordering
     /// range-read cost (scrub + pan, over the directory) and recommend
     /// `--blob-ordering`
@@ -212,7 +263,14 @@ fn main() -> Result<()> {
             explain,
         } => {
             tracing_subscriber::fmt::init();
-            run_recommend(&input, &time_field, &time_format, output, show_command, explain)
+            run_recommend(
+                &input,
+                &time_field,
+                &time_format,
+                output,
+                show_command,
+                explain,
+            )
         }
         Commands::Inspect {
             archive,
@@ -235,6 +293,27 @@ fn main() -> Result<()> {
             output,
             strict,
         } => run_doctor(&archive, sample, &format, output, strict),
+        Commands::Export {
+            archive,
+            output,
+            zoom,
+            layer,
+            bbox,
+            start,
+            end,
+            geometry_encoding,
+            format,
+        } => run_export(
+            &archive,
+            &output,
+            zoom,
+            layer,
+            bbox.as_deref(),
+            start.as_deref(),
+            end.as_deref(),
+            &geometry_encoding,
+            &format,
+        ),
         Commands::OrderAudit {
             archive,
             format,
@@ -371,7 +450,10 @@ fn run_recommend(
 
     if show_command {
         println!("\nSuggested stt-build command:");
-        println!("{}", recommend::to_command(&recommendations, input, time_field));
+        println!(
+            "{}",
+            recommend::to_command(&recommendations, input, time_field)
+        );
     }
 
     Ok(())
@@ -499,6 +581,39 @@ fn run_doctor(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_export(
+    archive: &PathBuf,
+    output: &PathBuf,
+    zoom: Option<u8>,
+    layer: Option<String>,
+    bbox: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+    geometry_encoding: &str,
+    format: &str,
+) -> Result<()> {
+    let opts = export::ExportOptions {
+        zoom,
+        layer,
+        bbox: bbox.map(export::parse_bbox).transpose()?,
+        start: start.map(export::parse_time_bound).transpose()?,
+        end: end.map(export::parse_time_bound).transpose()?,
+        geometry_encoding: export::GeometryEncoding::parse(geometry_encoding)?,
+    };
+    let tileset = PackedTileset::open(archive)?;
+    let report = export::export(&tileset, output, &opts)?;
+
+    // The report goes to stdout (so `--format json` pipes into jq); the files
+    // themselves are the actual output, already on disk.
+    let rendered = match format {
+        "json" => serde_json::to_string_pretty(&report)?,
+        _ => export::format_text(&report),
+    };
+    println!("{}", rendered);
+    Ok(())
+}
+
 fn run_order_audit(
     archive: &PathBuf,
     format: &str,
@@ -526,7 +641,9 @@ fn run_order_audit(
                 );
                 std::process::exit(1);
             }
-            Some(_) => eprintln!("--strict gate OK: current ordering is the measured recommendation"),
+            Some(_) => {
+                eprintln!("--strict gate OK: current ordering is the measured recommendation")
+            }
             None => eprintln!(
                 "--strict gate: current ordering not recorded (pre-2026-07 archive) — passing"
             ),
@@ -547,8 +664,6 @@ fn write_or_print(rendered: &str, output: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-
-
 #[cfg(test)]
 mod cli_doc_tests {
     use super::*;
@@ -565,9 +680,14 @@ mod cli_doc_tests {
             "/../../docs/api/cli-reference.md"
         ))
         .expect("read docs/api/cli-reference.md");
-        let start = doc.find("## `stt-optimize`").expect("stt-optimize section heading");
+        let start = doc
+            .find("## `stt-optimize`")
+            .expect("stt-optimize section heading");
         let body = &doc[start + 1..];
-        let end = body.find("\n## `").map(|i| start + 1 + i).unwrap_or(doc.len());
+        let end = body
+            .find("\n## `")
+            .map(|i| start + 1 + i)
+            .unwrap_or(doc.len());
         let section = &doc[start..end];
         let cmd = Cli::command();
         let mut missing: Vec<String> = Vec::new();

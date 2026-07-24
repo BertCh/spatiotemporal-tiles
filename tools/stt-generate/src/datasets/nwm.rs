@@ -4,9 +4,9 @@
 //! (`chrtout.zarr` on anonymous S3) over the NHDPlusV2 CONUS river network as
 //! `vertex_value_matrix` flow corridors — the continental-scale sibling of
 //! `bixi --streets`, with zero new tile-format features (design:
-//! `docs/roadmap/nwm-rivers-demo-2026-07.md`).
+//! `docs/roadmap/demos-and-datasets.md`).
 //!
-//! ## Pipeline (design §7 stage 2)
+//! ## Pipeline
 //! 1. **Chunk fetch** — the zarr chunks are *bare zstd frames* of C-order
 //!    int32 `[672 h × 30 000 reaches]` (× 0.01 → m³/s, fill −999 900), so a
 //!    plain HTTPS GET + zstd decode replaces any zarr crate. Compressed chunks
