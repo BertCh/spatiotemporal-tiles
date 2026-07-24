@@ -11,6 +11,9 @@ description = "Spatiotemporal dataset analyzer and optimizer for STT file genera
 readme = "README.md"
 keywords = ["tiles", "spatiotemporal", "geospatial", "optimization", "cli"]
 categories = ["science::geo", "command-line-utilities"]
+# Same as stt-core/stt-build: throwaway diagnostics (examples/nwm_geom_probe.rs)
+# and fixtures are not part of the published crate.
+exclude = ["/examples", "/tests"]
 
 [lib]
 name = "stt_optimize"

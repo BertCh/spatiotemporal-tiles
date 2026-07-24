@@ -27,7 +27,6 @@ let reader = stt::core::PackedReader::open("dataset/")?;
 | `build`              | `stt::build` — the tiler/encoder library                      |
 | `optimize`           | `stt::optimize` — dataset analysis + encoding recommendations |
 | `postgres`, `duckdb` | database input sources for `build`                            |
-| `projection`         | advanced CRS support (requires system libproj)                |
 
 The implementation crates ([`stt-core`](https://crates.io/crates/stt-core),
 [`stt-build`](https://crates.io/crates/stt-build),

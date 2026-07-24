@@ -1,7 +1,12 @@
 //! Tile types and operations
+//!
+//! [`TileId`] is all that survives here. The pre-Arrow decoded-tile model
+//! (`Tile`/`Layer`/`Feature`/`Position`/`Value`) was removed: the real build
+//! path is columnar end to end and never materialises a per-feature struct
+//! (see `stt_build::tiler::tile_feature_signals`), and the reader hands back
+//! Arrow record batches (see [`crate::arrow_tile`]).
 
 use crate::error::{Error, Result};
-use crate::types::{GeometryType, TimeRange};
 use std::cmp::Ordering;
 
 /// Unique identifier for a spatiotemporal tile
@@ -105,50 +110,6 @@ impl Ord for TileId {
             .then(self.hilbert_index().cmp(&other.hilbert_index()))
             .then(self.t.cmp(&other.t))
     }
-}
-
-/// A decoded tile with all its features
-#[derive(Debug, Clone)]
-pub struct Tile {
-    pub id: TileId,
-    pub time_range: TimeRange,
-    pub layers: Vec<Layer>,
-}
-
-/// A layer within a tile
-#[derive(Debug, Clone)]
-pub struct Layer {
-    pub name: String,
-    pub extent: u32,
-    pub features: Vec<Feature>,
-}
-
-/// A feature within a layer
-#[derive(Debug, Clone)]
-pub struct Feature {
-    pub id: u64,
-    pub geometry_type: GeometryType,
-    pub positions: Vec<Position>,
-    pub properties: std::collections::HashMap<String, Value>,
-    pub time_range: Option<TimeRange>,
-}
-
-/// Absolute geographic position
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Position {
-    pub lon: f64,
-    pub lat: f64,
-}
-
-/// Property value
-#[derive(Debug, Clone)]
-pub enum Value {
-    String(String),
-    Double(f64),
-    Float(f32),
-    Int(i64),
-    UInt(u64),
-    Bool(bool),
 }
 
 #[cfg(test)]

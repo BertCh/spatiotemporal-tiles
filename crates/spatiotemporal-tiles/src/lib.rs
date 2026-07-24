@@ -18,7 +18,6 @@
 //! | `build` | `build` — the tiler/encoder library behind the `stt-build` CLI |
 //! | `optimize` | `optimize` — dataset analysis + encoding recommendations |
 //! | `postgres` / `duckdb` | database input sources for `build` |
-//! | `projection` | advanced CRS support (requires system libproj) |
 //! | `cli` | the four binaries: `stt-build`, `stt-optimize`, `stt-validate`, `stt-serve` |
 //!
 //! Install the CLI tools with `cargo install spatiotemporal-tiles --features cli`

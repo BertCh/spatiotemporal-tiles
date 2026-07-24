@@ -56,7 +56,7 @@ pub const PACKED_FORMAT: &str = "stt-packed";
 /// keep reproducing it byte-identically (pinned by `tests/v1_golden.rs`).
 pub const PACKED_FORMAT_VERSION_V1: u32 = 1;
 /// The 2026-07 coordinated byte break
-/// (`docs/roadmap/stt-packed-v2-design-2026-07.md`): `STTP`/`STTD` object
+/// (`docs/roadmap/stt-packed-format-decisions.md`): `STTP`/`STTD` object
 /// magic, object-absolute blob offsets, and v2 sectioned layer frames
 /// referencing manifest-embedded schema templates (`manifest.schemas`).
 pub const PACKED_FORMAT_VERSION_V2: u32 = 2;

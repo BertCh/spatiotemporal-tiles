@@ -1,8 +1,10 @@
 [workspace]
+# Only the four PUBLISHED crates. The internal `stt-generate` generator lives at
+# tools/stt-generate with its own `[workspace]` and lockfile — as a member it
+# forced its dep tree's MSRV onto every crate here (see `rust-version` below).
 members = [
   "crates/stt-core",
   "crates/stt-build",
-  "crates/stt-generate",
   "crates/stt-optimize",
   "crates/spatiotemporal-tiles",
 ]
@@ -15,8 +17,16 @@ authors = ["Robert Christie"]
 license = "MIT"
 repository = "https://github.com/BertCh/spatiotemporal-tiles"
 homepage = "https://github.com/BertCh/spatiotemporal-tiles"
-# Empirically verified MSRV (forced by home/osmpbf/delaunator); enforced by the CI msrv job.
-rust-version = "1.88"
+# Empirically verified MSRV for the four PUBLISHED crates; enforced by the CI
+# msrv job. Bisected with `cargo +<v> check -p stt-core -p stt-build
+# -p stt-optimize -p spatiotemporal-tiles`:
+#   1.82  — Cargo cannot even parse arrow-schema 59's manifest (edition 2024).
+#   1.85/1.86 — `u64::is_multiple_of` (stt-build/src/input.rs) is still unstable.
+#   1.87  — first version that compiles all four. ← this value
+# It used to read 1.88 only because stt-generate was a workspace member and its
+# home→osmpbf / delaunator deps demanded that; the generator now lives in its
+# own workspace at tools/stt-generate and keeps its own 1.88 there.
+rust-version = "1.87"
 
 [workspace.dependencies]
 # Core dependencies
@@ -29,7 +39,6 @@ serde_json = "1.0"
 geo = "0.28"
 geo-types = "0.7"
 geojson = { version = "0.24", features = ["geo-types"] }
-geo-traits = "0.2"
 
 # Polygon tessellation (pre-baked triangle indices, MLT-style)
 earcutr = "0.5"
@@ -54,12 +63,6 @@ geozero = { version = "0.14", default-features = false, features = [
 ] }
 arrow-schema = "59"
 arrow-array = "59"
-
-# Data I/O
-csv = "1.3"
-
-# Compression
-flate2 = "1.0"
 
 # Spatial indexing
 hilbert_2d = "1.0"

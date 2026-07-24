@@ -119,6 +119,10 @@ def fetch_wind_subset(hour: datetime, cache: Path, level: str,
                 if len(f) > 4 and f[4] == idx_tag and f[3] in wanted:
                     msg[f[3]] = int(f[0])
             if any(v not in msg for v in wanted):
+                # A dropped hour is invisible downstream (the decode loop just
+                # `continue`s past the absent cache file), so name the miss.
+                print(f"    ⚠️  {key}: .idx has no {idx_tag} "
+                      f"{sorted(set(wanted) - set(msg))} — hour skipped")
                 return None
             # One range-GET per message (messages need not be adjacent in the
             # file). GRIB2 is self-delimiting, so concatenating the messages in
@@ -136,8 +140,10 @@ def fetch_wind_subset(hour: datetime, cache: Path, level: str,
             tmp.write_bytes(b"".join(chunks))
             tmp.rename(out)
             return out
-        except Exception:
+        except Exception as e:
             if attempt == retries - 1:
+                print(f"    ⚠️  {key}: fetch failed after {retries} tries "
+                      f"({e}) — hour skipped")
                 return None
     return None
 

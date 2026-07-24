@@ -37,9 +37,6 @@ tempfile = "3.10"
 # H3 hexagonal aggregation cells for the summary tier.
 h3o = "0.7"
 
-# Optional advanced projection support (requires system libproj)
-proj = { version = "0.27", optional = true }
-
 # GeoParquet support. Mandatory: the tiler's Arrow IPC encode path uses
 # arrow/parquet unconditionally, so a geoparquet-less stt-build cannot exist —
 # the `geoparquet` feature below is a no-op kept for CLI compat.
@@ -73,8 +70,6 @@ duckdb = { version = "1", features = ["bundled", "chrono"], optional = true }
 
 [features]
 default = ["geoparquet"]
-# Enable advanced projection support (requires system libproj)
-projection = ["stt-core/projection", "proj"]
 # No-op back-compat alias: GeoParquet/GeoArrow support is always compiled in
 # (the encode path needs arrow/parquet unconditionally).
 geoparquet = []

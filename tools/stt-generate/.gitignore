@@ -1,0 +1,3 @@
+# This crate is its own workspace, so it has its own target dir. The root
+# .gitignore only ignores `/target/` (anchored at the repo root).
+/target/

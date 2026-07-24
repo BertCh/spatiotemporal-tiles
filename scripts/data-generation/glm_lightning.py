@@ -112,8 +112,13 @@ def list_prefix(base: str, prefix: str, retries: int = 4) -> list[str]:
                 with urlopen(url, timeout=60) as r:
                     body = r.read()
                 break
-            except Exception:
+            except Exception as e:
                 if attempt == retries - 1:
+                    # "Treat as empty" is indistinguishable from an hour with no
+                    # flashes, so a dead bucket would silently build a dataset
+                    # with holes in it. Name the give-up.
+                    print(f"  WARNING: list {prefix} failed after {retries} tries "
+                          f"({e}) — key list is PARTIAL ({len(keys)} keys)")
                     return keys  # give up on this prefix; treat as empty
         root = ET.fromstring(body)
         token = None
@@ -175,8 +180,9 @@ def fetch(base: str, key: str, cache: Path, retries: int = 3) -> Path | None:
             tmp.write_bytes(data)
             tmp.rename(path)
             return path
-        except Exception:
+        except Exception as e:
             if attempt == retries - 1:
+                print(f"  WARNING: fetch {key} failed after {retries} tries: {e}")
                 return None
     return None
 

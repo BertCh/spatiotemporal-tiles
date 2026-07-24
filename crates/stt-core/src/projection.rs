@@ -3,32 +3,14 @@
 //! This module provides standardized coordinate transformations
 //! for accurate Web Mercator projections.
 //!
-//! The basic Web Mercator transformations are always available.
-//! With the `projection` feature, you can use the proj crate for
-//! advanced transformations between different coordinate systems.
+//! Web Mercator is the ONLY projection the tile pipeline needs — everything
+//! here is closed-form arithmetic with no CRS library behind it. Reprojecting
+//! non-4326 input is pushed down into SQL (`ST_Transform`, see the DB input
+//! adaptors and `stt-serve`), which is why an optional libproj dependency and
+//! its `projection` cargo feature were removed rather than kept as dead weight.
 
 use crate::error::{Error, Result};
 use geo_types::Point;
-
-#[cfg(feature = "projection")]
-use proj::Proj;
-
-// PROJ contexts hold raw C pointers and are neither Send nor Sync, so the
-// cached transform objects must be per-thread (`thread_local!`), never a
-// `static` (which requires Sync). Each thread pays one `Proj::new_known_crs`
-// on first use — negligible next to the transforms themselves.
-#[cfg(feature = "projection")]
-thread_local! {
-    /// Cached projection from WGS84 to Web Mercator (per thread).
-    static WGS84_TO_WEB_MERCATOR: Proj =
-        Proj::new_known_crs("EPSG:4326", "EPSG:3857", None)
-            .expect("Failed to initialize WGS84 to Web Mercator projection");
-
-    /// Cached projection from Web Mercator to WGS84 (per thread).
-    static WEB_MERCATOR_TO_WGS84: Proj =
-        Proj::new_known_crs("EPSG:3857", "EPSG:4326", None)
-            .expect("Failed to initialize Web Mercator to WGS84 projection");
-}
 
 /// Convert WGS84 lon/lat to Web Mercator tile coordinates
 ///
@@ -184,52 +166,6 @@ pub fn tile_coords_to_lonlat(
     Point::new(lon, lat)
 }
 
-/// Convert WGS84 coordinates to Web Mercator meters (EPSG:3857)
-///
-/// With the `projection` feature, this uses the proj crate for accurate transformations.
-/// Without it, uses a simple approximation.
-#[cfg(feature = "projection")]
-pub fn wgs84_to_meters(point: Point<f64>) -> Result<Point<f64>> {
-    let (x, y) = WGS84_TO_WEB_MERCATOR
-        .with(|proj| proj.convert((point.x(), point.y())))
-        .map_err(|e| Error::Other(format!("Projection error: {}", e)))?;
-    Ok(Point::new(x, y))
-}
-
-#[cfg(not(feature = "projection"))]
-pub fn wgs84_to_meters(point: Point<f64>) -> Result<Point<f64>> {
-    // Simple Web Mercator approximation (EPSG:3857)
-    // This is accurate enough for most use cases
-    const R: f64 = 6378137.0; // Earth radius in meters
-    let x = R * point.x().to_radians();
-    let y = R
-        * (std::f64::consts::FRAC_PI_4 + point.y().to_radians() / 2.0)
-            .tan()
-            .ln();
-    Ok(Point::new(x, y))
-}
-
-/// Convert Web Mercator meters (EPSG:3857) to WGS84 coordinates
-///
-/// With the `projection` feature, this uses the proj crate for accurate transformations.
-/// Without it, uses a simple approximation.
-#[cfg(feature = "projection")]
-pub fn meters_to_wgs84(point: Point<f64>) -> Result<Point<f64>> {
-    let (x, y) = WEB_MERCATOR_TO_WGS84
-        .with(|proj| proj.convert((point.x(), point.y())))
-        .map_err(|e| Error::Other(format!("Projection error: {}", e)))?;
-    Ok(Point::new(x, y))
-}
-
-#[cfg(not(feature = "projection"))]
-pub fn meters_to_wgs84(point: Point<f64>) -> Result<Point<f64>> {
-    // Simple Web Mercator to WGS84 approximation
-    const R: f64 = 6378137.0; // Earth radius in meters
-    let lon = point.x().to_degrees() / R;
-    let lat = (2.0 * (point.y() / R).exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees();
-    Ok(Point::new(lon, lat))
-}
-
 /// Calculate tile bounds in WGS84 coordinates
 pub fn tile_bounds(tile_x: u32, tile_y: u32, zoom: u8) -> crate::types::BoundingBox {
     let nw = tile_to_lonlat(tile_x, tile_y, zoom);
@@ -299,22 +235,6 @@ mod tests {
         // Should be very close to original
         assert!((point.x() - original_lon).abs() < 0.001);
         assert!((point.y() - original_lat).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_wgs84_to_meters() {
-        // Test San Francisco conversion
-        let point = Point::new(-122.4194, 37.7749);
-        let meters = wgs84_to_meters(point).unwrap();
-
-        // Web Mercator coordinates should be in the millions
-        assert!(meters.x().abs() > 10_000_000.0);
-        assert!(meters.y().abs() > 4_000_000.0);
-
-        // Roundtrip test (allow some tolerance for approximation)
-        let back = meters_to_wgs84(meters).unwrap();
-        assert!((back.x() - point.x()).abs() < 0.01); // ~1km tolerance
-        assert!((back.y() - point.y()).abs() < 0.01);
     }
 
     #[test]

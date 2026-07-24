@@ -52,7 +52,7 @@ Pass `--publish` for a deploy-ready build (zstd 19).
 
 Encoding, packing, and the directory come from [`stt-core`](../stt-core);
 `--auto` calls into [`stt-optimize`](../stt-optimize);
-[`stt-generate`](../stt-generate) shells out to this binary for every bundled
+[`stt-generate`](../../tools/stt-generate) shells out to this binary for every bundled
 dataset; [`stt-serve`](../stt-serve) reuses the same per-tile encoder to
 serve tiles on the fly; gate outputs in CI with
 [`stt-validate`](../stt-validate).

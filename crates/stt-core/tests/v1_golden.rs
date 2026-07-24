@@ -1,5 +1,5 @@
 //! Golden byte-stability pin for the **formatVersion 1** writer (packed v2
-//! design doc `docs/roadmap/stt-packed-v2-design-2026-07.md` §1, ★F3).
+//! design doc `docs/roadmap/stt-packed-format-decisions.md`, ★F3).
 //!
 //! THE CONTRACT (reworded 2026-07): v1 mode is **0.3.x-READER-compatible v1
 //! emission** — v1 frames, no object magic, `formatVersion: 1`, no `schemas`

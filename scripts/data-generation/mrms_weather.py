@@ -101,8 +101,14 @@ def list_prefix(prefix: str, retries: int = 4) -> list[str]:
                 with urlopen(url, timeout=60) as r:
                     body = r.read()
                 break
-            except Exception:
+            except Exception as e:
                 if attempt == retries - 1:
+                    # Giving up mid-pagination returns a TRUNCATED key list that
+                    # the caller cannot distinguish from a genuinely short
+                    # prefix — a dead/renamed bucket would silently build a
+                    # partial dataset. Say so instead of failing invisibly.
+                    print(f"  WARNING: list {prefix} failed after {retries} tries "
+                          f"({e}) — key list is PARTIAL ({len(keys)} keys)")
                     return keys
         root = ET.fromstring(body)
         token = None
@@ -162,8 +168,9 @@ def fetch(key: str, cache: Path, retries: int = 3) -> Path | None:
             tmp.write_bytes(data)
             tmp.rename(path)
             return path
-        except Exception:
+        except Exception as e:
             if attempt == retries - 1:
+                print(f"  WARNING: fetch {key} failed after {retries} tries: {e}")
                 return None
     return None
 

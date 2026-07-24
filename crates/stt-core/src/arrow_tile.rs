@@ -1124,7 +1124,7 @@ pub fn template_collector() -> Option<Arc<TemplateCollector>> {
 /// whatever the last `set_*` left behind (the origin of the `stt-serve` parity
 /// bug) and made it impossible to encode two different configurations in one
 /// process (blocking multi-dataset serve + parallel per-config tests). Passing an
-/// `EncoderConfig` explicitly to [`encode_tile_with`] / [`encode_layer_with`]
+/// `EncoderConfig` explicitly to [`encode_tile_with`]
 /// removes both problems. The globals + the no-arg [`encode_tile`] /
 /// [`encode_layer`] wrappers remain for the one-shot CLI and existing callers;
 /// [`EncoderConfig::from_globals`] snapshots them.
@@ -1606,7 +1606,7 @@ pub fn encode_layer(layer: &ColumnarLayer) -> Result<Vec<u8>> {
 ///
 /// The non-coordinate settings (attribute quantization, vector grouping,
 /// point-elevation fold, vertex-time precision) come from the process-wide
-/// globals; use [`encode_layer_with`] to pass every setting explicitly.
+/// globals; use [`encode_tile_with`] to pass every setting explicitly.
 pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) -> Result<Vec<u8>> {
     encode_layer_cfg(
         layer,
@@ -1617,15 +1617,13 @@ pub fn encode_layer_quantized(layer: &ColumnarLayer, quantize_m: Option<f64>) ->
     )
 }
 
-/// [`encode_layer`] with a fully-explicit [`EncoderConfig`] — no process-wide
-/// globals are read. This is the concurrency- and multi-config-safe entry point
-/// (e.g. a dynamic server fronting several datasets with different settings).
-pub fn encode_layer_with(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8>> {
-    encode_layer_cfg(layer, cfg)
-}
-
 /// The single-layer encode implementation, driven entirely by an explicit
-/// [`EncoderConfig`]. Every public `encode_layer*` entry point funnels here.
+/// [`EncoderConfig`] — no process-wide globals are read. Every public
+/// `encode_layer*` entry point funnels here.
+///
+/// Crate-private: the whole-TILE [`encode_tile_with`] is the public
+/// explicit-config entry point (that is the granularity every writer works at),
+/// so a public single-layer twin only ever went unused.
 ///
 /// Always emits the self-describing v1 shape — one Arrow IPC stream with ALL
 /// metadata inline. The v2 tile frame reuses the identical column/field build
@@ -3254,7 +3252,7 @@ mod tests {
             }],
             ..EncoderConfig::default()
         };
-        let ipc = encode_layer_with(&layer, &cfg).unwrap();
+        let ipc = encode_layer_cfg(&layer, &cfg).unwrap();
         let batch = decode_layer(&ipc).unwrap();
 
         // Scalars fused away; the grouped vector + the ungrouped `z` remain.
@@ -3303,7 +3301,7 @@ mod tests {
             point_elevation_column: "z".to_string(),
             ..EncoderConfig::default()
         };
-        let ipc = encode_layer_with(&layer, &cfg).unwrap();
+        let ipc = encode_layer_cfg(&layer, &cfg).unwrap();
         let batch = decode_layer(&ipc).unwrap();
 
         // Geometry is now a 3-wide list with z folded in; `z` is gone as a property.
@@ -3351,7 +3349,7 @@ mod tests {
             point_elevation_column: "z".to_string(),
             ..EncoderConfig::default()
         };
-        let ipc = encode_layer_with(&layer, &cfg).unwrap();
+        let ipc = encode_layer_cfg(&layer, &cfg).unwrap();
         let batch = decode_layer(&ipc).unwrap();
 
         let field = batch.schema().field_with_name("geometry").unwrap().clone();
@@ -3435,13 +3433,13 @@ mod tests {
         // to the historical encoder. Explicit config (not the global setter) so
         // this test stays hermetic under the parallel test runner.
         let plain =
-            decode_layer(&encode_layer_with(&make(), &EncoderConfig::default()).unwrap()).unwrap();
+            decode_layer(&encode_layer_cfg(&make(), &EncoderConfig::default()).unwrap()).unwrap();
         let zf = plain.schema().field_with_name("z").unwrap().clone();
         assert_eq!(zf.data_type(), &DataType::Float64);
         assert!(zf.metadata().get(STT_QUANT_ATTR_META_KEY).is_none());
 
         // Opt the `z` column in at 0.05-unit precision.
-        let q = encode_layer_with(
+        let q = encode_layer_cfg(
             &make(),
             &EncoderConfig {
                 quantize_attrs: HashMap::from([("z".to_string(), 0.05f64)]),
@@ -3503,7 +3501,7 @@ mod tests {
         // so this test can't flip `quantize_attrs_auto` under a concurrently
         // running test that reads the encoder globals via bare `encode_layer`.
         let plain =
-            decode_layer(&encode_layer_with(&make(), &EncoderConfig::default()).unwrap()).unwrap();
+            decode_layer(&encode_layer_cfg(&make(), &EncoderConfig::default()).unwrap()).unwrap();
         assert_eq!(
             plain.schema().field_with_name("depth").unwrap().data_type(),
             &DataType::Float64
@@ -3511,7 +3509,7 @@ mod tests {
 
         // Auto on → range-adaptive UInt16 + affine.
         let batch = decode_layer(
-            &encode_layer_with(
+            &encode_layer_cfg(
                 &make(),
                 &EncoderConfig {
                     quantize_attrs_auto: true,
@@ -4207,7 +4205,7 @@ mod tests {
         // explicit-config path and the global setter must reject it with the
         // minimum in the message; a precision at/above the floor encodes fine.
         let layer = sample_point_layer();
-        let err = encode_layer_with(
+        let err = encode_layer_cfg(
             &layer,
             &EncoderConfig {
                 quantize_coords_m: Some(0.001),
@@ -4221,7 +4219,7 @@ mod tests {
         );
 
         assert!(0.0187 > MIN_QUANTIZE_COORDS_M);
-        assert!(encode_layer_with(
+        assert!(encode_layer_cfg(
             &layer,
             &EncoderConfig {
                 quantize_coords_m: Some(0.0187),
@@ -4259,10 +4257,10 @@ mod tests {
             ..EncoderConfig::default()
         };
         // Sane altitude still encodes.
-        assert!(encode_layer_with(&make(5.0), &cfg).is_ok());
+        assert!(encode_layer_cfg(&make(5.0), &cfg).is_ok());
         // 1e18 m at a 0.05 m step → index 2e19, far outside i32.
         let err =
-            encode_layer_with(&make(1.0e18), &cfg).expect_err("overflowing altitude must error");
+            encode_layer_cfg(&make(1.0e18), &cfg).expect_err("overflowing altitude must error");
         let msg = err.to_string();
         // f64 Display renders 1.0e18 as its full integer form.
         assert!(
@@ -4290,7 +4288,7 @@ mod tests {
                 PropertyColumn::Numeric(vec![Some(0.0), Some(3.0e9)]),
             )],
         };
-        let err = encode_layer_with(
+        let err = encode_layer_cfg(
             &layer,
             &EncoderConfig {
                 quantize_attrs: HashMap::from([("v".to_string(), 1.0f64)]),

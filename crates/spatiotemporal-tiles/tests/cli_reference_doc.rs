@@ -36,14 +36,27 @@
 //! covers `stt-generate`, and checks the reverse direction.
 //!
 //! Coverage note: the binaries live in this package, so Cargo hands us their
-//! paths via `CARGO_BIN_EXE_<name>`. `stt-generate` lives in its own crate, so
-//! that variable does not exist here; `stt_generate_subcommands_are_documented`
-//! resolves it as a sibling of the test binary in the target profile dir and
-//! reports a loud skip when it has not been built (e.g. `cargo test -p
-//! spatiotemporal-tiles` alone). A full `cargo test --workspace` builds it, so
-//! CI does cover it — but at the subcommand level only, because the doc
-//! deliberately defers the per-dataset flags to `stt-generate <sub> --help`
-//! (see that test).
+//! paths via `CARGO_BIN_EXE_<name>`. `stt-generate` does not — it lives at
+//! `tools/stt-generate` in its OWN workspace (kept out of this one so its dep
+//! tree and MSRV stay off the published crates), so no `CARGO_BIN_EXE_` exists
+//! here AND no root-workspace build produces it.
+//! `stt_generate_subcommands_are_documented` resolves it as a sibling of the
+//! test binary in the target profile dir and reports a loud skip when it is
+//! not there — which is now the normal case. To actually exercise the
+//! generator half of this gate the binary has to be put in the root target dir
+//! first, e.g.
+//!
+//! ```text
+//! cargo build --manifest-path tools/stt-generate/Cargo.toml
+//! cp tools/stt-generate/target/debug/stt-generate target/debug/
+//! ```
+//!
+//! ⚠ A STALE `target/<profile>/stt-generate` left behind by an older build
+//! satisfies that lookup and will silently check the doc against obsolete
+//! `--help` output. Delete it rather than trusting a green run.
+//!
+//! Either way it is the subcommand level only, because the doc deliberately
+//! defers the per-dataset flags to `stt-generate <sub> --help` (see that test).
 
 // Every check below is `#[cfg]`-gated on the feature its binary needs (see the
 // `required-features` on each `[[bin]]`); compile the file out entirely when
@@ -467,11 +480,13 @@ fn stt_serve_flags_are_documented() {
 
 /// `stt-generate` is checked at the SUBCOMMAND level, not the flag level.
 ///
-/// Two reasons. First, it lives in its own crate, so Cargo gives this test no
-/// `CARGO_BIN_EXE_stt-generate` — it is resolved as a sibling of the test
-/// binary (`target/<profile>/stt-generate`), which a workspace build (what CI
-/// runs) always produces; anything else skips loudly rather than pretending the
-/// surface was covered. Second, the reference doc deliberately documents the
+/// Two reasons. First, it lives in its own workspace at `tools/stt-generate`,
+/// so Cargo gives this test no `CARGO_BIN_EXE_stt-generate` — it is resolved as
+/// a sibling of the test binary (`target/<profile>/stt-generate`), which no
+/// root-workspace build produces any more; absent that, this skips loudly
+/// rather than pretending the surface was covered (see the module docs for how
+/// to put it there, and the stale-binary warning). Second, the reference doc
+/// deliberately documents the
 /// per-dataset flags by reference ("run `stt-generate <subcommand> --help`")
 /// and enumerates the *subcommands* in a table, so the table is what there is
 /// to pin: adding a dataset generator must add its row.
@@ -479,9 +494,11 @@ fn stt_serve_flags_are_documented() {
 fn stt_generate_subcommands_are_documented() {
     let Some(exe) = sibling_binary("stt-generate") else {
         eprintln!(
-            "SKIPPED stt_generate_subcommands_are_documented: stt-generate is not \
-             built (it lives in the stt-generate crate, so no CARGO_BIN_EXE_ is \
-             available here). Run `cargo test --workspace` to include it."
+            "SKIPPED stt_generate_subcommands_are_documented: no \
+             target/<profile>/stt-generate (it lives in its own workspace at \
+             tools/stt-generate, so no CARGO_BIN_EXE_ is available here and no \
+             root-workspace build produces it). Build it there and copy the \
+             binary into the root target dir to include it."
         );
         return;
     };
@@ -538,9 +555,10 @@ fn stt_generate_subcommands_are_documented() {
 fn documented_flags_all_exist() {
     let Some(generate) = sibling_binary("stt-generate") else {
         eprintln!(
-            "SKIPPED documented_flags_all_exist: stt-generate is not built, so the \
-             doc's per-dataset flags would read as phantoms. Run `cargo test \
-             --workspace` to include it."
+            "SKIPPED documented_flags_all_exist: no target/<profile>/stt-generate, \
+             so the doc's per-dataset flags would read as phantoms. Build it from \
+             tools/stt-generate and copy the binary into the root target dir to \
+             include it."
         );
         return;
     };

@@ -19,7 +19,8 @@ serde.workspace = true
 # `raw_value`: the bundle profile (`pack::write_bundle`) embeds manifest.json
 # VERBATIM in the `.sttb` header so unpack reproduces it byte-identically.
 serde_json = { workspace = true, features = ["raw_value"] }
-geo.workspace = true
+# `geo-types` only (Point/Coord in the projection + tessellation paths). The
+# full `geo` algorithm crate went with geometry.rs — nothing here calls it.
 geo-types.workspace = true
 earcutr.workspace = true
 zstd = "0.13"
@@ -38,14 +39,6 @@ rayon.workspace = true
 
 # Apache Arrow: tile payloads are Arrow IPC, the archive index is an Arrow table
 arrow = { workspace = true }
-
-# Optional advanced projection support (requires system libproj)
-proj = { version = "0.27", optional = true }
-
-[features]
-# Enable advanced projection support with proj
-# Requires system libproj to be installed
-projection = ["proj"]
 
 [dev-dependencies]
 criterion.workspace = true

@@ -6,7 +6,7 @@ Use the unified `stt-generate` CLI tool to download and process datasets.
 
 ```bash
 # Install the tool
-cargo install --path ../../crates/stt-generate
+cargo install --path ../../tools/stt-generate
 
 # Generate all datasets
 stt-generate all --output-dir ../../examples/showcase/public/data

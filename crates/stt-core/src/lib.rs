@@ -22,7 +22,6 @@ pub mod curve;
 pub mod directory;
 pub mod directory_page;
 pub mod error;
-pub mod geometry;
 pub mod metadata;
 pub mod ordering_sim;
 pub mod pack;

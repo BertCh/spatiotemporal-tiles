@@ -83,6 +83,12 @@ def hour_url_and_path(dt: datetime, cache: Path) -> tuple[str, Path]:
     return url, path
 
 
+# Give-up reasons from `fetch_hour`, drained by `prefetch_year`. A missing hour
+# is silently "dry" downstream, so a dead endpoint would otherwise build a
+# rain-free year that looks like a legitimate result.
+_FETCH_ERRORS: list[str] = []
+
+
 def fetch_hour(dt: datetime, cache: Path, retries: int = 3) -> Path | None:
     url, path = hour_url_and_path(dt, cache)
     if path.exists() and path.stat().st_size > 0:
@@ -96,8 +102,12 @@ def fetch_hour(dt: datetime, cache: Path, retries: int = 3) -> Path | None:
             tmp.write_bytes(data)
             tmp.rename(path)
             return path
-        except Exception:
+        except Exception as e:
             if attempt == retries - 1:
+                # Not printed here: a whole-year prefetch would emit 8760 lines
+                # if the endpoint were down. `prefetch_year` tallies the misses
+                # instead — see the failure summary there.
+                _FETCH_ERRORS.append(f"{path.name}: {e}")
                 return None  # missing hour → treated as dry in aggregation
     return None
 
@@ -106,12 +116,17 @@ def prefetch_year(year: int, cache: Path, workers: int) -> None:
     start = datetime(year, 1, 1, tzinfo=timezone.utc)
     hours = [start + timedelta(hours=h) for h in range(365 * 24)]
     done = 0
+    _FETCH_ERRORS.clear()
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(fetch_hour, dt, cache): dt for dt in hours}
         for f in as_completed(futs):
             done += 1
             if done % 500 == 0 or done == len(hours):
                 print(f"  fetched {done}/{len(hours)} hourly files")
+    if _FETCH_ERRORS:
+        print(f"  WARNING: {len(_FETCH_ERRORS)}/{len(hours)} hourly files could "
+              f"not be fetched — those hours aggregate as DRY, not as an error. "
+              f"First: {_FETCH_ERRORS[0]}")
 
 
 def load_window_sum(

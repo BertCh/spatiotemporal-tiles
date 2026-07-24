@@ -107,9 +107,6 @@ optimize = ["dep:stt-optimize"]
 # Database input sources for the build library/CLI.
 postgres = ["build", "stt-build/postgres"]
 duckdb = ["build", "stt-build/duckdb"]
-# Advanced projection support (requires system libproj) — never a default,
-# never in prebuilt binaries, never on docs.rs.
-projection = ["stt-core/projection", "stt-build?/projection"]
 
 # --- CLI binaries -----------------------------------------------------------
 # Shared bin plumbing; not useful on its own.
@@ -155,7 +152,6 @@ cli = ["build-cli", "optimize-cli", "validate-cli", "bundle-cli", "serve"]
 tempfile = "3.10"
 
 # Prebuilt binaries (cargo-dist): all four CLIs, both stt-serve backends.
-# `projection` (system libproj) stays out of dist builds by design.
 [package.metadata.dist]
 features = ["cli"]
 

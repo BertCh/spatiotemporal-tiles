@@ -96,8 +96,10 @@ def fetch_day(day: datetime, cache: Path, retries: int = 3) -> Path | None:
             tmp.write_bytes(data)
             tmp.rename(path)
             return path
-        except Exception:
+        except Exception as e:
             if attempt == retries - 1:
+                print(f"  WARNING: CODSUS {day:%Y-%m-%d} failed after {retries} "
+                      f"tries ({e}) — that day has no fronts, not an error")
                 return None
     return None
 

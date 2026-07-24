@@ -1589,15 +1589,17 @@ fn build_tile(
 }
 
 /// Estimated uncompressed payload bytes for one tile feature (geometry + props).
-/// Mirrors `budget.rs`'s 16-bytes-per-coordinate-pair + per-property estimate so
-/// the byte cap is comparable to `TileBudget::estimate_size`.
+/// 16 bytes per coordinate pair + 16 per property + 32 of metadata overhead —
+/// the same arithmetic the byte cap in `stt_core::budget` is calibrated against,
+/// so the two stay comparable.
 fn tile_feature_size(f: &TileFeature) -> usize {
     let (verts, props) = tile_feature_signals(f);
     verts * 16 + props * 16 + 32
 }
 
-/// `(vertex_count, property_count)` signals the budget's importance scorer
-/// needs, extracted without building an `stt_core::tile::Feature`.
+/// `(vertex_count, property_count)` signals `TileBudget::score_signals` needs,
+/// read straight off the columnar `TileFeature` — no owned feature struct is
+/// ever materialised on the build path.
 fn tile_feature_signals(f: &TileFeature) -> (usize, usize) {
     match f {
         TileFeature::Original(o) => {

@@ -1311,8 +1311,8 @@ fn signed_ring_area(ring: &[Vec<f64>]) -> f64 {
 /// exactly one seam strictly inside its span. The caller dead-letters + counts
 /// these (`antimeridian_fallbacks`); expected 0 on real data.
 ///
-/// SIMPLIFY ORDERING (why `stt_core::geometry::simplify_polygon` is NOT wired):
-/// a simplification pass MUST run AFTER this split AND after the per-tile clip,
+/// SIMPLIFY ORDERING (why no simplification happens here): a simplification
+/// pass (`crate::simplify`) MUST run AFTER this split AND after the per-tile clip,
 /// and only BELOW the max tiled zoom (the max-zoom tier stays lossless).
 /// Simplifying a ring before splitting would move vertices off the seam and
 /// destroy the bit-identical watertight cut this function depends on.
