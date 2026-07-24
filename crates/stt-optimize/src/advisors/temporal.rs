@@ -148,7 +148,11 @@ fn advise_adaptive_temporal(result: &AnalysisResult) -> Option<Advice> {
 
     let n = round_nice(median as f64 * 4.0).clamp(ADAPTIVE_N_MIN, ADAPTIVE_N_MAX);
     let epd = &result.temporal.events_per_day;
-    let cov = if epd.avg > 0.0 { epd.std_dev / epd.avg } else { 0.0 };
+    let cov = if epd.avg > 0.0 {
+        epd.std_dev / epd.avg
+    } else {
+        0.0
+    };
     let confidence = if skew >= ADAPTIVE_SKEW_CONFIDENT {
         AdviceConfidence::Medium
     } else {
@@ -230,6 +234,8 @@ mod tests {
             avg_features_per_tile: median as f64 * 1.5,
             median_features_per_tile: median,
             max_features_per_tile: max,
+            p95_features_per_tile: max,
+            top1pct_feature_share: 0.0,
             oversized_tiles: 0,
             undersized_tiles: 0,
             estimated_size_uncompressed: 0,
@@ -391,7 +397,11 @@ mod tests {
         );
 
         let advice = advise(&result, &empty_data()).unwrap();
-        assert_eq!(advice.len(), 1, "expected only --adaptive-temporal: {advice:?}");
+        assert_eq!(
+            advice.len(),
+            1,
+            "expected only --adaptive-temporal: {advice:?}"
+        );
         let adaptive = &advice[0];
         assert_eq!(adaptive.flag, "--adaptive-temporal");
         assert!(!adaptive.lossy, "adaptive rebucketing drops no data");

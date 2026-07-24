@@ -138,6 +138,15 @@ These produce GeoParquet for `stt-build` outside the Rust generators:
   (**non-commercial, no redistribution**) at waymo.com/open, then `gcloud auth
 login`. Needs the `venv-waymo` python (`pyarrow numpy shapely pandas`) + a
   release `stt-build`. Run `bash waymo_batch.sh` (`FORCE=1` to rebuild).
+- `cosmos_drive_dreams.py` - the World Model Scenario Explorer bundle (`/worlds`):
+  ~300 NVIDIA Cosmos-Drive-Dreams clips on one synthetic grid, four combined
+  cross-scenario archives + `worlds.json` + the generated MP4s (see
+  [docs/roadmap/cosmos-drive-dreams.md](../../docs/roadmap/cosmos-drive-dreams.md)).
+  CC BY 4.0, no login. Phased and resumable — `--phases index,videos,select,download,transform,build,sidecar,cleanup`,
+  each phase marked done in `--cache-dir`. The `videos` phase STREAMS one part of
+  the split generated-video tar and keeps only the MP4s it wants, so the 40 GB
+  part is never stored. Uses the shared `venv` (plus `huggingface_hub` +
+  `requests`); `ffmpeg` optional for the `--reencode-crf` web-shrink pass.
 
 ### Python virtualenvs
 

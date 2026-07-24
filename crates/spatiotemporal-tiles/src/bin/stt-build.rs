@@ -251,6 +251,15 @@ struct Args {
     #[arg(long, default_value = "14")]
     simplify_max_zoom: u8,
 
+    /// Simplify with a latitude-corrected METRIC tolerance instead of the fixed
+    /// per-zoom degree table. The longitude axis is scaled by cos(latitude)
+    /// before simplifying, so a given zoom's tolerance means the same GROUND
+    /// distance at every latitude (a fixed degree tolerance is up to ~2× coarser
+    /// in E–W terms at 60° than at the equator). Opt-in — without it, builds are
+    /// byte-identical to before. Requires `--simplify`.
+    #[arg(long)]
+    simplify_metric: bool,
+
     /// Use time-aware TD-TR (Synchronized Euclidean Distance) simplification
     /// instead of plain spatial Visvalingam. Preserves per-vertex timing so
     /// zoomed-out trajectory playback keeps moving objects in the right place at
@@ -698,17 +707,15 @@ impl InputSource {
                 )
             }
             #[cfg(feature = "duckdb")]
-            InputSource::DuckDb { db_path, spec } => {
-                stt_build::duckdb_input::load_features_duckdb(
-                    db_path,
-                    spec,
-                    time_field,
-                    end_time_field,
-                    time_format,
-                    time_strictness,
-                    geometry_strictness,
-                )
-            }
+            InputSource::DuckDb { db_path, spec } => stt_build::duckdb_input::load_features_duckdb(
+                db_path,
+                spec,
+                time_field,
+                end_time_field,
+                time_format,
+                time_strictness,
+                geometry_strictness,
+            ),
         }
     }
 }
@@ -724,8 +731,7 @@ fn resolve_source(args: &Args) -> Result<InputSource> {
     // `--table`/`--sql` with no explicit backend default to PostGIS (which can
     // take its connection from STT_POSTGRES_URL / DATABASE_URL), preserving the
     // prior behaviour; DuckDB always needs an explicit `--duckdb <PATH|:memory:>`.
-    let wants_db =
-        wants_postgres || wants_duckdb || args.table.is_some() || args.sql.is_some();
+    let wants_db = wants_postgres || wants_duckdb || args.table.is_some() || args.sql.is_some();
     if wants_db {
         if args.input.is_some() {
             anyhow::bail!(
@@ -771,9 +777,7 @@ fn resolve_source(args: &Args) -> Result<InputSource> {
     })?;
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     if !matches!(ext.to_lowercase().as_str(), "parquet" | "geoparquet") {
-        anyhow::bail!(
-            "Input must be a GeoParquet file (.parquet or .geoparquet), got: .{ext}"
-        );
+        anyhow::bail!("Input must be a GeoParquet file (.parquet or .geoparquet), got: .{ext}");
     }
     Ok(InputSource::File(path))
 }
@@ -785,7 +789,10 @@ fn resolve_duckdb_source(args: &Args) -> Result<InputSource> {
     use stt_build::duckdb_input::{QuerySource, QuerySpec};
     // `wants_duckdb` gates this call, so `--duckdb` is Some; empty / ":memory:"
     // both mean an in-memory database (for scanning files via `--sql`).
-    let db_path = args.duckdb.clone().unwrap_or_else(|| ":memory:".to_string());
+    let db_path = args
+        .duckdb
+        .clone()
+        .unwrap_or_else(|| ":memory:".to_string());
     let source = match (&args.table, &args.sql) {
         (Some(_), Some(_)) => anyhow::bail!("--table and --sql are mutually exclusive"),
         (Some(t), None) => QuerySource::Table(t.clone()),
@@ -838,8 +845,8 @@ fn resolve_postgres_source(args: &Args) -> Result<InputSource> {
 
 fn main() -> Result<()> {
     let matches = Args::command().get_matches();
-    let mut args = Args::from_arg_matches(&matches)
-        .context("failed to parse stt-build arguments")?;
+    let mut args =
+        Args::from_arg_matches(&matches).context("failed to parse stt-build arguments")?;
 
     // Initialize logging
     let subscriber = tracing_subscriber::fmt()
@@ -925,10 +932,7 @@ fn main() -> Result<()> {
         };
 
     // Pack target size (MiB -> bytes). Never 0.
-    let pack_target_bytes = args
-        .pack_size
-        .saturating_mul(1024 * 1024)
-        .max(1);
+    let pack_target_bytes = args.pack_size.saturating_mul(1024 * 1024).max(1);
 
     let time_strictness = if args.strict_times {
         input::InputStrictness::Strict
@@ -978,10 +982,16 @@ fn main() -> Result<()> {
 
     // Parse temporal bucket size
     let temporal_bucket_ms = parse_duration(&args.temporal_bucket)?;
-    info!("Temporal bucket size: {} ms ({}))", temporal_bucket_ms, args.temporal_bucket);
+    info!(
+        "Temporal bucket size: {} ms ({}))",
+        temporal_bucket_ms, args.temporal_bucket
+    );
 
     if !args.no_clip {
-        info!("Trajectory clipping enabled (min {} vertices)", args.clip_min_vertices);
+        info!(
+            "Trajectory clipping enabled (min {} vertices)",
+            args.clip_min_vertices
+        );
     } else {
         info!("Trajectory clipping disabled (--no-clip)");
     }
@@ -1049,6 +1059,7 @@ fn main() -> Result<()> {
         clip_min_vertices: args.clip_min_vertices,
         simplify: args.simplify,
         simplify_max_zoom: args.simplify_max_zoom,
+        simplify_metric: args.simplify_metric,
         pre_tessellate: args.pre_tessellate,
         temporal_lod: temporal_lod.clone(),
         min_features_per_tile: args.min_features_per_tile,
@@ -1086,7 +1097,10 @@ fn main() -> Result<()> {
     } else {
         let caps = encoder_settings.required_capabilities();
         if !caps.is_empty() {
-            info!("Manifest capabilities (required-to-understand): {}", caps.join(", "));
+            info!(
+                "Manifest capabilities (required-to-understand): {}",
+                caps.join(", ")
+            );
         }
         caps
     };
@@ -1178,12 +1192,8 @@ fn main() -> Result<()> {
     } else if args.streaming {
         // Streaming mode: write tiles as each zoom level completes
         info!("Using streaming mode (lower memory usage)...");
-        let stats = tiler::generate_tiles_streaming(
-            &features,
-            &tile_config,
-            &mut writer,
-            args.workers,
-        )?;
+        let stats =
+            tiler::generate_tiles_streaming(&features, &tile_config, &mut writer, args.workers)?;
         info!(
             "Generated {} tiles ({} clipped segments, {} original features)",
             stats.total_tiles, stats.clipped_segments, stats.original_features
@@ -1244,9 +1254,7 @@ fn main() -> Result<()> {
             .summary_max_zoom
             .unwrap_or_else(|| (args.min_zoom + 4).min(args.max_zoom));
         if sm_min > sm_max {
-            anyhow::bail!(
-                "--summary-min-zoom ({sm_min}) > --summary-max-zoom ({sm_max})"
-            );
+            anyhow::bail!("--summary-min-zoom ({sm_min}) > --summary-max-zoom ({sm_max})");
         }
         let mut cols = summary::parse_summary_columns(&args.summary_columns)?;
         // Guarantee a count aggregate is recorded in the metadata even if
@@ -1354,6 +1362,15 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| "(none)".to_string()),
         );
         metadata = metadata.with_style_hints(hints);
+    }
+
+    // Record the DISTINCT source-feature count (pre-placement) so downstream
+    // "N features" badges don't have to sum the index-weighted per-tile total,
+    // which double-counts every feature that spans tiles / pyramid levels.
+    // Only for v2+: the frozen v1 kill-switch manifest must stay byte-identical
+    // to the 0.3.x golden, and this field is `skip_serializing_if = None`.
+    if args.format_version != stt_core::pack::PACKED_FORMAT_VERSION_V1 {
+        metadata.distinct_feature_count = Some(features.len() as u64);
     }
 
     let manifest = writer.finalize(&metadata)?;
@@ -1469,8 +1486,7 @@ fn compute_heatmap_domain(
         }
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let min = values[0];
-        let idx = ((values.len() as f64 * 0.95).floor() as usize)
-            .min(values.len() - 1);
+        let idx = ((values.len() as f64 * 0.95).floor() as usize).min(values.len() - 1);
         let max = values[idx];
         (min, max)
     }
@@ -1549,12 +1565,10 @@ fn apply_auto_recommendations(matches: &ArgMatches, args: &mut Args, mode: AutoM
         time_field: args.time_field.clone(),
         time_format: args.time_format.as_str().to_string(),
     };
-    let rec = stt_optimize::recommend_for(&source)
-        .context("stt-optimize analyzer failed")?;
+    let rec = stt_optimize::recommend_for(&source).context("stt-optimize analyzer failed")?;
 
-    let user_set = |name: &str| {
-        matches!(matches.value_source(name), Some(ValueSource::CommandLine))
-    };
+    let user_set =
+        |name: &str| matches!(matches.value_source(name), Some(ValueSource::CommandLine));
 
     if !user_set("min_zoom") {
         info!("  min-zoom: {} (auto)", rec.min_zoom);
@@ -1567,10 +1581,7 @@ fn apply_auto_recommendations(matches: &ArgMatches, args: &mut Args, mode: AutoM
     // rec.compression is NOT folded in: the packed format is zstd-only, so
     // an analyzer recommendation of gzip/none would just fail validation.
     if !user_set("temporal_bucket") && rec.temporal_bucket_ms > 0 {
-        info!(
-            "  temporal-bucket: {} (auto)",
-            rec.temporal_bucket_human
-        );
+        info!("  temporal-bucket: {} (auto)", rec.temporal_bucket_human);
         // Fold in the ms form: the human string ("30 days") is for logs only
         // and is not always `parse_duration`-compatible.
         args.temporal_bucket = format!("{}ms", rec.temporal_bucket_ms);
@@ -1601,7 +1612,9 @@ fn apply_auto_recommendations(matches: &ArgMatches, args: &mut Args, mode: AutoM
             continue;
         }
         if mode != AutoMode::Encode {
-            info!("  suggested, not applied (--auto encode applies byte-level levers): {suggestion}");
+            info!(
+                "  suggested, not applied (--auto encode applies byte-level levers): {suggestion}"
+            );
             continue;
         }
         match advice.flag.as_str() {
@@ -1643,7 +1656,10 @@ fn apply_auto_recommendations(matches: &ArgMatches, args: &mut Args, mode: AutoM
             // Semantic levers (--temporal-lod, --adaptive-temporal,
             // --summary-tier, --min-zoom-field, …) change what the archive
             // MEANS, not just its bytes — never auto-applied.
-            _ => info!("  suggested, not applied (semantic lever): {suggestion} — {}", advice.why),
+            _ => info!(
+                "  suggested, not applied (semantic lever): {suggestion} — {}",
+                advice.why
+            ),
         }
     }
     if mode == AutoMode::Encode {
@@ -1752,12 +1768,7 @@ fn build_attribute_filter(args: &Args) -> Result<stt_build::columnar::AttributeF
         }
     }
 
-    build_options::build_attribute_filter(
-        &args.exclude,
-        &args.include,
-        args.exclude_all,
-        &required,
-    )
+    build_options::build_attribute_filter(&args.exclude, &args.include, args.exclude_all, &required)
 }
 
 #[cfg(test)]
@@ -1846,12 +1857,7 @@ mod tests {
     #[test]
     fn filter_guards_summary_source_column() {
         // An --include that omits a summary source column must error.
-        let args = args_from(&[
-            "--summary-columns",
-            "depth:mean",
-            "--include",
-            "speed",
-        ]);
+        let args = args_from(&["--summary-columns", "depth:mean", "--include", "speed"]);
         let err = build_attribute_filter(&args).unwrap_err().to_string();
         assert!(err.contains("depth"), "got: {err}");
     }
@@ -1869,25 +1875,40 @@ mod tests {
 
     #[test]
     fn resolve_source_rejects_input_plus_database() {
-        let err = resolve_source(&args_src(&["--input", "x.parquet", "--duckdb", "d", "--table", "t"]))
-            .err()
-            .expect("input + duckdb should conflict")
-            .to_string();
+        let err = resolve_source(&args_src(&[
+            "--input",
+            "x.parquet",
+            "--duckdb",
+            "d",
+            "--table",
+            "t",
+        ]))
+        .err()
+        .expect("input + duckdb should conflict")
+        .to_string();
         assert!(err.contains("not both"), "got: {err}");
     }
 
     #[test]
     fn resolve_source_rejects_postgres_plus_duckdb() {
-        let err = resolve_source(&args_src(&["--postgres", "postgresql://x", "--duckdb", "d", "--table", "t"]))
-            .err()
-            .expect("postgres + duckdb should conflict")
-            .to_string();
+        let err = resolve_source(&args_src(&[
+            "--postgres",
+            "postgresql://x",
+            "--duckdb",
+            "d",
+            "--table",
+            "t",
+        ]))
+        .err()
+        .expect("postgres + duckdb should conflict")
+        .to_string();
         assert!(err.contains("mutually exclusive"), "got: {err}");
     }
 
     #[test]
     fn resolve_source_file_input_ok() {
-        let src = resolve_source(&args_src(&["--input", "x.parquet"])).expect("file input resolves");
+        let src =
+            resolve_source(&args_src(&["--input", "x.parquet"])).expect("file input resolves");
         assert!(matches!(src, InputSource::File(_)));
     }
 
@@ -1914,7 +1935,10 @@ mod tests {
 
     #[test]
     fn auto_encode_parses_to_encode() {
-        assert_eq!(args_from(&["--auto", "encode"]).auto, Some(AutoMode::Encode));
+        assert_eq!(
+            args_from(&["--auto", "encode"]).auto,
+            Some(AutoMode::Encode)
+        );
         // `--auto=encode` (require_equals is false, but `=` still works).
         assert_eq!(args_from(&["--auto=encode"]).auto, Some(AutoMode::Encode));
     }
@@ -1934,7 +1958,15 @@ mod tests {
 
     #[test]
     fn auto_rejects_unknown_mode() {
-        let argv = vec!["stt-build", "-i", "in.parquet", "-o", "out", "--auto", "bogus"];
+        let argv = vec![
+            "stt-build",
+            "-i",
+            "in.parquet",
+            "-o",
+            "out",
+            "--auto",
+            "bogus",
+        ];
         assert!(Args::try_parse_from(argv).is_err());
     }
 
@@ -1949,9 +1981,14 @@ mod tests {
             "/../../docs/api/cli-reference.md"
         ))
         .expect("read docs/api/cli-reference.md");
-        let start = doc.find("## `stt-build`").expect("stt-build section heading");
+        let start = doc
+            .find("## `stt-build`")
+            .expect("stt-build section heading");
         let body = &doc[start + 1..];
-        let end = body.find("\n## `").map(|i| start + 1 + i).unwrap_or(doc.len());
+        let end = body
+            .find("\n## `")
+            .map(|i| start + 1 + i)
+            .unwrap_or(doc.len());
         let section = &doc[start..end];
         let missing: Vec<String> = Args::command()
             .get_arguments()

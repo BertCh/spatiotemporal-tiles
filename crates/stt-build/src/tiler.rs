@@ -135,6 +135,12 @@ pub struct TileConfig {
     /// important for temporal LOD so zoomed-out playback keeps moving objects
     /// in the right place at the right time.
     pub time_aware_simplify: bool,
+    /// Use a latitude-corrected **metric** simplification tolerance instead of
+    /// the legacy fixed per-zoom degree table (see [`ClipConfig::simplify_metric`]).
+    /// Opt-in (default `false`) so existing builds stay byte-identical; a fixed
+    /// degree tolerance over-keeps/over-drops detail by up to the cos(latitude)
+    /// factor across a global dataset, which this corrects.
+    pub simplify_metric: bool,
     /// When set, replaces fixed `temporal_bucket_ms` chunking with adaptive
     /// windows of ~this many features each: dense periods get fine time windows,
     /// sparse periods coarse ones (the tippecanoe `--maximum-tile-features`
@@ -190,6 +196,7 @@ impl Default for TileConfig {
             clip_min_vertices: 2,
             simplify: false,
             simplify_max_zoom: 14,
+            simplify_metric: false,
             pre_tessellate: false,
             temporal_lod: Vec::new(),
             min_features_per_tile: 1,
@@ -680,6 +687,7 @@ fn clip_config_from(config: &TileConfig) -> ClipConfig {
         simplify: config.simplify,
         simplify_max_zoom: config.simplify_max_zoom,
         time_aware_simplify: config.time_aware_simplify,
+        simplify_metric: config.simplify_metric,
     }
 }
 
@@ -908,10 +916,11 @@ fn place_polygon<'a>(
                 // AFTER the clip. No-op above the gate (max tier stays lossless).
                 if simplify_here {
                     for rings in polys.iter_mut() {
-                        *rings = crate::simplify::simplify_polygon_rings_for_zoom(
+                        *rings = crate::simplify::simplify_polygon_rings_for_zoom_with(
                             rings,
                             zoom,
                             clip_config.simplify_max_zoom,
+                            clip_config.simplify_metric,
                         );
                     }
                 }
@@ -2598,6 +2607,7 @@ mod tests {
             simplify: true,
             time_aware_simplify: true,
             simplify_max_zoom: 14,
+            simplify_metric: false,
             ..TileConfig::default()
         };
         let tiles = generate_tiles(&[feat], &config, 1).unwrap();
@@ -3181,8 +3191,11 @@ mod tests {
         let west_col = projection::lonlat_to_tile(178.0, 15.0, z).unwrap().0;
         let east_col = projection::lonlat_to_tile(-178.0, 15.0, z).unwrap().0;
         let mid_col = projection::lonlat_to_tile(0.0, 15.0, z).unwrap().0;
-        let cols: std::collections::BTreeSet<u32> =
-            tiles.iter().filter(|t| t.id.z == z).map(|t| t.id.x).collect();
+        let cols: std::collections::BTreeSet<u32> = tiles
+            .iter()
+            .filter(|t| t.id.z == z)
+            .map(|t| t.id.x)
+            .collect();
         assert!(
             west_col != east_col,
             "test setup: hemispheres must differ in column"
@@ -3204,7 +3217,8 @@ mod tests {
         // (Sutherland–Hodgman preserves winding).
         for tile in &tiles {
             for layer in &tile.layers {
-                let stt_core::arrow_tile::GeometryColumn::Polygon(features) = &layer.geometry else {
+                let stt_core::arrow_tile::GeometryColumn::Polygon(features) = &layer.geometry
+                else {
                     panic!("expected polygon geometry");
                 };
                 for rings in features {
@@ -3295,8 +3309,11 @@ mod tests {
         let west_col = projection::lonlat_to_tile(178.0, 15.0, z).unwrap().0;
         let east_col = projection::lonlat_to_tile(-178.0, 15.0, z).unwrap().0;
         let mid_col = projection::lonlat_to_tile(0.0, 15.0, z).unwrap().0;
-        let cols: std::collections::BTreeSet<u32> =
-            tiles.iter().filter(|t| t.id.z == z).map(|t| t.id.x).collect();
+        let cols: std::collections::BTreeSet<u32> = tiles
+            .iter()
+            .filter(|t| t.id.z == z)
+            .map(|t| t.id.x)
+            .collect();
         // The crossing part still splits to BOTH dateline edges …
         assert!(
             cols.contains(&west_col) && cols.contains(&east_col),
@@ -3355,7 +3372,12 @@ mod tests {
         n
     }
 
-    fn poly_config(min_zoom: u8, max_zoom: u8, simplify: bool, simplify_max_zoom: u8) -> TileConfig {
+    fn poly_config(
+        min_zoom: u8,
+        max_zoom: u8,
+        simplify: bool,
+        simplify_max_zoom: u8,
+    ) -> TileConfig {
         TileConfig {
             min_zoom,
             max_zoom,
@@ -3489,8 +3511,11 @@ mod tests {
         let z = 6u8;
         let west_col = projection::lonlat_to_tile(178.0, 15.0, z).unwrap().0;
         let east_col = projection::lonlat_to_tile(-178.0, 15.0, z).unwrap().0;
-        let cols: std::collections::BTreeSet<u32> =
-            tiles.iter().filter(|t| t.id.z == z).map(|t| t.id.x).collect();
+        let cols: std::collections::BTreeSet<u32> = tiles
+            .iter()
+            .filter(|t| t.id.z == z)
+            .map(|t| t.id.x)
+            .collect();
         assert!(
             cols.contains(&west_col) && cols.contains(&east_col),
             "split must reach both dateline columns even with simplify on"

@@ -83,9 +83,7 @@ impl SummaryTier {
         self.cell_resolution_per_zoom
             .get(idx)
             .copied()
-            .unwrap_or_else(|| {
-                *self.cell_resolution_per_zoom.last().unwrap()
-            })
+            .unwrap_or_else(|| *self.cell_resolution_per_zoom.last().unwrap())
     }
 }
 
@@ -240,6 +238,15 @@ pub struct Metadata {
     /// stt-validate's `feature_count_index`; derived from the directory at
     /// write time for packed manifests.
     pub feature_count: u64,
+    /// Count of DISTINCT source features (before tile placement, clipping and
+    /// pyramid/LOD replication). Set by the builder from the ingested feature
+    /// set; unlike [`Self::feature_count`] it does NOT double-count a feature
+    /// that spans several tiles, so it is the correct number for a user-facing
+    /// "N features" total. `None` for archives written before this field
+    /// existed (and for v1 kill-switch builds) — consumers fall back to the
+    /// index-weighted `feature_count` then, ideally labelling it as such.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinct_feature_count: Option<u64>,
     /// Layer names
     pub layers: Vec<String>,
     /// Custom properties. A `BTreeMap` so the serialized JSON key order is
@@ -293,6 +300,7 @@ impl Default for Metadata {
             max_zoom: 14,
             tile_count: 0,
             feature_count: 0,
+            distinct_feature_count: None,
             layers: vec!["default".to_string()],
             properties: BTreeMap::new(),
             temporal_bucket_ms: 3600 * 1000, // 1 hour default
@@ -359,7 +367,11 @@ impl Metadata {
     /// when re-bucketing features into LOD aggregates.
     pub fn with_temporal_lod(mut self, levels: Vec<TemporalLodLevel>) -> Result<Self> {
         validate_temporal_lod(self.temporal_bucket_ms, &levels)?;
-        self.temporal_lod = if levels.is_empty() { None } else { Some(levels) };
+        self.temporal_lod = if levels.is_empty() {
+            None
+        } else {
+            Some(levels)
+        };
         Ok(self)
     }
 
@@ -567,7 +579,10 @@ mod tests {
         assert_eq!(decoded.min_zoom, 2);
         assert_eq!(decoded.max_zoom, 12);
         assert_eq!(decoded.temporal_bucket_ms, 3_600_000);
-        assert_eq!(decoded.properties.get("source").map(String::as_str), Some("unit-test"));
+        assert_eq!(
+            decoded.properties.get("source").map(String::as_str),
+            Some("unit-test")
+        );
     }
 
     #[test]
@@ -633,8 +648,14 @@ mod tests {
         assert_eq!(dt.max_zoom, 6);
 
         let json = String::from_utf8(bytes).unwrap();
-        assert!(json.contains("quadbin"), "scheme serializes lowercase: {json}");
-        assert!(json.contains("sub_buckets"), "sub_buckets is a manifest field: {json}");
+        assert!(
+            json.contains("quadbin"),
+            "scheme serializes lowercase: {json}"
+        );
+        assert!(
+            json.contains("sub_buckets"),
+            "sub_buckets is a manifest field: {json}"
+        );
     }
 
     #[test]
@@ -667,7 +688,10 @@ mod tests {
         let dt = m.summary_tier.expect("summary tier present");
         assert_eq!(dt.scheme, SummaryScheme::H3);
         assert_eq!(dt.sub_buckets, 1, "absent sub_buckets defaults to 1");
-        assert_eq!(dt.layer_name, "summary", "absent layer_name defaults to 'summary'");
+        assert_eq!(
+            dt.layer_name, "summary",
+            "absent layer_name defaults to 'summary'"
+        );
     }
 
     #[test]
@@ -773,9 +797,15 @@ mod tests {
         assert_eq!(cat["name"], "category");
         assert_eq!(cat["cardinality"], 7);
         let cat_keys: Vec<&String> = cat.as_object().unwrap().keys().collect();
-        assert_eq!(cat_keys.len(), 2, "categorical carries only name+cardinality: {cat_keys:?}");
+        assert_eq!(
+            cat_keys.len(),
+            2,
+            "categorical carries only name+cardinality: {cat_keys:?}"
+        );
         // Numeric entry: no cardinality key.
-        assert!(v["style_hints"]["properties"][0].get("cardinality").is_none());
+        assert!(v["style_hints"]["properties"][0]
+            .get("cardinality")
+            .is_none());
         assert_eq!(v["style_hints"]["suggested_playback_seconds"], 45);
         assert_eq!(v["style_hints"]["layer_hint"], "points");
 
@@ -900,9 +930,12 @@ mod tests {
 
     #[test]
     fn temporal_lod_rejects_non_multiple_bucket() {
-        let res = Metadata::new("bad").with_temporal_bucket_ms(hour()).with_temporal_lod(vec![
-            TemporalLodLevel { bucket_ms: hour() + 7, max_zoom_level: 5 },
-        ]);
+        let res = Metadata::new("bad")
+            .with_temporal_bucket_ms(hour())
+            .with_temporal_lod(vec![TemporalLodLevel {
+                bucket_ms: hour() + 7,
+                max_zoom_level: 5,
+            }]);
         assert!(res.is_err());
     }
 
@@ -910,21 +943,35 @@ mod tests {
     fn temporal_lod_rejects_bucket_smaller_than_or_equal_to_base() {
         let res = Metadata::new("bad")
             .with_temporal_bucket_ms(day())
-            .with_temporal_lod(vec![TemporalLodLevel { bucket_ms: hour(), max_zoom_level: 5 }]);
+            .with_temporal_lod(vec![TemporalLodLevel {
+                bucket_ms: hour(),
+                max_zoom_level: 5,
+            }]);
         assert!(res.is_err());
 
         let res = Metadata::new("bad")
             .with_temporal_bucket_ms(hour())
-            .with_temporal_lod(vec![TemporalLodLevel { bucket_ms: hour(), max_zoom_level: 5 }]);
+            .with_temporal_lod(vec![TemporalLodLevel {
+                bucket_ms: hour(),
+                max_zoom_level: 5,
+            }]);
         assert!(res.is_err());
     }
 
     #[test]
     fn temporal_lod_rejects_unsorted_levels() {
-        let res = Metadata::new("bad").with_temporal_bucket_ms(hour()).with_temporal_lod(vec![
-            TemporalLodLevel { bucket_ms: thirty_days(), max_zoom_level: 4 },
-            TemporalLodLevel { bucket_ms: day(), max_zoom_level: 8 },
-        ]);
+        let res = Metadata::new("bad")
+            .with_temporal_bucket_ms(hour())
+            .with_temporal_lod(vec![
+                TemporalLodLevel {
+                    bucket_ms: thirty_days(),
+                    max_zoom_level: 4,
+                },
+                TemporalLodLevel {
+                    bucket_ms: day(),
+                    max_zoom_level: 8,
+                },
+            ]);
         assert!(res.is_err());
     }
 
@@ -933,8 +980,14 @@ mod tests {
         let m = Metadata::new("lod")
             .with_temporal_bucket_ms(hour())
             .with_temporal_lod(vec![
-                TemporalLodLevel { bucket_ms: day(), max_zoom_level: 8 },
-                TemporalLodLevel { bucket_ms: thirty_days(), max_zoom_level: 4 },
+                TemporalLodLevel {
+                    bucket_ms: day(),
+                    max_zoom_level: 8,
+                },
+                TemporalLodLevel {
+                    bucket_ms: thirty_days(),
+                    max_zoom_level: 4,
+                },
             ])
             .unwrap();
         // Very-zoomed-out: both levels apply, pick the coarser (30d).

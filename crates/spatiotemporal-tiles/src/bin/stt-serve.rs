@@ -211,6 +211,12 @@ struct Args {
     #[arg(long, default_value = "14")]
     simplify_max_zoom: u8,
 
+    /// Simplify with a latitude-corrected METRIC tolerance (cos-latitude scaled)
+    /// instead of the fixed per-zoom degree table. Opt-in; inert without
+    /// `--simplify`.
+    #[arg(long)]
+    simplify_metric: bool,
+
     /// Use time-aware TD-TR (SED) simplification (preserves per-vertex timing).
     #[arg(long)]
     time_aware_simplify: bool,
@@ -1299,6 +1305,7 @@ fn build_config(
         clip_min_vertices: args.clip_min_vertices,
         simplify: args.simplify,
         simplify_max_zoom: args.simplify_max_zoom,
+        simplify_metric: args.simplify_metric,
         pre_tessellate: args.pre_tessellate,
         temporal_lod,
         min_features_per_tile: args.min_features_per_tile,

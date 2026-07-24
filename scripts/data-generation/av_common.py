@@ -210,6 +210,16 @@ MAP_LAYERS: frozenset[str] = frozenset({
     # centerlines read amber so junctions pop.
     "lane_centerline",
     "lane_centerline_intersection",
+    # ── Cosmos-Drive-Dreams (RDS-HQ) map layers ──
+    # Layers with no existing alias in the sets above (Cosmos lanes reuse
+    # "lane_centerline", lanelines "lane_boundary", wait lines "stop_line",
+    # crosswalks "crosswalk"). Traffic lights/signs are the source's 3D cuboids
+    # flattened to footprint polygons (cosmos_drive_dreams.py).
+    "road_boundary",
+    "road_marking",
+    "traffic_light",
+    "traffic_sign",
+    "pole",  # line (vertical in source; near-degenerate in 2D — opt-in emit)
 })
 
 # A generous set of native→canonical aliases covering the nuScenes / Argoverse
@@ -267,6 +277,17 @@ _CATEGORY_ALIASES: dict[str, str] = {
     "mobile_pedestrian_crossing_sign": "barrier",
     "message_board_trailer": "trailer",
     "traffic_light_trailer": "trailer",
+    # ── Cosmos-Drive-Dreams (RDS-HQ ``object_type``) additions ──
+    # Probed real values: Automobile / Heavy_truck; documented set also has
+    # Bus, Train_or_tram_car, Trolley_bus, Other_vehicle, Trailer, Person,
+    # Stroller, Rider, Animal, Protruding_object. ``person``/``stroller``/
+    # ``trailer``/``bus`` already alias above; unlisted classes (animal,
+    # train_or_tram_car, other_vehicle, protruding_object) fall through to
+    # OTHER_CATEGORY by design.
+    "automobile": "car",
+    "heavy_truck": "truck",
+    "trolley_bus": "bus",
+    "rider": "motorcycle",  # a mounted rider reads as a moving two-wheeler
 }
 
 
@@ -752,6 +773,119 @@ def write_ego_trips(
     return table.num_rows
 
 
+def _extra_property_columns(
+    n: int,
+    extra_categorical: Mapping[str, object] | None,
+    extra_numeric: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Build caller-supplied passthrough property columns (cosmos_drive_dreams.py).
+
+    ``extra_categorical`` maps column name → per-row string sequence (or a scalar,
+    broadcast to all ``n`` rows); ``extra_numeric`` likewise for numerics (Int64
+    when the values are integral, else Float64). stt-build passes unknown columns
+    through as feature properties, so these become client-visible props — e.g. a
+    per-feature ``scenario_id`` for picking or ``agent_count`` for GPU DataFilter.
+
+    Categorical values are validated against the storms.rs promotion gotcha: an
+    all-numeric string column is silently promoted to Numeric by stt-build,
+    no-opping categorical color maps — so bare-number strings raise here.
+    """
+    import pyarrow as pa
+
+    cols: dict[str, object] = {}
+    for name, vals in (extra_categorical or {}).items():
+        seq = [vals] * n if isinstance(vals, str) else [str(v) for v in vals]
+        if len(seq) != n:
+            raise ValueError(f"extra_categorical[{name!r}]: length {len(seq)} != {n}")
+        for v in seq[:1] + seq[-1:]:
+            try:
+                float(v)
+            except ValueError:
+                break
+            else:
+                raise ValueError(
+                    f"extra_categorical[{name!r}]: value {v!r} is a bare number — "
+                    "stt-build would promote the column to Numeric (storms.rs gotcha); "
+                    "prefix it (e.g. 'c-...')"
+                )
+        cols[name] = pa.array(seq, type=pa.string())
+    for name, vals in (extra_numeric or {}).items():
+        arr = np.asarray(vals)
+        if arr.ndim == 0:
+            arr = np.full(n, arr[()])
+        if len(arr) != n:
+            raise ValueError(f"extra_numeric[{name!r}]: length {len(arr)} != {n}")
+        if np.issubdtype(arr.dtype, np.integer) or (
+            np.issubdtype(arr.dtype, np.floating) and np.all(arr == np.trunc(arr))
+        ):
+            cols[name] = pa.array(arr.astype("int64"), type=pa.int64())
+        else:
+            cols[name] = pa.array(arr.astype("float64"), type=pa.float64())
+    return cols
+
+
+def write_trips_multi(
+    out_path: Path,
+    trips: Sequence[Mapping[str, object]],
+    *,
+    extra_categorical: Mapping[str, object] | None = None,
+    extra_numeric: Mapping[str, object] | None = None,
+) -> int:
+    """Write a MULTI-track ``ego``-schema trips GeoParquet (cosmos_drive_dreams.py).
+
+    Same per-row contract as ``write_ego_trips`` (one animated LineString with
+    ``timestamp`` / ``end_timestamp`` / ``vertex_timestamps`` / ``vertex_values`` /
+    ``vehicle``), but one row per entry in ``trips`` so a single archive carries
+    many scenarios' ego paths. Each ``trips`` element is a mapping with keys
+    ``lon``, ``lat``, ``vertex_timestamps``, ``vertex_values`` and optional
+    ``vehicle`` (default ``"ego"``). ``extra_*`` add per-trip passthrough property
+    columns (see ``_extra_property_columns``; scalars broadcast). Returns the row
+    count written.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from shapely import wkb
+    from shapely.geometry import LineString
+
+    geoms: list[bytes] = []
+    t_start: list[int] = []
+    t_end: list[int] = []
+    all_vts: list[list[int]] = []
+    all_vvals: list[list[np.float32]] = []
+    vehicles: list[str] = []
+    for i, trip in enumerate(trips):
+        lon = np.asarray(trip["lon"], dtype="float64")
+        lat = np.asarray(trip["lat"], dtype="float64")
+        vts = [int(t) for t in trip["vertex_timestamps"]]
+        vvals = [np.float32(v) for v in trip["vertex_values"]]
+        if not (len(lon) == len(lat) == len(vts) == len(vvals)):
+            raise ValueError(f"trips[{i}]: lon/lat/vertex_timestamps/vertex_values length mismatch")
+        if len(lon) < 2:
+            raise ValueError(f"trips[{i}]: need at least 2 vertices for a LineString")
+        geoms.append(wkb.dumps(LineString(list(zip(lon.tolist(), lat.tolist())))))
+        t_start.append(vts[0])
+        t_end.append(vts[-1])
+        all_vts.append(vts)
+        all_vvals.append(vvals)
+        vehicles.append(str(trip.get("vehicle", "ego")))
+
+    n = len(geoms)
+    cols = {
+        "geometry": pa.array(geoms, type=pa.binary()),
+        "timestamp": pa.array(t_start, type=pa.int64()),
+        "end_timestamp": pa.array(t_end, type=pa.int64()),
+        "vertex_timestamps": pa.array(all_vts, type=pa.list_(pa.int64())),
+        "vertex_values": pa.array(all_vvals, type=pa.list_(pa.float32())),
+        "vehicle": pa.array(vehicles, type=pa.string()),
+    }
+    cols.update(_extra_property_columns(n, extra_categorical, extra_numeric))
+    table = pa.table(cols)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, out_path, compression="snappy")
+    print(f"  wrote {n} trip LineString(s) → {out_path}")
+    return n
+
+
 def write_objects_points(
     out_path: Path,
     *,
@@ -766,6 +900,8 @@ def write_objects_points(
     track_id,
     speed,
     num_interior_pts=None,
+    extra_categorical: Mapping[str, object] | None = None,
+    extra_numeric: Mapping[str, object] | None = None,
 ) -> int:
     """Write the ``objects/`` POINT GeoParquet (av-cockpit.md §2c).
 
@@ -777,7 +913,9 @@ def write_objects_points(
     When ``num_interior_pts`` is given (a per-row array — Argoverse 2 ships the
     LIDAR-point count inside each cuboid), an Int64 ``num_interior_pts`` column
     is written too, for the object inspector / ghost-box filtering. Omitted
-    (``None``) for sources without it. Returns the row count written.
+    (``None``) for sources without it. ``extra_categorical`` / ``extra_numeric``
+    add passthrough property columns (see ``_extra_property_columns``; scalars
+    broadcast). Returns the row count written.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -802,6 +940,7 @@ def write_objects_points(
                 f"objects: num_interior_pts length {len(nip)} != point count {len(lon)}"
             )
         cols["num_interior_pts"] = pa.array(nip, type=pa.int64())
+    cols.update(_extra_property_columns(len(lon), extra_categorical, extra_numeric))
     table = pa.table(cols)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, out_path, compression="snappy")
@@ -818,14 +957,24 @@ def write_objects_points(
 # name (e.g. ``"drivable_area"``, ``"lane_divider"``) — NEVER a bare number — so
 # stt-build keeps it categorical and the renderer colors by ``map_layer`` via the
 # TS ``AV_MAP_COLORS`` palette (see ``MAP_LAYERS`` for the valid layer-name set).
-def write_map_polygons(out_parquet: Path, polys, t_start: int, t_end: int) -> int:
+def write_map_polygons(
+    out_parquet: Path,
+    polys,
+    t_start: int,
+    t_end: int,
+    *,
+    extra_categorical: Mapping[str, object] | None = None,
+    extra_numeric: Mapping[str, object] | None = None,
+) -> int:
     """Write the ``map_poly/`` source GeoParquet (av-cockpit.md §2 R2.2).
 
     ``polys`` is an iterable of ``(polygon, map_layer)`` where ``polygon`` is a
     shapely ``Polygon`` in **lon/lat** degrees and ``map_layer`` is the layer
     name string. Columns: ``geometry`` (WKB Polygon), ``map_layer`` (Utf8
     categorical), ``timestamp`` (Int64 = ``t_start``), ``end_timestamp``
-    (Int64 = ``t_end``). Returns the row count written.
+    (Int64 = ``t_end``). ``extra_*`` add per-row passthrough property columns
+    (see ``_extra_property_columns``; scalars broadcast, sequences must match
+    the polygon count). Returns the row count written.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -837,27 +986,37 @@ def write_map_polygons(out_parquet: Path, polys, t_start: int, t_end: int) -> in
         geoms.append(wkb.dumps(poly))
         layers.append(str(layer))
     n = len(geoms)
-    table = pa.table(
-        {
-            "geometry": pa.array(geoms, type=pa.binary()),
-            "map_layer": pa.array(layers, type=pa.string()),
-            "timestamp": pa.array([int(t_start)] * n, type=pa.int64()),
-            "end_timestamp": pa.array([int(t_end)] * n, type=pa.int64()),
-        }
-    )
+    cols = {
+        "geometry": pa.array(geoms, type=pa.binary()),
+        "map_layer": pa.array(layers, type=pa.string()),
+        "timestamp": pa.array([int(t_start)] * n, type=pa.int64()),
+        "end_timestamp": pa.array([int(t_end)] * n, type=pa.int64()),
+    }
+    cols.update(_extra_property_columns(n, extra_categorical, extra_numeric))
+    table = pa.table(cols)
     out_parquet.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, out_parquet, compression="snappy")
     print(f"  wrote {n} map polygon(s) → {out_parquet}")
     return n
 
 
-def write_map_lines(out_parquet: Path, lines, t_start: int, t_end: int) -> int:
+def write_map_lines(
+    out_parquet: Path,
+    lines,
+    t_start: int,
+    t_end: int,
+    *,
+    extra_categorical: Mapping[str, object] | None = None,
+    extra_numeric: Mapping[str, object] | None = None,
+) -> int:
     """Write the ``map_line/`` source GeoParquet (av-cockpit.md §2 R2.2).
 
     ``lines`` is an iterable of ``(linestring, map_layer)`` where ``linestring``
     is a shapely ``LineString`` in **lon/lat** degrees. Columns: ``geometry``
     (WKB LineString), ``map_layer`` (Utf8 categorical), ``timestamp``
-    (Int64 = ``t_start``), ``end_timestamp`` (Int64 = ``t_end``). Returns the row
+    (Int64 = ``t_start``), ``end_timestamp`` (Int64 = ``t_end``). ``extra_*``
+    add per-row passthrough property columns (see ``_extra_property_columns``;
+    scalars broadcast, sequences must match the line count). Returns the row
     count written.
     """
     import pyarrow as pa
@@ -870,17 +1029,86 @@ def write_map_lines(out_parquet: Path, lines, t_start: int, t_end: int) -> int:
         geoms.append(wkb.dumps(line))
         layers.append(str(layer))
     n = len(geoms)
-    table = pa.table(
-        {
-            "geometry": pa.array(geoms, type=pa.binary()),
-            "map_layer": pa.array(layers, type=pa.string()),
-            "timestamp": pa.array([int(t_start)] * n, type=pa.int64()),
-            "end_timestamp": pa.array([int(t_end)] * n, type=pa.int64()),
-        }
-    )
+    cols = {
+        "geometry": pa.array(geoms, type=pa.binary()),
+        "map_layer": pa.array(layers, type=pa.string()),
+        "timestamp": pa.array([int(t_start)] * n, type=pa.int64()),
+        "end_timestamp": pa.array([int(t_end)] * n, type=pa.int64()),
+    }
+    cols.update(_extra_property_columns(n, extra_categorical, extra_numeric))
+    table = pa.table(cols)
     out_parquet.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, out_parquet, compression="snappy")
     print(f"  wrote {n} map line(s) → {out_parquet}")
+    return n
+
+
+def write_map_points(
+    out_parquet: Path,
+    *,
+    lon,
+    lat,
+    map_layer,
+    home_zoom,
+    t_start: int,
+    t_end: int,
+    extra_numeric: Mapping[str, object] | None = None,
+) -> int:
+    """Write the ``map_points/`` additive-octree LOD overview GeoParquet.
+
+    A decimated POINT sampling of the HD-map lines (see ``sample_map_lod_points``)
+    so a multi-scenario gallery overview can draw a sparse dotted road network
+    instead of streaming the FULL line archive (~100 MB, every feature replicated
+    at every zoom) when a whole scenario is only a few pixels wide. Each point
+    carries a single ``home_zoom`` (Int64) so ``run_stt_build(min_zoom_field=
+    max_zoom_field="home_zoom")`` places it in exactly that zoom's tiles and the
+    client loads the UNION ``minZoom..cameraZoom`` (``lodMode:'additive'``) —
+    coarse zooms are a sparse overview, zoom-in streams only the residual.
+
+    Columns: ``geometry`` (WKB Point, lon/lat degrees), ``map_layer`` (Utf8
+    categorical, colored by the SAME MAP_COLORS ramp as the lines), ``home_zoom``
+    (Int64), ``timestamp`` = ``t_start`` / ``end_timestamp`` = ``t_end`` so every
+    point is valid for the whole replay — a TIMELESS substrate, like the map lines
+    (pair with ``run_stt_build(kind="point", static_full_range=True)`` so it lands
+    in one whole-scene bucket + carries the [start, end] validity). ``extra_numeric``
+    adds per-point passthrough numerics — pass the same FILTER_COLS the lines/trips
+    carry so a GPU DataFilter chip hides the same worlds here that it hides there
+    (a tile MISSING the column falls back to filterValue 0, which silently shows or
+    hides depending on the chip's range — so the overview must carry them). Returns
+    the row count written.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import shapely
+
+    lon = np.asarray(lon, dtype="float64")
+    lat = np.asarray(lat, dtype="float64")
+    n = len(lon)
+    if len(lat) != n:
+        raise ValueError(f"map_points: lon/lat length mismatch ({n} != {len(lat)})")
+    hz = np.asarray(home_zoom, dtype="int64")
+    if len(hz) != n:
+        raise ValueError(f"map_points: home_zoom length {len(hz)} != point count {n}")
+    layers = [str(v) for v in map_layer]
+    if len(layers) != n:
+        raise ValueError(
+            f"map_points: map_layer length {len(layers)} != point count {n}"
+        )
+    # Vectorised WKB (shapely 2.x) — a per-point Python Point() loop is ~10× slower
+    # on the ~10^6 samples a full gallery produces.
+    geoms = shapely.to_wkb(shapely.points(lon, lat))
+    cols = {
+        "geometry": pa.array(list(geoms), type=pa.binary()),
+        "map_layer": pa.array(layers, type=pa.string()),
+        "home_zoom": pa.array(hz, type=pa.int64()),
+        "timestamp": pa.array([int(t_start)] * n, type=pa.int64()),
+        "end_timestamp": pa.array([int(t_end)] * n, type=pa.int64()),
+    }
+    cols.update(_extra_property_columns(n, None, extra_numeric))
+    table = pa.table(cols)
+    out_parquet.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, out_parquet, compression="snappy")
+    print(f"  wrote {n} map LOD point(s) → {out_parquet}")
     return n
 
 
@@ -1957,6 +2185,91 @@ def lod_home_zoom(lon, lat, z, timestamp, *, min_zoom=LOD_MIN_ZOOM,
     return home
 
 
+# ── HD-map additive-octree LOD point overview ────────────────────────────────
+# A multi-scenario gallery (cosmos_drive_dreams.py /worlds) lays hundreds of clips
+# side by side, so its HD-map LINE archive replicates every centerline at every
+# zoom (~100 MB) even though a whole scenario is a few pixels wide from far out —
+# the overview pays for the full network to draw a smudge. This samples the lines
+# to a decimated POINT overview and gives each sample a single home zoom (the same
+# additive-octree idea as lod_home_zoom, curvature OFF since a flat road network
+# has no surface-variation to grade): the client loads a sparse coarse tier at
+# overview (lodMode:'additive') and streams the residual on zoom-in, while the
+# crisp vector lines take over once you fly into a cell.
+MAP_LOD_MIN_ZOOM = 10    # coarsest tier (== the HD-map tileset floor)
+# Finest tier the OVERVIEW keeps. The gallery swaps to the crisp lines one zoom
+# up (MAP_DETAIL_ZOOM=13 on the FE), so the point overview never needs to render
+# past here — points finer than this are pure archive weight the client never
+# loads. Kept spatially-UNIFORM at ~z12 voxel spacing (see the residual drop).
+MAP_LOD_MAX_ZOOM = 12
+# Run the voxel ladder this many levels DEEPER than MAP_LOD_MAX_ZOOM, then discard
+# everything finer. lod_home_zoom dumps every UNCLAIMED point into its top level;
+# capping the ladder at MAX directly would pile the whole residual (~50× the kept
+# set) into the z12 tier and un-sparse it. Running deeper lets the ladder keep
+# claiming one uniform representative per voxel through z12, and we drop the finer
+# claims + the residual — a REDUCED overview tier (the lossless base is map_line,
+# shown on zoom-in), NOT thinning of the base.
+MAP_LOD_LADDER_HEADROOM = 3
+MAP_LOD_SPACING_M = 3.0  # densify each line to this before the voxel decimation
+# Screen-px spacing per point at its home zoom (BIGGER = sparser overview). Tuned
+# larger than the LiDAR default (0.4) because the overview only needs the road
+# SHAPE, not a dense cloud — the crisp lines carry the detail on zoom-in. A pure
+# density knob; visually verify in-browser and retune (the /worlds galaxy look).
+MAP_LOD_PX_PER_POINT = 0.6
+
+
+def sample_map_lod_points(geoms, *, spacing_m=MAP_LOD_SPACING_M,
+                          min_zoom=MAP_LOD_MIN_ZOOM, max_zoom=MAP_LOD_MAX_ZOOM,
+                          ladder_headroom=MAP_LOD_LADDER_HEADROOM,
+                          px_per_point=MAP_LOD_PX_PER_POINT, anchor_lat=0.0):
+    """Sample an additive-octree POINT overview from HD-map LineStrings.
+
+    ``geoms`` is a sequence of shapely ``LineString``s in lon/lat degrees. Each
+    line is densified to ~``spacing_m`` (``shapely.segmentize`` at the ground-metre
+    spacing for ``anchor_lat``) so long sparse-vertex segments don't leave gaps,
+    its vertices are collected, then every sample is assigned ONE ``home_zoom`` via
+    ``lod_home_zoom`` (curvature off → a plain uniform coarse→fine voxel claim over
+    the whole set; a single constant timestamp = one group).
+
+    The ladder runs ``ladder_headroom`` levels past ``max_zoom`` and everything
+    finer than ``max_zoom`` is then DROPPED (see MAP_LOD_LADDER_HEADROOM): the kept
+    set is a spatially-uniform overview capped at the ``max_zoom`` voxel, without
+    the whole residual piling into the top tier. Deterministic (no RNG).
+
+    Returns ``(lon, lat, home_zoom, src)`` numpy arrays where ``src`` indexes the
+    source line each point came from — the caller maps per-line payload
+    (``map_layer``, the FILTER_COLS) through it with ``arr[src]``.
+    """
+    import shapely
+
+    spacing_deg = float(spacing_m) / M_PER_DEG_LAT
+    lon_parts: list = []
+    lat_parts: list = []
+    src_parts: list = []
+    for i, g in enumerate(geoms):
+        if g is None or g.is_empty:
+            continue
+        xy = np.asarray(shapely.segmentize(g, spacing_deg).coords, dtype="float64")
+        if len(xy) == 0:
+            continue
+        lon_parts.append(xy[:, 0])
+        lat_parts.append(xy[:, 1])
+        src_parts.append(np.full(len(xy), i, dtype="int64"))
+    if not lon_parts:
+        empty_f = np.zeros(0, dtype="float64")
+        empty_i = np.zeros(0, dtype="int64")
+        return empty_f, empty_f, empty_i, empty_i
+    lon = np.concatenate(lon_parts)
+    lat = np.concatenate(lat_parts)
+    src = np.concatenate(src_parts)
+    home = lod_home_zoom(
+        lon, lat, np.zeros(len(lon)), np.zeros(len(lon), dtype="int64"),
+        min_zoom=min_zoom, max_zoom=max_zoom + ladder_headroom,
+        px_per_point=px_per_point, curvature=False, anchor_lat=anchor_lat,
+    )
+    keep = home <= max_zoom
+    return lon[keep], lat[keep], home[keep], src[keep]
+
+
 # ── actor denoise (rain / sensor scatter removal) ────────────────────────────
 # The DYNAMIC actors are kept per-sweep (un-deduped) so motion animates, but in a
 # rainy/dusty scene that cloud is full of NOISE: rain returns + spurious hits that
@@ -2766,6 +3079,7 @@ def run_stt_build(
     min_zoom_field: str | None = None,
     max_zoom_field: str | None = None,
     static_full_range: bool = False,
+    blob_ordering: str | None = None,
     publish: bool = True,
 ) -> None:
     """Run ``stt-build`` on one archive's GeoParquet → a packed STT directory.
@@ -2805,6 +3119,13 @@ def run_stt_build(
       coordinate-heavy data). NOTE for meter-scale AV scenes: the grid is square
       in *degrees*, so at mid latitudes ``1.0`` snaps longitude to ~0.75 m
       (visible jitter on a ~4.5 m car) — use ``<= 0.1`` (~7.5 cm) for AV.
+
+    ``blob_ordering`` (when set) is passed straight through as
+    ``--blob-ordering``. PROJECT RULE: multi-cell PLAYBACK archives must pass
+    ``"time-major"`` explicitly — ``auto`` may pick spatial ordering, which
+    silently yields empty buffered time ranges and stalls playback (the
+    rain-flood-2019 gotcha). Leave ``None`` only for static/whole-window
+    archives (HD-map) where playback order is irrelevant.
     """
     valid = ("point", "trips", "map_poly", "map_line", "line")
     if kind not in valid:
@@ -2832,6 +3153,8 @@ def run_stt_build(
     # the caller asks for it, so the default build is unchanged.
     if quantize_coords is not None and quantize_coords > 0:
         cmd += ["--quantize-coords", repr(float(quantize_coords))]
+    if blob_ordering:
+        cmd += ["--blob-ordering", blob_ordering]
     # Opt-in numeric-attribute quantization (e.g. LiDAR ``z`` elevation): store
     # the named Float64 column as fixed-point ints + a per-column affine the
     # reader reconstructs. A raw Float64 ``z`` barely compresses (~38% of a

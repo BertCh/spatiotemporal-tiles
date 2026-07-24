@@ -14,6 +14,7 @@ use anyhow::Result;
 
 use super::{Advice, AdviceConfidence};
 use crate::analysis::density::ZoomDensity;
+use crate::analysis::spatial::SpatialDistribution;
 use crate::analysis::AnalysisResult;
 use crate::loader::{LoadedData, PropValue, SampledFeature};
 
@@ -28,6 +29,19 @@ const SUMMARY_TIER_MIN_FEATURES: usize = 1_000_000;
 /// Average features/tile at the recommended min zoom above which the overview
 /// tier counts as "heavy" for the summary-tier recommendation.
 const SUMMARY_TIER_HEAVY_AVG: f64 = 5_000.0;
+
+/// Share of features in the top 1% of overview cells above which the data is
+/// "hotspot-skewed" enough to warrant a summary tier even when the AVERAGE
+/// overview tile is light — a few dense cells the raw tier can't serve. This is
+/// the Sedona "cluster the partitioner can't balance" signal applied to tiles;
+/// the volume+average rule alone misses it because empty cells drag the average
+/// down.
+const SUMMARY_TIER_SKEW_SHARE: f64 = 0.60;
+
+/// Lower feature-count floor for the skew-triggered summary tier: concentration,
+/// not sheer volume, is the problem there, so it fires well below the
+/// dense-uniform [`SUMMARY_TIER_MIN_FEATURES`] floor.
+const SUMMARY_TIER_SKEW_MIN_FEATURES: usize = 100_000;
 
 /// Share of all features in the single top hotspot above which a per-feature
 /// LOD floor is worth suggesting (the existing density-issue rule).
@@ -117,17 +131,20 @@ fn oversized_tile_advice(result: &AnalysisResult) -> Option<Advice> {
     })
 }
 
-/// Additive `--summary-tier quadbin` for LARGE dense point datasets whose
-/// overview zoom is heavy. Not lossy: summary tiles are carried IN ADDITION
-/// to the raw tier and readers dispatch via `metadata.summaryTier`.
+/// Additive `--summary-tier` for point datasets whose overview zoom can't ship
+/// raw points — either because it is DENSE-UNIFORM (many features, heavy average
+/// tile) or HOTSPOT-SKEWED (a few overview cells hold most of the data, so the
+/// average is light but the peak is unservable; the density model's
+/// `top1pct_feature_share` is the skew signal). Picks hexagonal H3 for tightly
+/// concentrated (Localized) data — equal-area cells aggregate a dense blob more
+/// evenly and avoid Quadbin's axis-aligned blockiness — and the tile-aligned
+/// Quadbin grid otherwise. Not lossy: summary tiles are carried IN ADDITION to
+/// the raw tier and readers dispatch via `metadata.summaryTier`.
 fn summary_tier_advice(result: &AnalysisResult) -> Option<Advice> {
     if !matches!(
         result.geometry.dominant_type.as_str(),
         "Point" | "MultiPoint"
     ) {
-        return None;
-    }
-    if result.feature_count <= SUMMARY_TIER_MIN_FEATURES {
         return None;
     }
     let overview_zoom = result.spatial.recommended_min_zoom;
@@ -136,24 +153,68 @@ fn summary_tier_advice(result: &AnalysisResult) -> Option<Advice> {
         .per_zoom
         .iter()
         .find(|z| z.zoom == overview_zoom)?;
-    if overview.avg_features_per_tile <= SUMMARY_TIER_HEAVY_AVG {
+
+    // (1) Dense-uniform: sheer volume with a heavy average overview tile.
+    let dense_uniform = result.feature_count > SUMMARY_TIER_MIN_FEATURES
+        && overview.avg_features_per_tile > SUMMARY_TIER_HEAVY_AVG;
+    // (2) Hotspot-skewed: the densest 1% of overview cells dominate and their
+    //     peak is oversized, even if the average tile is light — the volume/avg
+    //     rule misses this (empty cells drag the average down).
+    let hotspot_skewed = result.feature_count > SUMMARY_TIER_SKEW_MIN_FEATURES
+        && overview.top1pct_feature_share >= SUMMARY_TIER_SKEW_SHARE
+        && overview.max_features_per_tile > OVERSIZED_TILE_FEATURES;
+    if !dense_uniform && !hotspot_skewed {
         return None;
     }
 
+    let scheme = if matches!(result.spatial.distribution, SpatialDistribution::Localized) {
+        "h3"
+    } else {
+        "quadbin"
+    };
+
+    // Skew-only triggers explain themselves with the concentration numbers; the
+    // dense-uniform message keeps the original average-based phrasing.
+    let (why, projected) = if hotspot_skewed && !dense_uniform {
+        (
+            format!(
+                "{} point features are hotspot-skewed at overview zoom z{}: the densest 1% \
+                 of cells hold {:.0}% of all features (peak {} features/tile) while the \
+                 average tile is light — a summary tier serves aggregate {} cells for the \
+                 hot cells the raw tier can't. Additive, not lossy; readers dispatch via \
+                 metadata.summaryTier",
+                result.feature_count,
+                overview_zoom,
+                overview.top1pct_feature_share * 100.0,
+                overview.max_features_per_tile,
+                scheme,
+            ),
+            format!(
+                "z{} hotspot cells (peak {} pts) ship as {} aggregates instead of raw points",
+                overview_zoom, overview.max_features_per_tile, scheme,
+            ),
+        )
+    } else {
+        (
+            format!(
+                "{} point features average {:.0} features/tile at overview zoom z{} — \
+                 server-aggregated low-zoom cells replace shipping every point at overview \
+                 zooms. Additive, not lossy: raw tiles are unchanged and readers dispatch \
+                 via metadata.summaryTier",
+                result.feature_count, overview.avg_features_per_tile, overview_zoom,
+            ),
+            format!(
+                "z{} tiles carry aggregate cells instead of ~{:.0} raw points each",
+                overview_zoom, overview.avg_features_per_tile
+            ),
+        )
+    };
+
     Some(Advice {
         flag: "--summary-tier".to_string(),
-        value: Some("quadbin".to_string()),
-        why: format!(
-            "{} point features average {:.0} features/tile at overview zoom z{} — \
-             server-aggregated low-zoom cells replace shipping every point at overview \
-             zooms. Additive, not lossy: raw tiles are unchanged and readers dispatch \
-             via metadata.summaryTier",
-            result.feature_count, overview.avg_features_per_tile, overview_zoom,
-        ),
-        projected: Some(format!(
-            "z{} tiles carry aggregate cells instead of ~{:.0} raw points each",
-            overview_zoom, overview.avg_features_per_tile
-        )),
+        value: Some(scheme.to_string()),
+        why,
+        projected: Some(projected),
         lossy: false,
         suggestion_only: false,
         confidence: AdviceConfidence::Medium,
@@ -372,6 +433,8 @@ mod tests {
             avg_features_per_tile: avg,
             median_features_per_tile: avg as usize,
             max_features_per_tile: max,
+            p95_features_per_tile: max,
+            top1pct_feature_share: 0.0,
             oversized_tiles: oversized,
             undersized_tiles: 0,
             estimated_size_uncompressed: features * 150,
@@ -569,6 +632,80 @@ mod tests {
     }
 
     #[test]
+    fn hotspot_skewed_points_yield_h3_summary_tier_below_the_volume_floor() {
+        // 300k points — below the 1M dense-uniform floor — but the densest 1% of
+        // overview cells hold 80% of them with an unservable 50k-feature peak,
+        // and the average overview tile is light. The skew trigger must still
+        // fire, and a Localized distribution selects hexagonal H3.
+        let mut result = result_with(
+            300_000,
+            "Point",
+            4,
+            12,
+            vec![
+                zoom_row(4, 500, 600.0, 50_000, 0),
+                zoom_row(12, 30_000, 10.0, 300, 0),
+            ],
+        );
+        result.spatial.distribution = SpatialDistribution::Localized;
+        // Concentration lives on the overview row (zoom_row defaults it to 0.0).
+        result.density.per_zoom[0].top1pct_feature_share = 0.80;
+
+        let advice = advise(&result, &empty_data()).unwrap();
+        let tier = advice
+            .iter()
+            .find(|a| a.flag == "--summary-tier")
+            .expect("skew-triggered summary tier below the volume floor");
+        assert_eq!(tier.value.as_deref(), Some("h3"), "Localized ⇒ H3");
+        assert!(!tier.lossy, "summary tier is additive");
+        assert_eq!(tier.confidence, AdviceConfidence::Medium);
+        assert!(
+            tier.why.contains("80%"),
+            "why must cite the concentration: {}",
+            tier.why
+        );
+        assert!(
+            tier.why.contains("50000"),
+            "why must cite the peak tile: {}",
+            tier.why
+        );
+    }
+
+    #[test]
+    fn light_average_without_skew_yields_no_summary_tier() {
+        // Same modest total and light average, but NO concentration (top1pct
+        // stays at the uniform default) — neither trigger fires.
+        let result = result_with(
+            300_000,
+            "Point",
+            4,
+            12,
+            vec![zoom_row(4, 500, 600.0, 5_000, 0)],
+        );
+        let advice = advise(&result, &empty_data()).unwrap();
+        assert!(advice.iter().all(|a| a.flag != "--summary-tier"));
+    }
+
+    #[test]
+    fn regional_dense_uniform_still_picks_quadbin() {
+        // The dense-uniform path on a Regional distribution keeps Quadbin (H3 is
+        // reserved for tightly Localized clusters).
+        let result = result_with(
+            2_000_000,
+            "Point",
+            3,
+            12,
+            vec![zoom_row(3, 40, 8_000.0, 9_500, 0)],
+        );
+        let tier = advise(&result, &empty_data())
+            .unwrap()
+            .into_iter()
+            .find(|a| a.flag == "--summary-tier")
+            .expect("dense-uniform summary tier");
+        assert_eq!(tier.value.as_deref(), Some("quadbin"));
+    }
+
+    #[test]
     fn line_dominant_data_never_gets_summary_tier() {
         let result = result_with(
             2_000_000,
@@ -668,7 +805,10 @@ mod tests {
             "why: {}",
             lod.why
         );
-        assert!(lod.suggestion_only, "categorical --min-zoom-field must not auto-apply");
+        assert!(
+            lod.suggestion_only,
+            "categorical --min-zoom-field must not auto-apply"
+        );
     }
 
     #[test]

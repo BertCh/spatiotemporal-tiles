@@ -12,7 +12,7 @@
 //! - Optional line simplification for lower zoom levels
 
 use crate::input::SharedProperties;
-use crate::simplify::{simplify_for_zoom, simplify_td_tr_for_zoom};
+use crate::simplify::{simplify_for_zoom_with, simplify_td_tr_for_zoom_with};
 use geojson::{Feature, Geometry, Value as GeomValue};
 use std::collections::HashSet;
 
@@ -74,6 +74,13 @@ pub struct ClipConfig {
     /// Euclidean Distance simplification instead of plain spatial Visvalingam,
     /// preserving per-vertex timing through the simplification.
     pub time_aware_simplify: bool,
+    /// When true (and `simplify` is on), simplify with a **latitude-corrected
+    /// metric tolerance** instead of the legacy fixed per-zoom degree table:
+    /// the longitude axis is scaled by `cos(latitude)` so a given zoom's
+    /// tolerance means the same GROUND distance at every latitude (a fixed
+    /// degree tolerance is ~2× coarser in E–W terms at 60° than at the
+    /// equator). Opt-in (default `false`) so existing builds stay byte-identical.
+    pub simplify_metric: bool,
 }
 
 impl Default for ClipConfig {
@@ -90,6 +97,7 @@ impl Default for ClipConfig {
             simplify: false,
             simplify_max_zoom: 14,
             time_aware_simplify: false,
+            simplify_metric: false,
         }
     }
 }
@@ -193,10 +201,7 @@ fn lonlat_to_world_tile(lon: f64, lat: f64, zoom: u8) -> (f64, f64) {
 /// The returned set is the union of tiles touched by all segments. Caller
 /// should still call `clip_trajectory_to_tile` per tile — the buffer the
 /// clipper applies can still drop a tile we list, which is fine.
-fn tiles_along_trajectory(
-    coords: &[(f64, f64, f64)],
-    zoom: u8,
-) -> HashSet<(u32, u32)> {
+fn tiles_along_trajectory(coords: &[(f64, f64, f64)], zoom: u8) -> HashSet<(u32, u32)> {
     let mut tiles: HashSet<(u32, u32)> = HashSet::new();
     if coords.is_empty() {
         return tiles;
@@ -245,8 +250,20 @@ fn supercover_segment<F: FnMut(i64, i64)>(x0: f64, y0: f64, x1: f64, y1: f64, em
     let dx = x1 - x0;
     let dy = y1 - y0;
     // Step in each axis.
-    let step_x: i64 = if dx > 0.0 { 1 } else if dx < 0.0 { -1 } else { 0 };
-    let step_y: i64 = if dy > 0.0 { 1 } else if dy < 0.0 { -1 } else { 0 };
+    let step_x: i64 = if dx > 0.0 {
+        1
+    } else if dx < 0.0 {
+        -1
+    } else {
+        0
+    };
+    let step_y: i64 = if dy > 0.0 {
+        1
+    } else if dy < 0.0 {
+        -1
+    } else {
+        0
+    };
 
     // Parametric `t` (in [0, 1]) at which we cross the next vertical/horizontal grid line.
     // For an axis with no motion, push the crossing to +∞ so it never wins.
@@ -279,8 +296,16 @@ fn supercover_segment<F: FnMut(i64, i64)>(x0: f64, y0: f64, x1: f64, y1: f64, em
         f64::INFINITY
     };
 
-    let t_delta_x = if step_x != 0 { (step_x as f64) * inv_dx } else { f64::INFINITY };
-    let t_delta_y = if step_y != 0 { (step_y as f64) * inv_dy } else { f64::INFINITY };
+    let t_delta_x = if step_x != 0 {
+        (step_x as f64) * inv_dx
+    } else {
+        f64::INFINITY
+    };
+    let t_delta_y = if step_y != 0 {
+        (step_y as f64) * inv_dy
+    } else {
+        f64::INFINITY
+    };
 
     // Hard cap to defend against pathological NaN/inf inputs.
     let mut guard = 0usize;
@@ -559,7 +584,12 @@ fn clip_trajectory_to_tile(
     }
 
     if clipped_coords.len() >= 2 {
-        Some((clipped_coords, clipped_times, clipped_values, clipped_matrix))
+        Some((
+            clipped_coords,
+            clipped_times,
+            clipped_values,
+            clipped_matrix,
+        ))
     } else {
         None
     }
@@ -573,10 +603,7 @@ fn clip_trajectory_to_tile(
 /// yields one segment per bucket. A vertex landing exactly on a boundary is
 /// shared between the closing and opening segment — not duplicated within
 /// either.
-fn slice_segment_temporally(
-    segment: ClippedSegment,
-    granularity_ms: u64,
-) -> Vec<ClippedSegment> {
+fn slice_segment_temporally(segment: ClippedSegment, granularity_ms: u64) -> Vec<ClippedSegment> {
     let n = segment.coordinates.len();
     if n < 2 || granularity_ms == 0 {
         return vec![segment];
@@ -750,8 +777,7 @@ pub fn clip_trajectory(
         Some(s) if s.len() == coords.len() => s.to_vec(),
         _ => compute_vertex_timestamps(&coords, start_time, end_time),
     };
-    let full_has_values =
-        matches!(supplied_vertex_values, Some(s) if s.len() == coords.len());
+    let full_has_values = matches!(supplied_vertex_values, Some(s) if s.len() == coords.len());
     let full_values: Vec<f32> = if full_has_values {
         supplied_vertex_values.unwrap().to_vec()
     } else {
@@ -777,19 +803,25 @@ pub fn clip_trajectory(
         if config.time_aware_simplify {
             // TD-TR keeps a subset of vertices preserving position-at-time,
             // carrying the real times + values (no alignment loss).
-            let (sc, st, sv) = simplify_td_tr_for_zoom(
+            let (sc, st, sv) = simplify_td_tr_for_zoom_with(
                 &coords,
                 &full_times,
                 &full_values,
                 zoom,
                 config.simplify_max_zoom,
+                config.simplify_metric,
             );
             (sc, st, sv, full_has_values)
         } else {
             // Spatial Visvalingam: dropped vertices break per-vertex-time
             // alignment, so recompute times by distance and drop the supplied
             // value channel when simplification changed the vertex set.
-            let sc = simplify_for_zoom(&coords, zoom, config.simplify_max_zoom);
+            let sc = simplify_for_zoom_with(
+                &coords,
+                zoom,
+                config.simplify_max_zoom,
+                config.simplify_metric,
+            );
             let preserved = sc.len() == original_vertex_count;
             let st = if preserved {
                 full_times.clone()
@@ -828,8 +860,7 @@ pub fn clip_trajectory(
     let mut run_start = 0usize;
     for split in 1..=coords.len() {
         let at_end = split == coords.len();
-        let crosses_antimeridian =
-            !at_end && (coords[split].0 - coords[split - 1].0).abs() > 180.0;
+        let crosses_antimeridian = !at_end && (coords[split].0 - coords[split - 1].0).abs() > 180.0;
         if !(at_end || crosses_antimeridian) {
             continue;
         }
@@ -900,7 +931,11 @@ pub fn clip_trajectory(
                     coordinates: clipped_coords,
                     timestamps: clipped_times,
                     // Drop the value channel for trajectories that carry none.
-                    vertex_values: if has_values { clipped_values } else { Vec::new() },
+                    vertex_values: if has_values {
+                        clipped_values
+                    } else {
+                        Vec::new()
+                    },
                     // Already empty when no matrix was supplied.
                     vertex_value_matrix: clipped_matrix,
                     start_time: seg_start_time,
@@ -1017,9 +1052,8 @@ fn sutherland_hodgman_ring(ring: &[Vec<f64>], bounds: &TileBounds) -> Vec<Vec<f6
 
     // Drop consecutive (and wrap-around) near-duplicate vertices the
     // successive half-plane passes can introduce at rect corners.
-    let close = |a: &(f64, f64), b: &(f64, f64)| {
-        (a.0 - b.0).abs() <= 1e-12 && (a.1 - b.1).abs() <= 1e-12
-    };
+    let close =
+        |a: &(f64, f64), b: &(f64, f64)| (a.0 - b.0).abs() <= 1e-12 && (a.1 - b.1).abs() <= 1e-12;
     let mut cleaned: Vec<(f64, f64)> = Vec::with_capacity(pts.len());
     for p in pts {
         if cleaned.last().map_or(true, |q| !close(q, &p)) {
@@ -1291,9 +1325,9 @@ pub(crate) fn split_polygon_at_antimeridian(poly: &PolygonRings) -> Vec<PolygonR
     };
 
     // Exterior unwrapped lon-bbox + its continuous frame centre.
-    let (xlo, xhi) = ext
-        .iter()
-        .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+    let (xlo, xhi) = ext.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+        (lo.min(p.0), hi.max(p.0))
+    });
     let ec = (xlo + xhi) / 2.0;
 
     // The single seam meridian; bail (dead-letter) if the span is unsplittable.
@@ -1309,9 +1343,9 @@ pub(crate) fn split_polygon_at_antimeridian(poly: &PolygonRings) -> Vec<PolygonR
         let Some(hole) = unwrap_ring(hole_raw) else {
             continue; // vanished / degenerate / self-winding hole
         };
-        let (hlo, hhi) = hole
-            .iter()
-            .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+        let (hlo, hhi) = hole.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+            (lo.min(p.0), hi.max(p.0))
+        });
         let hc = (hlo + hhi) / 2.0;
         let shift = ((ec - hc) / 360.0).round() * 360.0;
         rings_unwrapped.push(hole.iter().map(|(x, y)| (x + shift, *y)).collect());
@@ -1627,10 +1661,7 @@ mod tests {
     #[test]
     fn test_temporal_slicing() {
         // Test that temporal slicing splits segments at boundaries
-        let feature = make_linestring_feature(vec![
-            vec![-122.4, 37.7],
-            vec![-122.41, 37.71],
-        ]);
+        let feature = make_linestring_feature(vec![vec![-122.4, 37.7], vec![-122.41, 37.71]]);
 
         // Config with 1 second temporal granularity
         let config = ClipConfig {
@@ -1715,10 +1746,7 @@ mod tests {
         // Use the boundary lon between tiles 163 and 164 at zoom 10:
         //  lon = (164/1024) * 360 - 180 = -122.34375
         let edge_lon = -122.343_75;
-        let coords = vec![
-            (edge_lon - 1e-9, 37.77, 0.0),
-            (edge_lon - 1e-9, 37.78, 0.0),
-        ];
+        let coords = vec![(edge_lon - 1e-9, 37.77, 0.0), (edge_lon - 1e-9, 37.78, 0.0)];
         let tiles = tiles_along_trajectory(&coords, 10);
         assert!(
             tiles.contains(&(163, 395)),
@@ -1738,7 +1766,10 @@ mod tests {
         let tiles = tiles_along_trajectory(&coords, 1);
         // Should touch at least 3 cells (start, opposite corner, one of the
         // two diagonal-adjacent cells).
-        assert!(tiles.len() >= 3, "diagonal should touch >=3 tiles, got {tiles:?}");
+        assert!(
+            tiles.len() >= 3,
+            "diagonal should touch >=3 tiles, got {tiles:?}"
+        );
     }
 
     #[test]
@@ -1856,7 +1887,11 @@ mod tests {
         let polys = vec![vec![exterior, hole]];
         let zoom = 10u8;
         let pieces = clip_polygons_to_tiles(&polys, zoom, 0.0, None);
-        assert_eq!(pieces.len(), 4, "expected the 4 corner tiles, got {pieces:?}");
+        assert_eq!(
+            pieces.len(),
+            4,
+            "expected the 4 corner tiles, got {pieces:?}"
+        );
         let tiles: Vec<(u32, u32)> = pieces.iter().map(|(t, _)| *t).collect();
         assert_eq!(tiles, vec![(511, 511), (511, 512), (512, 511), (512, 512)]);
         for ((x, y), tile_polys) in &pieces {
@@ -1889,14 +1924,20 @@ mod tests {
         let left = seam_bits(piece(511, 511));
         let right = seam_bits(piece(512, 511));
         assert!(!left.is_empty(), "left piece should touch the lon=0 seam");
-        assert_eq!(left, right, "seam vertices must be bit-identical across the tile edge");
+        assert_eq!(
+            left, right,
+            "seam vertices must be bit-identical across the tile edge"
+        );
 
         // Single-tile restriction (the stt-serve path) returns the
         // byte-identical piece the full sweep produced for that tile.
         let restricted = clip_polygons_to_tiles(&polys, zoom, 0.0, Some((512, 511)));
         assert_eq!(restricted.len(), 1);
         assert_eq!(restricted[0].0, (512, 511));
-        assert_eq!(&restricted[0].1, &pieces.iter().find(|(t, _)| *t == (512, 511)).unwrap().1);
+        assert_eq!(
+            &restricted[0].1,
+            &pieces.iter().find(|(t, _)| *t == (512, 511)).unwrap().1
+        );
         // A target outside the bbox sweeps nothing.
         assert!(clip_polygons_to_tiles(&polys, zoom, 0.0, Some((0, 0))).is_empty());
     }
@@ -1930,13 +1971,21 @@ mod tests {
         // Fiji-like square: raw lon 177 → -177 (crosses +180), lat 10 → 20.
         let poly = poly_from(&[&[(177.0, 10.0), (-177.0, 10.0), (-177.0, 20.0), (177.0, 20.0)]]);
         let pieces = split_polygon_at_antimeridian(&poly);
-        assert_eq!(pieces.len(), 2, "must split into west + east, got {pieces:?}");
+        assert_eq!(
+            pieces.len(),
+            2,
+            "must split into west + east, got {pieces:?}"
+        );
         for piece in &pieces {
             assert_eq!(piece.len(), 1, "single exterior, no holes");
             let ext = &piece[0];
             assert_eq!(ext.first(), ext.last(), "ring must stay closed");
             for c in ext {
-                assert!((-180.0..=180.0).contains(&c[0]), "lon {} out of range", c[0]);
+                assert!(
+                    (-180.0..=180.0).contains(&c[0]),
+                    "lon {} out of range",
+                    c[0]
+                );
             }
             assert!(
                 signed_ring_area(ext) > 0.0,
@@ -1965,7 +2014,10 @@ mod tests {
         let orig = unwrapped_area(&poly[0]);
         let sum: f64 = pieces.iter().map(|p| signed_ring_area(&p[0]).abs()).sum();
         assert!((orig - 60.0).abs() < 1e-9, "orig area {orig} != 60");
-        assert!((orig - sum).abs() < 1e-9, "area not conserved: {orig} vs {sum}");
+        assert!(
+            (orig - sum).abs() < 1e-9,
+            "area not conserved: {orig} vs {sum}"
+        );
     }
 
     #[test]
@@ -1998,7 +2050,10 @@ mod tests {
         );
         let orig = unwrapped_area(&poly[0]);
         let sum: f64 = pieces.iter().map(|p| signed_ring_area(&p[0]).abs()).sum();
-        assert!((orig - sum).abs() < 1e-9, "area not conserved: {orig} vs {sum}");
+        assert!(
+            (orig - sum).abs() < 1e-9,
+            "area not conserved: {orig} vs {sum}"
+        );
     }
 
     #[test]
@@ -2041,7 +2096,10 @@ mod tests {
             .map(|p| signed_ring_area(&p[0]).abs() - signed_ring_area(&p[1]).abs())
             .sum();
         assert!((orig - 44.0).abs() < 1e-9, "net orig area {orig} != 44");
-        assert!((orig - sum).abs() < 1e-9, "holed area not conserved: {orig} vs {sum}");
+        assert!(
+            (orig - sum).abs() < 1e-9,
+            "holed area not conserved: {orig} vs {sum}"
+        );
     }
 
     #[test]
@@ -2057,7 +2115,10 @@ mod tests {
         assert_eq!(pieces.len(), 2);
         assert_eq!(pieces[0].len(), 2, "west keeps exterior + the hole");
         assert_eq!(pieces[1].len(), 1, "east has no hole (clipped empty)");
-        assert!(signed_ring_area(&pieces[0][1]) < 0.0, "retained hole must be CW");
+        assert!(
+            signed_ring_area(&pieces[0][1]) < 0.0,
+            "retained hole must be CW"
+        );
     }
 
     #[test]
@@ -2067,12 +2128,7 @@ mod tests {
         // (mirrors the watertight-seam pin in
         // clip_polygons_to_tiles_covers_and_preserves_holes). Slanted seam edges
         // make the interpolated latitudes non-round.
-        let poly = poly_from(&[&[
-            (176.0, 10.0),
-            (-176.0, 14.0),
-            (-176.0, 26.0),
-            (176.0, 22.0),
-        ]]);
+        let poly = poly_from(&[&[(176.0, 10.0), (-176.0, 14.0), (-176.0, 26.0), (176.0, 22.0)]]);
         let pieces = split_polygon_at_antimeridian(&poly);
         assert_eq!(pieces.len(), 2);
         let seam_lats = |ring: &[Vec<f64>], seam_lon: f64| -> Vec<u64> {
@@ -2126,4 +2182,3 @@ mod tests {
         );
     }
 }
-

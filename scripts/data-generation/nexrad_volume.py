@@ -472,9 +472,46 @@ def vel_band_column(vel: np.ndarray) -> pa.Array:
                    pa.array(idx, mask=~np.isfinite(vel)))
 
 
+# ── stratified LOD min-zoom assignment ────────────────────────────────────────
+def lod_min_zoom(lon: np.ndarray, lat: np.ndarray, alt: np.ndarray, dbz: np.ndarray,
+                 min_zoom: int, max_zoom: int,
+                 cell_deg_top: float, cell_alt_top: float) -> np.ndarray:
+    """Assign each gate the coarsest zoom at which it survives a nested 3D-grid
+    thinning, so `--min-zoom-field` yields a real spatial LOD pyramid for a
+    homogeneous point cloud (where `--maximum-tile-features --drop-densest` is a
+    no-op — every single-vertex gate scores equally, so the cap just truncates
+    scan order and drops whole regions).
+
+    At each zoom below `max_zoom` we lay a 3D grid (horizontal `cell_deg`, vertical
+    `cell_alt`) sized `cell_*_top` at `max_zoom-1` and DOUBLING per zoom out, and
+    keep one representative per cell — the strongest-echo gate (so the coarse
+    skeleton is the meaningful storm core, not noise). A gate's `min_zoom` is the
+    coarsest zoom where it wins its cell; gates that never win default to
+    `max_zoom` → the deepest tier stays lossless (every gate present). Deterministic
+    (stable argsort on dBZ). Returns an int16 column.
+    """
+    n = len(lon)
+    alt = np.nan_to_num(alt.astype(np.float64), nan=0.0)
+    dbz = np.nan_to_num(dbz.astype(np.float64), nan=-99.0)
+    lon0, lat0, alt0 = lon.min(), lat.min(), alt.min()
+    order = np.argsort(-dbz, kind="stable")          # strongest echoes win cells
+    min_z = np.full(n, max_zoom, dtype=np.int16)
+    for z in range(min_zoom, max_zoom):
+        scale = 2 ** (max_zoom - 1 - z)              # top tier = 1×, coarser doubles
+        cd, ca = cell_deg_top * scale, cell_alt_top * scale
+        cx = ((lon - lon0) / cd).astype(np.int64)
+        cy = ((lat - lat0) / cd).astype(np.int64)
+        cz = ((alt - alt0) / ca).astype(np.int64)
+        code = (cx << 40) ^ (cy << 20) ^ cz
+        _, first = np.unique(code[order], return_index=True)
+        np.minimum.at(min_z, order[first], z)        # rep of this z-cell
+    return min_z
+
+
 # ── stt-build (glm_lightning / storms flag style) ─────────────────────────────
 def run_stt_build(parquet: Path, out_dir: Path, stt_build: str,
-                  min_zoom: int, max_zoom: int, quantize: bool, publish: bool) -> None:
+                  min_zoom: int, max_zoom: int, quantize: bool, publish: bool,
+                  min_zoom_field: str | None = None) -> None:
     cmd = [
         stt_build,
         "--input", str(parquet),
@@ -489,6 +526,14 @@ def run_stt_build(parquet: Path, out_dir: Path, stt_build: str,
         # pick spatial and silently stall the playhead (blob-ordering gotcha).
         "--blob-ordering", "time-major",
     ]
+    if min_zoom_field:
+        # Stratified LOD pyramid (§5, §9.1 reduced-tier amendment): each gate's
+        # `min_zoom` column names the coarsest zoom it appears at. Coarse zooms
+        # carry a spatially-uniform, strongest-echo-first skeleton; the deepest
+        # zoom stays LOSSLESS (every gate present). Cuts per-bucket resident
+        # gates ~7× at the framing zoom AND shrinks the archive ~2.5× — with
+        # zero data loss, since full detail is one zoom-in away.
+        cmd += ["--min-zoom-field", min_zoom_field]
     if quantize:
         cmd += ["--quantize-coords", "100", "--quantize-attrs-auto"]
     if publish:
@@ -519,6 +564,15 @@ def main() -> int:
     ap.add_argument("--az-decim-deg", type=float, default=1.0)
     ap.add_argument("--couplet-min-dv", type=float, default=30.0,
                     help="min gate-to-gate azimuthal Δv (m/s) for a couplet peak")
+    # Stratified LOD pyramid (lossless — deepest zoom keeps every gate). The two
+    # cell knobs set the grid at the top LOD tier (z8); shrink them to densify
+    # the coarse-zoom skeleton (higher fidelity at the framing zoom, less perf).
+    ap.add_argument("--no-lod", action="store_true",
+                    help="disable the min-zoom LOD pyramid (legacy full-duplication build)")
+    ap.add_argument("--lod-cell-deg", type=float, default=0.0015,
+                    help="horizontal LOD cell (deg) at the z8 tier; doubles per zoom out")
+    ap.add_argument("--lod-cell-alt", type=float, default=250.0,
+                    help="vertical LOD cell (m) at the z8 tier; doubles per zoom out")
     ap.add_argument("--workers", type=int, default=6,
                     help="volume-decode processes (each ~1.5 GB peak)")
     ap.add_argument("--skip-fetch", action="store_true", help="use cached volumes only")
@@ -592,7 +646,7 @@ def main() -> int:
     order = np.argsort(gates["t"], kind="stable")
     gates = {k: v[order] for k, v in gates.items()}
     nan_vel = ~np.isfinite(gates["vel"])
-    table = pa.table({
+    cols = {
         "lon": pa.array(gates["lon"], type=pa.float64()),
         "lat": pa.array(gates["lat"], type=pa.float64()),
         "timestamp": pa.array(gates["t"], type=pa.int64()),
@@ -602,7 +656,17 @@ def main() -> int:
         "sweep_deg": pa.array(gates["sweep"], type=pa.float32()),
         "dbz_band": dbz_band_column(gates["dbz"]),
         "vel_band": vel_band_column(gates["vel"]),
-    })
+    }
+    if not args.no_lod:
+        mz = lod_min_zoom(gates["lon"], gates["lat"], gates["alt"], gates["dbz"],
+                          min_zoom=4, max_zoom=9,
+                          cell_deg_top=args.lod_cell_deg, cell_alt_top=args.lod_cell_alt)
+        cols["min_zoom"] = pa.array(mz, type=pa.int16())
+        cum = np.cumsum(np.bincount(mz - 4, minlength=6))
+        print("  LOD min-zoom pyramid (gates loaded at each zoom / % of full):")
+        for i, z in enumerate(range(4, 10)):
+            print(f"    z{z}: {cum[i]:>10,}  ({100.0 * cum[i] / max(len(mz), 1):5.1f}%)")
+    table = pa.table(cols)
     vol_pq = args.out_dir / "storm4d-volume.parquet"
     pq.write_table(table, vol_pq, compression="snappy")
     with_vel = int((~nan_vel).sum())
@@ -633,7 +697,8 @@ def main() -> int:
     # column (§9.0 LiDAR pattern — elevationProperty + one shared
     # STORM4D_ELEVATION_SCALE in the FE), NOT --point-elevation-column.
     run_stt_build(vol_pq, args.out_dir / "storm4d-volume", args.stt_build,
-                  min_zoom=4, max_zoom=9, quantize=True, publish=args.publish)
+                  min_zoom=4, max_zoom=9, quantize=True, publish=args.publish,
+                  min_zoom_field=None if args.no_lod else "min_zoom")
     if rows:
         # storm4d-couplet: a handful of markers — z3-9, no quantization needed.
         run_stt_build(coup_pq, args.out_dir / "storm4d-couplet", args.stt_build,

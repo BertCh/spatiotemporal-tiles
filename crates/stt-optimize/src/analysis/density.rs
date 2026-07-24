@@ -47,6 +47,18 @@ pub struct ZoomDensity {
     pub median_features_per_tile: usize,
     /// Maximum features in any tile
     pub max_features_per_tile: usize,
+    /// 95th-percentile features per tile — a skew-robust "typical busy tile"
+    /// that, unlike [`Self::max_features_per_tile`], is not pinned by a single
+    /// outlier cell.
+    #[serde(default)]
+    pub p95_features_per_tile: usize,
+    /// Share of ALL features that fall in the top 1% most-populated tiles
+    /// (0.0–1.0) — a Gini-style spatial-concentration signal. ~0.01 = uniform;
+    /// toward 1.0 = a few cells hold almost everything (a hotspot a raw tier
+    /// can't serve but a summary tier can). This is the skew signal the
+    /// summary-tier advisor triggers on beyond raw totals/averages.
+    #[serde(default)]
+    pub top1pct_feature_share: f64,
     /// Number of oversized tiles (> 10,000 features)
     pub oversized_tiles: usize,
     /// Number of undersized tiles (< 10 features)
@@ -174,13 +186,32 @@ fn bucket_zoom(
     let total_uncompressed: usize = tiles.values().map(|&(_, bytes)| bytes).sum();
 
     let tile_count = feature_counts.len();
+    let total_features: usize = feature_counts.iter().sum();
     let avg_features_per_tile = if tile_count > 0 {
-        feature_counts.iter().sum::<usize>() as f64 / tile_count as f64
+        total_features as f64 / tile_count as f64
     } else {
         0.0
     };
     let median_features_per_tile = feature_counts.get(tile_count / 2).copied().unwrap_or(0);
     let max_features_per_tile = feature_counts.last().copied().unwrap_or(0);
+    // Skew signals (feature_counts is sorted ascending, so the top-k tiles are
+    // the last k). p95 = a busy-but-not-outlier tile; top1pct share = how much
+    // of the data concentrates in the densest 1% of cells.
+    let p95_features_per_tile = if tile_count > 0 {
+        let idx = ((tile_count as f64 * 0.95).ceil() as usize)
+            .min(tile_count)
+            .saturating_sub(1);
+        feature_counts[idx]
+    } else {
+        0
+    };
+    let top1pct_feature_share = if total_features > 0 && tile_count > 0 {
+        let k = ((tile_count as f64 * 0.01).ceil() as usize).clamp(1, tile_count);
+        let top_sum: usize = feature_counts[tile_count - k..].iter().sum();
+        top_sum as f64 / total_features as f64
+    } else {
+        0.0
+    };
     // 10,000-feature "oversized" threshold is a rough rule of thumb for a tile
     // that will be slow to decode/render; it is not a hard format limit.
     let oversized_tiles = feature_counts.iter().filter(|&&c| c > 10_000).count();
@@ -193,8 +224,7 @@ fn bucket_zoom(
     // summed per-feature formula and a rough assumed compression ratio.
     let (estimated_size_uncompressed, estimated_size_compressed) = match measured {
         Some(m) => {
-            let bucketed_features: usize = feature_counts.iter().sum();
-            let compressed = (bucketed_features as f64 * m.bytes_per_feature).round() as usize;
+            let compressed = (total_features as f64 * m.bytes_per_feature).round() as usize;
             let uncompressed = (compressed as f64 * m.zstd_ratio).round() as usize;
             (uncompressed, compressed)
         }
@@ -210,6 +240,8 @@ fn bucket_zoom(
         avg_features_per_tile,
         median_features_per_tile,
         max_features_per_tile,
+        p95_features_per_tile,
+        top1pct_feature_share,
         oversized_tiles,
         undersized_tiles,
         estimated_size_uncompressed,
