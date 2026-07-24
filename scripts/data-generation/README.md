@@ -141,7 +141,7 @@ login`. Needs the `venv-waymo` python (`pyarrow numpy shapely pandas`) + a
 - `cosmos_drive_dreams.py` - the World Model Scenario Explorer bundle (`/worlds`):
   ~300 NVIDIA Cosmos-Drive-Dreams clips on one synthetic grid, four combined
   cross-scenario archives + `worlds.json` + the generated MP4s (see
-  [docs/roadmap/cosmos-drive-dreams.md](../../docs/roadmap/cosmos-drive-dreams.md)).
+  [docs/roadmap/demos-and-datasets.md](../../docs/roadmap/demos-and-datasets.md)).
   CC BY 4.0, no login. Phased and resumable — `--phases index,videos,select,download,transform,build,sidecar,cleanup`,
   each phase marked done in `--cache-dir`. The `videos` phase STREAMS one part of
   the split generated-video tar and keeps only the MP4s it wants, so the 40 GB

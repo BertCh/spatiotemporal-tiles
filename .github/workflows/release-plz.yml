@@ -8,7 +8,7 @@ permissions:
   pull-requests: write
   contents: write
   # OIDC for crates.io Trusted Publishing (configured per-crate on crates.io
-  # after the first manual publish; see docs/roadmap/shipping-2026-07.md).
+  # after the first manual publish; see docs/roadmap/shipping.md).
   id-token: write
 
 concurrency:

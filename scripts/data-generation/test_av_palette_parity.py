@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Python↔TS AV-palette parity guard (naming-types-consistency-2026-06 F1).
+"""Python↔TS AV-palette parity guard (stt-packed-format-decisions.md, wire-token invariants F1).
 
 The AV cockpit color palettes live in TWO hand-maintained copies:
 
