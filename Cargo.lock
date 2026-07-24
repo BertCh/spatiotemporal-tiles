@@ -4079,7 +4079,7 @@ dependencies = [
 
 [[package]]
 name = "spatiotemporal-tiles"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arrow 59.0.0",
@@ -4150,7 +4150,7 @@ dependencies = [
 
 [[package]]
 name = "stt-build"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arrow 59.0.0",
@@ -4180,7 +4180,7 @@ dependencies = [
 
 [[package]]
 name = "stt-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow 59.0.0",
  "base64 0.22.1",
@@ -4207,7 +4207,7 @@ dependencies = [
 
 [[package]]
 name = "stt-generate"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arrow 59.0.0",
@@ -4245,7 +4245,7 @@ dependencies = [
 
 [[package]]
 name = "stt-optimize"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arrow 59.0.0",
