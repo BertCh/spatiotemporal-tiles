@@ -1,47 +1,45 @@
 # stt-optimize
 
-Analyzer, flag-recommender, and tileset profiler for STT builds. On the
-input side (`analyze`/`recommend`) it inspects a source's spatial extent,
-temporal distribution, geometry mix, and density — plus a measured sample
-encoding through the real encoder + zstd — then recommends `stt-build`
-settings (zoom range, temporal bucket) so you don't hand-tune them per
-dataset. The same logic is what runs inside `stt-build --auto`; the CLI
-exists to run the analysis standalone, inspect the reasoning (`--verbose`),
-or emit machine-readable reports. On the output side (`inspect`/`diff`/
-`doctor`) it profiles **built** packed datasets — per-zoom directory stats,
-dedup and compression ratios, per-column compressed cost — and compares two
-builds with a CI-friendly `--fail-on-growth` size gate.
+Analyzer, flag-recommender, and tileset profiler for STT builds. It reads a
+source before the build and the packed dataset after it:
 
-On top of the basics sits an **advisor layer**: evidence-based suggestions
-for the wider `stt-build` flag surface (coordinate/attribute quantization,
-temporal LOD, wire layout, per-tile budgets). Advisors never speak from
-folklore — where it matters they trial-encode the loader sample through the
-real encoder and report the measured delta; each suggestion carries the
-dataset-specific rationale, a projection, and a confidence grade. Anything
-that discards or degrades data is marked **lossy** and stays a per-dataset
-opt-in: lossy levers never join the suggested command (`recommend
---show-command`) and are never auto-applied by `stt-build --auto` — only the
-reversible byte-level levers are applied, and only under `--auto encode`.
-Inspect the full evidence with `recommend --explain`.
+| Subcommand              | Reads          | Reports                                                                   |
+| ----------------------- | -------------- | ------------------------------------------------------------------------- |
+| `analyze` / `recommend` | GeoParquet     | Recommended zoom range and temporal bucket, plus the evidence behind them |
+| `inspect`               | packed dataset | Per-zoom directory stats, dedup and compression ratios, per-column cost   |
+| `doctor`                | packed dataset | Severity-ranked findings with the remediation flag for each               |
+| `diff`                  | two datasets   | Total / per-zoom / per-column deltas, with a `--fail-on-growth` size gate |
+| `order-audit`           | packed dataset | Simulated range-read cost per blob ordering                               |
 
-**`doctor`** turns the inspect numbers into a lint pass over a built
-tileset: severity-ranked findings (`CRITICAL`/`WARNING`/`INFO`), each citing
-the tileset's measured numbers, with the concrete remediation flag(s) and —
-where derivable from the measured column costs — a labeled projected win.
-The rule catalog productizes this repo's recurring manual optimization
-passes: raw Float64 property columns, near-incompressible hash-like feature
-ids, constant/all-null columns, shallow-pyramid "z0 bombs", whole-load
-directories past 10k entries, oversized tiles, and missing summary tiers.
-`doctor --strict` exits non-zero on any Warning-or-worse finding — a CI
-gate, like `diff --fail-on-growth`.
+`analyze`/`recommend` profile spatial extent, temporal distribution, geometry
+mix, and density, and trial-encode a deterministic sample through the real
+encoder plus zstd to calibrate the size estimates. The same logic runs inside
+`stt-build --auto`; the CLI exists to run it standalone, inspect the reasoning
+(`--verbose`), or emit machine-readable reports.
 
-The crate also houses the **style-hints profiler**
-(`analysis::properties::profile_properties`) behind `stt-build
---style-hints`: bounded per-property value profiles (numeric percentiles
-with a `[min, ~p97]` `suggested_domain`, categorical cardinality) plus a
-suggested playback duration and a layer-type hint, baked into archive
-metadata as a versioned `style_hints` block. Hints are render _defaults_
-readers may always override; old readers are unaffected.
+**Advisors.** Beyond zoom range and bucket, an advisor layer suggests flags
+across the wider `stt-build` surface (coordinate/attribute quantization,
+temporal LOD, wire layout, per-tile budgets). Where it matters the projection is
+measured rather than extrapolated, and each suggestion carries the
+dataset-specific rationale and a confidence grade. Anything that discards or
+degrades data is marked lossy and stays opt-in: lossy levers never join the
+suggested command (`recommend --show-command`) and are never auto-applied by
+`stt-build --auto`. Only the reversible byte-level levers are applied, and only
+under `--auto encode`. `recommend --explain` prints the full evidence table.
+
+**`doctor`** lints a built tileset, citing that tileset's own measured numbers in
+each finding. The rule catalog covers raw Float64 property columns,
+near-incompressible hash-like feature ids, constant/all-null columns,
+shallow-pyramid "z0 bombs", whole-load directories past 10k entries, oversized
+tiles, and missing summary tiers. `--strict` exits non-zero on any
+Warning-or-worse finding — the CI gate counterpart to `diff --fail-on-growth`.
+
+**Style hints.** The crate also houses the profiler behind `stt-build
+--style-hints` (`analysis::properties::profile_properties`): bounded per-property
+profiles (numeric percentiles with a `[min, ~p97]` `suggested_domain`,
+categorical cardinality) plus a suggested playback duration and a layer-type
+hint, baked into archive metadata as a versioned `style_hints` block. Hints are
+render defaults a reader may override; old readers are unaffected.
 
 > **Internal implementation crate** of
 > [`spatiotemporal-tiles`](https://crates.io/crates/spatiotemporal-tiles):
