@@ -90,7 +90,12 @@ fn point_layer(seed: u64, n: usize) -> ColumnarLayer {
         end_times: (0..n as i64).map(|i| base + i * 1000 + 60_000).collect(),
         geometry: GeometryColumn::Point(
             (0..n)
-                .map(|i| [-122.4 + seed as f64 * 0.01 + i as f64 * 1e-4, 37.7 + i as f64 * 5e-5])
+                .map(|i| {
+                    [
+                        -122.4 + seed as f64 * 0.01 + i as f64 * 1e-4,
+                        37.7 + i as f64 * 5e-5,
+                    ]
+                })
                 .collect(),
         ),
         vertex_times: None,
@@ -289,10 +294,9 @@ fn v1_build_is_byte_identical_to_golden() {
          spec-versioned v1 change (see the header comment)",
         fixture_root.display()
     );
-    let expected_hashes: BTreeMap<String, String> = serde_json::from_slice(
-        &fs::read(fixture_root.join("expected-hashes.json")).unwrap(),
-    )
-    .unwrap();
+    let expected_hashes: BTreeMap<String, String> =
+        serde_json::from_slice(&fs::read(fixture_root.join("expected-hashes.json")).unwrap())
+            .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
     let mut rebuilt_hashes: BTreeMap<String, String> = BTreeMap::new();

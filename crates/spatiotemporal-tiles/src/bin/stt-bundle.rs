@@ -89,8 +89,13 @@ fn pack(input: &Path, output: &Path) -> Result<()> {
             input.display()
         );
     };
-    let summary = stt_core::pack::write_bundle(&manifest_path, output)
-        .with_context(|| format!("packing {} into {}", manifest_path.display(), output.display()))?;
+    let summary = stt_core::pack::write_bundle(&manifest_path, output).with_context(|| {
+        format!(
+            "packing {} into {}",
+            manifest_path.display(),
+            output.display()
+        )
+    })?;
     println!(
         "packed {} object(s) into {} ({} bytes)",
         summary.objects,
@@ -141,9 +146,14 @@ mod tests {
             "/../../docs/api/cli-reference.md"
         ))
         .expect("read docs/api/cli-reference.md");
-        let start = doc.find("## `stt-bundle`").expect("stt-bundle section heading");
+        let start = doc
+            .find("## `stt-bundle`")
+            .expect("stt-bundle section heading");
         let body = &doc[start + 1..];
-        let end = body.find("\n## `").map(|i| start + 1 + i).unwrap_or(doc.len());
+        let end = body
+            .find("\n## `")
+            .map(|i| start + 1 + i)
+            .unwrap_or(doc.len());
         let section = &doc[start..end];
         let cmd = Cli::command();
         let mut missing: Vec<String> = Vec::new();
@@ -229,8 +239,16 @@ mod tests {
                 properties: vec![],
             }])
             .unwrap();
-            w.add_tile_full(&TileId::new(10, k as u32, 0, 0), 0, 100, None, n as u32, None, &payload)
-                .unwrap();
+            w.add_tile_full(
+                &TileId::new(10, k as u32, 0, 0),
+                0,
+                100,
+                None,
+                n as u32,
+                None,
+                &payload,
+            )
+            .unwrap();
         }
         w.finalize(&Metadata::new("bundle-cli-fixture")).unwrap();
     }

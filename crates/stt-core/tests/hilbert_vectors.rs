@@ -152,7 +152,10 @@ fn curve_endpoints_and_adjacency() {
             let (x0, y0) = w[0];
             let (x1, y1) = w[1];
             let manhattan = x0.abs_diff(x1) + y0.abs_diff(y1);
-            assert_eq!(manhattan, 1, "curve jump between ({x0},{y0}) and ({x1},{y1}) at z={z}");
+            assert_eq!(
+                manhattan, 1,
+                "curve jump between ({x0},{y0}) and ({x1},{y1}) at z={z}"
+            );
         }
     }
 }

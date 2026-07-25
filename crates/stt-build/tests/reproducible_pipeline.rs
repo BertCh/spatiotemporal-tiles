@@ -89,13 +89,19 @@ fn full_pipeline_is_byte_reproducible() {
     );
     let dir_bytes_a = std::fs::read(out_a.join(&man_a.directory.key)).unwrap();
     let dir_bytes_b = std::fs::read(out_b.join(&man_b.directory.key)).unwrap();
-    assert_eq!(dir_bytes_a, dir_bytes_b, "directory object bytes differ across rebuilds");
+    assert_eq!(
+        dir_bytes_a, dir_bytes_b,
+        "directory object bytes differ across rebuilds"
+    );
 
     // (2) Pack key list identical (order + content-address), and every pack's
     // on-disk bytes identical.
     let keys_a: Vec<&String> = man_a.packs.iter().map(|p| &p.key).collect();
     let keys_b: Vec<&String> = man_b.packs.iter().map(|p| &p.key).collect();
-    assert_eq!(keys_a, keys_b, "pack content-addresses must be stable across rebuilds");
+    assert_eq!(
+        keys_a, keys_b,
+        "pack content-addresses must be stable across rebuilds"
+    );
     for pack in &man_a.packs {
         let bytes_a = std::fs::read(out_a.join(&pack.key)).unwrap();
         let bytes_b = std::fs::read(out_b.join(&pack.key)).unwrap();

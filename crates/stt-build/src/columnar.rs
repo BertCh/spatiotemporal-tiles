@@ -129,11 +129,10 @@ pub fn build_layers_from_features_with(
     let mut layers = Vec::new();
     // When a tile has multiple kinds, suffix the layer name so a reader can
     // tell them apart; the dominant kind keeps the bare name.
-    let kinds_present =
-        [!points.is_empty(), !lines.is_empty(), !polygons.is_empty()]
-            .iter()
-            .filter(|p| **p)
-            .count();
+    let kinds_present = [!points.is_empty(), !lines.is_empty(), !polygons.is_empty()]
+        .iter()
+        .filter(|p| **p)
+        .count();
     let name_for = |kind: &str| -> String {
         if kinds_present <= 1 {
             layer_name.to_string()
@@ -182,7 +181,11 @@ pub fn build_layer_from_segments(
         start_times.push(seg.start_time as i64);
         end_times.push(seg.end_time as i64);
 
-        let coords: Vec<Coord> = seg.coordinates.iter().map(|(x, y, _alt)| [*x, *y]).collect();
+        let coords: Vec<Coord> = seg
+            .coordinates
+            .iter()
+            .map(|(x, y, _alt)| [*x, *y])
+            .collect();
 
         // Per-vertex timestamps: use the segment's real timestamps where
         // present, padding with the start time if the clipper produced fewer.
@@ -410,8 +413,7 @@ fn build_polygon_layer(
     // baked, hole-aware `indices` buffer makes the renderer skip earcut, so the
     // sidecar is MANDATORY for these layers, not just a perf win. Layers whose
     // every feature is a single ring stay lean (no sidecar).
-    let needs_triangles =
-        opts.pre_tessellate || geometry.iter().any(|rings| rings.len() > 1);
+    let needs_triangles = opts.pre_tessellate || geometry.iter().any(|rings| rings.len() > 1);
     let triangles = if needs_triangles {
         let mut tris: Vec<Vec<u32>> = Vec::with_capacity(geometry.len());
         for rings in &geometry {
@@ -546,7 +548,11 @@ impl PropertyAccumulator {
             if value.is_number() {
                 kind.has_number = true;
             } else if let Some(s) = value.as_str() {
-                if s.trim().parse::<f64>().map(|f| f.is_finite()).unwrap_or(false) {
+                if s.trim()
+                    .parse::<f64>()
+                    .map(|f| f.is_finite())
+                    .unwrap_or(false)
+                {
                     kind.has_numeric_string = true;
                 } else {
                     kind.has_other = true;
@@ -665,7 +671,11 @@ fn extract_line_coords(feature: &ParsedFeature) -> Result<Vec<Coord>> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("feature has no geometry"))?;
     let coords: Vec<Coord> = match &geom.value {
-        GeomValue::LineString(pts) => pts.iter().filter(|c| c.len() >= 2).map(|c| [c[0], c[1]]).collect(),
+        GeomValue::LineString(pts) => pts
+            .iter()
+            .filter(|c| c.len() >= 2)
+            .map(|c| [c[0], c[1]])
+            .collect(),
         GeomValue::MultiLineString(lines) => lines
             .iter()
             .flatten()
@@ -691,14 +701,13 @@ fn extract_polygon_rings(feature: &ParsedFeature) -> Result<Vec<Vec<Coord>>> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("feature has no geometry"))?;
     let to_ring = |ring: &Vec<Vec<f64>>| -> Vec<Coord> {
-        ring.iter().filter(|c| c.len() >= 2).map(|c| [c[0], c[1]]).collect()
+        ring.iter()
+            .filter(|c| c.len() >= 2)
+            .map(|c| [c[0], c[1]])
+            .collect()
     };
     let rings: Vec<Vec<Coord>> = match &geom.value {
-        GeomValue::Polygon(rings) => rings
-            .iter()
-            .map(to_ring)
-            .filter(|r| r.len() >= 4)
-            .collect(),
+        GeomValue::Polygon(rings) => rings.iter().map(to_ring).filter(|r| r.len() >= 4).collect(),
         GeomValue::MultiPolygon(polys) => polys
             .iter()
             .flat_map(|p| p.iter().map(to_ring))
@@ -819,9 +828,7 @@ fn segment_feature_id(segment: &ClippedSegment) -> u64 {
         }
     }
     match segment.coordinates.first() {
-        Some((lon, lat, _)) => {
-            fnv1a_64_fields(&[segment.start_time, lon.to_bits(), lat.to_bits()])
-        }
+        Some((lon, lat, _)) => fnv1a_64_fields(&[segment.start_time, lon.to_bits(), lat.to_bits()]),
         None => fnv1a_64_fields(&[segment.start_time]),
     }
 }
@@ -1007,17 +1014,26 @@ mod tests {
     /// property AND all system columns (id/start/end/geometry) intact.
     #[test]
     fn exclude_drops_only_named_property() {
-        let f1 = point_feature(-122.4, 37.7, json!({ "speed": 10.0, "kind": "car", "name": "a" }));
-        let f2 = point_feature(-122.5, 37.8, json!({ "speed": 20.0, "kind": "bus", "name": "b" }));
+        let f1 = point_feature(
+            -122.4,
+            37.7,
+            json!({ "speed": 10.0, "kind": "car", "name": "a" }),
+        );
+        let f2 = point_feature(
+            -122.5,
+            37.8,
+            json!({ "speed": 20.0, "kind": "bus", "name": "b" }),
+        );
         let opts = ColumnarOptions {
-            attribute_filter: AttributeFilter::Exclude(
-                ["kind".to_string()].into_iter().collect(),
-            ),
+            attribute_filter: AttributeFilter::Exclude(["kind".to_string()].into_iter().collect()),
             ..Default::default()
         };
-        let layers =
-            build_layers_from_features_with(&[&f1, &f2], "default", opts).unwrap();
-        let names: Vec<&str> = layers[0].properties.iter().map(|(n, _)| n.as_str()).collect();
+        let layers = build_layers_from_features_with(&[&f1, &f2], "default", opts).unwrap();
+        let names: Vec<&str> = layers[0]
+            .properties
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
         assert!(!names.contains(&"kind"), "excluded property must be gone");
         assert!(names.contains(&"speed"));
         assert!(names.contains(&"name"));
@@ -1030,17 +1046,26 @@ mod tests {
     /// `--include` keeps ONLY the named properties (plus system columns).
     #[test]
     fn include_keeps_only_named_properties() {
-        let f1 = point_feature(-122.4, 37.7, json!({ "speed": 10.0, "kind": "car", "name": "a" }));
-        let f2 = point_feature(-122.5, 37.8, json!({ "speed": 20.0, "kind": "bus", "name": "b" }));
+        let f1 = point_feature(
+            -122.4,
+            37.7,
+            json!({ "speed": 10.0, "kind": "car", "name": "a" }),
+        );
+        let f2 = point_feature(
+            -122.5,
+            37.8,
+            json!({ "speed": 20.0, "kind": "bus", "name": "b" }),
+        );
         let opts = ColumnarOptions {
-            attribute_filter: AttributeFilter::Include(
-                ["speed".to_string()].into_iter().collect(),
-            ),
+            attribute_filter: AttributeFilter::Include(["speed".to_string()].into_iter().collect()),
             ..Default::default()
         };
-        let layers =
-            build_layers_from_features_with(&[&f1, &f2], "default", opts).unwrap();
-        let names: Vec<&str> = layers[0].properties.iter().map(|(n, _)| n.as_str()).collect();
+        let layers = build_layers_from_features_with(&[&f1, &f2], "default", opts).unwrap();
+        let names: Vec<&str> = layers[0]
+            .properties
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
         assert_eq!(names, vec!["speed"], "only the included property survives");
         // System columns untouched.
         assert_eq!(layers[0].feature_count(), 2);
@@ -1056,8 +1081,7 @@ mod tests {
             attribute_filter: AttributeFilter::ExcludeAll,
             ..Default::default()
         };
-        let layers =
-            build_layers_from_features_with(&[&f1], "default", opts).unwrap();
+        let layers = build_layers_from_features_with(&[&f1], "default", opts).unwrap();
         assert!(layers[0].properties.is_empty(), "no user property survives");
         // System columns remain.
         assert_eq!(layers[0].feature_count(), 1);
@@ -1090,22 +1114,43 @@ mod tests {
         // Without the declared map, this tile would have NO `sog` column.
         let tile_b =
             build_layers_from_features_with(&[&all_null], "default", opts.clone()).unwrap();
-        let names_b: Vec<&str> =
-            tile_b[0].properties.iter().map(|(n, _)| n.as_str()).collect();
+        let names_b: Vec<&str> = tile_b[0]
+            .properties
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
         // finish() emits numeric columns first, then categorical.
-        assert_eq!(names_b, vec!["sog", "class"], "declared columns always present");
-        match &tile_b[0].properties.iter().find(|(n, _)| n == "sog").unwrap().1 {
+        assert_eq!(
+            names_b,
+            vec!["sog", "class"],
+            "declared columns always present"
+        );
+        match &tile_b[0]
+            .properties
+            .iter()
+            .find(|(n, _)| n == "sog")
+            .unwrap()
+            .1
+        {
             PropertyColumn::Numeric(v) => assert_eq!(v, &vec![None]),
             other => panic!("declared-numeric sog must stay Numeric, got {other:?}"),
         }
 
         // The populated tile has the identical property schema.
-        let tile_a =
-            build_layers_from_features_with(&[&with_val], "default", opts).unwrap();
-        let names_a: Vec<&str> =
-            tile_a[0].properties.iter().map(|(n, _)| n.as_str()).collect();
+        let tile_a = build_layers_from_features_with(&[&with_val], "default", opts).unwrap();
+        let names_a: Vec<&str> = tile_a[0]
+            .properties
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
         assert_eq!(names_a, names_b, "schema identical across tiles");
-        match &tile_a[0].properties.iter().find(|(n, _)| n == "sog").unwrap().1 {
+        match &tile_a[0]
+            .properties
+            .iter()
+            .find(|(n, _)| n == "sog")
+            .unwrap()
+            .1
+        {
             PropertyColumn::Numeric(v) => assert_eq!(v, &vec![Some(3.5)]),
             other => panic!("expected Numeric sog, got {other:?}"),
         }
@@ -1115,13 +1160,20 @@ mod tests {
         let numeric_string = point_feature(0.0, 0.0, json!({ "class": "42" }));
         let opts2 = ColumnarOptions {
             property_types: Arc::new(
-                [("class".to_string(), PropertyKind::Categorical)].into_iter().collect(),
+                [("class".to_string(), PropertyKind::Categorical)]
+                    .into_iter()
+                    .collect(),
             ),
             ..Default::default()
         };
-        let tile_c =
-            build_layers_from_features_with(&[&numeric_string], "default", opts2).unwrap();
-        match &tile_c[0].properties.iter().find(|(n, _)| n == "class").unwrap().1 {
+        let tile_c = build_layers_from_features_with(&[&numeric_string], "default", opts2).unwrap();
+        match &tile_c[0]
+            .properties
+            .iter()
+            .find(|(n, _)| n == "class")
+            .unwrap()
+            .1
+        {
             PropertyColumn::Categorical(v) => assert_eq!(v, &vec![Some("42".to_string())]),
             other => panic!("declared-categorical must stay Categorical, got {other:?}"),
         }
@@ -1180,14 +1232,13 @@ mod tests {
 
     #[test]
     fn line_with_duration_gets_interpolated_vertex_times() {
-        let line = line_feature(
-            vec![[0.0, 0.0], [0.0, 1.0], [0.0, 2.0]],
-            1000,
-            Some(3000),
-        );
+        let line = line_feature(vec![[0.0, 0.0], [0.0, 1.0], [0.0, 2.0]], 1000, Some(3000));
         let refs = vec![&line];
         let layers = build_layers_from_features(&refs, "default").unwrap();
-        let vt = layers[0].vertex_times.as_ref().expect("vertex times present");
+        let vt = layers[0]
+            .vertex_times
+            .as_ref()
+            .expect("vertex times present");
         assert_eq!(vt[0].len(), 3);
         // Evenly spaced vertices -> first 1000, last 3000, middle ~2000.
         assert_eq!(vt[0][0], 1000);

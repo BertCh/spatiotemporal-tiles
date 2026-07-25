@@ -55,8 +55,8 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use stt_core::TileEntry;
 use stt_core::metadata::Metadata;
+use stt_core::TileEntry;
 use stt_core::{Manifest, PackedReader};
 
 #[derive(Parser)]
@@ -263,7 +263,11 @@ fn validate_bundle(bundle_path: &Path, args: &Args, report: &mut Report) -> Resu
 /// Decode-tier validation shared by the exploded and bundle inputs: every
 /// entry through `read_payload` + the per-tile checks, then the
 /// metadata-total reconciliation.
-fn validate_with_reader(reader: &PackedReader, args: &Args, report: &mut Report) -> Result<Metadata> {
+fn validate_with_reader(
+    reader: &PackedReader,
+    args: &Args,
+    report: &mut Report,
+) -> Result<Metadata> {
     let metadata = reader.metadata().clone();
     let entries = reader.entries().to_vec();
     report.tile_count = entries.len();
@@ -310,7 +314,10 @@ fn verify_paged_directly(
         push_err(report, args.fail_fast, msg)
     };
     let Some(root_length) = manifest.directory.root_length else {
-        push_unique(report, "integrity: paged directory: manifest missing rootLength".into())?;
+        push_unique(
+            report,
+            "integrity: paged directory: manifest missing rootLength".into(),
+        )?;
         return Ok(());
     };
     let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
@@ -319,8 +326,8 @@ fn verify_paged_directly(
     let Ok(dir_bytes) = std::fs::read(root.join(&manifest.directory.key)) else {
         return Ok(());
     };
-    let zstd = manifest.directory.encoding.as_deref()
-        == Some(stt_core::pack::DIRECTORY_ENCODING_ZSTD);
+    let zstd =
+        manifest.directory.encoding.as_deref() == Some(stt_core::pack::DIRECTORY_ENCODING_ZSTD);
     // formatVersion 2 prefixes the object with the 8-byte STTD magic; the
     // codec bytes (and rootLength math) start after it. Malformed magic is
     // already reported by the integrity pass — skip the re-check here.
@@ -335,7 +342,10 @@ fn verify_paged_directly(
                 push_unique(report, format!("integrity: {issue}"))?;
             }
         }
-        Err(e) => push_unique(report, format!("integrity: paged structure check failed: {e}"))?,
+        Err(e) => push_unique(
+            report,
+            format!("integrity: paged structure check failed: {e}"),
+        )?,
     }
     Ok(())
 }
@@ -539,7 +549,9 @@ fn validate_entries(
                     let sig = schema_signature(&layers);
                     if schemas.insert(sig.clone()) {
                         match &first_schema_example {
-                            None => first_schema_example = Some((format!("{:?}", entry.tile_id()), sig)),
+                            None => {
+                                first_schema_example = Some((format!("{:?}", entry.tile_id()), sig))
+                            }
                             Some((first_tile, first_sig)) => {
                                 push_err(
                                     report,
@@ -581,7 +593,10 @@ fn validate_entries(
         )?;
     }
     for (msg, (count, first_tile)) in warning_tally {
-        push_warn(report, format!("{msg} — {count} decoded tile(s), first {first_tile}"));
+        push_warn(
+            report,
+            format!("{msg} — {count} decoded tile(s), first {first_tile}"),
+        );
     }
 
     report.distinct_schemas = schemas.len();
@@ -685,7 +700,10 @@ fn print_summary(report: &Report, metadata: &Metadata) {
             report.tiles_decoded, report.tile_count
         );
     } else {
-        println!("decoded          {} of {} tiles", report.tiles_decoded, report.tile_count);
+        println!(
+            "decoded          {} of {} tiles",
+            report.tiles_decoded, report.tile_count
+        );
     }
     println!("distinct schemas {}", report.distinct_schemas);
     if report.feature_count_decoded_complete {
@@ -699,7 +717,11 @@ fn print_summary(report: &Report, metadata: &Metadata) {
             report.feature_count_index,
             report.feature_count_decoded,
             report.tiles_decoded,
-            if report.sampled { "sampled" } else { "decode skipped" }
+            if report.sampled {
+                "sampled"
+            } else {
+                "decode skipped"
+            }
         );
     }
     println!(
@@ -716,10 +738,16 @@ fn print_summary(report: &Report, metadata: &Metadata) {
         "time range       {} .. {}",
         metadata.time_range.start, metadata.time_range.end
     );
-    println!("zoom range       {} .. {}", metadata.min_zoom, metadata.max_zoom);
+    println!(
+        "zoom range       {} .. {}",
+        metadata.min_zoom, metadata.max_zoom
+    );
     println!("elapsed          {} ms", report.elapsed_ms);
     if !report.warnings.is_empty() {
-        println!("\n{} warning(s) (never affect the exit code):", report.warnings.len());
+        println!(
+            "\n{} warning(s) (never affect the exit code):",
+            report.warnings.len()
+        );
         for w in &report.warnings {
             println!("  - {w}");
         }
@@ -749,9 +777,14 @@ mod tests {
             "/../../docs/api/cli-reference.md"
         ))
         .expect("read docs/api/cli-reference.md");
-        let start = doc.find("## `stt-validate`").expect("stt-validate section heading");
+        let start = doc
+            .find("## `stt-validate`")
+            .expect("stt-validate section heading");
         let body = &doc[start + 1..];
-        let end = body.find("\n## `").map(|i| start + 1 + i).unwrap_or(doc.len());
+        let end = body
+            .find("\n## `")
+            .map(|i| start + 1 + i)
+            .unwrap_or(doc.len());
         let section = &doc[start..end];
         let missing: Vec<String> = Args::command()
             .get_arguments()
@@ -785,7 +818,12 @@ mod tests {
         let legacy = Metadata::new("legacy");
         finalize_feature_check(&args, &mut report, &legacy);
         assert!(report.errors.is_empty(), "errors were: {:?}", report.errors);
-        assert_eq!(report.warnings.len(), 2, "warnings were: {:?}", report.warnings);
+        assert_eq!(
+            report.warnings.len(),
+            2,
+            "warnings were: {:?}",
+            report.warnings
+        );
         assert!(
             report.warnings.iter().all(|w| w.contains("stt-build")),
             "warnings must name the fix: {:?}",
@@ -802,7 +840,11 @@ mod tests {
         wrong.tile_count = 2;
         wrong.feature_count = 9;
         finalize_feature_check(&args, &mut report, &wrong);
-        assert!(report.warnings.is_empty(), "warnings were: {:?}", report.warnings);
+        assert!(
+            report.warnings.is_empty(),
+            "warnings were: {:?}",
+            report.warnings
+        );
         assert_eq!(report.errors.len(), 2, "errors were: {:?}", report.errors);
 
         // Matching totals: clean.
@@ -816,6 +858,10 @@ mod tests {
         ok.feature_count = 7;
         finalize_feature_check(&args, &mut report, &ok);
         assert!(report.errors.is_empty(), "errors were: {:?}", report.errors);
-        assert!(report.warnings.is_empty(), "warnings were: {:?}", report.warnings);
+        assert!(
+            report.warnings.is_empty(),
+            "warnings were: {:?}",
+            report.warnings
+        );
     }
 }

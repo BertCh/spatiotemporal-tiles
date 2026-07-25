@@ -24,8 +24,8 @@
 use arrow::datatypes::DataType;
 use stt_core::arrow_tile::{
     decode_tile, encode_tile, encode_tile_quantized, encode_tile_with, tessellate_polygon,
-    AttrQuant, ColumnarLayer, Coord, EncoderConfig, GeometryColumn, PropertyColumn, QuantAffine,
-    DecodedLayer, VectorElem, STT_QUANT_ATTR_META_KEY, STT_QUANT_META_KEY, TRIANGLES_METADATA_KEY,
+    AttrQuant, ColumnarLayer, Coord, DecodedLayer, EncoderConfig, GeometryColumn, PropertyColumn,
+    QuantAffine, VectorElem, STT_QUANT_ATTR_META_KEY, STT_QUANT_META_KEY, TRIANGLES_METADATA_KEY,
 };
 
 mod common;
@@ -79,7 +79,11 @@ fn assert_core_columns(decoded: &DecodedLayer, expected_geoarrow_name: &str) {
     let start = schema
         .field_with_name("start_time")
         .expect("`start_time` column present");
-    assert_eq!(start.data_type(), &DataType::Int64, "start_time must be Int64");
+    assert_eq!(
+        start.data_type(),
+        &DataType::Int64,
+        "start_time must be Int64"
+    );
     assert!(!start.is_nullable(), "start_time is non-null per spec");
 
     let end = schema
@@ -171,21 +175,22 @@ fn polygon_layer_matches_spec_schema() {
         plain.batch.column_by_name("triangles").is_none(),
         "polygon without --pre-tessellate must not carry a triangles column",
     );
-    assert!(!plain.batch.schema().metadata().contains_key(TRIANGLES_METADATA_KEY));
+    assert!(!plain
+        .batch
+        .schema()
+        .metadata()
+        .contains_key(TRIANGLES_METADATA_KEY));
 }
 
 #[test]
 fn pre_tessellated_polygon_carries_triangles_column() {
     // With pre-tessellation on (the `--pre-tessellate` build path).
-    let exterior: Vec<Coord> = vec![
-        [0.0, 0.0],
-        [4.0, 0.0],
-        [4.0, 4.0],
-        [0.0, 4.0],
-        [0.0, 0.0],
-    ];
+    let exterior: Vec<Coord> = vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]];
     let tris = tessellate_polygon(&[exterior]);
-    assert!(!tris.is_empty(), "earcut should produce indices for a square");
+    assert!(
+        !tris.is_empty(),
+        "earcut should produce indices for a square"
+    );
 
     let decoded = roundtrip(polygon_layer(Some(vec![tris])));
     assert_core_columns(&decoded, "geoarrow.polygon");
@@ -208,7 +213,10 @@ fn pre_tessellated_polygon_carries_triangles_column() {
 
     // The spec's schema-metadata advertisement flag must be set.
     assert_eq!(
-        schema.metadata().get(TRIANGLES_METADATA_KEY).map(String::as_str),
+        schema
+            .metadata()
+            .get(TRIANGLES_METADATA_KEY)
+            .map(String::as_str),
         Some("true"),
         "pre-tessellated layers must advertise stt:has_triangles=true",
     );
@@ -257,7 +265,10 @@ fn vector_group_column_matches_spec_schema() {
     let quat = schema
         .field_with_name("surfel_quat")
         .expect("f32 vector-group column present");
-    assert!(quat.is_nullable(), "vector-group column is nullable per spec");
+    assert!(
+        quat.is_nullable(),
+        "vector-group column is nullable per spec"
+    );
     match quat.data_type() {
         DataType::FixedSizeList(child, len) => {
             assert_eq!(*len, 4, "vector width is the FixedSizeList size");
@@ -312,7 +323,9 @@ fn attribute_quantization_roundtrips_via_stt_qa() {
     let decoded = decoded.pop().unwrap();
 
     let schema = decoded.batch.schema();
-    let speed = schema.field_with_name("speed").expect("quantized property present");
+    let speed = schema
+        .field_with_name("speed")
+        .expect("quantized property present");
     assert!(
         matches!(speed.data_type(), DataType::UInt16 | DataType::Int32),
         "quantized property must be a UInt16/Int32 fixed-point leaf, got {:?}",
@@ -334,7 +347,10 @@ fn attribute_quantization_roundtrips_via_stt_qa() {
         .as_any()
         .downcast_ref::<UInt16Array>()
         .expect("this fixture's range fits the UInt16 leaf");
-    assert!(!col.is_null(0) && col.is_null(1) && !col.is_null(2), "nulls survive quantization");
+    assert!(
+        !col.is_null(0) && col.is_null(1) && !col.is_null(2),
+        "nulls survive quantization"
+    );
     for (i, want) in [(0usize, 10.0f64), (2, 30.0)] {
         let got = qa.value(col.value(i) as i64);
         assert!(
@@ -362,7 +378,9 @@ fn coordinate_quantization_roundtrips_via_stt_quant() {
     let decoded = decoded.pop().unwrap();
 
     let schema = decoded.batch.schema();
-    let geom = schema.field_with_name("geometry").expect("geometry present");
+    let geom = schema
+        .field_with_name("geometry")
+        .expect("geometry present");
     assert_eq!(
         geom.metadata().get(GEOARROW_EXT_KEY).map(String::as_str),
         Some("geoarrow.point"),
@@ -393,7 +411,9 @@ fn coordinate_quantization_roundtrips_via_stt_quant() {
         .as_any()
         .downcast_ref::<Int32Array>()
         .expect("quantized leaf must be Int32");
-    let GeometryColumn::Point(points) = &layer.geometry else { unreachable!() };
+    let GeometryColumn::Point(points) = &layer.geometry else {
+        unreachable!()
+    };
     for (i, [lon, lat]) in points.iter().enumerate() {
         let got_lon = q.lon(leaf.value(i * 2));
         let got_lat = q.lat(leaf.value(i * 2 + 1));
@@ -412,12 +432,20 @@ fn coordinate_quantization_roundtrips_via_stt_quant() {
     // The unquantized encode of the same layer DOES carry the CRS84 metadata —
     // the writer-MUST in docs/spec/conformance.md §3.
     let plain = roundtrip(point_layer());
-    let plain_geom = plain.batch.schema().field_with_name("geometry").unwrap().clone();
+    let plain_geom = plain
+        .batch
+        .schema()
+        .field_with_name("geometry")
+        .unwrap()
+        .clone();
     let crs = plain_geom
         .metadata()
         .get("ARROW:extension:metadata")
         .expect("unquantized geometry must carry the GeoArrow CRS metadata");
-    assert!(crs.contains("OGC:CRS84"), "CRS must pin OGC:CRS84, got {crs}");
+    assert!(
+        crs.contains("OGC:CRS84"),
+        "CRS must pin OGC:CRS84, got {crs}"
+    );
 }
 
 #[test]
@@ -464,7 +492,10 @@ fn vertex_value_matrix_carries_consistent_bucket_count() {
         other => panic!("vertex_value_matrix must be a List, got {other:?}"),
     }
     assert_eq!(
-        schema.metadata().get("stt:vertex_value_buckets").map(String::as_str),
+        schema
+            .metadata()
+            .get("stt:vertex_value_buckets")
+            .map(String::as_str),
         Some("2"),
         "bucket count must be recorded in schema metadata",
     );
@@ -480,11 +511,14 @@ fn vertex_value_matrix_carries_consistent_bucket_count() {
         .unwrap();
     let want = layer.vertex_value_matrix.as_ref().unwrap();
     for (i, (row, n_vertices)) in want.iter().zip([3usize, 2]).enumerate() {
-        assert_eq!(col.value_length(i) as usize, n_vertices * buckets, "row {i} width");
+        assert_eq!(
+            col.value_length(i) as usize,
+            n_vertices * buckets,
+            "row {i} width"
+        );
         let vals = col.value(i);
         let vals = vals.as_any().downcast_ref::<Float32Array>().unwrap();
         let got: Vec<f32> = (0..vals.len()).map(|j| vals.value(j)).collect();
         assert_eq!(&got, row, "row {i} values");
     }
 }
-

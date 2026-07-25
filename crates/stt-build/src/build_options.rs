@@ -90,10 +90,9 @@ pub fn parse_quantize_attrs(specs: &[String]) -> Result<HashMap<String, f64>> {
         let (name, prec) = spec
             .split_once('=')
             .ok_or_else(|| anyhow::anyhow!("--quantize-attr expects NAME=PREC, got {spec:?}"))?;
-        let prec: f64 = prec
-            .trim()
-            .parse()
-            .map_err(|_| anyhow::anyhow!("--quantize-attr {spec:?}: PREC {prec:?} is not a number"))?;
+        let prec: f64 = prec.trim().parse().map_err(|_| {
+            anyhow::anyhow!("--quantize-attr {spec:?}: PREC {prec:?} is not a number")
+        })?;
         if prec <= 0.0 {
             anyhow::bail!("--quantize-attr {spec:?}: PREC must be > 0");
         }
@@ -254,7 +253,11 @@ impl EncoderSettings {
         if !self.quantize_attr.is_empty() || self.quantize_attrs_auto {
             caps.push(stt_core::pack::CAPABILITY_ATTR_QUANT.to_string());
         }
-        if self.point_elevation_column.as_deref().is_some_and(|c| !c.is_empty()) {
+        if self
+            .point_elevation_column
+            .as_deref()
+            .is_some_and(|c| !c.is_empty())
+        {
             caps.push(stt_core::pack::CAPABILITY_ELEVATION_FOLD.to_string());
         }
         caps
@@ -316,8 +319,7 @@ pub fn build_attribute_filter(
         AttributeFilter::KeepAll
     };
 
-    let dropped_required: Vec<&String> =
-        required.iter().filter(|p| !filter.keeps(p)).collect();
+    let dropped_required: Vec<&String> = required.iter().filter(|p| !filter.keeps(p)).collect();
     if !dropped_required.is_empty() {
         let uniq: HashSet<&String> = dropped_required.into_iter().collect();
         let mut names: Vec<&str> = uniq.iter().map(|s| s.as_str()).collect();
@@ -367,7 +369,8 @@ mod tests {
 
     #[test]
     fn vector_group_specs() {
-        let g = parse_vector_groups(&["rgba=r,g,b,a:u8".into(), "quat=qx,qy,qz,qw".into()]).unwrap();
+        let g =
+            parse_vector_groups(&["rgba=r,g,b,a:u8".into(), "quat=qx,qy,qz,qw".into()]).unwrap();
         assert_eq!(g.len(), 2);
         assert_eq!(g[0].name, "rgba");
         assert_eq!(g[0].components, vec!["r", "g", "b", "a"]);
@@ -380,7 +383,9 @@ mod tests {
     #[test]
     fn required_capabilities_from_settings() {
         // No re-typing feature → no capabilities (the manifest key is omitted).
-        assert!(EncoderSettings::default().required_capabilities().is_empty());
+        assert!(EncoderSettings::default()
+            .required_capabilities()
+            .is_empty());
 
         // Each re-typing feature declares its registry entry.
         let all = EncoderSettings {
@@ -395,7 +400,10 @@ mod tests {
         );
 
         // Auto attr-quantization alone also re-types columns.
-        let auto = EncoderSettings { quantize_attrs_auto: true, ..Default::default() };
+        let auto = EncoderSettings {
+            quantize_attrs_auto: true,
+            ..Default::default()
+        };
         assert_eq!(auto.required_capabilities(), ["attr-quant"]);
 
         // Additive features (vector groups, vertex-time precision) and an

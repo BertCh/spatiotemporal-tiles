@@ -33,8 +33,8 @@ fn write_parquet(
     let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
     let mut props = WriterProperties::builder();
     if let Some(geo_json) = geo {
-        props = props
-            .set_key_value_metadata(Some(vec![KeyValue::new("geo".to_string(), geo_json)]));
+        props =
+            props.set_key_value_metadata(Some(vec![KeyValue::new("geo".to_string(), geo_json)]));
     }
     let file = std::fs::File::create(path).unwrap();
     let mut writer = ArrowWriter::try_new(file, schema, Some(props.build())).unwrap();
@@ -101,7 +101,11 @@ fn non_wgs84_crs_warns_by_default_and_fails_under_strict() {
     // Default (Warn): the build proceeds — the CRS is advisory only.
     let features = load(&path, InputStrictness::Warn, InputStrictness::Warn)
         .expect("non-WGS84 CRS must not block the build by default");
-    assert_eq!(features.len(), 1, "row tiled as-is under the warn-only guard");
+    assert_eq!(
+        features.len(),
+        1,
+        "row tiled as-is under the warn-only guard"
+    );
 
     // --strict-geometry (Strict): the same input hard-errors, naming both the
     // found CRS and the required one.
@@ -426,7 +430,10 @@ fn naive_iso_timestamps_build_as_utc() {
     write_parquet(
         &path,
         string_time_schema(),
-        string_time_columns(vec![Some("2024-09-28T12:00:00"), Some("2024-09-28 12:00:00")]),
+        string_time_columns(vec![
+            Some("2024-09-28T12:00:00"),
+            Some("2024-09-28 12:00:00"),
+        ]),
         None,
     );
     let features = load_features(
@@ -440,7 +447,10 @@ fn naive_iso_timestamps_build_as_utc() {
     .expect("zone-less ISO timestamps must parse as UTC");
     assert_eq!(features.len(), 2);
     assert_eq!(features[0].timestamp, 1_727_524_800_000); // 2024-09-28T12:00:00Z
-    assert_eq!(features[0].timestamp, features[1].timestamp, "T and space forms agree");
+    assert_eq!(
+        features[0].timestamp, features[1].timestamp,
+        "T and space forms agree"
+    );
 }
 
 /// EVERY row failing to parse means the column/format is wrong, and the
@@ -468,8 +478,14 @@ fn all_timestamps_unparseable_fails_even_in_warn_mode() {
     )
     .expect_err("an input whose every timestamp fails must not build");
     let msg = format!("{err:#}");
-    assert!(msg.contains("'timestamp'"), "must name the time column: {msg}");
-    assert!(msg.contains("epoch 0"), "must explain the coercion hazard: {msg}");
+    assert!(
+        msg.contains("'timestamp'"),
+        "must name the time column: {msg}"
+    );
+    assert!(
+        msg.contains("epoch 0"),
+        "must explain the coercion hazard: {msg}"
+    );
 
     // One bad row among good ones keeps the documented warn+coerce behavior.
     let one_bad = dir.path().join("one_bad.parquet");
@@ -502,7 +518,9 @@ fn all_null_timestamps_fail_even_in_warn_mode() {
         &path,
         binary_geom_schema("geometry"),
         vec![
-            Arc::new(BinaryArray::from_opt_vec(vec![Some(wkb_point(1.0, 2.0).as_slice())])),
+            Arc::new(BinaryArray::from_opt_vec(vec![Some(
+                wkb_point(1.0, 2.0).as_slice(),
+            )])),
             Arc::new(Int64Array::from(vec![None::<i64>])),
         ],
         None,

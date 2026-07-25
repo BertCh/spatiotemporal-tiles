@@ -43,10 +43,19 @@ fn duckdb_matches_file_parsed_features() {
     // The core fix: per-vertex columns now survive the DB path. (Both linestring
     // rows carry vertex_timestamps + vertex_values; before the fix the DB reader
     // hardcoded all three to None.)
-    let with_vts = duck.iter().filter(|f| f.vertex_timestamps.is_some()).count();
+    let with_vts = duck
+        .iter()
+        .filter(|f| f.vertex_timestamps.is_some())
+        .count();
     let with_vvs = duck.iter().filter(|f| f.vertex_values.is_some()).count();
-    assert_eq!(with_vts, 2, "duckdb must carry per-vertex timestamps for the 2 linestrings");
-    assert_eq!(with_vvs, 2, "duckdb must carry per-vertex values for the 2 linestrings");
+    assert_eq!(
+        with_vts, 2,
+        "duckdb must carry per-vertex timestamps for the 2 linestrings"
+    );
+    assert_eq!(
+        with_vvs, 2,
+        "duckdb must carry per-vertex values for the 2 linestrings"
+    );
 }
 
 #[cfg(feature = "duckdb")]
@@ -124,7 +133,10 @@ fn duckdb_property_kinds_match_file() {
     )
     .expect("duckdb property kinds");
 
-    assert_eq!(file_kinds, duck_kinds, "file and DuckDB must pin identical kinds");
+    assert_eq!(
+        file_kinds, duck_kinds,
+        "file and DuckDB must pin identical kinds"
+    );
     // Spot-check the expected shape (and that system columns stayed out).
     assert_eq!(duck_kinds.get("mag"), Some(&PropertyKind::Numeric));
     assert_eq!(duck_kinds.get("cnt"), Some(&PropertyKind::Numeric));

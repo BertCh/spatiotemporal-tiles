@@ -150,9 +150,21 @@ fn check_layer_schema(layer: &DecodedLayer, findings: &mut SchemaFindings) {
 
     // (c) optional per-vertex columns, when present, must carry the expected
     // List<inner> types.
-    check_optional_list(name, &schema, "vertex_time", &[DataType::UInt16, DataType::Int64], issues);
+    check_optional_list(
+        name,
+        &schema,
+        "vertex_time",
+        &[DataType::UInt16, DataType::Int64],
+        issues,
+    );
     check_optional_list(name, &schema, "vertex_value", &[DataType::Float32], issues);
-    check_optional_list(name, &schema, "vertex_value_matrix", &[DataType::Float32], issues);
+    check_optional_list(
+        name,
+        &schema,
+        "vertex_value_matrix",
+        &[DataType::Float32],
+        issues,
+    );
     check_optional_list(
         name,
         &schema,
@@ -429,8 +441,7 @@ fn is_valid_property_field(field: &Field) -> bool {
         // scale) or UInt8 (RGBA colour). The renderer binds the child buffer
         // zero-copy, so only those two leaf types are encodable.
         DataType::FixedSizeList(item, n) => {
-            *n > 0
-                && matches!(item.data_type(), DataType::Float32 | DataType::UInt8)
+            *n > 0 && matches!(item.data_type(), DataType::Float32 | DataType::UInt8)
         }
         // Quantized numeric: only valid WITH a parseable affine — a bare
         // UInt16/Int32 property with no (or malformed) `stt:qa` is producer
@@ -505,11 +516,11 @@ pub fn schema_signature(layers: &[DecodedLayer]) -> String {
 mod tests {
     use super::*;
     use arrow::datatypes::Field;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use stt_core::arrow_tile::{
         decode_tile, encode_tile, ColumnarLayer, GeometryColumn, PropertyColumn,
     };
-    use std::collections::HashMap;
-    use std::sync::Arc;
 
     /// A well-formed point layer (id/start/end/geometry + one numeric + one
     /// categorical property), encoded then decoded so the test exercises the
@@ -526,7 +537,10 @@ mod tests {
             triangles: None,
             vertex_value_matrix: None,
             properties: vec![
-                ("speed".into(), PropertyColumn::Numeric(vec![Some(1.0), None, Some(3.0)])),
+                (
+                    "speed".into(),
+                    PropertyColumn::Numeric(vec![Some(1.0), None, Some(3.0)]),
+                ),
                 (
                     "kind".into(),
                     PropertyColumn::Categorical(vec![Some("a".into()), Some("b".into()), None]),
@@ -588,15 +602,22 @@ mod tests {
             Field::new("end_time", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(schema, vec![id, end]).unwrap();
-        let layers = vec![DecodedLayer { name: "broken".into(), batch }];
+        let layers = vec![DecodedLayer {
+            name: "broken".into(),
+            batch,
+        }];
 
         let issues = check_tile_schema(&layers).errors;
         assert!(
-            issues.iter().any(|i| i.contains("missing required column 'start_time'")),
+            issues
+                .iter()
+                .any(|i| i.contains("missing required column 'start_time'")),
             "issues were: {issues:?}"
         );
         assert!(
-            issues.iter().any(|i| i.contains("missing required 'geometry'")),
+            issues
+                .iter()
+                .any(|i| i.contains("missing required 'geometry'")),
             "issues were: {issues:?}"
         );
     }
@@ -626,11 +647,16 @@ mod tests {
             Field::new("end_time", DataType::Int64, false),
             Field::new("geometry", geom.data_type().clone(), false).with_metadata(geom_meta),
         ]));
-        let batch =
-            RecordBatch::try_new(schema, vec![id, start, end, geom]).unwrap();
-        let issues = check_tile_schema(&[DecodedLayer { name: "drift".into(), batch }]).errors;
+        let batch = RecordBatch::try_new(schema, vec![id, start, end, geom]).unwrap();
+        let issues = check_tile_schema(&[DecodedLayer {
+            name: "drift".into(),
+            batch,
+        }])
+        .errors;
         assert!(
-            issues.iter().any(|i| i.contains("column 'id'") && i.contains("expected UInt64")),
+            issues
+                .iter()
+                .any(|i| i.contains("column 'id'") && i.contains("expected UInt64")),
             "issues were: {issues:?}"
         );
     }
@@ -659,7 +685,11 @@ mod tests {
             Field::new("geometry", geom.data_type().clone(), false),
         ]));
         let batch = RecordBatch::try_new(schema, vec![id, start, end, geom]).unwrap();
-        let issues = check_tile_schema(&[DecodedLayer { name: "nogeo".into(), batch }]).errors;
+        let issues = check_tile_schema(&[DecodedLayer {
+            name: "nogeo".into(),
+            batch,
+        }])
+        .errors;
         assert!(
             issues.iter().any(|i| i.contains("extension name")),
             "issues were: {issues:?}"
@@ -726,19 +756,27 @@ mod tests {
                 vec![id.clone(), start.clone(), end.clone(), geom.clone()],
             )
             .unwrap();
-            check_tile_schema(&[DecodedLayer { name: "q".into(), batch }]).errors
+            check_tile_schema(&[DecodedLayer {
+                name: "q".into(),
+                batch,
+            }])
+            .errors
         };
 
         // Missing affine entirely.
         let issues = build(None);
         assert!(
-            issues.iter().any(|i| i.contains("stt:quant") && i.contains("missing")),
+            issues
+                .iter()
+                .any(|i| i.contains("stt:quant") && i.contains("missing")),
             "issues were: {issues:?}"
         );
         // Present but malformed JSON.
         let issues = build(Some("{not json"));
         assert!(
-            issues.iter().any(|i| i.contains("stt:quant") && i.contains("not a valid")),
+            issues
+                .iter()
+                .any(|i| i.contains("stt:quant") && i.contains("not a valid")),
             "issues were: {issues:?}"
         );
         // Present and well-formed: clean.
@@ -774,7 +812,10 @@ mod tests {
             layer.batch.schema().metadata().clone(),
         ));
         let batch = RecordBatch::try_new(schema, layer.batch.columns().to_vec()).unwrap();
-        DecodedLayer { name: layer.name.clone(), batch }
+        DecodedLayer {
+            name: layer.name.clone(),
+            batch,
+        }
     }
 
     #[test]
@@ -787,7 +828,11 @@ mod tests {
             meta.remove(GEOARROW_EXT_META_KEY);
         });
         let findings = check_tile_schema(&[stripped]);
-        assert!(findings.errors.is_empty(), "errors were: {:?}", findings.errors);
+        assert!(
+            findings.errors.is_empty(),
+            "errors were: {:?}",
+            findings.errors
+        );
         assert!(
             findings
                 .warnings
@@ -840,25 +885,36 @@ mod tests {
         let stripped = with_schema_metadata(&decoded[0], HashMap::new());
         let issues = check_tile_schema(&[stripped]).errors;
         assert!(
-            issues.iter().any(|i| i.contains(VERTEX_TIME_ORIGIN_KEY) && i.contains("missing")),
+            issues
+                .iter()
+                .any(|i| i.contains(VERTEX_TIME_ORIGIN_KEY) && i.contains("missing")),
             "issues were: {issues:?}"
         );
         assert!(
-            issues.iter().any(|i| i.contains(VERTEX_TIME_STEP_KEY) && i.contains("missing")),
+            issues
+                .iter()
+                .any(|i| i.contains(VERTEX_TIME_STEP_KEY) && i.contains("missing")),
             "issues were: {issues:?}"
         );
 
         // Insane values (non-integer origin, zero step) are rejected too.
         let mut bad = HashMap::new();
-        bad.insert(VERTEX_TIME_ORIGIN_KEY.to_string(), "not-a-number".to_string());
+        bad.insert(
+            VERTEX_TIME_ORIGIN_KEY.to_string(),
+            "not-a-number".to_string(),
+        );
         bad.insert(VERTEX_TIME_STEP_KEY.to_string(), "0".to_string());
         let issues = check_tile_schema(&[with_schema_metadata(&decoded[0], bad)]).errors;
         assert!(
-            issues.iter().any(|i| i.contains(VERTEX_TIME_ORIGIN_KEY) && i.contains("not an integer")),
+            issues
+                .iter()
+                .any(|i| i.contains(VERTEX_TIME_ORIGIN_KEY) && i.contains("not an integer")),
             "issues were: {issues:?}"
         );
         assert!(
-            issues.iter().any(|i| i.contains(VERTEX_TIME_STEP_KEY) && i.contains("positive")),
+            issues
+                .iter()
+                .any(|i| i.contains(VERTEX_TIME_STEP_KEY) && i.contains("positive")),
             "issues were: {issues:?}"
         );
     }
@@ -901,7 +957,9 @@ mod tests {
         let issues = check_tile_schema(&[with_schema_metadata(&decoded[0], meta)]).errors;
         for key in [VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY] {
             assert!(
-                issues.iter().any(|i| i.contains(key) && i.contains("must not carry")),
+                issues
+                    .iter()
+                    .any(|i| i.contains(key) && i.contains("must not carry")),
                 "no 'must not carry' issue for {key}; issues were: {issues:?}"
             );
         }
@@ -930,7 +988,12 @@ mod tests {
         };
         let decoded = decode(&[layer]);
         assert_eq!(
-            decoded[0].batch.schema().metadata().get(VERTEX_VALUE_BUCKETS_KEY).map(String::as_str),
+            decoded[0]
+                .batch
+                .schema()
+                .metadata()
+                .get(VERTEX_VALUE_BUCKETS_KEY)
+                .map(String::as_str),
             Some("2")
         );
         assert!(all_findings(&decoded).is_empty());
@@ -943,14 +1006,18 @@ mod tests {
         // Positive but inconsistent with the row widths.
         let issues = tamper("4");
         assert!(
-            issues.iter().any(|i| i.contains("vertex_value_matrix row") && i.contains("expected")),
+            issues
+                .iter()
+                .any(|i| i.contains("vertex_value_matrix row") && i.contains("expected")),
             "issues were: {issues:?}"
         );
         // Non-positive / non-integer.
         for bad in ["0", "-2", "two"] {
             let issues = tamper(bad);
             assert!(
-                issues.iter().any(|i| i.contains(VERTEX_VALUE_BUCKETS_KEY) && i.contains("positive")),
+                issues
+                    .iter()
+                    .any(|i| i.contains(VERTEX_VALUE_BUCKETS_KEY) && i.contains("positive")),
                 "value {bad:?}: issues were: {issues:?}"
             );
         }
@@ -958,7 +1025,9 @@ mod tests {
 
     #[test]
     fn quantized_property_with_malformed_affine_is_reported() {
-        use arrow::array::{Array, FixedSizeListArray, Float64Array, Int64Array, UInt16Array, UInt64Array};
+        use arrow::array::{
+            Array, FixedSizeListArray, Float64Array, Int64Array, UInt16Array, UInt64Array,
+        };
         use arrow::datatypes::Schema;
         use arrow::record_batch::RecordBatch;
 
@@ -989,9 +1058,15 @@ mod tests {
         ]));
         let depth = Arc::new(UInt16Array::from(vec![7u16]));
         let batch = RecordBatch::try_new(schema, vec![id, start, end, geom, depth]).unwrap();
-        let issues = check_tile_schema(&[DecodedLayer { name: "qa".into(), batch }]).errors;
+        let issues = check_tile_schema(&[DecodedLayer {
+            name: "qa".into(),
+            batch,
+        }])
+        .errors;
         assert!(
-            issues.iter().any(|i| i.contains("'depth'") && i.contains(STT_QUANT_ATTR_META_KEY)),
+            issues
+                .iter()
+                .any(|i| i.contains("'depth'") && i.contains(STT_QUANT_ATTR_META_KEY)),
             "issues were: {issues:?}"
         );
     }

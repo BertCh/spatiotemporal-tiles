@@ -17,9 +17,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use stt_core::BlobOrdering;
 use stt_core::curve;
 use stt_core::pack::PackedReader;
+use stt_core::BlobOrdering;
 
 /// Read `--flag value` from the argv slice.
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -59,8 +59,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The native (finest) tier is the honest picture of the data's shape; the
     // summary/LOD tiers are aggregates that would flatten the density.
-    let native: Vec<&stt_core::TileEntry> =
-        reader.entries().iter().filter(|e| e.zoom == max_zoom).collect();
+    let native: Vec<&stt_core::TileEntry> = reader
+        .entries()
+        .iter()
+        .filter(|e| e.zoom == max_zoom)
+        .collect();
     if native.is_empty() {
         return Err(format!("no entries at native zoom {max_zoom}").into());
     }
@@ -145,7 +148,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         idx.sort_by_key(|&i| {
             let e = native[i];
             curve::space_time_key(
-                o, e.zoom, e.x, e.y, e.hilbert, e.time_start, tb_of(e), tb_min, tb_span,
+                o,
+                e.zoom,
+                e.x,
+                e.y,
+                e.hilbert,
+                e.time_start,
+                tb_of(e),
+                tb_min,
+                tb_span,
             )
         });
         let mut breaks = 0u64;
@@ -200,9 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Flat [sx, sy, tb, count, bytes] tuples keep the JSON compact.
     let cells: Vec<serde_json::Value> = cube
         .iter()
-        .map(|(&(sx, sy, tb), &(count, bytes))| {
-            serde_json::json!([sx, sy, tb, count, bytes])
-        })
+        .map(|(&(sx, sy, tb), &(count, bytes))| serde_json::json!([sx, sy, tb, count, bytes]))
         .collect();
 
     let out = serde_json::json!({

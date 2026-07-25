@@ -23,14 +23,14 @@ use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 
 use arrow::array::{
-    Array, DictionaryArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array,
-    Int64Array, ListArray, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
+    Array, DictionaryArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    ListArray, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, UInt16Type};
 use stt_core::arrow_tile::{
     decode_tile, decode_tile_with_templates, encode_tile_with, set_quantize_attrs,
-    set_quantize_attrs_auto, set_quantize_coords_m, AttrQuant, ColumnarLayer, Coord,
-    EncoderConfig, GeometryColumn, PropertyColumn, QuantAffine, STT_QUANT_ATTR_META_KEY,
+    set_quantize_attrs_auto, set_quantize_coords_m, AttrQuant, ColumnarLayer, Coord, EncoderConfig,
+    GeometryColumn, PropertyColumn, QuantAffine, STT_QUANT_ATTR_META_KEY,
 };
 use stt_core::pack::{PackWriter, PackedReader};
 use stt_core::tile::TileId;
@@ -50,7 +50,9 @@ const RESERVED: &[&str] = &[
 /// Read the geometry field's quantization affine, if the tile is quantized.
 fn geom_affine(batch: &RecordBatch) -> Option<QuantAffine> {
     let f = batch.schema().field_with_name("geometry").ok()?.clone();
-    f.metadata().get("stt:quant").and_then(|s| QuantAffine::from_json(s))
+    f.metadata()
+        .get("stt:quant")
+        .and_then(|s| QuantAffine::from_json(s))
 }
 
 /// One [x,y] coord from a leaf (Float64 or quantized Int32) at index `i` (the
@@ -78,7 +80,9 @@ fn read_geometry(batch: &RecordBatch, kind: &str) -> GeometryColumn {
             let fsl = col.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
             let leaf = fsl.values();
             let n = fsl.len();
-            let pts = (0..n).map(|i| coord_at(leaf.as_ref(), i, aff.as_ref())).collect();
+            let pts = (0..n)
+                .map(|i| coord_at(leaf.as_ref(), i, aff.as_ref()))
+                .collect();
             GeometryColumn::Point(pts)
         }
         "geoarrow.linestring" => {
@@ -125,8 +129,12 @@ fn read_list_i64_vertex_time(batch: &RecordBatch) -> Option<Vec<Vec<i64>>> {
     let list = col.as_any().downcast_ref::<ListArray>()?;
     // u16-delta encoding carries origin/step in schema metadata.
     let meta = batch.schema().metadata().clone();
-    let origin: Option<i64> = meta.get("stt:vertex_time_origin_ms").and_then(|s| s.parse().ok());
-    let step: Option<i64> = meta.get("stt:vertex_time_step_ms").and_then(|s| s.parse().ok());
+    let origin: Option<i64> = meta
+        .get("stt:vertex_time_origin_ms")
+        .and_then(|s| s.parse().ok());
+    let step: Option<i64> = meta
+        .get("stt:vertex_time_step_ms")
+        .and_then(|s| s.parse().ok());
     let mut out = Vec::with_capacity(list.len());
     for i in 0..list.len() {
         if list.is_null(i) {
@@ -192,7 +200,9 @@ fn read_property(batch: &RecordBatch, idx: usize) -> (String, PropertyColumn) {
         DataType::Float64 => {
             let a = col.as_any().downcast_ref::<Float64Array>().unwrap();
             PropertyColumn::Numeric(
-                (0..a.len()).map(|i| (!a.is_null(i)).then(|| a.value(i))).collect(),
+                (0..a.len())
+                    .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+                    .collect(),
             )
         }
         DataType::UInt16 => {
@@ -214,12 +224,21 @@ fn read_property(batch: &RecordBatch, idx: usize) -> (String, PropertyColumn) {
             )
         }
         DataType::Dictionary(_, _) => {
-            let dict = col.as_any().downcast_ref::<DictionaryArray<UInt16Type>>().unwrap();
-            let vals = dict.values().as_any().downcast_ref::<StringArray>().unwrap();
+            let dict = col
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt16Type>>()
+                .unwrap();
+            let vals = dict
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
             let keys = dict.keys();
             PropertyColumn::Categorical(
                 (0..keys.len())
-                    .map(|i| (!keys.is_null(i)).then(|| vals.value(keys.value(i) as usize).to_string()))
+                    .map(|i| {
+                        (!keys.is_null(i)).then(|| vals.value(keys.value(i) as usize).to_string())
+                    })
                     .collect(),
             )
         }
@@ -322,18 +341,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--format-version" => { format_version = Some(args[i + 1].parse()?); i += 2; }
-            "--quantize-coords" => { coord_m = args[i + 1].parse()?; i += 2; }
+            "--format-version" => {
+                format_version = Some(args[i + 1].parse()?);
+                i += 2;
+            }
+            "--quantize-coords" => {
+                coord_m = args[i + 1].parse()?;
+                i += 2;
+            }
             "--quantize-attr" => {
                 let (n, p) = args[i + 1].split_once('=').expect("name=prec");
                 attrs.insert(n.to_string(), p.parse()?);
                 i += 2;
             }
-            "--quantize-attrs-auto" => { auto = true; i += 1; }
-            "--drop" => { drop.insert(args[i + 1].clone()); i += 2; }
-            "--no-seq-ids" => { seq_ids = false; i += 1; }
-            "--zstd" => { zstd = args[i + 1].parse()?; i += 2; }
-            other => { eprintln!("unknown arg {other}"); std::process::exit(2); }
+            "--quantize-attrs-auto" => {
+                auto = true;
+                i += 1;
+            }
+            "--drop" => {
+                drop.insert(args[i + 1].clone());
+                i += 2;
+            }
+            "--no-seq-ids" => {
+                seq_ids = false;
+                i += 1;
+            }
+            "--zstd" => {
+                zstd = args[i + 1].parse()?;
+                i += 2;
+            }
+            other => {
+                eprintln!("unknown arg {other}");
+                std::process::exit(2);
+            }
         }
     }
 
@@ -375,8 +415,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // never disagree, and a v2 build's templates land in `manifest.schemas`.
     let encoder_cfg = EncoderConfig {
         format_version: writer.format_version(),
-        template_collector: (writer.format_version()
-            == stt_core::pack::PACKED_FORMAT_VERSION_V2)
+        template_collector: (writer.format_version() == stt_core::pack::PACKED_FORMAT_VERSION_V2)
             .then(|| writer.template_collector()),
         ..EncoderConfig::from_globals()
     };

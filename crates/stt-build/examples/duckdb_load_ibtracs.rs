@@ -20,7 +20,10 @@ fn main() -> anyhow::Result<()> {
     use anyhow::Context;
 
     let args: Vec<String> = std::env::args().collect();
-    let csv = args.get(1).map(String::as_str).unwrap_or("data/ibtracs.csv");
+    let csv = args
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or("data/ibtracs.csv");
     let outdir = args.get(2).map(String::as_str).unwrap_or("scratch-duckdb");
     std::fs::create_dir_all(outdir)?;
     let db_path = format!("{outdir}/hurricane.duckdb");
@@ -75,7 +78,8 @@ fn main() -> anyhow::Result<()> {
             FROM hurricane_obs WHERE iso_time >= TIMESTAMP '1970-01-01' \
          ) TO '{parquet_path}' (FORMAT parquet);"
     );
-    conn.execute_batch(&copy).context("export baseline parquet")?;
+    conn.execute_batch(&copy)
+        .context("export baseline parquet")?;
     let pq: i64 = conn.query_row(
         &format!("SELECT COUNT(*) FROM read_parquet('{parquet_path}')"),
         [],

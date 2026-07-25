@@ -19,7 +19,9 @@
 
 use std::collections::BTreeSet;
 use stt_build::input::ParsedFeature;
-use stt_build::tiler::{generate_tiles, generate_tiles_streaming, GeneratedTile, TileConfig, TileWriter};
+use stt_build::tiler::{
+    generate_tiles, generate_tiles_streaming, GeneratedTile, TileConfig, TileWriter,
+};
 use stt_core::arrow_tile::GeometryColumn;
 
 const TS: u64 = 1_700_000_000_000;
@@ -85,9 +87,11 @@ fn load_fixture(name: &str) -> ParsedFeature {
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let gj: geojson::GeoJson = text.parse().unwrap_or_else(|e| panic!("parse {path}: {e}"));
     let feature = match gj {
-        geojson::GeoJson::FeatureCollection(fc) => {
-            fc.features.into_iter().next().expect("empty FeatureCollection")
-        }
+        geojson::GeoJson::FeatureCollection(fc) => fc
+            .features
+            .into_iter()
+            .next()
+            .expect("empty FeatureCollection"),
         geojson::GeoJson::Feature(f) => f,
         geojson::GeoJson::Geometry(g) => geojson::Feature {
             bbox: None,
@@ -153,14 +157,21 @@ fn segments_cross(p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], p4: [f64; 2]) -> boo
     let d4 = orient(p1, p2, p4);
     // Strict straddle both ways ⇒ a proper crossing (collinear/touching is
     // tolerated — those are the accepted seam-tangency / shared-vertex cases).
-    ((d1 > 0.0) != (d2 > 0.0)) && ((d3 > 0.0) != (d4 > 0.0)) && d1 != 0.0 && d2 != 0.0 && d3 != 0.0 && d4 != 0.0
+    ((d1 > 0.0) != (d2 > 0.0))
+        && ((d3 > 0.0) != (d4 > 0.0))
+        && d1 != 0.0
+        && d2 != 0.0
+        && d3 != 0.0
+        && d4 != 0.0
 }
 
 /// Brute-force simplicity of a single closed ring: no two NON-adjacent edges
 /// cross. Edges lying on the ±180 seam are skipped (the accepted seam-tangency
 /// artifact — a hole may run along the shell on the meridian).
 fn ring_is_simple(ring: &[[f64; 2]]) -> bool {
-    let on_seam = |a: [f64; 2], b: [f64; 2]| (a[0].abs() - 180.0).abs() < 1e-9 && (b[0].abs() - 180.0).abs() < 1e-9;
+    let on_seam = |a: [f64; 2], b: [f64; 2]| {
+        (a[0].abs() - 180.0).abs() < 1e-9 && (b[0].abs() - 180.0).abs() < 1e-9
+    };
     let m = ring.len();
     if m < 4 {
         return true;
@@ -200,7 +211,11 @@ fn assert_tile_valid(tile: &GeneratedTile) {
         for rings in features {
             assert!(!rings.is_empty(), "feature with no rings in {:?}", tile.id);
             for ring in rings {
-                assert!(ring.len() >= 4, "degenerate ring in {:?}: {ring:?}", tile.id);
+                assert!(
+                    ring.len() >= 4,
+                    "degenerate ring in {:?}: {ring:?}",
+                    tile.id
+                );
                 assert_eq!(ring.first(), ring.last(), "unclosed ring in {:?}", tile.id);
                 for c in ring {
                     assert!(
@@ -221,7 +236,11 @@ fn assert_tile_valid(tile: &GeneratedTile) {
             let exterior = &rings[0];
             let ext_area = ring_area(exterior);
             if ext_area.abs() > 1e-12 {
-                assert!(ext_area > 0.0, "exterior must be CCW (positive) in {:?}", tile.id);
+                assert!(
+                    ext_area > 0.0,
+                    "exterior must be CCW (positive) in {:?}",
+                    tile.id
+                );
             }
             for hole in &rings[1..] {
                 let ha = ring_area(hole);
@@ -315,9 +334,13 @@ fn source_net_area(feat: &ParsedFeature) -> f64 {
 /// the fallback count) and the geometry path (for ring invariants).
 fn assert_gate(feat: &ParsedFeature, min_zoom: u8, max_zoom: u8) {
     let mut writer = NullWriter;
-    let stats =
-        generate_tiles_streaming(std::slice::from_ref(feat), &config(min_zoom, max_zoom), &mut writer, 1)
-            .unwrap();
+    let stats = generate_tiles_streaming(
+        std::slice::from_ref(feat),
+        &config(min_zoom, max_zoom),
+        &mut writer,
+        1,
+    )
+    .unwrap();
     assert_eq!(
         stats.antimeridian_fallbacks, 0,
         "a splittable dateline feature must never fall back"
@@ -331,7 +354,11 @@ fn assert_gate(feat: &ParsedFeature, min_zoom: u8, max_zoom: u8) {
             if let GeometryColumn::Polygon(features) = &layer.geometry {
                 for rings in features {
                     for ring in rings {
-                        assert!(ring_is_simple(ring), "self-intersecting ring in {:?}", tile.id);
+                        assert!(
+                            ring_is_simple(ring),
+                            "self-intersecting ring in {:?}",
+                            tile.id
+                        );
                     }
                 }
             }

@@ -26,8 +26,8 @@ pub use analysis::inspect::InspectReport;
 pub use diff::DiffReport;
 pub use doctor::DoctorReport;
 pub use export::{ExportOptions, ExportReport, GeometryEncoding};
-pub use order_audit::OrderAuditReport;
 pub use loader::DataSource;
+pub use order_audit::OrderAuditReport;
 pub use packed::PackedTileset;
 pub use recommend::Recommendations;
 

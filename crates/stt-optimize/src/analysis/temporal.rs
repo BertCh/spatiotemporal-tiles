@@ -114,7 +114,8 @@ pub fn analyze(data: &LoadedData) -> Result<TemporalAnalysis> {
     let events_per_day = calculate_events_per_day(&timestamps, duration_ms);
 
     // Classify distribution
-    let distribution = classify_distribution(&events_per_day, &hourly, unique_timestamps, duration_ms);
+    let distribution =
+        classify_distribution(&events_per_day, &hourly, unique_timestamps, duration_ms);
 
     // Recommend bucket size
     let (bucket_ms, bucket_human) = recommend_bucket_size(
@@ -342,8 +343,7 @@ fn recommend_bucket_size(
         TemporalDistribution::Sparse => 0.5,
         _ => 1.0,
     };
-    let mut target_buckets =
-        (TARGET_PLAYBACK_SECONDS * PLAYBACK_FPS * frame_factor).round() as u64;
+    let mut target_buckets = (TARGET_PLAYBACK_SECONDS * PLAYBACK_FPS * frame_factor).round() as u64;
 
     // Bound by measured data facts (the previously-ignored inputs):
     //  - never more buckets than distinct timestamps (finer is empty resolution);
@@ -422,7 +422,8 @@ mod tests {
     fn test_recommend_bucket_size() {
         // 1 year duration
         let one_year = 365 * 86_400_000u64;
-        let (bucket, _) = recommend_bucket_size(one_year, 10000, 100000, &TemporalDistribution::Uniform);
+        let (bucket, _) =
+            recommend_bucket_size(one_year, 10000, 100000, &TemporalDistribution::Uniform);
         assert!(bucket >= 3_600_000); // At least 1 hour
     }
 
@@ -432,8 +433,7 @@ mod tests {
         // distinct timestamps, 50000 features both leave it at 1350). Over a
         // 30-day span the chosen bucket must land at-or-under that target.
         let span = 30 * 86_400_000u64; // 30 days
-        let target =
-            (super::TARGET_PLAYBACK_SECONDS * super::PLAYBACK_FPS).round() as u64; // 1350
+        let target = (super::TARGET_PLAYBACK_SECONDS * super::PLAYBACK_FPS).round() as u64; // 1350
         let (bucket, name) =
             recommend_bucket_size(span, 5000, 50000, &TemporalDistribution::Uniform);
         assert!(bucket > 0, "bucket must be non-zero for a real span");
@@ -458,8 +458,7 @@ mod tests {
         let span = 365 * 86_400_000u64; // 1 year
         let (many, _) =
             recommend_bucket_size(span, 100_000, 1_000_000, &TemporalDistribution::Uniform);
-        let (few, _) =
-            recommend_bucket_size(span, 100, 1_000_000, &TemporalDistribution::Uniform);
+        let (few, _) = recommend_bucket_size(span, 100, 1_000_000, &TemporalDistribution::Uniform);
         assert!(
             few > many,
             "100 distinct timestamps should coarsen the bucket ({few} vs {many})",
@@ -489,15 +488,16 @@ mod tests {
         // coarsest one (30 days) — never a finer bucket than what the loop
         // just rejected as producing too many buckets.
         let span = 10 * 365 * 86_400_000u64; // 10 years
-        let (bucket, name) =
-            recommend_bucket_size(span, 100, 100, &TemporalDistribution::Uniform);
-        assert_eq!(bucket, 2_592_000_000, "expected 30-day fallback, got {name}");
+        let (bucket, name) = recommend_bucket_size(span, 100, 100, &TemporalDistribution::Uniform);
+        assert_eq!(
+            bucket, 2_592_000_000,
+            "expected 30-day fallback, got {name}"
+        );
     }
 
     #[test]
     fn test_recommend_bucket_zero_for_empty_span() {
-        let (bucket, name) =
-            recommend_bucket_size(0, 0, 0, &TemporalDistribution::Instantaneous);
+        let (bucket, name) = recommend_bucket_size(0, 0, 0, &TemporalDistribution::Instantaneous);
         assert_eq!(bucket, 0);
         assert_eq!(name, "N/A");
     }
@@ -507,10 +507,8 @@ mod tests {
         // Sparse distribution targets only 500 buckets, so for the same span it
         // should choose a coarser (>=) bucket than a uniform distribution.
         let span = 365 * 86_400_000u64; // 1 year
-        let (uniform, _) =
-            recommend_bucket_size(span, 1000, 10000, &TemporalDistribution::Uniform);
-        let (sparse, _) =
-            recommend_bucket_size(span, 1000, 10000, &TemporalDistribution::Sparse);
+        let (uniform, _) = recommend_bucket_size(span, 1000, 10000, &TemporalDistribution::Uniform);
+        let (sparse, _) = recommend_bucket_size(span, 1000, 10000, &TemporalDistribution::Sparse);
         assert!(
             sparse >= uniform,
             "sparse bucket {} should be >= uniform bucket {}",
@@ -519,4 +517,3 @@ mod tests {
         );
     }
 }
-

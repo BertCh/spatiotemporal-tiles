@@ -501,10 +501,16 @@ mod tests {
 
     #[test]
     fn test_region_name() {
-        assert_eq!(get_region_name(-122.0, 37.0), Some("Western North America".to_string()));
+        assert_eq!(
+            get_region_name(-122.0, 37.0),
+            Some("Western North America".to_string())
+        );
         assert_eq!(get_region_name(2.0, 48.0), Some("Europe".to_string()));
         // 139.0 lon, 35.0 lat is in Asia (Central/East) range
-        assert_eq!(get_region_name(139.0, 35.0), Some("Asia (Central/East)".to_string()));
+        assert_eq!(
+            get_region_name(139.0, 35.0),
+            Some("Asia (Central/East)".to_string())
+        );
     }
 
     #[test]
@@ -542,7 +548,11 @@ mod tests {
         }
         let data = make_data(&pts);
         let z = density_based_max_zoom(&data, data.features.len());
-        assert!(z <= 6, "sparse global scatter should yield a low zoom, got {}", z);
+        assert!(
+            z <= 6,
+            "sparse global scatter should yield a low zoom, got {}",
+            z
+        );
     }
 
     #[test]
@@ -574,4 +584,3 @@ mod tests {
         assert!(analysis.recommended_min_zoom <= analysis.recommended_max_zoom);
     }
 }
-

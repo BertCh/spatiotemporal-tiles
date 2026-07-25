@@ -90,7 +90,9 @@ pub fn analyze(data: &LoadedData) -> Result<GeometryAnalysis> {
     // Count geometry types
     let mut type_counts: HashMap<String, usize> = HashMap::new();
     for feature in &data.features {
-        *type_counts.entry(feature.geometry_type.to_string()).or_insert(0) += 1;
+        *type_counts
+            .entry(feature.geometry_type.to_string())
+            .or_insert(0) += 1;
     }
 
     // Find dominant type
@@ -296,4 +298,3 @@ mod tests {
         assert!(matches!(complexity, GeometryComplexity::Simple));
     }
 }
-

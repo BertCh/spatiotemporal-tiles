@@ -5,9 +5,7 @@
 use geojson::{Feature, Geometry, Value as GeomValue};
 use std::sync::Arc;
 use stt_build::input::ParsedFeature;
-use stt_build::summary::{
-    build_summary_tier, parse_summary_columns, SummaryConfig,
-};
+use stt_build::summary::{build_summary_tier, parse_summary_columns, SummaryConfig};
 use stt_build::tiler::{generate_tiles_streaming, TileConfig};
 use stt_core::metadata::{Metadata, SummaryScheme};
 use stt_core::{BlobOrdering, PackWriter, PackedReader};
@@ -118,12 +116,11 @@ fn raw_plus_summary_tier_roundtrips_through_archive() {
             zooms_with_summary += 1;
             summary_feature_total += entry.feature_count as u64;
             // Summary layers carry the implicit `count` column.
-            let batch = &layers
-                .iter()
-                .find(|l| l.name == "summary")
-                .unwrap()
-                .batch;
-            assert!(batch.column_by_name("count").is_some(), "summary tile must carry count");
+            let batch = &layers.iter().find(|l| l.name == "summary").unwrap().batch;
+            assert!(
+                batch.column_by_name("count").is_some(),
+                "summary tile must carry count"
+            );
             assert!(
                 batch.column_by_name("mean_magnitude").is_some(),
                 "summary tile must carry mean_magnitude"

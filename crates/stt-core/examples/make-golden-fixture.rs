@@ -31,11 +31,11 @@
 //! leaving the committed v1 fixture bytes untouched — for future fixture
 //! needs; nothing consumes the v2 output yet, so it is not committed.
 
+use std::path::PathBuf;
 use stt_core::arrow_tile::{encode_tile_with, ColumnarLayer, EncoderConfig, GeometryColumn};
 use stt_core::metadata::Metadata;
 use stt_core::pack::{PACKED_FORMAT_VERSION_V1, PACKED_FORMAT_VERSION_V2};
 use stt_core::{BlobOrdering, PackWriter, TileId};
-use std::path::PathBuf;
 
 /// Frame-version-coherent encoder config: frames follow the writer's
 /// formatVersion (mirroring stt-build's `pack_encoder_config`) instead of the
@@ -57,18 +57,21 @@ fn encoder_config(format_version: u32) -> EncoderConfig {
 fn payload_for(id_seed: u64, cfg: &EncoderConfig) -> Vec<u8> {
     let ids: Vec<u64> = (0..3).map(|i| 100 * id_seed + i).collect();
     let n = ids.len();
-    encode_tile_with(&[ColumnarLayer {
-        name: "default".to_string(),
-        feature_ids: ids,
-        start_times: vec![1000 * id_seed as i64; n],
-        end_times: vec![1000 * id_seed as i64 + 100; n],
-        geometry: GeometryColumn::Point(vec![[-122.4 + 0.01 * id_seed as f64, 37.7]; n]),
-        vertex_times: None,
-        vertex_values: None,
-        triangles: None,
-        vertex_value_matrix: None,
-        properties: vec![],
-    }], cfg)
+    encode_tile_with(
+        &[ColumnarLayer {
+            name: "default".to_string(),
+            feature_ids: ids,
+            start_times: vec![1000 * id_seed as i64; n],
+            end_times: vec![1000 * id_seed as i64 + 100; n],
+            geometry: GeometryColumn::Point(vec![[-122.4 + 0.01 * id_seed as f64, 37.7]; n]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![],
+        }],
+        cfg,
+    )
     .unwrap()
 }
 
@@ -85,7 +88,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => return Err(format!("unknown argument {other:?} (only --v2)").into()),
         }
     }
-    let format_version = if v2 { PACKED_FORMAT_VERSION_V2 } else { PACKED_FORMAT_VERSION_V1 };
+    let format_version = if v2 {
+        PACKED_FORMAT_VERSION_V2
+    } else {
+        PACKED_FORMAT_VERSION_V1
+    };
     let suffix = if v2 { "-v2" } else { "" };
     let cfg = encoder_config(format_version);
 
@@ -137,7 +144,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_temporal_bucket_ms(1000)
         // Tile k spans [1000*k, 1000*k + 100]; cover the lot so the fixture
         // passes `stt-validate`'s temporal-extent cross-check.
-        .with_time_range(stt_core::types::TimeRange::new(0, 1000 * (n_tiles - 1) + 100));
+        .with_time_range(stt_core::types::TimeRange::new(
+            0,
+            1000 * (n_tiles - 1) + 100,
+        ));
 
     let manifest = w.finalize(&meta)?;
     let total: u64 = manifest.packs.iter().map(|p| p.length).sum();
@@ -153,7 +163,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, p) in manifest.packs.iter().enumerate() {
         println!("  pack[{i}] {} ({} bytes)", p.key, p.length);
     }
-    println!("  directory {} ({} bytes)", manifest.directory.key, manifest.directory.length);
+    println!(
+        "  directory {} ({} bytes)",
+        manifest.directory.key, manifest.directory.length
+    );
 
     // --- Paged-directory cross-impl fixtures --------------------------------
     // A richer grid dataset (spatial spread × time buckets × two zooms) emitted
@@ -161,7 +174,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SAME shared payloads — so the TS differential test can assert the paged
     // query path returns byte-identical results to a whole-load directory while
     // fetching only a fraction of the leaf pages.
-    let base = manifest_dir.join("..").join("..").join("packages").join("core").join("test").join("fixtures");
+    let base = manifest_dir
+        .join("..")
+        .join("..")
+        .join("packages")
+        .join("core")
+        .join("test")
+        .join("fixtures");
     let grid = build_grid_tiles(&cfg);
     let grid_meta = Metadata::new("paged-golden")
         .with_description("Deterministic STT paged-directory cross-impl fixture")
@@ -195,7 +214,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gm.directory.length,
             gm.directory
                 .page_count
-                .map(|p| format!(" (paged: {p} leaf pages, root {} B)", gm.directory.root_length.unwrap_or(0)))
+                .map(|p| format!(
+                    " (paged: {p} leaf pages, root {} B)",
+                    gm.directory.root_length.unwrap_or(0)
+                ))
                 .unwrap_or_default(),
         );
     }
@@ -215,7 +237,12 @@ fn build_grid_tiles(cfg: &EncoderConfig) -> Vec<(TileId, i64, i64, Vec<u8>)> {
             let (x, y) = (520 + gx, 384 + gy);
             let b = ((gx + gy) % 3) as i64;
             let t = b * bucket;
-            out.push((TileId::new(10, x, y, t.max(0) as u64), t, t + bucket - 1, payload_for(seed, cfg)));
+            out.push((
+                TileId::new(10, x, y, t.max(0) as u64),
+                t,
+                t + bucket - 1,
+                payload_for(seed, cfg),
+            ));
             seed += 1;
         }
     }
@@ -225,7 +252,12 @@ fn build_grid_tiles(cfg: &EncoderConfig) -> Vec<(TileId, i64, i64, Vec<u8>)> {
             let (x, y) = (2084 + gx, 1536 + gy);
             let b = ((gx * 7 + gy) % 3) as i64;
             let t = b * bucket;
-            out.push((TileId::new(12, x, y, t.max(0) as u64), t, t + bucket - 1, payload_for(seed, cfg)));
+            out.push((
+                TileId::new(12, x, y, t.max(0) as u64),
+                t,
+                t + bucket - 1,
+                payload_for(seed, cfg),
+            ));
             seed += 1;
         }
     }

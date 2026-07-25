@@ -3,12 +3,12 @@
 //! This module provides various analyzers for understanding dataset characteristics
 //! and deriving optimization recommendations.
 
-pub mod spatial;
-pub mod temporal;
-pub mod geometry;
 pub mod density;
+pub mod geometry;
 pub mod inspect;
 pub mod properties;
+pub mod spatial;
+pub mod temporal;
 
 use serde::{Deserialize, Serialize};
 
@@ -33,5 +33,3 @@ pub struct AnalysisResult {
     /// sample); `None` when the sample was too small to measure.
     pub measured: Option<crate::measure::MeasuredEncoding>,
 }
-
-

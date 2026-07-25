@@ -120,9 +120,7 @@ fn kind_of(geom: &geo_types::Geometry<f64>) -> Option<GeomKind> {
     match geom {
         G::Point(_) | G::MultiPoint(_) => Some(GeomKind::Point),
         G::Line(_) | G::LineString(_) | G::MultiLineString(_) => Some(GeomKind::Line),
-        G::Polygon(_) | G::MultiPolygon(_) | G::Rect(_) | G::Triangle(_) => {
-            Some(GeomKind::Polygon)
-        }
+        G::Polygon(_) | G::MultiPolygon(_) | G::Rect(_) | G::Triangle(_) => Some(GeomKind::Polygon),
         G::GeometryCollection(_) => None,
     }
 }

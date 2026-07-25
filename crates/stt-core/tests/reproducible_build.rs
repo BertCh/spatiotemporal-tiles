@@ -135,7 +135,10 @@ fn bakes_time_offset_min_start() {
     let li = encode_layer(&line_fixture()).unwrap();
     let lb = decode_layer(&li).unwrap();
     assert_eq!(
-        lb.schema().metadata().get("stt:time_offset_ms").map(String::as_str),
+        lb.schema()
+            .metadata()
+            .get("stt:time_offset_ms")
+            .map(String::as_str),
         Some("0")
     );
 }
@@ -234,7 +237,15 @@ fn v2_dataset_rebuild_is_byte_identical_including_schemas() {
         for k in order {
             let payload = encode_tile_with(std::slice::from_ref(&tiles[k]), &cfg).unwrap();
             writer
-                .add_tile_full(&TileId::new(4, k as u32, 0, 0), 0, 100, None, 3, None, &payload)
+                .add_tile_full(
+                    &TileId::new(4, k as u32, 0, 0),
+                    0,
+                    100,
+                    None,
+                    3,
+                    None,
+                    &payload,
+                )
                 .unwrap();
         }
         writer.finalize(&Metadata::new("v2-repro")).unwrap()
@@ -245,9 +256,15 @@ fn v2_dataset_rebuild_is_byte_identical_including_schemas() {
     let manifest_a = build(&a, false);
     let manifest_b = build(&b, true);
 
-    assert!(!manifest_a.schemas.is_empty(), "v2 manifest must carry templates");
+    assert!(
+        !manifest_a.schemas.is_empty(),
+        "v2 manifest must carry templates"
+    );
     let hashes: Vec<&str> = manifest_a.schemas.iter().map(|s| s.hash.as_str()).collect();
-    assert!(hashes.windows(2).all(|w| w[0] < w[1]), "schemas sorted by hash");
+    assert!(
+        hashes.windows(2).all(|w| w[0] < w[1]),
+        "schemas sorted by hash"
+    );
 
     assert_eq!(
         fs::read(a.join("manifest.json")).unwrap(),

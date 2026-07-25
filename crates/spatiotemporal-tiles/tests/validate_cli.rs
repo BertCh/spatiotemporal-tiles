@@ -44,7 +44,9 @@ fn point_layer(name: &str, base_id: u64, n: usize, start: i64, end: i64) -> Colu
         feature_ids: (0..n as u64).map(|i| base_id + i).collect(),
         start_times: vec![start; n],
         end_times: vec![end; n],
-        geometry: GeometryColumn::Point((0..n).map(|i| [i as f64 * 0.01, i as f64 * 0.01]).collect()),
+        geometry: GeometryColumn::Point(
+            (0..n).map(|i| [i as f64 * 0.01, i as f64 * 0.01]).collect(),
+        ),
         vertex_times: None,
         vertex_values: None,
         triangles: None,
@@ -148,7 +150,10 @@ fn sample_limits_decoded_tile_count_and_skips_grand_total() {
     // --sample 5 over 20 tiles → stride = ceil(20/5) = 4 → indices 0,4,8,12,16
     // → exactly 5 decoded tiles.
     let (ok, report) = run_json(&archive, &["--sample", "5"]);
-    assert!(ok, "sampled run of a valid archive should still pass: {report}");
+    assert!(
+        ok,
+        "sampled run of a valid archive should still pass: {report}"
+    );
     assert_eq!(report["tile_count"], 20);
     assert_eq!(report["tiles_decoded"], 5, "sample must cap decoded count");
     assert_eq!(report["sampled"], true);

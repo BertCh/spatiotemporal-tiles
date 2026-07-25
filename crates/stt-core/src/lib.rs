@@ -32,18 +32,18 @@ pub mod types;
 
 // Re-export commonly used types.
 // Packed format — the canonical container.
-pub use pack::{verify_packed_objects, Manifest, PackWriter, PackedReader};
+pub use curve::BlobOrdering;
 pub use directory::TileEntry;
 pub use directory_page::{
     decode_paged_directory, encode_paged_directory, verify_paged_structure, PageDescriptor,
     PagedRoot, DEFAULT_PAGE_ENTRIES,
 };
-pub use curve::BlobOrdering;
+pub use error::{Error, Result};
 pub use ordering_sim::{
     evaluate as evaluate_orderings, measured_ordering, OrderingCost, QueryCost, SimOptions,
     TileSample, CANDIDATES, DEFAULT_COALESCE_GAP_BYTES,
 };
-pub use error::{Error, Result};
+pub use pack::{verify_packed_objects, Manifest, PackWriter, PackedReader};
 pub use tile::TileId;
 pub use timestamp::{
     normalize_timestamp_to_ms, reject_negative_timestamp, scale_timestamp_to_ms, TimestampUnit,

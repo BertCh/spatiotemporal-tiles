@@ -13,21 +13,28 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
 
     // Header
     output.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-    output.push_str(&format!("         STT Optimization Report - {}\n", result.source));
+    output.push_str(&format!(
+        "         STT Optimization Report - {}\n",
+        result.source
+    ));
     output.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
 
     // Dataset Summary
     output.push_str("📊 Dataset Summary\n");
-    output.push_str(&format!("  Features:        {:>12}\n", format_number(result.feature_count)));
-    output.push_str(&format!("  Time Range:      {}\n", result.temporal.time_range_description()));
+    output.push_str(&format!(
+        "  Features:        {:>12}\n",
+        format_number(result.feature_count)
+    ));
+    output.push_str(&format!(
+        "  Time Range:      {}\n",
+        result.temporal.time_range_description()
+    ));
     output.push_str(&format!(
         "  Spatial Bounds:  [{:.2}, {:.2}] to [{:.2}, {:.2}]\n",
-        result.bounds.min_lon,
-        result.bounds.min_lat,
-        result.bounds.max_lon,
-        result.bounds.max_lat
+        result.bounds.min_lon, result.bounds.min_lat, result.bounds.max_lon, result.bounds.max_lat
     ));
-    output.push_str(&format!("  Geometry Type:   {} ({})\n", 
+    output.push_str(&format!(
+        "  Geometry Type:   {} ({})\n",
         result.geometry.dominant_type,
         format_type_distribution(&result.geometry.type_distribution)
     ));
@@ -35,8 +42,11 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
 
     // Spatial Analysis
     output.push_str("🗺️  Spatial Analysis\n");
-    output.push_str(&format!("  Distribution:    {}\n", result.spatial.distribution));
-    
+    output.push_str(&format!(
+        "  Distribution:    {}\n",
+        result.spatial.distribution
+    ));
+
     // Show coverage at key zoom levels
     for z in [4, 6, 8, 10, 12, 14, 16].iter() {
         if let Some(cov) = result.spatial.zoom_coverage.iter().find(|c| c.zoom == *z) {
@@ -46,11 +56,10 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
             ));
         }
     }
-    
+
     output.push_str(&format!(
         "  Recommended Zoom: {}-{}\n",
-        result.spatial.recommended_min_zoom,
-        result.spatial.recommended_max_zoom
+        result.spatial.recommended_min_zoom, result.spatial.recommended_max_zoom
     ));
 
     if !result.spatial.hotspots.is_empty() {
@@ -59,7 +68,9 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
             let name = hotspot.name.as_deref().unwrap_or("Unknown region");
             output.push_str(&format!(
                 "    {}. {} ({} features)\n",
-                i + 1, name, format_number(hotspot.feature_count)
+                i + 1,
+                name,
+                format_number(hotspot.feature_count)
             ));
         }
     }
@@ -67,8 +78,14 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
 
     // Temporal Analysis
     output.push_str("⏰ Temporal Analysis\n");
-    output.push_str(&format!("  Duration:        {}\n", result.temporal.duration_human));
-    output.push_str(&format!("  Distribution:    {}\n", result.temporal.distribution));
+    output.push_str(&format!(
+        "  Duration:        {}\n",
+        result.temporal.duration_human
+    ));
+    output.push_str(&format!(
+        "  Distribution:    {}\n",
+        result.temporal.distribution
+    ));
     output.push_str(&format!(
         "  Events/day avg:  {:.1}\n",
         result.temporal.events_per_day.avg
@@ -85,7 +102,10 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
 
     // Geometry Analysis
     output.push_str("📐 Geometry Analysis\n");
-    output.push_str(&format!("  Complexity:      {}\n", result.geometry.complexity));
+    output.push_str(&format!(
+        "  Complexity:      {}\n",
+        result.geometry.complexity
+    ));
     output.push_str(&format!(
         "  Vertices (avg):  {:.1}\n",
         result.geometry.vertex_stats.avg
@@ -161,21 +181,12 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
 
     // Recommendations
     output.push_str("💡 Recommendations\n");
-    output.push_str(&format!(
-        "  --min-zoom {}\n",
-        recommendations.min_zoom
-    ));
-    output.push_str(&format!(
-        "  --max-zoom {}\n",
-        recommendations.max_zoom
-    ));
+    output.push_str(&format!("  --min-zoom {}\n", recommendations.min_zoom));
+    output.push_str(&format!("  --max-zoom {}\n", recommendations.max_zoom));
     output.push('\n');
 
     // Confidence
-    output.push_str(&format!(
-        "  Confidence: {}%\n",
-        recommendations.confidence
-    ));
+    output.push_str(&format!("  Confidence: {}%\n", recommendations.confidence));
     output.push('\n');
 
     // Advisor suggestions — evidence-based flag advice beyond the zoom/bucket
@@ -209,7 +220,10 @@ pub fn generate_text(result: &AnalysisResult, recommendations: &Recommendations)
     output.push_str(&format!(
         "  stt-build --input {} --output {} \\\n",
         result.source,
-        result.source.trim_end_matches(".parquet").trim_end_matches(".geoparquet")
+        result
+            .source
+            .trim_end_matches(".parquet")
+            .trim_end_matches(".geoparquet")
     ));
     output.push_str(&format!(
         "    --time-field timestamp --min-zoom {} --max-zoom {}\n",
@@ -405,5 +419,3 @@ mod tests {
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
     }
 }
-
-

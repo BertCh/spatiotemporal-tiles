@@ -32,11 +32,7 @@ pub fn point_fixture() -> ColumnarLayer {
         feature_ids: vec![1, 2, 3],
         start_times: vec![3000, 1000, 2000],
         end_times: vec![3500, 1500, 2500],
-        geometry: GeometryColumn::Point(vec![
-            [-122.4, 37.7],
-            [-122.5, 37.8],
-            [-122.6, 37.9],
-        ]),
+        geometry: GeometryColumn::Point(vec![[-122.4, 37.7], [-122.5, 37.8], [-122.6, 37.9]]),
         vertex_times: None,
         vertex_values: None,
         triangles: None,
@@ -142,8 +138,7 @@ pub fn tile_payload_v2(ids: Vec<u64>) -> Vec<u8> {
         format_version: stt_core::arrow_tile::FORMAT_VERSION_V2,
         ..stt_core::arrow_tile::EncoderConfig::default()
     };
-    stt_core::arrow_tile::encode_tile_with(std::slice::from_ref(&fuzz_layer(ids, n)), &cfg)
-        .unwrap()
+    stt_core::arrow_tile::encode_tile_with(std::slice::from_ref(&fuzz_layer(ids, n)), &cfg).unwrap()
 }
 
 fn fuzz_layer(ids: Vec<u64>, n: usize) -> ColumnarLayer {

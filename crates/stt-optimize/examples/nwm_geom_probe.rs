@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 use stt_optimize::packed::PackedTileset;
 
 fn main() -> Result<()> {
-    let path = std::env::args().nth(1).ok_or_else(|| anyhow!("usage: nwm_geom_probe <manifest.json>"))?;
+    let path = std::env::args()
+        .nth(1)
+        .ok_or_else(|| anyhow!("usage: nwm_geom_probe <manifest.json>"))?;
     let ts = PackedTileset::open(&path)?;
 
     // Per-zoom aggregates.
@@ -94,13 +96,20 @@ fn main() -> Result<()> {
         }
     }
     if let (Some(&f), Some(&l)) = (tv.first(), tv.last()) {
-        println!("  first={f} last={l} (each grid-aligned: {})", tv.iter().all(|t| t % chunk_ms == 0));
+        println!(
+            "  first={f} last={l} (each grid-aligned: {})",
+            tv.iter().all(|t| t % chunk_ms == 0)
+        );
     }
     println!("Per-zoom resolution:");
     println!("  zoom | tiles | features |    verts | verts/feat | maxFeat/tile | avg seg(units)");
     for (z, s) in &per_zoom {
         let vpf = s.verts as f64 / s.features.max(1) as f64;
-        let avgseg = if s.seg_count > 0 { s.seg_total_m / s.seg_count as f64 } else { 0.0 };
+        let avgseg = if s.seg_count > 0 {
+            s.seg_total_m / s.seg_count as f64
+        } else {
+            0.0
+        };
         println!(
             "  {:>4} | {:>5} | {:>8} | {:>8} | {:>10.1} | {:>12} | {:>10.2}",
             z, s.tiles, s.features, s.verts, vpf, s.max_feat_in_tile, avgseg
@@ -118,14 +127,25 @@ fn main() -> Result<()> {
             .unwrap();
         let layers = ts.read_layers(entry)?;
         let batch = &layers[0].batch;
-        let list = batch.column_by_name("geometry").unwrap().as_any().downcast_ref::<ListArray>().unwrap();
+        let list = batch
+            .column_by_name("geometry")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
         let offs = list.value_offsets();
-        let fsl = list.values().as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let fsl = list
+            .values()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
         let get = read_xy(fsl.values().as_ref());
         let nfeat = list.len();
 
         // width column (per-feature) if present.
-        let width = batch.column_by_name("width").and_then(|c| c.as_any().downcast_ref::<Float64Array>().map(|a| a.clone()));
+        let width = batch
+            .column_by_name("width")
+            .and_then(|c| c.as_any().downcast_ref::<Float64Array>().map(|a| a.clone()));
 
         let mut bboxes = Vec::with_capacity(nfeat);
         let mut vcounts = Vec::with_capacity(nfeat);
@@ -136,29 +156,42 @@ fn main() -> Result<()> {
             let (mut minx, mut miny, mut maxx, mut maxy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
             for v in a..b {
                 let (x, y) = get(v);
-                minx = minx.min(x); miny = miny.min(y);
-                maxx = maxx.max(x); maxy = maxy.max(y);
+                minx = minx.min(x);
+                miny = miny.min(y);
+                maxx = maxx.max(x);
+                maxy = maxy.max(y);
             }
             bboxes.push((minx, miny, maxx, maxy));
         }
         let mut vc = vcounts.clone();
         vc.sort_unstable();
-        println!("  features: {nfeat}, vertex-count min/median/max: {}/{}/{}",
-            vc.first().unwrap_or(&0), vc.get(vc.len()/2).unwrap_or(&0), vc.last().unwrap_or(&0));
+        println!(
+            "  features: {nfeat}, vertex-count min/median/max: {}/{}/{}",
+            vc.first().unwrap_or(&0),
+            vc.get(vc.len() / 2).unwrap_or(&0),
+            vc.last().unwrap_or(&0)
+        );
         if let Some(w) = &width {
             let mut ws: Vec<f64> = (0..nfeat).map(|i| w.value(i)).collect();
-            ws.sort_by(|a,b| a.partial_cmp(b).unwrap());
-            println!("  width min/median/max: {:.2}/{:.2}/{:.2}", ws[0], ws[ws.len()/2], ws[ws.len()-1]);
+            ws.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "  width min/median/max: {:.2}/{:.2}/{:.2}",
+                ws[0],
+                ws[ws.len() / 2],
+                ws[ws.len() - 1]
+            );
         }
         // Count heavily-overlapping feature pairs (IoU-ish on bbox).
         let mut overlap_pairs = 0u64;
         for i in 0..nfeat {
-            for j in (i+1)..nfeat {
+            for j in (i + 1)..nfeat {
                 if bbox_overlap_frac(bboxes[i], bboxes[j]) > 0.5 {
                     overlap_pairs += 1;
                 }
             }
-            if i > 400 { break; } // cap the O(n^2) on huge tiles
+            if i > 400 {
+                break;
+            } // cap the O(n^2) on huge tiles
         }
         println!("  bbox-overlap>50% feature pairs (first ~400): {overlap_pairs}");
     }

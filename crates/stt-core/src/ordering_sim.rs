@@ -97,7 +97,11 @@ pub struct QueryCost {
 }
 
 impl QueryCost {
-    const ZERO: QueryCost = QueryCost { reads: 0, bytes_read: 0, bytes_needed: 0 };
+    const ZERO: QueryCost = QueryCost {
+        reads: 0,
+        bytes_read: 0,
+        bytes_needed: 0,
+    };
 }
 
 /// Aggregate cost of one ordering across the canonical query mix.
@@ -148,9 +152,9 @@ pub fn evaluate(samples: &[TileSample], opts: SimOptions) -> Vec<OrderingCost> {
             .collect();
     }
 
-    let (tb_min, tb_max) = samples
-        .iter()
-        .fold((i64::MAX, i64::MIN), |(lo, hi), s| (lo.min(s.tb), hi.max(s.tb)));
+    let (tb_min, tb_max) = samples.iter().fold((i64::MAX, i64::MIN), |(lo, hi), s| {
+        (lo.min(s.tb), hi.max(s.tb))
+    });
     let tb_span = tb_max - tb_min;
 
     // Both canonical queries read the SAME bounded viewport (the central spatial
@@ -203,13 +207,26 @@ pub fn measured_ordering(samples: &[TileSample], opts: SimOptions) -> BlobOrderi
 /// Index permutation of `samples` in `ordering` byte order, using the writer's
 /// exact total sort key (`crates/stt-core/src/pack.rs` finalize) so the
 /// simulated layout is byte-identical to what the writer lays down.
-fn linearize(samples: &[TileSample], ordering: BlobOrdering, tb_min: i64, tb_span: i64) -> Vec<u32> {
+fn linearize(
+    samples: &[TileSample],
+    ordering: BlobOrdering,
+    tb_min: i64,
+    tb_span: i64,
+) -> Vec<u32> {
     let mut idx: Vec<u32> = (0..samples.len() as u32).collect();
     idx.sort_by_key(|&i| {
         let s = &samples[i as usize];
         (
             curve::space_time_key(
-                ordering, s.z, s.x, s.y, s.hilbert, s.time_start, s.tb, tb_min, tb_span,
+                ordering,
+                s.z,
+                s.x,
+                s.y,
+                s.hilbert,
+                s.time_start,
+                s.tb,
+                tb_min,
+                tb_span,
             ),
             s.z,
             s.x,
@@ -305,7 +322,11 @@ fn simulate_query(
         reads += 1;
         bytes_read += run_bytes;
     }
-    QueryCost { reads, bytes_read, bytes_needed }
+    QueryCost {
+        reads,
+        bytes_read,
+        bytes_needed,
+    }
 }
 
 /// The bounded viewport both canonical queries read: the central quarter of the
@@ -375,11 +396,22 @@ mod tests {
     // coalescing engages but over-read is penalised — so the blended cost
     // actually discriminates orderings (the 2 MiB default would fuse tiny
     // fixtures to ~1 read for everything).
-    const OPTS: SimOptions = SimOptions { coalesce_gap_bytes: 1500, pack_bytes: 1 << 30 };
+    const OPTS: SimOptions = SimOptions {
+        coalesce_gap_bytes: 1500,
+        pack_bytes: 1 << 30,
+    };
     const LEN: u64 = 1000;
 
     fn s(x: u32, y: u32, hilbert: u64, tb: i64, len: u64) -> TileSample {
-        TileSample { z: 8, x, y, hilbert, time_start: tb, tb, len }
+        TileSample {
+            z: 8,
+            x,
+            y,
+            hilbert,
+            time_start: tb,
+            tb,
+            len,
+        }
     }
 
     #[test]
@@ -393,7 +425,10 @@ mod tests {
             samples.push(s(0, 0, 0, t, LEN));
             samples.push(s(1, 0, 1, t, LEN));
         }
-        assert_eq!(measured_ordering(&samples, OPTS), BlobOrdering::SpatialMajor);
+        assert_eq!(
+            measured_ordering(&samples, OPTS),
+            BlobOrdering::SpatialMajor
+        );
     }
 
     #[test]
@@ -401,7 +436,10 @@ mod tests {
         // One time bucket → SpatialMajor (pure 2D Hilbert); the degenerate 3D
         // time axis never helps. (Measured-path parity with the F2 choose rule.)
         let samples: Vec<TileSample> = (0..16u32).map(|i| s(i, 0, i as u64, 0, LEN)).collect();
-        assert_eq!(measured_ordering(&samples, OPTS), BlobOrdering::SpatialMajor);
+        assert_eq!(
+            measured_ordering(&samples, OPTS),
+            BlobOrdering::SpatialMajor
+        );
     }
 
     #[test]
@@ -416,7 +454,10 @@ mod tests {
                 }
             }
             let ranked = evaluate(&samples, OPTS);
-            assert!(ranked.iter().any(|c| c.ordering == BlobOrdering::Morton3), "morton3 reported");
+            assert!(
+                ranked.iter().any(|c| c.ordering == BlobOrdering::Morton3),
+                "morton3 reported"
+            );
             let expected = ranked
                 .iter()
                 .map(|c| c.ordering)
@@ -430,9 +471,14 @@ mod tests {
     #[test]
     fn cost_is_bytes_plus_reads_times_gap() {
         // The ranking key is the blended cost, not raw request count.
-        let samples: Vec<TileSample> = (0..12u32).map(|i| s(i, 0, i as u64, (i % 4) as i64, LEN)).collect();
+        let samples: Vec<TileSample> = (0..12u32)
+            .map(|i| s(i, 0, i as u64, (i % 4) as i64, LEN))
+            .collect();
         for c in evaluate(&samples, OPTS) {
-            assert_eq!(c.cost, c.total_bytes_read + c.total_reads * OPTS.coalesce_gap_bytes);
+            assert_eq!(
+                c.cost,
+                c.total_bytes_read + c.total_reads * OPTS.coalesce_gap_bytes
+            );
         }
     }
 
@@ -447,14 +493,19 @@ mod tests {
         let a = evaluate(&samples, SimOptions::default());
         let b = evaluate(&samples, SimOptions::default());
         let key = |v: &[OrderingCost]| {
-            v.iter().map(|c| (c.ordering.as_str(), c.cost)).collect::<Vec<_>>()
+            v.iter()
+                .map(|c| (c.ordering.as_str(), c.cost))
+                .collect::<Vec<_>>()
         };
         assert_eq!(key(&a), key(&b));
     }
 
     #[test]
     fn empty_input_is_safe_and_spatial() {
-        assert_eq!(measured_ordering(&[], SimOptions::default()), BlobOrdering::SpatialMajor);
+        assert_eq!(
+            measured_ordering(&[], SimOptions::default()),
+            BlobOrdering::SpatialMajor
+        );
         assert_eq!(evaluate(&[], SimOptions::default()).len(), 4);
     }
 

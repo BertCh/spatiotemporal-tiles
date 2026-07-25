@@ -20,7 +20,9 @@ use stt_core::BlobOrdering;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: pack-cover <in_dir/manifest.json> <out_dir> [pack_size_mb=64] [ordering=auto]");
+        eprintln!(
+            "usage: pack-cover <in_dir/manifest.json> <out_dir> [pack_size_mb=64] [ordering=auto]"
+        );
         std::process::exit(2);
     }
     let (inp, out_dir) = (&args[1], &args[2]);

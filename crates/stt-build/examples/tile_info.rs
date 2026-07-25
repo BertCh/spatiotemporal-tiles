@@ -15,7 +15,11 @@ fn main() -> anyhow::Result<()> {
 
     let layers = stt_core::arrow_tile::decode_tile(&bytes)?;
     let total: usize = layers.iter().map(|l| l.batch.num_rows()).sum();
-    println!("{path}: {} bytes, {} layer(s), {total} feature(s)", bytes.len(), layers.len());
+    println!(
+        "{path}: {} bytes, {} layer(s), {total} feature(s)",
+        bytes.len(),
+        layers.len()
+    );
     for l in &layers {
         println!(
             "  layer '{}': {} rows, columns: {}",

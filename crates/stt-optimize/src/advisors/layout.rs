@@ -185,7 +185,10 @@ fn blob_ordering_advice(result: &AnalysisResult, data: &LoadedData) -> Option<Ad
         flag: "--blob-ordering".to_string(),
         value: Some(value.to_string()),
         why,
-        projected: Some(format!("measured-best over {} tiles (simulated)", samples.len())),
+        projected: Some(format!(
+            "measured-best over {} tiles (simulated)",
+            samples.len()
+        )),
         lossy: false,
         suggestion_only: caveat.is_some(),
         confidence,
@@ -534,14 +537,21 @@ mod tests {
         assert_eq!(ordering.value.as_deref(), Some("spatial"));
         assert!(!ordering.lossy);
         // Simulated, not the heuristic fallback.
-        assert!(ordering.why.contains("range-read simulation"), "{}", ordering.why);
+        assert!(
+            ordering.why.contains("range-read simulation"),
+            "{}",
+            ordering.why
+        );
         assert!(!ordering.why.contains("too few tiles"));
         // Playback tension surfaced → Medium confidence + the time-major hint,
         // AND the advice is suggestion-only: auto-applying `spatial` on a
         // multi-bucket dataset silently stalls time-playback, so it must stay
         // out of `to_command` and the MCP auto-args.
         assert!(matches!(ordering.confidence, AdviceConfidence::Medium));
-        assert!(ordering.suggestion_only, "playback-caveated spatial must not auto-apply");
+        assert!(
+            ordering.suggestion_only,
+            "playback-caveated spatial must not auto-apply"
+        );
         assert!(ordering.why.contains("time-major"), "{}", ordering.why);
         assert!(ordering.projected.as_deref().unwrap().contains("simulated"));
     }

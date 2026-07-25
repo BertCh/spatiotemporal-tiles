@@ -11,8 +11,12 @@ fn point_layer(n: usize) -> ColumnarLayer {
     ColumnarLayer {
         name: "default".to_string(),
         feature_ids: (0..n as u64).collect(),
-        start_times: (0..n as i64).map(|i| 1_600_000_000_000 + i * 1000).collect(),
-        end_times: (0..n as i64).map(|i| 1_600_000_000_000 + i * 1000 + 500).collect(),
+        start_times: (0..n as i64)
+            .map(|i| 1_600_000_000_000 + i * 1000)
+            .collect(),
+        end_times: (0..n as i64)
+            .map(|i| 1_600_000_000_000 + i * 1000 + 500)
+            .collect(),
         geometry: GeometryColumn::Point(
             (0..n)
                 .map(|i| [-122.4 + (i as f64) * 1e-4, 37.7 + (i as f64) * 1e-4])

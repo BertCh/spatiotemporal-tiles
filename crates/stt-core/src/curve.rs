@@ -344,7 +344,10 @@ mod tests {
     fn scale_axes_keeps_native_ranges() {
         let bits = curve_bits(10, 23);
         let (_, _, qt) = scale_axes(10, 512, 300, 10, 0, bits);
-        assert!(qt < (1 << bits_for(24)), "time axis must stay native ~5-bit, got {qt}");
+        assert!(
+            qt < (1 << bits_for(24)),
+            "time axis must stay native ~5-bit, got {qt}"
+        );
         let (xs, ys, _) = scale_axes(10, 777, 123, 0, 0, bits);
         assert_eq!((xs, ys), (777, 123));
     }

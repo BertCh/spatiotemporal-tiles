@@ -128,7 +128,9 @@ pub(crate) fn ceil_ms_to_seconds(ms: i64) -> i64 {
 /// invariant). Precision beyond f64 is rounded, same as a `DOUBLE` column; an
 /// unparseable string (can't happen for a Decimal Display) → JSON `null`.
 pub(crate) fn decimal_string_to_json(s: &str) -> serde_json::Value {
-    s.parse::<f64>().map(json_number_or_null).unwrap_or(serde_json::Value::Null)
+    s.parse::<f64>()
+        .map(json_number_or_null)
+        .unwrap_or(serde_json::Value::Null)
 }
 
 #[cfg(test)]
@@ -137,7 +139,10 @@ mod tests {
 
     #[test]
     fn int_time_format_mapping() {
-        assert_eq!(apply_int_time_format(5, TimeFormat::UnixSec, 0).unwrap(), 5000);
+        assert_eq!(
+            apply_int_time_format(5, TimeFormat::UnixSec, 0).unwrap(),
+            5000
+        );
         assert_eq!(apply_int_time_format(5, TimeFormat::UnixMs, 0).unwrap(), 5);
         assert_eq!(apply_int_time_format(5, TimeFormat::Iso8601, 0).unwrap(), 5);
     }
@@ -180,6 +185,9 @@ mod tests {
             decimal_string_to_json("0.10000000000000000001"),
             serde_json::json!(0.1)
         );
-        assert_eq!(decimal_string_to_json("not-a-number"), serde_json::Value::Null);
+        assert_eq!(
+            decimal_string_to_json("not-a-number"),
+            serde_json::Value::Null
+        );
     }
 }

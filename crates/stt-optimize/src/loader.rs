@@ -858,7 +858,14 @@ mod tests {
 
     #[test]
     fn looks_temporal_matches_common_names() {
-        for name in ["iso_time", "timestamp", "start_date", "TS", "epoch_ms", "datetime"] {
+        for name in [
+            "iso_time",
+            "timestamp",
+            "start_date",
+            "TS",
+            "epoch_ms",
+            "datetime",
+        ] {
             assert!(looks_temporal(name), "{name} should look temporal");
         }
         for name in ["name", "wind", "magnitude", "id"] {

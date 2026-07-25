@@ -11,11 +11,11 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
-use stt_core::TileEntry;
 use stt_core::arrow_tile::DecodedLayer;
 use stt_core::metadata::Metadata;
 use stt_core::pack::{Manifest, PackedReader};
 use stt_core::types::TimeRange;
+use stt_core::TileEntry;
 
 /// A local packed STT dataset (`manifest.json` + `index/*.sttd` + `packs/*.sttp`)
 /// opened for analysis.
@@ -137,9 +137,7 @@ impl PackedTileset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stt_core::arrow_tile::{
-        encode_tile_with, ColumnarLayer, EncoderConfig, GeometryColumn,
-    };
+    use stt_core::arrow_tile::{encode_tile_with, ColumnarLayer, EncoderConfig, GeometryColumn};
     use stt_core::curve::BlobOrdering;
     use stt_core::pack::PackWriter;
     use stt_core::tile::TileId;

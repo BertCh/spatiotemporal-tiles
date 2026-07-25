@@ -8,7 +8,9 @@
 //! CLI path (parquet ingestion producing the scalar `Numeric` columns that the
 //! grouping then fuses) composes correctly.
 
-use arrow::array::{Array, ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Float64Array, Int64Array};
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Float64Array, Int64Array,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -41,7 +43,9 @@ fn vector_group_fuses_scalar_surfel_columns_end_to_end() {
         Field::new("qz", DataType::Float64, true),
         Field::new("qw", DataType::Float64, true),
     ]));
-    let geom_bytes: Vec<Vec<u8>> = (0..n).map(|i| wkb_point(-122.4 + i as f64 * 0.001, 37.7)).collect();
+    let geom_bytes: Vec<Vec<u8>> = (0..n)
+        .map(|i| wkb_point(-122.4 + i as f64 * 0.001, 37.7))
+        .collect();
     let geom_refs: Vec<&[u8]> = geom_bytes.iter().map(|v| v.as_slice()).collect();
     let columns: Vec<ArrayRef> = vec![
         Arc::new(BinaryArray::from(geom_refs)),
@@ -83,7 +87,10 @@ fn vector_group_fuses_scalar_surfel_columns_end_to_end() {
 
     let batch = decode_layer(&ipc).unwrap();
     // Scalars fused away; one interleaved FixedSizeList<Float32,4> remains.
-    assert!(batch.column_by_name("qx").is_none(), "scalar qx must be consumed");
+    assert!(
+        batch.column_by_name("qx").is_none(),
+        "scalar qx must be consumed"
+    );
     let quat = batch
         .column_by_name("surfel_quat")
         .expect("grouped surfel_quat column present")
@@ -92,7 +99,11 @@ fn vector_group_fuses_scalar_surfel_columns_end_to_end() {
         .unwrap();
     assert_eq!(quat.len(), n);
     assert_eq!(quat.value_length(), 4);
-    let child = quat.values().as_any().downcast_ref::<Float32Array>().unwrap();
+    let child = quat
+        .values()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
     // Row-major interleave: feature i occupies [i*4, i*4+4).
     assert_eq!(child.value(3), 1.0); // feature 0, qw
     assert_eq!(child.value(4), 0.5); // feature 1, qx
@@ -112,7 +123,9 @@ fn point_elevation_folds_into_3d_geometry_end_to_end() {
         Field::new("timestamp", DataType::Int64, true),
         Field::new("z", DataType::Float64, true),
     ]));
-    let geom_bytes: Vec<Vec<u8>> = (0..n).map(|i| wkb_point(-122.4 + i as f64 * 0.001, 37.7)).collect();
+    let geom_bytes: Vec<Vec<u8>> = (0..n)
+        .map(|i| wkb_point(-122.4 + i as f64 * 0.001, 37.7))
+        .collect();
     let geom_refs: Vec<&[u8]> = geom_bytes.iter().map(|v| v.as_slice()).collect();
     let columns: Vec<ArrayRef> = vec![
         Arc::new(BinaryArray::from(geom_refs)),
@@ -126,7 +139,12 @@ fn point_elevation_folds_into_3d_geometry_end_to_end() {
     writer.close().unwrap();
 
     let features = load_features(
-        &path, "timestamp", None, TimeFormat::UnixMs, InputStrictness::Warn, InputStrictness::Warn,
+        &path,
+        "timestamp",
+        None,
+        TimeFormat::UnixMs,
+        InputStrictness::Warn,
+        InputStrictness::Warn,
     )
     .unwrap();
     let refs: Vec<&_> = features.iter().collect();
@@ -137,7 +155,10 @@ fn point_elevation_folds_into_3d_geometry_end_to_end() {
     set_point_elevation_column("");
     let batch = decode_layer(&ipc).unwrap();
 
-    assert!(batch.column_by_name("z").is_none(), "z folded into geometry");
+    assert!(
+        batch.column_by_name("z").is_none(),
+        "z folded into geometry"
+    );
     let geom = batch
         .column_by_name("geometry")
         .unwrap()

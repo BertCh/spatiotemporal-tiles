@@ -46,12 +46,15 @@ fn single_tile_encoding_matches_offline_build() {
     assert!(!offline.is_empty(), "offline build produced no tiles");
     // The fixture must fan out across zooms and buckets for this to be a
     // meaningful sweep (5 features × 9 zooms, several time buckets).
-    assert!(offline.len() > 20, "expected a multi-tile sweep, got {}", offline.len());
+    assert!(
+        offline.len() > 20,
+        "expected a multi-tile sweep, got {}",
+        offline.len()
+    );
 
     let mut clipped_layer_seen = false;
     for tile in &offline {
-        let offline_bytes =
-            encode_tile_with(&tile.layers, &encoder).expect("encode offline tile");
+        let offline_bytes = encode_tile_with(&tile.layers, &encoder).expect("encode offline tile");
         let (single_bytes, single_count) = encode_single_tile_counted(
             &features,
             tile.id.z,
@@ -85,14 +88,11 @@ fn single_tile_encoding_matches_offline_build() {
         assert_eq!(
             single_bytes, offline_bytes,
             "payload bytes diverge at z{}/{}/{} t{}",
-            tile.id.z,
-            tile.id.x,
-            tile.id.y,
-            tile.id.t
+            tile.id.z, tile.id.x, tile.id.y, tile.id.t
         );
 
-        clipped_layer_seen |= tile.layers.iter().any(|l| l.name.ends_with("_originals"))
-            || tile.layers.len() > 1;
+        clipped_layer_seen |=
+            tile.layers.iter().any(|l| l.name.ends_with("_originals")) || tile.layers.len() > 1;
     }
     assert!(
         offline
@@ -106,5 +106,8 @@ fn single_tile_encoding_matches_offline_build() {
     // A cell/bucket the offline build never emitted must be empty here too.
     let empty = encode_single_tile_counted(&features, 8, 3, 3, 0, &config, &encoder)
         .expect("encode empty tile");
-    assert!(empty.is_none(), "an offline-empty (z,x,y,t) must encode to None");
+    assert!(
+        empty.is_none(),
+        "an offline-empty (z,x,y,t) must encode to None"
+    );
 }

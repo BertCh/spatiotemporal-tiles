@@ -41,17 +41,26 @@ fn wkb_point(x: f64, y: f64) -> Vec<u8> {
 
 /// Write a single-row GeoParquet with a WKB point `geometry` column and one
 /// scalar `start_time` column of the given Arrow type; return the file path.
-fn write_scalar_time_parquet(dir: &std::path::Path, label: &str, start_time: ArrayRef) -> std::path::PathBuf {
+fn write_scalar_time_parquet(
+    dir: &std::path::Path,
+    label: &str,
+    start_time: ArrayRef,
+) -> std::path::PathBuf {
     let path = dir.join(format!("scalar_{label}.parquet"));
-    let geom = Arc::new(BinaryArray::from_opt_vec(vec![Some(wkb_point(1.0, 2.0).as_slice())])) as ArrayRef;
+    let geom = Arc::new(BinaryArray::from_opt_vec(vec![Some(
+        wkb_point(1.0, 2.0).as_slice(),
+    )])) as ArrayRef;
     let cols: Vec<(&str, ArrayRef)> = vec![("geometry", geom), ("start_time", start_time)];
     let fields: Vec<Field> = cols
         .iter()
         .map(|(n, a)| Field::new(*n, a.data_type().clone(), true))
         .collect();
     let schema = Arc::new(Schema::new(fields));
-    let batch =
-        RecordBatch::try_new(schema.clone(), cols.iter().map(|(_, a)| a.clone()).collect()).unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        cols.iter().map(|(_, a)| a.clone()).collect(),
+    )
+    .unwrap();
     let file = std::fs::File::create(&path).unwrap();
     let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
     w.write(&batch).unwrap();
@@ -89,8 +98,11 @@ fn microsecond_vertex_timestamps_parity_file_vs_duckdb() {
         .map(|(n, a)| Field::new(*n, a.data_type().clone(), true))
         .collect();
     let schema = Arc::new(Schema::new(fields));
-    let batch =
-        RecordBatch::try_new(schema.clone(), cols.iter().map(|(_, a)| a.clone()).collect()).unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        cols.iter().map(|(_, a)| a.clone()).collect(),
+    )
+    .unwrap();
     let file = std::fs::File::create(&path).unwrap();
     let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
     w.write(&batch).unwrap();
@@ -202,7 +214,10 @@ fn scalar_nanosecond_and_second_timestamps_parity_file_vs_duckdb() {
     );
     let (file_sec, duck_sec) = read_both(&sec_path, TimeFormat::UnixSec);
     assert_eq!(file_sec, base_ms as u64, "file reader scales unix-sec → ms");
-    assert_eq!(file_sec, duck_sec, "file and DuckDB must agree on unix-sec → ms");
+    assert_eq!(
+        file_sec, duck_sec,
+        "file and DuckDB must agree on unix-sec → ms"
+    );
 }
 
 #[test]

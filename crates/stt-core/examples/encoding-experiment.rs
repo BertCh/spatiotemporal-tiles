@@ -20,7 +20,9 @@ use arrow::datatypes::DataType;
 use stt_core::pack::PackedReader;
 
 fn zlen(b: &[u8]) -> usize {
-    zstd::bulk::compress(b, 9).map(|v| v.len()).unwrap_or(b.len())
+    zstd::bulk::compress(b, 9)
+        .map(|v| v.len())
+        .unwrap_or(b.len())
 }
 
 fn le_bytes_u16(v: &[u16]) -> Vec<u8> {
@@ -69,7 +71,12 @@ fn delta_bitpack(values: &[i64]) -> Vec<u8> {
                 d
             })
             .collect();
-        let bits = deltas.iter().map(|d| 64 - d.leading_zeros()).max().unwrap_or(1).max(1) as u64;
+        let bits = deltas
+            .iter()
+            .map(|d| 64 - d.leading_zeros())
+            .max()
+            .unwrap_or(1)
+            .max(1) as u64;
         out.push(bits as u8);
         let mut acc: u128 = 0;
         let mut nbits = 0u32;
@@ -153,19 +160,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(col) = batch.column_by_name("vertex_time") {
                 if let Some(list) = col.as_any().downcast_ref::<ListArray>() {
                     let vals = list.values();
-                    let ints: Vec<i64> = if let Some(a) = vals.as_any().downcast_ref::<UInt16Array>() {
-                        let v: Vec<u16> = a.values().to_vec();
-                        vt.raw += v.len() * 2;
-                        vt.raw_z += zlen(&le_bytes_u16(&v));
-                        v.iter().map(|&x| x as i64).collect()
-                    } else if let Some(a) = vals.as_any().downcast_ref::<Int64Array>() {
-                        let v: Vec<i64> = a.values().to_vec();
-                        vt.raw += v.len() * 8;
-                        vt.raw_z += zlen(&le_bytes_i64(&v));
-                        v
-                    } else {
-                        continue;
-                    };
+                    let ints: Vec<i64> =
+                        if let Some(a) = vals.as_any().downcast_ref::<UInt16Array>() {
+                            let v: Vec<u16> = a.values().to_vec();
+                            vt.raw += v.len() * 2;
+                            vt.raw_z += zlen(&le_bytes_u16(&v));
+                            v.iter().map(|&x| x as i64).collect()
+                        } else if let Some(a) = vals.as_any().downcast_ref::<Int64Array>() {
+                            let v: Vec<i64> = a.values().to_vec();
+                            vt.raw += v.len() * 8;
+                            vt.raw_z += zlen(&le_bytes_i64(&v));
+                            v
+                        } else {
+                            continue;
+                        };
                     vt.n += ints.len();
                     vt.dv_z += zlen(&delta_varint(&ints));
                     vt.bp_z += zlen(&delta_bitpack(&ints));
@@ -197,9 +205,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("=== {} ({} tiles sampled, blob bytes {} = at-rest zstd frames)", args[1], tiles, blob_total);
+    println!(
+        "=== {} ({} tiles sampled, blob bytes {} = at-rest zstd frames)",
+        args[1], tiles, blob_total
+    );
     let pct = |a: usize, b: usize| -> f64 {
-        if b == 0 { 0.0 } else { (a as f64 / b as f64 - 1.0) * 100.0 }
+        if b == 0 {
+            0.0
+        } else {
+            (a as f64 / b as f64 - 1.0) * 100.0
+        }
     };
     println!(
         "vertex_time   ({:>9} vals): raw {:>9} | raw+zstd {:>9} | delta-varint+zstd {:>9} ({:+.1}%) | delta-bitpack+zstd {:>9} ({:+.1}%)",

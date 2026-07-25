@@ -66,10 +66,7 @@ pub fn profile_properties(
     StyleHints {
         version: STYLE_HINTS_VERSION,
         properties,
-        suggested_playback_seconds: suggested_playback_seconds(
-            time_range_ms,
-            temporal_bucket_ms,
-        ),
+        suggested_playback_seconds: suggested_playback_seconds(time_range_ms, temporal_bucket_ms),
         layer_hint: layer_kind_hint
             .filter(|h| LAYER_HINTS.contains(h))
             .map(str::to_string),
@@ -96,10 +93,7 @@ fn numeric_hint(name: &str, raw: &[f64]) -> Option<PropertyStyleHint> {
         p97: Some(p97),
         p99: Some(percentile(&vals, 0.99)),
         max: Some(max),
-        suggested_domain: Some([
-            round_2sf_outward(min, false),
-            round_2sf_outward(p97, true),
-        ]),
+        suggested_domain: Some([round_2sf_outward(min, false), round_2sf_outward(p97, true)]),
         cardinality: None,
     })
 }
@@ -235,7 +229,10 @@ mod tests {
     #[test]
     fn categorical_carries_cardinality_only() {
         let hints = profile_properties(
-            &[("category".to_string(), PropertyValues::Categorical { distinct: 7 })],
+            &[(
+                "category".to_string(),
+                PropertyValues::Categorical { distinct: 7 },
+            )],
             0,
             0,
             None,
@@ -278,10 +275,15 @@ mod tests {
     #[test]
     fn layer_hint_passes_known_vocabulary_only() {
         assert_eq!(
-            profile_properties(&[], 0, 0, Some("trips")).layer_hint.as_deref(),
+            profile_properties(&[], 0, 0, Some("trips"))
+                .layer_hint
+                .as_deref(),
             Some("trips")
         );
-        assert_eq!(profile_properties(&[], 0, 0, Some("hexagons")).layer_hint, None);
+        assert_eq!(
+            profile_properties(&[], 0, 0, Some("hexagons")).layer_hint,
+            None
+        );
         assert_eq!(profile_properties(&[], 0, 0, None).layer_hint, None);
     }
 }

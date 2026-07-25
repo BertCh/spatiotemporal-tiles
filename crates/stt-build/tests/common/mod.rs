@@ -112,7 +112,11 @@ pub fn fixture_rows() -> Vec<Row> {
             cnt: 30,
             name: "charlie".into(),
             flag: true,
-            vts: Some(vec![T0 + 7_200_000, T0 + 7_200_000 + 1000, T0 + 7_200_000 + 2000]),
+            vts: Some(vec![
+                T0 + 7_200_000,
+                T0 + 7_200_000 + 1000,
+                T0 + 7_200_000 + 2000,
+            ]),
             vvs: Some(vec![Some(0.1), Some(0.2), Some(0.3)]),
         },
         // LineString WITH a NULL per-vertex value element (→ NaN) (2 vertices).
@@ -159,18 +163,24 @@ pub fn fixture_rows() -> Vec<Row> {
 pub fn write_fixture_parquet(rows: &[Row], path: &std::path::Path) {
     let geom: Vec<Option<&[u8]>> = rows.iter().map(|r| r.wkb.as_deref()).collect();
     let geom_arr = Arc::new(BinaryArray::from_opt_vec(geom)) as ArrayRef;
-    let ts_arr = Arc::new(Int64Array::from(rows.iter().map(|r| r.ts).collect::<Vec<_>>())) as ArrayRef;
-    let end_arr =
-        Arc::new(Int64Array::from(rows.iter().map(|r| r.end).collect::<Vec<_>>())) as ArrayRef;
-    let mag_arr =
-        Arc::new(Float64Array::from(rows.iter().map(|r| r.mag).collect::<Vec<_>>())) as ArrayRef;
-    let cnt_arr =
-        Arc::new(Int64Array::from(rows.iter().map(|r| r.cnt).collect::<Vec<_>>())) as ArrayRef;
+    let ts_arr = Arc::new(Int64Array::from(
+        rows.iter().map(|r| r.ts).collect::<Vec<_>>(),
+    )) as ArrayRef;
+    let end_arr = Arc::new(Int64Array::from(
+        rows.iter().map(|r| r.end).collect::<Vec<_>>(),
+    )) as ArrayRef;
+    let mag_arr = Arc::new(Float64Array::from(
+        rows.iter().map(|r| r.mag).collect::<Vec<_>>(),
+    )) as ArrayRef;
+    let cnt_arr = Arc::new(Int64Array::from(
+        rows.iter().map(|r| r.cnt).collect::<Vec<_>>(),
+    )) as ArrayRef;
     let name_arr = Arc::new(arrow::array::StringArray::from(
         rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
     )) as ArrayRef;
-    let flag_arr =
-        Arc::new(BooleanArray::from(rows.iter().map(|r| r.flag).collect::<Vec<_>>())) as ArrayRef;
+    let flag_arr = Arc::new(BooleanArray::from(
+        rows.iter().map(|r| r.flag).collect::<Vec<_>>(),
+    )) as ArrayRef;
 
     let mut vts_b = ListBuilder::new(Int64Builder::new());
     for r in rows {
@@ -296,15 +306,7 @@ pub fn load_postgres(dsn: &str, table: &str, rows: &[Row]) -> anyhow::Result<Vec
         client.execute(
             &stmt,
             &[
-                &r.wkb,
-                &r.ts,
-                &r.end,
-                &r.mag,
-                &r.cnt,
-                &r.name,
-                &r.flag,
-                &r.vts,
-                &r.vvs,
+                &r.wkb, &r.ts, &r.end, &r.mag, &r.cnt, &r.name, &r.flag, &r.vts, &r.vvs,
             ],
         )?;
     }
@@ -361,7 +363,10 @@ pub fn assert_features_equal(file: &[ParsedFeature], other: &[ParsedFeature], la
 
     for (i, (fa, fb)) in a.iter().zip(&b).enumerate() {
         assert_eq!(fa.timestamp, fb.timestamp, "{label} row {i}: timestamp");
-        assert_eq!(fa.end_timestamp, fb.end_timestamp, "{label} row {i}: end_timestamp");
+        assert_eq!(
+            fa.end_timestamp, fb.end_timestamp,
+            "{label} row {i}: end_timestamp"
+        );
         assert!(
             (fa.lon - fb.lon).abs() < 1e-9 && (fa.lat - fb.lat).abs() < 1e-9,
             "{label} row {i}: centroid (file={:?}, {label}={:?})",
@@ -414,7 +419,9 @@ pub fn build_archive(features: &[ParsedFeature], config: &TileConfig) -> tempfil
 /// The per-tile identity key-set of an archive: `(zoom, x, y, time_start,
 /// time_end, feature_count)` for every tile — order-independent and robust to
 /// within-tile feature ordering (which legitimately differs by source).
-pub fn archive_tile_keys(dir: &std::path::Path) -> std::collections::BTreeSet<(u8, u32, u32, i64, i64, u32)> {
+pub fn archive_tile_keys(
+    dir: &std::path::Path,
+) -> std::collections::BTreeSet<(u8, u32, u32, i64, i64, u32)> {
     let reader = PackedReader::open(dir.join("manifest.json")).unwrap();
     reader
         .entries()
@@ -429,7 +436,8 @@ pub fn assert_archives_equal(a: &std::path::Path, b: &std::path::Path, label: &s
     let ka = archive_tile_keys(a);
     let kb = archive_tile_keys(b);
     assert_eq!(
-        ka, kb,
+        ka,
+        kb,
         "{label}: archive tile key-sets differ ({} vs {} tiles)",
         ka.len(),
         kb.len()

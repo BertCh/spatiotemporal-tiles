@@ -21,10 +21,10 @@ use std::sync::Arc;
 use arrow::array::{Array, FixedSizeListArray, Float64Array, Int32Array, RecordBatch, UInt64Array};
 use arrow::ipc::writer::StreamWriter;
 use h3o::{LatLng, Resolution};
+use stt_build::quadbin;
 use stt_core::arrow_tile::{DecodedLayer, QuantAffine, STT_QUANT_META_KEY};
 use stt_core::metadata::SummaryScheme;
 use stt_core::{BlobOrdering, PackWriter, PackedReader, TileId};
-use stt_build::quadbin;
 
 const FRAME_ALIGN: usize = 8;
 const ALIGNED_FRAME_FLAG: u16 = 0x8000;
@@ -198,8 +198,8 @@ fn fix_layer_ids(
 
     let read_lonlat: Box<dyn Fn(usize) -> (f64, f64)> =
         if let Some(i32arr) = child.as_any().downcast_ref::<Int32Array>() {
-            let aff = affine
-                .ok_or_else(|| anyhow::anyhow!("i32 geometry without a stt:quant affine"))?;
+            let aff =
+                affine.ok_or_else(|| anyhow::anyhow!("i32 geometry without a stt:quant affine"))?;
             Box::new(move |i| {
                 let qx = i32arr.value(i * stride);
                 let qy = i32arr.value(i * stride + 1);

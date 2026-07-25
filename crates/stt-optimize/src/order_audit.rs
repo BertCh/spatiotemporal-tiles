@@ -93,7 +93,10 @@ pub fn order_audit(tileset: &PackedTileset) -> Result<OrderAuditReport> {
         .max()
         .unwrap_or(ordering_sim::DEFAULT_PACK_BYTES)
         .max(1 << 20);
-    let opts = SimOptions { pack_bytes, ..SimOptions::default() };
+    let opts = SimOptions {
+        pack_bytes,
+        ..SimOptions::default()
+    };
     let ranked = ordering_sim::evaluate(&samples, opts);
     // The recommendation is the cheapest SELECTABLE ordering (never morton3) —
     // identical to what `--blob-ordering measured` would resolve.
@@ -213,7 +216,11 @@ pub fn format_text(r: &OrderAuditReport) -> String {
     );
     for row in &r.orderings {
         let mark = if row.recommended { " * " } else { "   " };
-        let note = if row.ordering == "morton3" { "  (research only)" } else { "" };
+        let note = if row.ordering == "morton3" {
+            "  (research only)"
+        } else {
+            ""
+        };
         let _ = writeln!(
             s,
             "{}{:<11} {:>10} {:>12} {:>12}{}",
@@ -231,7 +238,11 @@ pub fn format_text(r: &OrderAuditReport) -> String {
         "  cost = bytes read + reads × {} gap (the reader's own request/byte trade)",
         mib(r.coalesce_gap_bytes)
     );
-    let _ = writeln!(s, "  recommended : {} (measured — lowest cost)", r.recommended);
+    let _ = writeln!(
+        s,
+        "  recommended : {} (measured — lowest cost)",
+        r.recommended
+    );
     let _ = writeln!(s, "  auto picks  : {}", r.auto_choice);
     match &r.current {
         Some(c) if *c == r.recommended => {
@@ -278,7 +289,8 @@ mod tests {
                 let t = b * bucket;
                 let id = TileId::new(10, 4_000 + x, 5_000, t as u64);
                 let payload = format!("t-{x}-{b}").into_bytes();
-                w.add_tile_full(&id, t, t + bucket - 1, Some(t), 1, None, &payload).unwrap();
+                w.add_tile_full(&id, t, t + bucket - 1, Some(t), 1, None, &payload)
+                    .unwrap();
             }
         }
         let meta = Metadata::new("audit").with_temporal_bucket_ms(bucket as u64);
@@ -304,9 +316,18 @@ mod tests {
             }
         }
         // The archive records its concrete ordering (F4a) and the audit surfaces it.
-        let current = r.current.clone().expect("built-with-Auto archive records blobOrdering");
-        assert!(matches!(current.as_str(), "spatial" | "time-major" | "hilbert3" | "morton3"));
-        assert!(matches!(r.auto_choice.as_str(), "spatial" | "time-major" | "hilbert3" | "morton3"));
+        let current = r
+            .current
+            .clone()
+            .expect("built-with-Auto archive records blobOrdering");
+        assert!(matches!(
+            current.as_str(),
+            "spatial" | "time-major" | "hilbert3" | "morton3"
+        ));
+        assert!(matches!(
+            r.auto_choice.as_str(),
+            "spatial" | "time-major" | "hilbert3" | "morton3"
+        ));
         assert!(format_text(&r).contains("recommended :"));
     }
 

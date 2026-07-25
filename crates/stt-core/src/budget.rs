@@ -109,9 +109,8 @@ impl TileBudget {
         }
 
         // Pre-score every item once.
-        let mut scored: Vec<(usize, f64, usize)> = (0..count)
-            .map(|i| (i, score(i), size(i)))
-            .collect();
+        let mut scored: Vec<(usize, f64, usize)> =
+            (0..count).map(|i| (i, score(i), size(i))).collect();
 
         // Step 1: count cap — keep the highest-scored items.
         if scored.len() > self.max_feature_count {
@@ -163,9 +162,7 @@ impl TileBudget {
         match self.scorer {
             ImportanceScorer::GeometrySize => vertex_count as f64,
             ImportanceScorer::PropertyCount => property_count as f64,
-            ImportanceScorer::Combined
-            | ImportanceScorer::FeatureId
-            | ImportanceScorer::Random => {
+            ImportanceScorer::Combined | ImportanceScorer::FeatureId | ImportanceScorer::Random => {
                 vertex_count as f64 + property_count as f64 * 10.0
             }
         }
@@ -226,11 +223,7 @@ mod tests {
         // Well within both caps -> every index returned, in order.
         let budget = TileBudget::new(1_000_000, 256 * 1024, 1000);
         let sizes = [100usize, 50, 200, 75];
-        let keep = budget.enforce_indexed(
-            sizes.len(),
-            |i| sizes[i] as f64,
-            |i| sizes[i],
-        );
+        let keep = budget.enforce_indexed(sizes.len(), |i| sizes[i] as f64, |i| sizes[i]);
         assert_eq!(keep, vec![0, 1, 2, 3]);
     }
 
@@ -241,11 +234,7 @@ mod tests {
         // ascending index order.
         let budget = TileBudget::new(1_000_000, 256 * 1024, 2);
         let sizes = [10usize, 50, 200, 100];
-        let mut keep = budget.enforce_indexed(
-            sizes.len(),
-            |i| sizes[i] as f64,
-            |i| sizes[i],
-        );
+        let mut keep = budget.enforce_indexed(sizes.len(), |i| sizes[i] as f64, |i| sizes[i]);
         keep.sort_unstable();
         assert_eq!(keep, vec![2, 3]); // 200 and 100 are largest
     }
@@ -255,11 +244,7 @@ mod tests {
         // Tiny byte cap forces a size-based drop; result must fit under cap.
         let budget = TileBudget::new(150, 256 * 1024, 10_000);
         let sizes = [100usize, 100, 100, 100];
-        let keep = budget.enforce_indexed(
-            sizes.len(),
-            |i| sizes[i] as f64,
-            |i| sizes[i],
-        );
+        let keep = budget.enforce_indexed(sizes.len(), |i| sizes[i] as f64, |i| sizes[i]);
         let kept_bytes: usize = keep.iter().map(|&i| sizes[i]).sum();
         assert!(keep.len() < sizes.len(), "expected some features dropped");
         // 90%-of-cap target with slight-overshoot tolerance (<=105%).

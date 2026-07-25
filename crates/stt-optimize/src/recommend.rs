@@ -97,12 +97,18 @@ fn calculate_confidence(result: &AnalysisResult) -> u8 {
     }
 
     // Lower confidence with sparse data
-    if matches!(result.spatial.distribution, crate::analysis::spatial::SpatialDistribution::Sparse) {
+    if matches!(
+        result.spatial.distribution,
+        crate::analysis::spatial::SpatialDistribution::Sparse
+    ) {
         score = score.saturating_sub(10);
     }
 
     // Lower confidence with complex geometry
-    if matches!(result.geometry.complexity, crate::analysis::geometry::GeometryComplexity::VeryComplex) {
+    if matches!(
+        result.geometry.complexity,
+        crate::analysis::geometry::GeometryComplexity::VeryComplex
+    ) {
         score = score.saturating_sub(10);
     }
 
@@ -146,11 +152,7 @@ pub fn to_build_config(
 /// data and stays a per-dataset opt-in the user must add by hand. The same
 /// goes for `suggestion_only` advice: non-lossy, but the tradeoff spelled out
 /// in its `why` needs a human decision before the flag is safe to run.
-pub fn to_command(
-    recommendations: &Recommendations,
-    input: &Path,
-    time_field: &str,
-) -> String {
+pub fn to_command(recommendations: &Recommendations, input: &Path, time_field: &str) -> String {
     // The input exactly as the caller addressed it (pasteable from the same
     // cwd); a basename would break the command from anywhere else. Suggest the
     // packed dataset DIRECTORY (the input's stem): stt-build's output is a
@@ -165,11 +167,7 @@ pub fn to_command(
 
     let mut cmd = format!(
         "stt-build --input {} --output {} \\\n  --time-field {} --min-zoom {} --max-zoom {}",
-        input_str,
-        output_str,
-        time_field,
-        recommendations.min_zoom,
-        recommendations.max_zoom,
+        input_str, output_str, time_field, recommendations.min_zoom, recommendations.max_zoom,
     );
     // The recommended bucket is the recipe's core scalar — the command must
     // carry it or a paste-and-run build silently falls back to the 1h default.
@@ -251,7 +249,10 @@ mod tests {
         let cmd = to_command(&rec, Path::new("/data/in/quakes.parquet"), "timestamp");
         // Full path as addressed by the caller — a basename would break the
         // command pasted from any other cwd.
-        assert!(cmd.contains("--input /data/in/quakes.parquet"), "command: {cmd}");
+        assert!(
+            cmd.contains("--input /data/in/quakes.parquet"),
+            "command: {cmd}"
+        );
         assert!(cmd.contains("--output /data/in/quakes"), "command: {cmd}");
     }
 
@@ -261,11 +262,7 @@ mod tests {
         caveated.suggestion_only = true;
         let mut semantic = advice("--min-zoom-field", Some("category"), false);
         semantic.suggestion_only = true;
-        let rec = rec_with_advice(vec![
-            caveated,
-            semantic,
-            advice("--publish", None, false),
-        ]);
+        let rec = rec_with_advice(vec![caveated, semantic, advice("--publish", None, false)]);
         let cmd = to_command(&rec, Path::new("data.parquet"), "timestamp");
         // Suggestion-only levers stay out of the auto path even though they
         // are non-lossy — their `why` carries a decision the user must make.
@@ -279,7 +276,10 @@ mod tests {
         let result = synthetic_result();
         let rec = generate_recommendations(
             &result,
-            vec![advice("--publish", None, false), advice("--quantize-coords", Some("1"), true)],
+            vec![
+                advice("--publish", None, false),
+                advice("--quantize-coords", Some("1"), true),
+            ],
         );
         assert_eq!(rec.advice.len(), 2);
         assert_eq!(rec.advice[0].flag, "--publish");
@@ -302,10 +302,17 @@ mod tests {
         let cmd = to_command(&rec, Path::new("data.parquet"), "timestamp");
 
         // Non-lossy advice present, with values, in advisor (input) order.
-        let lod = cmd.find("--temporal-lod 1d,30d").expect("temporal-lod in command");
+        let lod = cmd
+            .find("--temporal-lod 1d,30d")
+            .expect("temporal-lod in command");
         let publish = cmd.find("--publish").expect("publish in command");
-        let ordering = cmd.find("--blob-ordering spatial").expect("blob-ordering in command");
-        assert!(lod < publish && publish < ordering, "advisor order preserved: {cmd}");
+        let ordering = cmd
+            .find("--blob-ordering spatial")
+            .expect("blob-ordering in command");
+        assert!(
+            lod < publish && publish < ordering,
+            "advisor order preserved: {cmd}"
+        );
     }
 
     #[test]
@@ -331,7 +338,10 @@ mod tests {
         let command = config["command"].as_str().expect("command string");
         assert!(command.contains("--min-zoom 0"), "command: {command}");
         // Non-lossy advice rides the command; lossy quantize does not.
-        assert!(command.contains("--blob-ordering spatial"), "command: {command}");
+        assert!(
+            command.contains("--blob-ordering spatial"),
+            "command: {command}"
+        );
         assert!(!command.contains("--quantize-coords"), "command: {command}");
     }
 
@@ -361,10 +371,17 @@ mod tests {
             advice("--maximum-tile-features", Some("10000"), true),
         ]);
         let cmd = to_command(&rec, Path::new("data.parquet"), "timestamp");
-        assert!(!cmd.contains("--quantize-coords"), "lossy flag leaked: {cmd}");
-        assert!(!cmd.contains("--quantize-attrs-auto"), "lossy flag leaked: {cmd}");
-        assert!(!cmd.contains("--maximum-tile-features"), "lossy flag leaked: {cmd}");
+        assert!(
+            !cmd.contains("--quantize-coords"),
+            "lossy flag leaked: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--quantize-attrs-auto"),
+            "lossy flag leaked: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--maximum-tile-features"),
+            "lossy flag leaked: {cmd}"
+        );
     }
 }
-
-

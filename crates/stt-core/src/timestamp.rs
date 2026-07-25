@@ -87,10 +87,22 @@ mod tests {
 
     #[test]
     fn scale_matches_units() {
-        assert_eq!(scale_timestamp_to_ms(5, TimestampUnit::Second).unwrap(), 5000);
-        assert_eq!(scale_timestamp_to_ms(5, TimestampUnit::Millisecond).unwrap(), 5);
-        assert_eq!(scale_timestamp_to_ms(5_000, TimestampUnit::Microsecond).unwrap(), 5);
-        assert_eq!(scale_timestamp_to_ms(5_000_000, TimestampUnit::Nanosecond).unwrap(), 5);
+        assert_eq!(
+            scale_timestamp_to_ms(5, TimestampUnit::Second).unwrap(),
+            5000
+        );
+        assert_eq!(
+            scale_timestamp_to_ms(5, TimestampUnit::Millisecond).unwrap(),
+            5
+        );
+        assert_eq!(
+            scale_timestamp_to_ms(5_000, TimestampUnit::Microsecond).unwrap(),
+            5
+        );
+        assert_eq!(
+            scale_timestamp_to_ms(5_000_000, TimestampUnit::Nanosecond).unwrap(),
+            5
+        );
     }
 
     #[test]

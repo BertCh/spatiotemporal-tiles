@@ -419,14 +419,20 @@ mod tests {
             "old",
             1_000_000,
             vec![zoom(3, 10, 200_000), zoom(5, 40, 800_000)],
-            vec![column("geometry", 600_000, 15.0), column("speed", 100_000, 2.5)],
+            vec![
+                column("geometry", 600_000, 15.0),
+                column("speed", 100_000, 2.5),
+            ],
             false,
         );
         let after = report(
             "new",
             900_000,
             vec![zoom(2, 4, 180_000), zoom(5, 40, 720_000)],
-            vec![column("geometry", 600_000, 15.0), column("speed_q", 40_000, 1.0)],
+            vec![
+                column("geometry", 600_000, 15.0),
+                column("speed_q", 40_000, 1.0),
+            ],
             true,
         );
 
@@ -461,7 +467,10 @@ mod tests {
 
         // Per-column: largest side first, one-sided flags both ways.
         assert_eq!(
-            d.per_column.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            d.per_column
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["geometry", "speed", "speed_q"]
         );
         let speed = &d.per_column[1];

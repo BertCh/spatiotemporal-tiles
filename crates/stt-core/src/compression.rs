@@ -65,7 +65,8 @@ pub fn compress_zstd_with_dict_level(
 ) -> Result<Vec<u8>> {
     let level = level.clamp(1, ZSTD_LEVEL_MAX);
     let Some(dict) = dict else {
-        return zstd::stream::encode_all(data, level).map_err(|e| Error::Compression(e.to_string()));
+        return zstd::stream::encode_all(data, level)
+            .map_err(|e| Error::Compression(e.to_string()));
     };
     let mut out = Vec::with_capacity(data.len() / 2 + 64);
     let mut encoder = zstd::stream::Encoder::with_dictionary(&mut out, level, dict)
@@ -126,8 +127,7 @@ mod tests {
 
     #[test]
     fn test_zstd_roundtrip() {
-        let data = b"Hello, world! This is a test string that should compress well."
-            .repeat(50);
+        let data = b"Hello, world! This is a test string that should compress well.".repeat(50);
         let compressed = compress(&data, Compression::Zstd).unwrap();
         assert!(compressed.len() < data.len());
 

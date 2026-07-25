@@ -159,8 +159,10 @@ mod tests {
     #[test]
     fn valid_h3_cells_pass_and_sequential_ids_fail() {
         let t = tier(SummaryScheme::H3, vec![5]);
-        let good =
-            summary_layers("summary", vec![h3_cell(45.0, -73.5, 5), h3_cell(45.1, -73.6, 5)]);
+        let good = summary_layers(
+            "summary",
+            vec![h3_cell(45.0, -73.5, 5), h3_cell(45.1, -73.6, 5)],
+        );
         assert!(check_summary_cells(&t, 0, &good).is_empty());
 
         // The exact shipped-blank-demos failure: a sequential integer id column.
