@@ -558,6 +558,38 @@ pub fn infer_property_types<'a>(
         .collect()
 }
 
+/// Fill the property kinds an input schema did not type, from a whole-dataset
+/// pass over the features.
+///
+/// `declared` is authoritative and is never overridden — a `Utf8` column whose
+/// values all happen to look numeric stays [`PropertyKind::Categorical`]. But a
+/// schema does not answer for every column: the GeoParquet mapping types the
+/// numeric/string/bool columns and returns nothing for the rest (a
+/// `Dictionary`-encoded, `List`, or all-`Null` column), and the map is empty
+/// outright when the schema could not be read.
+///
+/// Any column left untyped falls through to per-tile sniffing, which drifts the
+/// layer schema across tiles — see [`infer_property_types`]. This closes those
+/// gaps. Returns the merged map plus the names that were filled in, so the
+/// caller can report them.
+pub fn fill_property_type_gaps<'a>(
+    declared: &PropertyTypes,
+    features: impl IntoIterator<Item = Option<&'a serde_json::Map<String, serde_json::Value>>>,
+    filter: &AttributeFilter,
+) -> (PropertyTypes, Vec<String>) {
+    let inferred = infer_property_types(features, filter);
+    let mut merged = declared.clone();
+    let mut filled = Vec::new();
+    for (name, kind) in inferred {
+        if !merged.contains_key(&name) {
+            merged.insert(name.clone(), kind);
+            filled.push(name);
+        }
+    }
+    filled.sort();
+    (merged, filled)
+}
+
 impl PropertyAccumulator {
     /// Construct with an opt-in user-property selection and the (possibly
     /// empty) authoritative schema kinds. Pass [`AttributeFilter::KeepAll`] +
@@ -883,6 +915,54 @@ mod tests {
     use super::*;
     use geojson::{Feature, Geometry, Value as GeomValue};
     use serde_json::json;
+
+    /// The schema stays authoritative for the columns it types; only the gaps
+    /// are filled. A `Utf8` column whose values all look numeric must NOT be
+    /// re-typed numeric by the inference pass.
+    #[test]
+    fn gap_fill_never_overrides_a_declared_kind() {
+        let feats = vec![
+            point_feature(0.0, 0.0, json!({ "code": "123", "untyped": "abc" })),
+            point_feature(1.0, 1.0, json!({ "code": "456", "untyped": "def" })),
+        ];
+        let declared: PropertyTypes = [("code".to_string(), PropertyKind::Categorical)]
+            .into_iter()
+            .collect();
+        let (merged, filled) = fill_property_type_gaps(
+            &declared,
+            feats.iter().map(|f| f.shared_properties.as_deref()),
+            &AttributeFilter::KeepAll,
+        );
+        assert_eq!(
+            merged.get("code"),
+            Some(&PropertyKind::Categorical),
+            "declared kind survives even though the values look numeric"
+        );
+        assert_eq!(merged.get("untyped"), Some(&PropertyKind::Categorical));
+        assert_eq!(
+            filled,
+            vec!["untyped".to_string()],
+            "only the gap is filled"
+        );
+    }
+
+    /// A column the schema DID type but which is absent from the sampled
+    /// features must not be dropped from the merged map.
+    #[test]
+    fn gap_fill_keeps_declared_columns_absent_from_the_features() {
+        let feats = vec![point_feature(0.0, 0.0, json!({ "present": 1 }))];
+        let declared: PropertyTypes = [("only_in_schema".to_string(), PropertyKind::Numeric)]
+            .into_iter()
+            .collect();
+        let (merged, filled) = fill_property_type_gaps(
+            &declared,
+            feats.iter().map(|f| f.shared_properties.as_deref()),
+            &AttributeFilter::KeepAll,
+        );
+        assert_eq!(merged.get("only_in_schema"), Some(&PropertyKind::Numeric));
+        assert_eq!(merged.get("present"), Some(&PropertyKind::Numeric));
+        assert_eq!(filled, vec!["present".to_string()]);
+    }
 
     /// Dataset-wide inference pins a column's kind so every tile agrees.
     ///

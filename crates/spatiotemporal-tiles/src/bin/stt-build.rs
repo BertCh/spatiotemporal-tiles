@@ -839,18 +839,26 @@ fn resolve_postgres_source(args: &Args) -> Result<InputSource> {
 
 /// Resolve the dataset-wide property kinds fed to every tile builder.
 ///
-/// The input SCHEMA is authoritative where there is one (GeoParquet columns,
-/// Postgres/DuckDB column types). GeoJSON has no schema, so that path returns
-/// nothing and the tile builder would fall back to sniffing types from each
-/// tile's own features — which drifts the layer schema across tiles: a column
-/// whose values are all null in one tile disappears from it, and a column
-/// holding only numeric-looking strings in one tile but a real string in
-/// another flips between numeric and dictionary. Both leave the archive with
-/// several schemas for one layer (`stt-validate` reports "schema drift").
+/// The input SCHEMA is authoritative wherever it has an answer: GeoParquet
+/// column types, Postgres/DuckDB column types. But it does not answer for every
+/// column — `property_kind_for` maps the numeric/string/bool types and returns
+/// nothing for the rest (a `Dictionary`-encoded, `List`, or all-`Null` column,
+/// say), and the whole map is empty if the schema could not be read at all.
 ///
-/// So when the schema yields nothing, infer the kinds ONCE across every loaded
-/// feature and pin them. The classification rule is the same either way; only
-/// the evidence widens from one tile to the whole dataset.
+/// A column the schema doesn't cover falls through to the tile builder, which
+/// sniffs its kind from the features of ONE tile. That drifts the layer schema
+/// across tiles two ways: a column whose values are all null in some tile
+/// disappears from that tile's schema, and a column holding only
+/// numeric-looking strings in one tile but a real string in another is numeric
+/// in the first and categorical in the second. `stt-validate` reports both as
+/// schema drift, and a consumer styling on the column gets a different type
+/// depending on which tile it reads.
+///
+/// So: take the schema's answers, then fill the GAPS from a single pass over
+/// every loaded feature. Schema entries are never overridden — a `Utf8` column
+/// whose values all look numeric stays categorical, as documented. The
+/// gap-filling rule is the same one the tile builder would have used; only the
+/// evidence widens from one tile to the whole dataset.
 fn resolve_property_types(
     source: &InputSource,
     args: &Args,
@@ -858,22 +866,21 @@ fn resolve_property_types(
     attribute_filter: &stt_build::columnar::AttributeFilter,
 ) -> Arc<stt_build::columnar::PropertyTypes> {
     let declared = source.property_kinds(&args.time_field, args.end_time_field.as_deref());
-    if !declared.is_empty() {
-        return declared;
-    }
-    let inferred = stt_build::columnar::infer_property_types(
+    let (merged, filled) = stt_build::columnar::fill_property_type_gaps(
+        &declared,
         features.iter().map(|f| f.shared_properties.as_deref()),
         attribute_filter,
     );
-    if inferred.is_empty() {
+    if filled.is_empty() {
         return declared;
     }
     info!(
-        "Inferred {} property kind(s) across the whole dataset (input carries no \
-         schema); tile schemas stay identical",
-        inferred.len()
+        "Pinned {} property kind(s) the input schema did not type ({}) from a \
+         whole-dataset pass, so every tile emits the same columns",
+        filled.len(),
+        filled.join(", ")
     );
-    Arc::new(inferred)
+    Arc::new(merged)
 }
 
 fn main() -> Result<()> {
