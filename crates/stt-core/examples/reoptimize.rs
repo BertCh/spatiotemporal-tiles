@@ -47,6 +47,46 @@ const RESERVED: &[&str] = &[
     "triangles",
 ];
 
+/// Metres per degree of latitude — the constant `world_grid_affine` sizes the
+/// coordinate grid from (`sx = sy = metres / M_PER_DEG_LAT`). Inverting it
+/// recovers the ORIGINAL `--quantize-coords` value from a tile's affine.
+const M_PER_DEG_LAT: f64 = 111_320.0;
+
+/// Recover the source's quantization settings from an already-encoded tile.
+///
+/// `decode_tile` hands back the raw Arrow batch — Int32 leaves plus the
+/// `stt:quant` / `stt:qa` affines — and this example's `read_geometry` /
+/// `read_property` then INVERT them to Float64. Re-encoding without restoring
+/// the same settings therefore silently writes a dequantized copy: correct
+/// values (they stay snapped to the original grid) but far bigger, since coords
+/// are the dominant near-incompressible column. Measured on the showcase fleet
+/// that cost up to 1.69x (satellites 1.78 GB -> 3.0 GB).
+///
+/// Returns `(coord_metres, per-column attr steps)`; either may be empty when the
+/// source was not quantized on that axis.
+fn recover_quant(batch: &RecordBatch) -> (f64, HashMap<String, f64>) {
+    let coord_m = geom_affine(batch)
+        // sy is degrees-per-quantum; the requested ground precision is its
+        // metre equivalent. Round-tripping through f64 is exact enough that
+        // re-quantizing lands on the identical grid.
+        .map(|a| a.sy * M_PER_DEG_LAT)
+        .unwrap_or(0.0);
+    let mut attrs = HashMap::new();
+    for f in batch.schema().fields() {
+        if RESERVED.contains(&f.name().as_str()) {
+            continue;
+        }
+        if let Some(q) = f
+            .metadata()
+            .get(STT_QUANT_ATTR_META_KEY)
+            .and_then(|s| AttrQuant::from_json(s))
+        {
+            attrs.insert(f.name().to_string(), q.s);
+        }
+    }
+    (coord_m, attrs)
+}
+
 /// Read the geometry field's quantization affine, if the tile is quantized.
 fn geom_affine(batch: &RecordBatch) -> Option<QuantAffine> {
     let f = batch.schema().field_with_name("geometry").ok()?.clone();
@@ -324,7 +364,7 @@ fn batch_to_columnar(batch: &RecordBatch, name: String) -> ColumnarLayer {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
-        eprintln!("usage: reoptimize <src/manifest.json> <out_dir> [--format-version N] [--quantize-coords M] [--quantize-attr n=p]... [--drop col]... [--no-seq-ids] [--zstd N]");
+        eprintln!("usage: reoptimize <src/manifest.json> <out_dir> [--format-version N] [--blob-ordering time-major|spatial|hilbert3|morton3|auto] [--quantize-coords M] [--quantize-attr n=p]... [--drop col]... [--no-seq-ids] [--zstd N]");
         std::process::exit(2);
     }
     let src = &args[0];
@@ -333,6 +373,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut attrs: HashMap<String, f64> = HashMap::new();
     let mut drop: HashSet<String> = HashSet::new();
     let mut seq_ids = true;
+    // Blob ordering for the output pack. v1 archives predate `manifest.blobOrdering`,
+    // so a migration has nothing to preserve and `Auto` would re-derive one —
+    // which resolves to `SpatialMajor` on space-dominated datasets and silently
+    // breaks time playback (empty buffered ranges → stalls). Callers migrating a
+    // playback dataset must pass `--blob-ordering time-major` explicitly.
+    let mut ordering = BlobOrdering::Auto;
     let mut auto = false;
     let mut zstd = 19;
     // None = preserve the source's formatVersion (data-preserving default);
@@ -366,6 +412,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 seq_ids = false;
                 i += 1;
             }
+            "--blob-ordering" => {
+                ordering = args[i + 1].parse()?;
+                i += 2;
+            }
             "--zstd" => {
                 zstd = args[i + 1].parse()?;
                 i += 2;
@@ -377,14 +427,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let reader = PackedReader::open(src)?;
+    let meta = reader.metadata().clone();
+    let entries = reader.entries().to_vec();
+
+    // PRESERVE the source's quantization unless this run overrides it. Decode
+    // inverts both affines to Float64, so without this a plain container
+    // migration silently ships a dequantized (much larger) copy — see
+    // `recover_quant`. An explicit `--quantize-*` flag still wins.
+    if coord_m == 0.0 && attrs.is_empty() && !auto {
+        // Sample several tiles, not just the first. `--quantize-attrs-auto`
+        // (range-adaptive) derives a per-tile step of `range / u16::MAX`, so a
+        // column's step VARIES across tiles; a fixed `--quantize-attr n=p` is
+        // constant. Pinning tile 0's adaptive step onto every tile is what
+        // introduces schema drift: a wider tile then overflows the UInt16 leaf
+        // and gets promoted to Int32, so one layer ends up with two schemas.
+        // Auto mode is stable by construction (it always emits UInt16), so
+        // varying steps ⇒ re-enable auto instead of pinning.
+        let n = entries.len();
+        let step = (n / 8).max(1);
+        let mut steps: HashMap<String, Vec<f64>> = HashMap::new();
+        for e in entries.iter().step_by(step).take(8) {
+            let payload = reader.read_payload(e)?;
+            let probe = match reader.templates() {
+                Some(t) => decode_tile_with_templates(&payload, t),
+                None => decode_tile(&payload),
+            };
+            if let Some(layer) = probe.ok().and_then(|l| l.into_iter().next()) {
+                let (m, a) = recover_quant(&layer.batch);
+                if m > 0.0 && coord_m == 0.0 {
+                    eprintln!("preserving source coord quantization: {m:.4} m");
+                    coord_m = m;
+                }
+                for (name, s) in a {
+                    steps.entry(name).or_default().push(s);
+                }
+            }
+        }
+        let adaptive = steps.values().any(|v| {
+            v.windows(2)
+                .any(|w| (w[0] - w[1]).abs() > f64::EPSILON * w[0].abs().max(1.0))
+        });
+        if adaptive {
+            eprintln!("preserving source attr quantization: range-adaptive (auto)");
+            auto = true;
+        } else if !steps.is_empty() {
+            let mut names: Vec<_> = steps.keys().cloned().collect();
+            names.sort();
+            eprintln!("preserving source attr quantization: {}", names.join(", "));
+            attrs = steps.into_iter().map(|(k, v)| (k, v[0])).collect();
+        }
+    }
+
     // Process-global encoder config (the encoder reads these on encode_tile).
     set_quantize_coords_m(coord_m)?;
     set_quantize_attrs(attrs.clone());
     set_quantize_attrs_auto(auto);
-
-    let reader = PackedReader::open(src)?;
-    let meta = reader.metadata().clone();
-    let entries = reader.entries().to_vec();
     // Tiles are fully re-encoded, so the output's capability declarations
     // (spec §3.1) come from THIS run's settings, not the source manifest.
     // The elevation fold survives decode→re-encode as a 3-wide leaf, so that
@@ -403,7 +501,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         capabilities.push(stt_core::pack::CAPABILITY_ELEVATION_FOLD.to_string());
     }
-    let mut writer = PackWriter::create(out, BlobOrdering::Auto, 64 * 1024 * 1024)?
+    let mut writer = PackWriter::create(out, ordering, 64 * 1024 * 1024)?
         .with_paging(Some(4096))
         .with_zstd_level(zstd)
         .with_format_version(format_version.unwrap_or_else(|| reader.format_version()))
@@ -415,7 +513,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // never disagree, and a v2 build's templates land in `manifest.schemas`.
     let encoder_cfg = EncoderConfig {
         format_version: writer.format_version(),
-        template_collector: (writer.format_version() == stt_core::pack::PACKED_FORMAT_VERSION_V2)
+        template_collector: (writer.format_version() == stt_core::pack::PACKED_FORMAT_VERSION)
             .then(|| writer.template_collector()),
         ..EncoderConfig::from_globals()
     };

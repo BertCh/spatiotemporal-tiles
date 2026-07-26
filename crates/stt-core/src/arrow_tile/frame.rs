@@ -10,23 +10,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-/// Top bit of the layer frame's leading u16: marks an *aligned* frame whose
-/// IPC streams are padded to 8-byte boundaries (see the module docs). The
-/// remaining 15 bits carry the layer count, so a tile may have at most
-/// `0x7fff` layers. Old frames never set this bit (layer counts are tiny).
-pub const ALIGNED_FRAME_FLAG: u16 = 0x8000;
-
-/// Alignment (bytes) of each layer's Arrow IPC stream within an aligned frame.
+/// Alignment (bytes) of each layer's Arrow IPC stream within the frame.
 pub(crate) const FRAME_ALIGN: usize = 8;
 // ----------------------------------------------------------------------------
-// Layer frame v2 (packed formatVersion 2) — see the module docs.
+// Layer frame — see the module docs.
 // ----------------------------------------------------------------------------
 
-/// Leading u16 of a **v2** layer frame. Deliberately unreachable from the v1
-/// writer: the v1 encoder rejects tiles whose `count | ALIGNED_FRAME_FLAG`
-/// would collide with this escape, so the two frame shapes are disjoint on
-/// their first two bytes. Manifest `formatVersion` remains the authoritative
-/// discriminator (design ★F6); this escape is defense-in-depth.
+/// Leading u16 of a layer frame: the escape that marks a payload as a frame at
+/// all. Manifest `formatVersion` remains the authoritative discriminator
+/// (design ★F6); this escape is defense-in-depth against a non-frame payload.
 pub const FRAME_V2_ESCAPE: u16 = 0xFFFF;
 
 /// `frame_version` byte of the v2 frame.
@@ -54,13 +46,10 @@ pub(crate) const REF_KIND_TEMPLATE_HASH: u8 = 1;
 /// schema/template and no `PROPS_BATCH` section.
 pub(crate) const REF_KIND_NO_PROPS: u8 = 2;
 
-/// The frame format this encoder emits when nothing opts in explicitly —
-/// v1, the frozen 0.3.x wire shape. `stt-build` opts into v2 explicitly
-/// (its `--format-version` default is 2); `stt-serve` and every other
-/// existing caller stays v1 without changes (design §7).
-pub const FORMAT_VERSION_V1: u32 = 1;
-/// The sectioned template-referencing frame (packed formatVersion 2).
-pub const FORMAT_VERSION_V2: u32 = 2;
+/// The layer-frame format: the sectioned, template-referencing frame. The only
+/// version this codebase emits or reads — the transitional v1 (0.3.x) frame was
+/// removed once the published fleet was migrated.
+pub const FORMAT_VERSION: u32 = 2;
 /// blake3 content hash truncated to 128 bits — the v2 template reference
 /// (16 raw bytes in the frame; lowercase hex in `manifest.schemas`).
 pub(crate) fn blake3_128(bytes: &[u8]) -> [u8; 16] {

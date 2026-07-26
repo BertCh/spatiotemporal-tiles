@@ -37,7 +37,7 @@ pub enum BlobOrdering {
     /// `Default`. The `stt-build` CLI defaults to `--blob-ordering auto`
     /// (resolved to a concrete order by [`choose`](BlobOrdering::choose)); there
     /// is no no-reorder mode — the packed writer always reorders before cutting
-    /// packs (`eager` is a legacy alias for `auto`). An opt-in
+    /// packs. An opt-in
     /// `--blob-ordering measured` instead picks the concrete order by simulating
     /// per-ordering range-read cost (see [`crate::ordering_sim`]).
     #[default]

@@ -226,7 +226,7 @@ fn v2_dataset_rebuild_is_byte_identical_including_schemas() {
         let cfg = EncoderConfig {
             quantize_coords_m: Some(1.0),
             quantize_attrs_auto: true,
-            format_version: FORMAT_VERSION_V2,
+            format_version: FORMAT_VERSION,
             template_collector: Some(writer.template_collector()),
             ..EncoderConfig::default()
         };

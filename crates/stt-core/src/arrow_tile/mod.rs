@@ -20,29 +20,10 @@
 //! | `<property>`  | `Float64` or `Dictionary<UInt16,Utf8>`   | one column per property       |
 //!
 //! All layers in one tile are concatenated with a tiny frame so a tile can
-//! carry, say, a linestring layer and a point layer side by side. Two frame
-//! shapes exist, selected by [`EncoderConfig::format_version`] (the payload
-//! side of the packed format's `manifest.formatVersion` — the two are bumped
-//! in lockstep, see `docs/spec/stt-packed-format.md` §9):
+//! carry, say, a linestring layer and a point layer side by side.
 //!
-//! **v1** (`format_version: 1`, the 0.3.x wire shape — frozen, byte-identical):
-//!
-//! ```text
-//! [u16 layer_count | ALIGNED_FRAME_FLAG]
-//!   repeated: [u16 name_len][name utf8][u32 ipc_len][pad to 8][ipc stream bytes]
-//! ```
-//!
-//! The leading u16's top bit ([`ALIGNED_FRAME_FLAG`]) marks the *aligned*
-//! frame: zero padding after each `ipc_len` places every Arrow IPC stream at
-//! an 8-byte boundary relative to the payload start, so readers can hand the
-//! stream to an Arrow implementation zero-copy (Arrow buffers are 8-byte
-//! aligned *within* a stream; the stream itself must start aligned for that
-//! to survive). The pad length is not stored — readers derive it as
-//! `(8 - pos % 8) % 8` from the position after `ipc_len`. Frames without the
-//! flag (every archive written before the flag existed) carry no padding and
-//! decode exactly as before.
-//!
-//! **v2** (`format_version: 2`, default for new `stt-build` output): a
+//! The frame (`format_version: 2` — the payload side of the packed format's
+//! `manifest.formatVersion`; see `docs/spec/stt-packed-format.md` §9) is a
 //! sectioned frame that hoists each layer's Arrow IPC *schema message* into a
 //! per-dataset **template** (referenced by blake3-128 hash, resolved through
 //! the manifest's `schemas` table) so the per-tile schema tax disappears, and
@@ -74,9 +55,9 @@
 //! and a reader materialises `concat(template, tail)` for a stock Arrow
 //! reader. Unknown section tags are skippable via the TOC. Rows are
 //! stable-sorted by `start_time` at encode (after id assignment), declared by
-//! `TILE_META.sorted`. The v2 escape is unreachable from the v1 writer: the
-//! v1 path caps `layer_count` below `0x7fff`, so an aligned v1 frame can
-//! never start with `0xFFFF`.
+//! `TILE_META.sorted`. The leading `0xFFFF` escape identifies a payload as a
+//! frame at all, so a truncated read or an error body is rejected rather than
+//! misparsed.
 //!
 //! ## Module layout
 //!

@@ -17,7 +17,7 @@
 
 use arrow::ipc::writer::StreamWriter;
 use stt_core::arrow_tile::{
-    decode_tile, decode_tile_with_templates, is_frame_v2, DecodedLayer, TemplateRegistry,
+    decode_tile_with_templates, is_frame_v2, DecodedLayer, TemplateRegistry,
 };
 use stt_core::compression;
 use stt_core::directory::{decode_directory, TileEntry};
@@ -25,8 +25,7 @@ use stt_core::directory_page::decode_paged_directory;
 use stt_core::error::{Error, Result};
 use stt_core::pack::{
     directory_codec_bytes, Manifest, DIRECTORY_ENCODING_ZSTD, KNOWN_CAPABILITIES, OBJECT_MAGIC_LEN,
-    PACKED_FORMAT, PACKED_FORMAT_VERSION_V1, PACKED_FORMAT_VERSION_V2, PACK_MAGIC,
-    SUPPORTED_PACKED_FORMAT_VERSIONS,
+    PACKED_FORMAT, PACKED_FORMAT_VERSION, PACK_MAGIC,
 };
 use stt_core::types::Compression;
 
@@ -112,7 +111,7 @@ pub struct Archive {
     manifest: Manifest,
     compression: Compression,
     /// v2 only: the hash-validated template registry from `manifest.schemas`.
-    templates: Option<TemplateRegistry>,
+    templates: TemplateRegistry,
     entries: Vec<TileEntry>,
     directory_loaded: bool,
 }
@@ -136,16 +135,11 @@ impl Archive {
                 manifest.format
             )));
         }
-        if !SUPPORTED_PACKED_FORMAT_VERSIONS.contains(&manifest.format_version) {
+        if manifest.format_version != PACKED_FORMAT_VERSION {
             return Err(Error::InvalidArchive(format!(
-                "unsupported packed formatVersion {} (this reader supports 1 and 2)",
+                "unsupported packed formatVersion {} (this reader supports {PACKED_FORMAT_VERSION})",
                 manifest.format_version
             )));
-        }
-        if manifest.format_version == PACKED_FORMAT_VERSION_V1 && !manifest.schemas.is_empty() {
-            return Err(Error::InvalidArchive(
-                "formatVersion-1 manifest carries a schemas table (v2-only)".into(),
-            ));
         }
         let unknown: Vec<&str> = manifest
             .capabilities
@@ -171,11 +165,7 @@ impl Archive {
             }
         };
 
-        let templates = if manifest.format_version == PACKED_FORMAT_VERSION_V2 {
-            Some(build_template_registry(&manifest)?)
-        } else {
-            None
-        };
+        let templates = build_template_registry(&manifest)?;
 
         Ok(Self {
             manifest,
@@ -360,17 +350,15 @@ impl Archive {
                 pack_bytes.len()
             )));
         }
-        // A v2 pack object self-identifies (packed spec §9.2). Checking the tag
+        // A pack object self-identifies (packed spec §9.2). Checking the tag
         // turns the likeliest host mistake — passing the DIRECTORY object, or a
         // 404 body — into a named error rather than a CRC failure that reads
         // like a corrupt archive. (stt-core's private `strip_object_magic` also
         // pins the version and reserved bytes; nothing below depends on
-        // stripping them, because v2 offsets are object-absolute.)
-        if self.manifest.format_version == PACKED_FORMAT_VERSION_V2
-            && (pack_bytes.len() < OBJECT_MAGIC_LEN || pack_bytes[..4] != PACK_MAGIC)
-        {
+        // stripping them, because blob offsets are object-absolute.)
+        if pack_bytes.len() < OBJECT_MAGIC_LEN || pack_bytes[..4] != PACK_MAGIC {
             return Err(Error::InvalidArchive(format!(
-                "pack {:?}: missing \"STTP\" magic (formatVersion-2 objects start \
+                "pack {:?}: missing \"STTP\" magic (pack objects start \
                  with an 8-byte magic prelude)",
                 self.pack_key(entry.pack_id as usize)?
             )));
@@ -423,37 +411,15 @@ impl Archive {
         Ok(payload)
     }
 
-    /// Decode a tile payload under the dataset's declared `formatVersion` and
-    /// re-frame each layer as a standalone Arrow IPC stream.
-    ///
-    /// The manifest is authoritative: a v2 frame inside a v1-declared dataset
-    /// is a hard error and vice versa — never a best-effort decode of a
-    /// mixed-version dataset. Mirrors `PackedReader::decode_payload`.
+    /// Decode a tile payload and re-frame each layer as a standalone Arrow IPC
+    /// stream. Mirrors `PackedReader::decode_payload`.
     pub fn decode_payload(&self, payload: &[u8]) -> Result<Vec<LayerIpc>> {
-        let v2_frame = is_frame_v2(payload);
-        let layers = if self.manifest.format_version == PACKED_FORMAT_VERSION_V2 {
-            if !v2_frame {
-                return Err(Error::InvalidArchive(
-                    "v1 layer frame inside a formatVersion-2 dataset (the manifest is \
-                     authoritative; mixed-version datasets are invalid)"
-                        .into(),
-                ));
-            }
-            let templates = self
-                .templates
-                .as_ref()
-                .expect("v2 open always builds the template registry");
-            decode_tile_with_templates(payload, templates)?
-        } else {
-            if v2_frame {
-                return Err(Error::InvalidArchive(
-                    "v2 layer frame inside a formatVersion-1 dataset (the manifest is \
-                     authoritative; mixed-version datasets are invalid)"
-                        .into(),
-                ));
-            }
-            decode_tile(payload)?
-        };
+        if !is_frame_v2(payload) {
+            return Err(Error::InvalidArchive(
+                "tile payload is not a layer frame (missing the frame escape)".into(),
+            ));
+        }
+        let layers = decode_tile_with_templates(payload, &self.templates)?;
         layers.iter().map(layer_to_ipc).collect()
     }
 }

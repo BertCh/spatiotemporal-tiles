@@ -488,7 +488,23 @@ fn check_optional_list(
 /// any difference yields a different signature. Geometry *coordinate* shape is
 /// folded into the type rendering, so a point tile and a polygon tile differ.
 pub fn schema_signature(layers: &[DecodedLayer]) -> String {
-    let mut parts: Vec<String> = layers
+    let mut parts: Vec<String> = layer_schema_signatures(layers)
+        .into_iter()
+        .map(|(name, cols)| format!("{name}{{{cols}}}"))
+        .collect();
+    parts.sort();
+    parts.join("|")
+}
+
+/// Per-layer `(name, column signature)` for one tile.
+///
+/// Drift detection keys on this rather than on [`schema_signature`]: a tile's
+/// LAYER SET legitimately varies across a dataset (a companion `_originals`
+/// layer present only at some zooms), while a given layer's own columns must
+/// stay stable. Comparing whole-tile signatures conflated the two and reported
+/// every such dataset as drifting.
+pub fn layer_schema_signatures(layers: &[DecodedLayer]) -> Vec<(String, String)> {
+    layers
         .iter()
         .map(|layer| {
             let cols: Vec<String> = layer
@@ -505,11 +521,9 @@ pub fn schema_signature(layers: &[DecodedLayer]) -> String {
                     format!("{}:{:?}{ext}", f.name(), f.data_type())
                 })
                 .collect();
-            format!("{}{{{}}}", layer.name, cols.join(","))
+            (layer.name.clone(), cols.join(","))
         })
-        .collect();
-    parts.sort();
-    parts.join("|")
+        .collect()
 }
 
 #[cfg(test)]

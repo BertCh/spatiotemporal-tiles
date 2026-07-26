@@ -145,17 +145,6 @@ struct Args {
     #[arg(long, default_value = "4096")]
     page_entries: usize,
 
-    /// Packed format version to emit: 2 (default — schema templates in the
-    /// manifest, sectioned layer frames, STTP/STTD object magic) or 1 (the
-    /// frozen 0.3.x layout). `--format-version 1` is the transitional KILL
-    /// SWITCH for the v2 byte break: it reproduces the 0.3.x writer
-    /// byte-for-byte (golden-pinned) so a v2 regression can be rolled back by
-    /// rebuilding, and it is what `stt-serve` byte-parity checks build
-    /// against (serve emits v1 frames). v1 emission is kept for one release
-    /// and then removed.
-    #[arg(long, default_value = "2", value_parser = clap::value_parser!(u32).range(1..=2))]
-    format_version: u32,
-
     /// zstd level for tile blobs + directory (1..=22). Default 3 is zstd's
     /// "fast" tier; a **publish** build should pass 19 — the format is
     /// write-once / serve-many, so the higher (one-time, offline) build CPU buys
@@ -224,14 +213,6 @@ struct Args {
     /// By default, LineStrings with duration are clipped at tile boundaries
     #[arg(long)]
     no_clip: bool,
-
-    /// Restore legacy whole-feature placement for NON-trajectory geometry
-    /// (polygons, MultiPolygons, timeless LineStrings/MultiLineStrings,
-    /// MultiPoints): the entire feature lands only in the single tile
-    /// containing its representative point, so neighbouring tiles it spans
-    /// render a hole. Kill switch for the default coverage-clipping behaviour.
-    #[arg(long)]
-    whole_feature_placement: bool,
 
     /// Minimum vertices required to clip a trajectory (skip short paths)
     #[arg(long, default_value = "2")]
@@ -934,17 +915,16 @@ fn main() -> Result<()> {
     parse_compression(&args.compression)?;
 
     // Parse the pack ordering (the packed format always buffers + reorders
-    // before cutting packs). `eager` is a legacy alias for `auto`; `measured`
-    // is the opt-in per-dataset picker resolved by simulating range-read cost at
-    // finalize (it uses the Auto slot as its placeholder ordering).
+    // before cutting packs). `measured` is the opt-in per-dataset picker
+    // resolved by simulating range-read cost at finalize (it uses the Auto slot
+    // as its placeholder ordering).
     let blob_arg = args.blob_ordering.trim();
     let measured_ordering = blob_arg.eq_ignore_ascii_case("measured");
-    let pack_ordering: stt_core::BlobOrdering =
-        if measured_ordering || blob_arg.eq_ignore_ascii_case("eager") {
-            stt_core::BlobOrdering::Auto
-        } else {
-            blob_arg.parse().map_err(|e: String| anyhow::anyhow!(e))?
-        };
+    let pack_ordering: stt_core::BlobOrdering = if measured_ordering {
+        stt_core::BlobOrdering::Auto
+    } else {
+        blob_arg.parse().map_err(|e: String| anyhow::anyhow!(e))?
+    };
 
     // Pack target size (MiB -> bytes). Never 0.
     let pack_target_bytes = args.pack_size.saturating_mul(1024 * 1024).max(1);
@@ -1070,7 +1050,6 @@ fn main() -> Result<()> {
         layer_name: args.layer.clone(),
         temporal_bucket_ms,
         clip_trajectories: !args.no_clip,
-        clip_non_trajectory: !args.whole_feature_placement,
         clip_min_vertices: args.clip_min_vertices,
         simplify: args.simplify,
         simplify_max_zoom: args.simplify_max_zoom,
@@ -1120,7 +1099,6 @@ fn main() -> Result<()> {
         caps
     };
     let mut writer = stt_core::PackWriter::create(&out_dir, pack_ordering, pack_target_bytes)?
-        .with_format_version(args.format_version)
         .with_paging((!args.single_directory).then_some(args.page_entries))
         .with_zstd_level(args.zstd_level)
         .with_capabilities(manifest_capabilities)
@@ -1143,12 +1121,6 @@ fn main() -> Result<()> {
     // (`TileWriter`/`LodTileWriter`/`write_tiles_parallel` in stt_build::tiler)
     // encode every payload with the writer's format_version + template
     // collector, so frames and `manifest.formatVersion` can never diverge.
-    if args.format_version == stt_core::pack::PACKED_FORMAT_VERSION_V1 {
-        warn!(
-            "--format-version 1: emitting the frozen 0.3.x layout (kill switch; \
-             one-release transitional escape hatch — see the packed spec §9)"
-        );
-    }
     if args.zstd_level != stt_core::compression::ZSTD_LEVEL {
         info!(
             "zstd level {} (publish tuning; default {})",
@@ -1386,11 +1358,7 @@ fn main() -> Result<()> {
     // Record the DISTINCT source-feature count (pre-placement) so downstream
     // "N features" badges don't have to sum the index-weighted per-tile total,
     // which double-counts every feature that spans tiles / pyramid levels.
-    // Only for v2+: the frozen v1 kill-switch manifest must stay byte-identical
-    // to the 0.3.x golden, and this field is `skip_serializing_if = None`.
-    if args.format_version != stt_core::pack::PACKED_FORMAT_VERSION_V1 {
-        metadata.distinct_feature_count = Some(features.len() as u64);
-    }
+    metadata.distinct_feature_count = Some(features.len() as u64);
 
     let manifest = writer.finalize(&metadata)?;
 

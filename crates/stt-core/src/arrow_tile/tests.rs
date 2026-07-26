@@ -1163,92 +1163,6 @@ fn non_polygon_layer_drops_stray_triangles() {
     assert!(batch.column_by_name("triangles").is_none());
 }
 
-/// Walk a frame and return each layer's IPC start offset + length,
-/// honouring the aligned-frame padding rule.
-fn ipc_offsets(payload: &[u8]) -> Vec<(usize, usize)> {
-    let raw = u16::from_le_bytes([payload[0], payload[1]]);
-    let aligned = raw & ALIGNED_FRAME_FLAG != 0;
-    let count = (raw & !ALIGNED_FRAME_FLAG) as usize;
-    let mut pos = 2usize;
-    let mut out = Vec::new();
-    for _ in 0..count {
-        let name_len = u16::from_le_bytes([payload[pos], payload[pos + 1]]) as usize;
-        pos += 2 + name_len;
-        let ipc_len = u32::from_le_bytes([
-            payload[pos],
-            payload[pos + 1],
-            payload[pos + 2],
-            payload[pos + 3],
-        ]) as usize;
-        pos += 4;
-        if aligned {
-            pos += (FRAME_ALIGN - pos % FRAME_ALIGN) % FRAME_ALIGN;
-        }
-        out.push((pos, ipc_len));
-        pos += ipc_len;
-    }
-    out
-}
-
-#[test]
-fn encoded_frames_align_every_ipc_stream_to_8_bytes() {
-    // Layer names of varying lengths so the unpadded offsets would land
-    // all over the place; the aligned frame must place every IPC stream
-    // at an 8-byte boundary regardless.
-    let mut a = sample_line_layer();
-    a.name = "x".into();
-    let mut b = sample_point_layer();
-    b.name = "a-longer-layer-name".into();
-    let payload = encode_tile(&[a, b]).unwrap();
-
-    let raw = u16::from_le_bytes([payload[0], payload[1]]);
-    assert_ne!(
-        raw & ALIGNED_FRAME_FLAG,
-        0,
-        "writer must set the aligned flag"
-    );
-
-    let offsets = ipc_offsets(&payload);
-    assert_eq!(offsets.len(), 2);
-    for (off, _) in &offsets {
-        assert_eq!(off % 8, 0, "IPC stream at offset {off} is misaligned");
-    }
-
-    // And the padded frame still round-trips.
-    let decoded = decode_tile(&payload).unwrap();
-    assert_eq!(decoded[0].name, "x");
-    assert_eq!(decoded[1].name, "a-longer-layer-name");
-    assert_eq!(decoded[0].batch.num_rows(), 2);
-    assert_eq!(decoded[1].batch.num_rows(), 3);
-}
-
-#[test]
-fn legacy_unpadded_frames_still_decode() {
-    // Rebuild an old-style frame (no flag, no padding) from the layers'
-    // IPC bytes — the shape every pre-alignment archive carries — and
-    // assert the decoder reproduces the aligned frame's batches.
-    let layers = vec![sample_line_layer(), sample_point_layer()];
-    let aligned_payload = encode_tile(&layers).unwrap();
-    let aligned = decode_tile(&aligned_payload).unwrap();
-
-    let mut legacy: Vec<u8> = Vec::new();
-    legacy.extend_from_slice(&(layers.len() as u16).to_le_bytes());
-    for ((off, len), layer) in ipc_offsets(&aligned_payload).iter().zip(&layers) {
-        let name = layer.name.as_bytes();
-        legacy.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        legacy.extend_from_slice(name);
-        legacy.extend_from_slice(&(*len as u32).to_le_bytes());
-        legacy.extend_from_slice(&aligned_payload[*off..*off + *len]);
-    }
-
-    let decoded = decode_tile(&legacy).unwrap();
-    assert_eq!(decoded.len(), aligned.len());
-    for (l, a) in decoded.iter().zip(&aligned) {
-        assert_eq!(l.name, a.name);
-        assert_eq!(l.batch, a.batch);
-    }
-}
-
 #[test]
 fn truncated_tile_frame_errors_cleanly() {
     let payload = encode_tile(&[sample_point_layer()]).unwrap();
@@ -1277,48 +1191,12 @@ fn length_mismatch_is_rejected_by_v2_frame_too() {
     let err = encode_tile_with(
         &[layer],
         &EncoderConfig {
-            format_version: FORMAT_VERSION_V2,
+            format_version: FORMAT_VERSION,
             ..EncoderConfig::default()
         },
     )
     .expect_err("length-inconsistent layer must Err through the v2 path");
     assert!(err.to_string().contains("end_times"), "got: {err}");
-}
-
-/// The v1 frame's leading u16 has only 15 bits for the layer count (bit
-/// 15 is the aligned flag), so counts in [0x8000, 0xFFFE] would OR into
-/// the flag as silently-mangled smaller counts, and 0x7FFF collides with
-/// the v2 escape. The guard must reject the ENTIRE range, not just the
-/// escape collision.
-#[test]
-fn v1_frame_rejects_unrepresentable_layer_counts() {
-    // Boundary on the extracted predicate (cheap — no encoding).
-    assert!(v1_layer_count_ok(0));
-    assert!(v1_layer_count_ok(0x7FFE), "max representable count");
-    assert!(!v1_layer_count_ok(0x7FFF), "v2-escape collision");
-    assert!(!v1_layer_count_ok(0x8000), "bit-15 OR is a no-op → count 0");
-    assert!(!v1_layer_count_ok(0xFFFE), "top of the mangled range");
-    assert!(!v1_layer_count_ok(0x10000));
-
-    // End-to-end: a 0x8000-layer tile previously ENCODED with a mangled
-    // count of 0; now a descriptive error. The guard runs before any
-    // per-layer encode, so 32Ki empty layers are cheap.
-    let empty = ColumnarLayer {
-        name: "l".to_string(),
-        feature_ids: vec![],
-        start_times: vec![],
-        end_times: vec![],
-        geometry: GeometryColumn::Point(vec![]),
-        vertex_times: None,
-        vertex_values: None,
-        triangles: None,
-        vertex_value_matrix: None,
-        properties: vec![],
-    };
-    let layers = vec![empty; 0x8000];
-    let err = encode_tile_with(&layers, &EncoderConfig::default())
-        .expect_err("0x8000 layers must be rejected");
-    assert!(err.to_string().contains("frame limit"), "got: {err}");
 }
 
 #[test]
@@ -1453,7 +1331,7 @@ fn quantized_attr_index_beyond_i32_errors_instead_of_clamping() {
 /// needed to decode), layered over `base`.
 fn v2_inline(base: &EncoderConfig) -> EncoderConfig {
     EncoderConfig {
-        format_version: FORMAT_VERSION_V2,
+        format_version: FORMAT_VERSION,
         template_collector: None,
         ..base.clone()
     }
@@ -1463,7 +1341,7 @@ fn v2_inline(base: &EncoderConfig) -> EncoderConfig {
 /// `collector`; frames carry 16-byte hashes), layered over `base`.
 fn v2_hashed(base: &EncoderConfig, collector: &Arc<TemplateCollector>) -> EncoderConfig {
     EncoderConfig {
-        format_version: FORMAT_VERSION_V2,
+        format_version: FORMAT_VERSION,
         template_collector: Some(Arc::clone(collector)),
         ..base.clone()
     }

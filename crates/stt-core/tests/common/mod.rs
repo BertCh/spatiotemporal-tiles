@@ -22,6 +22,21 @@ use proptest::prelude::*;
 use stt_core::arrow_tile::{encode_tile, ColumnarLayer, GeometryColumn, PropertyColumn};
 use stt_core::directory::TileEntry;
 
+/// The encoder canonicalizes rows by `start_time` (stable sort). Fixtures with
+/// deliberately out-of-order times therefore decode in a DIFFERENT row order
+/// than they were built in, so per-row expectations must be permuted the same
+/// way. Returns the input indices in decoded-row order.
+pub fn canonical_order(start_times: &[i64]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..start_times.len()).collect();
+    idx.sort_by_key(|&i| start_times[i]); // stable — mirrors the encoder
+    idx
+}
+
+/// Permute a slice into the encoder's canonical row order.
+pub fn permute<T: Clone>(v: &[T], order: &[usize]) -> Vec<T> {
+    order.iter().map(|&i| v[i].clone()).collect()
+}
+
 /// A three-point layer with a numeric (`speed`, with a null) and a categorical
 /// (`kind`, with a null) property. The start times are deliberately
 /// out-of-order so the baked `stt:time_offset_ms` is the real minimum (1000),
@@ -135,7 +150,7 @@ pub fn tile_payload(ids: Vec<u64>) -> Vec<u8> {
 pub fn tile_payload_v2(ids: Vec<u64>) -> Vec<u8> {
     let n = ids.len();
     let cfg = stt_core::arrow_tile::EncoderConfig {
-        format_version: stt_core::arrow_tile::FORMAT_VERSION_V2,
+        format_version: stt_core::arrow_tile::FORMAT_VERSION,
         ..stt_core::arrow_tile::EncoderConfig::default()
     };
     stt_core::arrow_tile::encode_tile_with(std::slice::from_ref(&fuzz_layer(ids, n)), &cfg).unwrap()

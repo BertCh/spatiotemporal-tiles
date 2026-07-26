@@ -32,7 +32,7 @@ mod common;
 // The points/timed-linestring fixtures are shared with `reproducible_build.rs`;
 // their exact time values don't matter to these schema-lock assertions, only
 // their column *shapes* (numeric+categorical props, tight-span vertex times).
-use common::{line_fixture as line_layer, point_fixture as point_layer};
+use common::{canonical_order, line_fixture as line_layer, permute, point_fixture as point_layer};
 
 /// The standard GeoArrow extension-name metadata key the spec mandates on the
 /// `geometry` field.
@@ -347,11 +347,25 @@ fn attribute_quantization_roundtrips_via_stt_qa() {
         .as_any()
         .downcast_ref::<UInt16Array>()
         .expect("this fixture's range fits the UInt16 leaf");
-    assert!(
-        !col.is_null(0) && col.is_null(1) && !col.is_null(2),
-        "nulls survive quantization"
-    );
-    for (i, want) in [(0usize, 10.0f64), (2, 30.0)] {
+    // The fixture's start times are deliberately out of order, so decoded rows
+    // arrive in canonical (start_time-sorted) order — permute the expectation.
+    let order = canonical_order(&layer.start_times);
+    let PropertyColumn::Numeric(speed_want) = &layer.properties[0].1 else {
+        unreachable!()
+    };
+    let speed_want = permute(speed_want, &order);
+    for (i, want) in speed_want.iter().enumerate() {
+        assert_eq!(
+            col.is_null(i),
+            want.is_none(),
+            "row {i}: nulls survive quantization"
+        );
+    }
+    for (i, want) in speed_want
+        .iter()
+        .enumerate()
+        .filter_map(|(i, w)| w.map(|v| (i, v)))
+    {
         let got = qa.value(col.value(i) as i64);
         assert!(
             (got - want).abs() <= precision / 2.0,
@@ -414,6 +428,7 @@ fn coordinate_quantization_roundtrips_via_stt_quant() {
     let GeometryColumn::Point(points) = &layer.geometry else {
         unreachable!()
     };
+    let points = permute(points, &canonical_order(&layer.start_times));
     for (i, [lon, lat]) in points.iter().enumerate() {
         let got_lon = q.lon(leaf.value(i * 2));
         let got_lat = q.lat(leaf.value(i * 2 + 1));

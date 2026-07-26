@@ -50,7 +50,7 @@ mod temporal;
 use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use schema::{check_tile_schema, schema_signature};
+use schema::{check_tile_schema, layer_schema_signatures, schema_signature};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -393,8 +393,13 @@ fn validate_entries(
     // Distinct schema signatures seen across decoded layers, for producer-drift
     // detection. We keep the first tile that exhibited each signature so the
     // error can name a concrete disagreeing pair.
+    // Keyed by LAYER NAME, not by the whole-tile signature: which layers a tile
+    // carries legitimately varies across a dataset (an `_originals` companion
+    // layer that only exists at some zooms, a summary layer only at the tier's
+    // zooms). Only a given layer's own column schema must stay stable — keying
+    // on the tile-wide signature flagged every such dataset as drifting.
     let mut schemas: BTreeSet<String> = BTreeSet::new();
-    let mut first_schema_example: Option<(String, String)> = None;
+    let mut first_layer_schema: BTreeMap<String, (String, String)> = BTreeMap::new();
 
     // Interval-sanity tally across every decoded tile: one aggregate error
     // (count + first offender) instead of one error per bad feature.
@@ -546,23 +551,25 @@ fn validate_entries(
                     // Producer-drift detection: track the distinct schema
                     // signatures and flag the first tile that disagrees with
                     // an earlier one.
-                    let sig = schema_signature(&layers);
-                    if schemas.insert(sig.clone()) {
-                        match &first_schema_example {
+                    schemas.insert(schema_signature(&layers));
+                    for (name, sig) in layer_schema_signatures(&layers) {
+                        match first_layer_schema.get(&name) {
                             None => {
-                                first_schema_example = Some((format!("{:?}", entry.tile_id()), sig))
+                                first_layer_schema
+                                    .insert(name, (format!("{:?}", entry.tile_id()), sig));
                             }
-                            Some((first_tile, first_sig)) => {
+                            Some((first_tile, first_sig)) if *first_sig != sig => {
                                 push_err(
                                     report,
                                     args.fail_fast,
                                     format!(
-                                        "schema drift: tile {:?} layer schema differs from tile {first_tile}\n  {first_tile}: {first_sig}\n  {:?}: {sig}",
+                                        "schema drift: tile {:?} layer {name:?} differs from tile {first_tile}\n  {first_tile}: {first_sig}\n  {:?}: {sig}",
                                         entry.tile_id(),
                                         entry.tile_id()
                                     ),
                                 )?;
                             }
+                            Some(_) => {}
                         }
                     }
                 }

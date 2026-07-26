@@ -98,14 +98,6 @@ pub struct TileConfig {
     pub temporal_bucket_ms: u64,
     /// Whether to clip LineString trajectories at tile boundaries.
     pub clip_trajectories: bool,
-    /// Whether to clip NON-trajectory geometry (polygons, MultiPolygons,
-    /// timeless LineStrings/MultiLineStrings, MultiPoints) at tile boundaries
-    /// so a feature spanning several tiles is present — clipped — in each of
-    /// them. Default TRUE. `false` (`--whole-feature-placement`) restores the
-    /// legacy behaviour: the whole feature lands only in the single tile
-    /// containing its representative point, and neighbouring tiles render a
-    /// hole. Points are single-tile either way (they can't span tiles).
-    pub clip_non_trajectory: bool,
     /// Minimum vertices required before a trajectory is clipped.
     pub clip_min_vertices: usize,
     /// Whether to simplify geometry at lower zoom levels.
@@ -192,7 +184,6 @@ impl Default for TileConfig {
             layer_name: "default".to_string(),
             temporal_bucket_ms: 3600 * 1000,
             clip_trajectories: true,
-            clip_non_trajectory: true,
             clip_min_vertices: 2,
             simplify: false,
             simplify_max_zoom: 14,
@@ -1277,9 +1268,9 @@ fn place_polyline<'a>(
 }
 
 /// Place a non-trajectory feature: coverage placement + clipping for
-/// polygons, timeless (multi)lines and multipoints when
-/// `config.clip_non_trajectory` is on; legacy whole-feature single-tile
-/// placement otherwise (and always for Points / GeometryCollections).
+/// polygons, timeless (multi)lines and multipoints. Points and
+/// GeometryCollections are always whole-feature (they cannot span tiles, or
+/// carry no single clippable geometry).
 fn place_non_trajectory<'a>(
     feature: &'a ParsedFeature,
     zoom: u8,
@@ -1289,9 +1280,6 @@ fn place_non_trajectory<'a>(
     target: Option<(u32, u32)>,
 ) -> Vec<(u32, u32, TileFeature<'a>)> {
     use geojson::Value as G;
-    if !config.clip_non_trajectory {
-        return place_whole_feature(feature, zoom, counters);
-    }
     let Some(geom) = feature.geojson.geometry.as_ref() else {
         return place_whole_feature(feature, zoom, counters);
     };
@@ -2848,75 +2836,42 @@ mod tests {
         }
     }
 
-    /// FAST PATH: a polygon fully inside one buffered tile must take the
-    /// legacy single-placement path — output byte-identical to a build with
-    /// non-trajectory clipping disabled.
+    /// FAST PATH: a polygon fully inside one buffered tile is placed whole in
+    /// that single tile — the clipper must not split it or rewrite its ring.
     #[test]
-    fn fully_inside_polygon_is_byte_identical_to_legacy_path() {
+    fn fully_inside_polygon_is_placed_whole_in_one_tile() {
         let ts = 1_700_000_000_000u64;
-        let make = || polygon_feature(vec![square_ring(-122.5, 37.8, -122.45, 37.85)], ts);
+        let feat = polygon_feature(vec![square_ring(-122.5, 37.8, -122.45, 37.85)], ts);
+        let ring = match feat.geojson.geometry.as_ref().map(|g| &g.value) {
+            Some(GeomValue::Polygon(rings)) => rings[0].clone(),
+            other => panic!("expected a polygon fixture, got {other:?}"),
+        };
         let config = TileConfig {
             min_zoom: 10,
             max_zoom: 10,
             layer_name: "areas".to_string(),
             temporal_bucket_ms: 3_600_000,
             clip_trajectories: false,
-            ..TileConfig::default()
-        };
-        let legacy_config = TileConfig {
-            clip_non_trajectory: false,
-            ..config.clone()
-        };
-        let new_tiles = generate_tiles(&[make()], &config, 1).unwrap();
-        let old_tiles = generate_tiles(&[make()], &legacy_config, 1).unwrap();
-        assert_eq!(new_tiles.len(), 1);
-        assert_eq!(old_tiles.len(), 1);
-        assert_eq!(
-            (
-                new_tiles[0].id.z,
-                new_tiles[0].id.x,
-                new_tiles[0].id.y,
-                new_tiles[0].id.t
-            ),
-            (
-                old_tiles[0].id.z,
-                old_tiles[0].id.x,
-                old_tiles[0].id.y,
-                old_tiles[0].id.t
-            ),
-        );
-        let new_bytes = encode_tile(&new_tiles[0].layers).unwrap();
-        let old_bytes = encode_tile(&old_tiles[0].layers).unwrap();
-        assert_eq!(
-            new_bytes, old_bytes,
-            "fully-inside polygon must be byte-identical to the legacy path"
-        );
-    }
-
-    /// Kill switch: `clip_non_trajectory: false` (`--whole-feature-placement`)
-    /// restores the legacy behaviour — the spanning polygon lands whole in the
-    /// single tile containing its representative point.
-    #[test]
-    fn whole_feature_placement_restores_single_tile_placement() {
-        let feat = polygon_feature(vec![square_ring(-0.1, -0.1, 0.1, 0.1)], 1_700_000_000_000);
-        let config = TileConfig {
-            min_zoom: 10,
-            max_zoom: 10,
-            layer_name: "areas".to_string(),
-            temporal_bucket_ms: 3_600_000,
-            clip_trajectories: false,
-            clip_non_trajectory: false,
             ..TileConfig::default()
         };
         let tiles = generate_tiles(&[feat], &config, 1).unwrap();
-        assert_eq!(
-            tiles.len(),
-            1,
-            "kill switch must restore single-tile placement"
-        );
-        // Representative point = first exterior vertex (-0.1, -0.1) → (511, 512).
-        assert_eq!((tiles[0].id.x, tiles[0].id.y), (511, 512));
+        assert_eq!(tiles.len(), 1, "a fully-inside polygon must not be split");
         assert_eq!(tiles[0].feature_count(), 1);
+
+        // The ring survives untouched: the fast path skips the clipper, so no
+        // tile-cut vertices are synthesized and no coordinate is moved.
+        let bytes = encode_tile(&tiles[0].layers).unwrap();
+        let decoded = stt_core::arrow_tile::decode_tile(&bytes).unwrap();
+        let geom = &decoded[0].batch;
+        assert_eq!(geom.num_rows(), 1);
+        assert_eq!(
+            ring.len(),
+            match &tiles[0].layers[0].geometry {
+                stt_core::arrow_tile::GeometryColumn::Polygon(polys) => polys[0][0].len(),
+                other => panic!("expected a polygon column, got {other:?}"),
+            },
+            "the placed ring must keep its original vertex count"
+        );
     }
 
     /// A timeless LineString (no duration) spanning several tiles must be

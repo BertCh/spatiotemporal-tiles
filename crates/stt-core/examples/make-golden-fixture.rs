@@ -32,9 +32,11 @@
 //! needs; nothing consumes the v2 output yet, so it is not committed.
 
 use std::path::PathBuf;
-use stt_core::arrow_tile::{encode_tile_with, ColumnarLayer, EncoderConfig, GeometryColumn};
+use stt_core::arrow_tile::{
+    encode_tile_with, ColumnarLayer, EncoderConfig, GeometryColumn, PropertyColumn,
+};
 use stt_core::metadata::Metadata;
-use stt_core::pack::{PACKED_FORMAT_VERSION_V1, PACKED_FORMAT_VERSION_V2};
+use stt_core::pack::PACKED_FORMAT_VERSION;
 use stt_core::{BlobOrdering, PackWriter, TileId};
 
 /// Frame-version-coherent encoder config: frames follow the writer's
@@ -68,7 +70,27 @@ fn payload_for(id_seed: u64, cfg: &EncoderConfig) -> Vec<u8> {
             vertex_values: None,
             triangles: None,
             vertex_value_matrix: None,
-            properties: vec![],
+            // A numeric and a categorical column, each carrying a null, so the
+            // cross-impl readers exercise BOTH property kinds (and their null
+            // sentinels) against real writer output.
+            properties: vec![
+                (
+                    "speed".to_string(),
+                    PropertyColumn::Numeric(vec![
+                        Some(10.0 + id_seed as f64),
+                        None,
+                        Some(30.0 + id_seed as f64),
+                    ]),
+                ),
+                (
+                    "kind".to_string(),
+                    PropertyColumn::Categorical(vec![
+                        Some("car".to_string()),
+                        Some("bus".to_string()),
+                        None,
+                    ]),
+                ),
+            ],
         }],
         cfg,
     )
@@ -76,24 +98,14 @@ fn payload_for(id_seed: u64, cfg: &EncoderConfig) -> Vec<u8> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Version coherence: the committed fixtures are v1 (byte-frozen), so the
-    // writers are PINNED to v1 rather than inheriting `PackWriter`'s v2
-    // default — and the payload frames follow the same pin (see
-    // `encoder_config`). `--v2` writes a coherent v2 copy NEXT TO the v1
-    // outputs (`*-v2/` suffix), never over them.
-    let mut v2 = false;
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
-            "--v2" => v2 = true,
-            other => return Err(format!("unknown argument {other:?} (only --v2)").into()),
-        }
+    // One format, one fixture set: the writer and the payload frames both use
+    // `PACKED_FORMAT_VERSION` (see `encoder_config`), so a fixture can never
+    // pair a manifest of one version with frames of another.
+    if let Some(other) = std::env::args().nth(1) {
+        return Err(format!("unknown argument {other:?} (this example takes none)").into());
     }
-    let format_version = if v2 {
-        PACKED_FORMAT_VERSION_V2
-    } else {
-        PACKED_FORMAT_VERSION_V1
-    };
-    let suffix = if v2 { "-v2" } else { "" };
+    let format_version = PACKED_FORMAT_VERSION;
+    let suffix = "";
     let cfg = encoder_config(format_version);
 
     // <crate>/../../packages/core/test/fixtures/packed-golden

@@ -269,6 +269,7 @@ pub fn format_text(r: &OrderAuditReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stt_core::arrow_tile::{encode_tile, ColumnarLayer, GeometryColumn};
     use stt_core::metadata::Metadata;
     use stt_core::pack::PackWriter;
     use stt_core::tile::TileId;
@@ -278,17 +279,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("audit");
         // Deep-time, narrow-space fixture built with Auto (records blobOrdering).
-        // v1-pinned: payloads are opaque bytes, not v2 frames (add_tile_full
-        // enforces frame/manifest version coherence).
-        let mut w = PackWriter::create(&out, BlobOrdering::Auto, 1 << 20)
-            .unwrap()
-            .with_format_version(stt_core::pack::PACKED_FORMAT_VERSION_V1);
+        // Payloads must be real layer frames: `add_tile_full` checks the frame
+        // against the writer's format version.
+        let mut w = PackWriter::create(&out, BlobOrdering::Auto, 1 << 20).unwrap();
         let bucket = 3_600_000i64;
         for x in 0..3u32 {
             for b in 0..24i64 {
                 let t = b * bucket;
                 let id = TileId::new(10, 4_000 + x, 5_000, t as u64);
-                let payload = format!("t-{x}-{b}").into_bytes();
+                // Distinct ids per tile so no two blobs dedup to one.
+                let payload = encode_tile(&[ColumnarLayer {
+                    name: "default".to_string(),
+                    feature_ids: vec![u64::from(x) * 1_000 + b as u64],
+                    start_times: vec![t],
+                    end_times: vec![t + bucket - 1],
+                    geometry: GeometryColumn::Point(vec![[x as f64, b as f64]]),
+                    vertex_times: None,
+                    vertex_values: None,
+                    triangles: None,
+                    vertex_value_matrix: None,
+                    properties: vec![],
+                }])
+                .unwrap();
                 w.add_tile_full(&id, t, t + bucket - 1, Some(t), 1, None, &payload)
                     .unwrap();
             }

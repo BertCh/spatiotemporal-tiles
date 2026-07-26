@@ -22,8 +22,7 @@
 use super::{
     blake3_128_hex, decode_directory_entries, directory_codec_bytes, strip_object_magic,
     verify_manifest_schemas, verify_v2_frame_template_refs, write_atomic, Manifest,
-    DIRECTORY_ENCODING_ZSTD, DIRECTORY_MAGIC, PACKED_FORMAT, PACKED_FORMAT_VERSION_V2, PACK_MAGIC,
-    SUPPORTED_PACKED_FORMAT_VERSIONS,
+    DIRECTORY_ENCODING_ZSTD, DIRECTORY_MAGIC, PACKED_FORMAT, PACKED_FORMAT_VERSION, PACK_MAGIC,
 };
 use crate::error::{Error, Result};
 use memmap2::Mmap;
@@ -493,9 +492,9 @@ pub fn verify_bundle_objects<P: AsRef<Path>>(bundle_path: P) -> Result<Vec<Strin
             manifest.format
         ));
     }
-    if !SUPPORTED_PACKED_FORMAT_VERSIONS.contains(&manifest.format_version) {
+    if manifest.format_version != PACKED_FORMAT_VERSION {
         issues.push(format!(
-            "manifest formatVersion is {}, expected one of {SUPPORTED_PACKED_FORMAT_VERSIONS:?}",
+            "manifest formatVersion is {}, expected {PACKED_FORMAT_VERSION}",
             manifest.format_version
         ));
     }
@@ -579,7 +578,7 @@ pub fn verify_bundle_objects<P: AsRef<Path>>(bundle_path: P) -> Result<Vec<Strin
     }
 
     // v2 objects must self-identify: validate each window's magic prelude.
-    if manifest.format_version == PACKED_FORMAT_VERSION_V2 {
+    if manifest.format_version == PACKED_FORMAT_VERSION {
         for (key, kind) in std::iter::once((&manifest.directory.key, DIRECTORY_MAGIC))
             .chain(manifest.packs.iter().map(|p| (&p.key, PACK_MAGIC)))
         {

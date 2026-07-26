@@ -7,7 +7,7 @@
 //! explicitly instead.
 
 use super::columns::DEFAULT_VERTEX_TIME_MAX_STEP_MS;
-use super::frame::{TemplateCollector, FORMAT_VERSION_V1};
+use super::frame::{TemplateCollector, FORMAT_VERSION};
 use super::layer::VectorElem;
 use super::quantize::validate_quantize_coords_m;
 use crate::error::Result;
@@ -171,18 +171,15 @@ pub struct EncoderConfig {
     pub point_elevation_column: String,
     /// Ceiling (ms) on the per-vertex time u16-delta quantization step.
     pub vertex_time_max_step_ms: u32,
-    /// Layer-frame format version ([`FORMAT_VERSION_V1`] |
-    /// [`FORMAT_VERSION_V2`](crate::arrow_tile::FORMAT_VERSION_V2)). The SINGLE branch point
-    /// between the frozen
-    /// 0.3.x v1 frame and the sectioned v2 frame (design §1 ★F3): everything
-    /// upstream of frame assembly + metadata placement is shared. Defaults to
-    /// v1 so every existing caller stays byte-identical; `stt-build` passes 2.
+    /// Layer-frame format version. Only [`FORMAT_VERSION`] is accepted; the
+    /// field is retained so a frame-format revision has an explicit, checked
+    /// channel rather than a silent assumption at the encode boundary.
     pub format_version: u32,
-    /// v2 only: when set, layer schemas are hoisted into this collector and
-    /// frames carry 16-byte template-hash references (the packed-dataset
-    /// mode — `PackWriter::finalize` publishes the collected templates in
-    /// `manifest.schemas`). `None` under v2 emits self-contained frames with
-    /// inline schema sections. Ignored under v1.
+    /// When set, layer schemas are hoisted into this collector and frames carry
+    /// 16-byte template-hash references (the packed-dataset mode —
+    /// `PackWriter::finalize` publishes the collected templates in
+    /// `manifest.schemas`). `None` emits self-contained frames with inline
+    /// schema sections (what `stt-serve` uses: no manifest to carry a registry).
     pub template_collector: Option<Arc<TemplateCollector>>,
 }
 
@@ -195,7 +192,7 @@ impl Default for EncoderConfig {
             vector_groups: Vec::new(),
             point_elevation_column: String::new(),
             vertex_time_max_step_ms: DEFAULT_VERTEX_TIME_MAX_STEP_MS,
-            format_version: FORMAT_VERSION_V1,
+            format_version: FORMAT_VERSION,
             template_collector: None,
         }
     }
@@ -209,7 +206,7 @@ impl EncoderConfig {
     /// The frame version and template sink are deliberately NOT global: they
     /// have to match the writer that will store the frame, so they come from
     /// [`crate::PackWriter::encoder_config`] and default to a self-contained
-    /// v1 frame here.
+    /// (inline-schema) frame here.
     pub fn from_globals() -> Self {
         Self {
             quantize_coords_m: quantize_coords_m(),

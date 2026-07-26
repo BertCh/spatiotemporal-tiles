@@ -18,7 +18,7 @@ use stt_core::arrow_tile::{
 };
 use stt_core::curve::BlobOrdering;
 use stt_core::metadata::Metadata;
-use stt_core::pack::{PackWriter, PACKED_FORMAT_VERSION_V2};
+use stt_core::pack::{PackWriter, PACKED_FORMAT_VERSION};
 use stt_core::projection::lonlat_to_tile;
 use stt_core::tile::TileId;
 use stt_optimize::export::{self, ExportOptions, GeometryEncoding};
@@ -68,7 +68,7 @@ fn build_points(dir: &Path, cfg_of: impl Fn(&PackWriter) -> EncoderConfig) -> Pa
     let out = dir.join("points");
     let mut w = PackWriter::create(&out, BlobOrdering::TimeMajor, 1 << 20)
         .unwrap()
-        .with_format_version(PACKED_FORMAT_VERSION_V2);
+        .with_format_version(PACKED_FORMAT_VERSION);
     for (id, [lon, lat], start, end, num, cat) in point_fixture() {
         let layer = ColumnarLayer {
             name: "default".to_string(),
@@ -536,7 +536,7 @@ fn multiple_layers_split_into_one_file_each() {
     let out_dir = dir.path().join("mixed");
     let mut w = PackWriter::create(&out_dir, BlobOrdering::TimeMajor, 1 << 20)
         .unwrap()
-        .with_format_version(PACKED_FORMAT_VERSION_V2);
+        .with_format_version(PACKED_FORMAT_VERSION);
 
     let line: Vec<[f64; 2]> = vec![[-73.60, 45.50], [-73.58, 45.52], [-73.56, 45.51]];
     let layers = vec![
@@ -683,7 +683,7 @@ fn vertex_times_are_absolute_and_derived_columns_are_dropped() {
     let out_dir = dir.path().join("tracks");
     let mut w = PackWriter::create(&out_dir, BlobOrdering::TimeMajor, 1 << 20)
         .unwrap()
-        .with_format_version(PACKED_FORMAT_VERSION_V2);
+        .with_format_version(PACKED_FORMAT_VERSION);
 
     let line: Vec<[f64; 2]> = vec![[-73.60, 45.50], [-73.58, 45.52], [-73.56, 45.51]];
     let vtimes: Vec<i64> = vec![1_700_000_000_000, 1_700_000_030_000, 1_700_000_060_000];

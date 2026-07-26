@@ -127,6 +127,23 @@ fn arb_linestring_layer() -> impl Strategy<Value = ColumnarLayer> {
     })
 }
 
+/// The encoder canonicalizes row order: rows are sorted by `start_time` with a
+/// STABLE sort (`sort_rows_by_start_time`). A round-trip therefore preserves
+/// every row's fields TOGETHER, but not the input's row order — so the expected
+/// side is permuted the same way before comparing positionally. Comparing
+/// per-row (rather than as a multiset) is what keeps the assertions strong:
+/// it catches a permutation that desynchronizes columns from one another.
+fn canonical_order(start_times: &[i64]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..start_times.len()).collect();
+    idx.sort_by_key(|&i| start_times[i]); // stable — mirrors the encoder
+    idx
+}
+
+/// Permute a slice into the encoder's canonical row order.
+fn permute<T: Clone>(v: &[T], order: &[usize]) -> Vec<T> {
+    order.iter().map(|&i| v[i].clone()).collect()
+}
+
 proptest! {
     // Encode+decode of a full tile is heavier than the codec fuzzers above, so
     // a smaller case count keeps CI fast while still covering the domain.
@@ -143,25 +160,27 @@ proptest! {
         let batch = decoded.pop().unwrap().batch;
         let n = layer.feature_ids.len();
         prop_assert_eq!(batch.num_rows(), n);
+        let order = canonical_order(&layer.start_times);
 
         // ids (UInt64) — exact.
         let ids = batch.column_by_name("id").unwrap()
             .as_any().downcast_ref::<UInt64Array>().unwrap();
-        prop_assert_eq!(ids.values().to_vec(), layer.feature_ids.clone());
+        prop_assert_eq!(ids.values().to_vec(), permute(&layer.feature_ids, &order));
 
         // start/end times (Int64, stored ABSOLUTE — the baked offset is only a
         // decoder hint) — exact.
         let starts = batch.column_by_name("start_time").unwrap()
             .as_any().downcast_ref::<Int64Array>().unwrap();
-        prop_assert_eq!(starts.values().to_vec(), layer.start_times.clone());
+        prop_assert_eq!(starts.values().to_vec(), permute(&layer.start_times, &order));
         let ends = batch.column_by_name("end_time").unwrap()
             .as_any().downcast_ref::<Int64Array>().unwrap();
-        prop_assert_eq!(ends.values().to_vec(), layer.end_times.clone());
+        prop_assert_eq!(ends.values().to_vec(), permute(&layer.end_times, &order));
 
         // geometry: FixedSizeList<Float64,2> — exact per coordinate.
         let geom = batch.column_by_name("geometry").unwrap()
             .as_any().downcast_ref::<FixedSizeListArray>().unwrap();
         let GeometryColumn::Point(points) = &layer.geometry else { unreachable!() };
+        let points = permute(points, &order);
         for (i, [x, y]) in points.iter().enumerate() {
             let pt = geom.value(i);
             let pt = pt.as_any().downcast_ref::<Float64Array>().unwrap();
@@ -173,6 +192,7 @@ proptest! {
         let speed = batch.column_by_name("speed").unwrap()
             .as_any().downcast_ref::<Float64Array>().unwrap();
         let PropertyColumn::Numeric(want) = &layer.properties[0].1 else { unreachable!() };
+        let want = permute(want, &order);
         for (i, w) in want.iter().enumerate() {
             match w {
                 None => prop_assert!(speed.is_null(i), "row {} expected null speed", i),
@@ -189,6 +209,7 @@ proptest! {
         let dict_vals = kind.values().as_any().downcast_ref::<StringArray>().unwrap();
         let keys = kind.keys();
         let PropertyColumn::Categorical(kw) = &layer.properties[1].1 else { unreachable!() };
+        let kw = permute(kw, &order);
         for (i, w) in kw.iter().enumerate() {
             match w {
                 None => prop_assert!(kind.is_null(i), "row {} expected null kind", i),
@@ -210,22 +231,24 @@ proptest! {
         prop_assert_eq!(decoded.len(), 1);
         let batch = decoded.pop().unwrap().batch;
         prop_assert_eq!(batch.num_rows(), layer.feature_ids.len());
+        let order = canonical_order(&layer.start_times);
 
         let ids = batch.column_by_name("id").unwrap()
             .as_any().downcast_ref::<UInt64Array>().unwrap();
-        prop_assert_eq!(ids.values().to_vec(), layer.feature_ids.clone());
+        prop_assert_eq!(ids.values().to_vec(), permute(&layer.feature_ids, &order));
         let starts = batch.column_by_name("start_time").unwrap()
             .as_any().downcast_ref::<Int64Array>().unwrap();
-        prop_assert_eq!(starts.values().to_vec(), layer.start_times.clone());
+        prop_assert_eq!(starts.values().to_vec(), permute(&layer.start_times, &order));
         let ends = batch.column_by_name("end_time").unwrap()
             .as_any().downcast_ref::<Int64Array>().unwrap();
-        prop_assert_eq!(ends.values().to_vec(), layer.end_times.clone());
+        prop_assert_eq!(ends.values().to_vec(), permute(&layer.end_times, &order));
 
         // geometry: List<FixedSizeList<Float64,2>> — exact per vertex, and the
         // per-feature vertex COUNT is preserved (offset buffer round-trips).
         let geom = batch.column_by_name("geometry").unwrap()
             .as_any().downcast_ref::<ListArray>().unwrap();
         let GeometryColumn::LineString(lines) = &layer.geometry else { unreachable!() };
+        let lines = permute(lines, &order);
         for (i, verts) in lines.iter().enumerate() {
             let line = geom.value(i);
             let line = line.as_any().downcast_ref::<FixedSizeListArray>().unwrap();

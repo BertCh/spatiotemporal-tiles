@@ -212,8 +212,8 @@ mod tests {
         assert!(unpack(&src.join("manifest.json"), &dir.path().join("y")).is_err());
     }
 
-    /// Minimal packed dataset for the round-trip test. v1-pinned: the
-    /// payloads are bare `encode_tile` v1 frames and the bundle container is
+    /// Minimal packed dataset for the round-trip test: the
+    /// payloads are bare `encode_tile` frames and the bundle container is
     /// format-version-agnostic (`add_tile_full` enforces frame/manifest
     /// coherence, so the writer must not inherit the v2 default).
     fn build_fixture(out: &Path) {
@@ -222,7 +222,7 @@ mod tests {
         use stt_core::{BlobOrdering, PackWriter, TileId};
         let mut w = PackWriter::create(out, BlobOrdering::Auto, 8 * 1024)
             .unwrap()
-            .with_format_version(stt_core::pack::PACKED_FORMAT_VERSION_V1);
+            .with_format_version(stt_core::pack::PACKED_FORMAT_VERSION);
         for k in 0..6u64 {
             let ids: Vec<u64> = (0..4).map(|i| k * 10 + i).collect();
             let n = ids.len();

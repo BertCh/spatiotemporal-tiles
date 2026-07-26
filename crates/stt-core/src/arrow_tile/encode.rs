@@ -1,4 +1,4 @@
-//! Tile encoding — layer parts, v1 frame assembly, v2 sectioned frames.
+//! Tile encoding — layer parts and sectioned-frame assembly.
 //!
 //! The public `encode_layer*` / `encode_tile*` entry points, the shared
 //! [`build_layer_parts`] front end that both frame versions run, and the two
@@ -11,11 +11,10 @@ use super::columns::{
 };
 use super::config::EncoderConfig;
 use super::frame::{
-    TileMeta, ALIGNED_FRAME_FLAG, FORMAT_VERSION_V1, FORMAT_VERSION_V2, FRAME_ALIGN,
-    FRAME_V2_ESCAPE, FRAME_V2_VERSION, REF_KIND_INLINE, REF_KIND_NO_PROPS, REF_KIND_TEMPLATE_HASH,
-    SECTION_CORE_BATCH, SECTION_INLINE_SCHEMA_CORE, SECTION_INLINE_SCHEMA_PROPS,
-    SECTION_PROPS_BATCH, SECTION_TILE_META, TIME_OFFSET_MS_KEY, VERTEX_TIME_ORIGIN_KEY,
-    VERTEX_TIME_STEP_KEY, VERTEX_VALUE_BUCKETS_KEY,
+    TileMeta, FORMAT_VERSION, FRAME_ALIGN, FRAME_V2_ESCAPE, FRAME_V2_VERSION, REF_KIND_INLINE,
+    REF_KIND_NO_PROPS, REF_KIND_TEMPLATE_HASH, SECTION_CORE_BATCH, SECTION_INLINE_SCHEMA_CORE,
+    SECTION_INLINE_SCHEMA_PROPS, SECTION_PROPS_BATCH, SECTION_TILE_META, TIME_OFFSET_MS_KEY,
+    VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY, VERTEX_VALUE_BUCKETS_KEY,
 };
 use super::layer::{
     ColumnarLayer, GeometryColumn, PropertyColumn, VectorElem, GEOARROW_CRS_METADATA,
@@ -87,13 +86,13 @@ pub fn encode_layer_with(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<V
 /// explicit-config entry point (that is the granularity every writer works at),
 /// so a public single-layer twin only ever went unused.
 ///
-/// Always emits the self-describing v1 shape — one Arrow IPC stream with ALL
-/// metadata inline. The v2 tile frame reuses the identical column/field build
+/// Always emits the self-describing shape — one Arrow IPC stream with ALL
+/// metadata inline. The tile frame reuses the identical column/field build
 /// ([`build_layer_parts`]) and changes only metadata PLACEMENT at assembly
-/// ([`encode_layer_v2_parts`]) — the design's single v1/v2 branch point.
+/// ([`encode_layer_v2_parts`]).
 pub(crate) fn encode_layer_cfg(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Result<Vec<u8>> {
     let parts = build_layer_parts(layer, cfg)?;
-    assemble_layer_ipc_v1(parts)
+    assemble_layer_ipc_self_describing(parts)
 }
 
 /// Everything a frame assembler needs about one built layer: the Arrow fields
@@ -452,10 +451,11 @@ fn write_ipc_stream(schema: Arc<Schema>, columns: Vec<ArrayRef>) -> Result<Vec<u
     Ok(buf)
 }
 
-/// v1 assembly: one schema carrying EVERY metadata key (dataset-constant AND
-/// per-tile-varying), serialized as a single IPC stream — the frozen 0.3.x
-/// bytes, guarded by the `tests/v1_golden.rs` fixture.
-fn assemble_layer_ipc_v1(parts: LayerParts) -> Result<Vec<u8>> {
+/// Self-describing assembly: one schema carrying EVERY metadata key
+/// (dataset-constant AND per-tile-varying), serialized as a single IPC stream.
+/// This is the STANDALONE-LAYER shape (`encode_layer`), not the tile frame —
+/// the frame splits schema and batch into sections instead.
+fn assemble_layer_ipc_self_describing(parts: LayerParts) -> Result<Vec<u8>> {
     // Schema-level metadata records the layer name and geometry kind so a
     // reader does not have to inspect the geometry column. When the
     // vertex_time column is u16-delta encoded we add `origin_ms` and
@@ -715,8 +715,7 @@ pub(crate) fn encode_layer_v2_parts(
 
 /// Encode a full tile payload (one or more layers) with the layer frame.
 ///
-/// Always emits the *aligned* frame ([`ALIGNED_FRAME_FLAG`] set): each
-/// layer's IPC stream is preceded by zero padding to an 8-byte boundary
+/// Each layer's IPC stream is preceded by zero padding to an 8-byte boundary
 /// relative to the payload start, so readers can wrap the stream zero-copy.
 /// `ipc_len` records the exact IPC byte length (padding excluded); readers
 /// derive the pad from alignment math alone.
@@ -747,68 +746,20 @@ pub fn encode_tile_with(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result
 }
 
 /// The single tile-encode implementation, driven entirely by an explicit
-/// [`EncoderConfig`]. Every public `encode_tile*` entry point funnels here,
-/// then branches ONCE on [`EncoderConfig::format_version`] (design §1 ★F3):
+/// [`EncoderConfig`]. Every public `encode_tile*` entry point funnels here;
 /// everything upstream (column/field build) is shared.
 fn encode_tile_cfg(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result<Vec<u8>> {
-    match cfg.format_version {
-        FORMAT_VERSION_V1 => encode_tile_frame_v1(layers, cfg),
-        FORMAT_VERSION_V2 => encode_tile_frame_v2(layers, cfg),
-        other => Err(Error::Other(format!(
-            "unsupported format version {other} (this writer emits 1 or 2)"
-        ))),
-    }
-}
-
-/// v1 frame layer-count guard: the aligned frame's leading u16 spends bit 15
-/// on [`ALIGNED_FRAME_FLAG`], leaving 15 bits for the count — so 0x7FFE is the
-/// maximum representable count. 0x7FFF is additionally reserved (its OR with
-/// the flag collides with [`FRAME_V2_ESCAPE`]), and any count with bit 15 set
-/// (0x8000..) would OR into the flag as a silently-mangled smaller count.
-/// `>= 0x7FFF` rejects the collision AND the whole unrepresentable range.
-pub(crate) fn v1_layer_count_ok(count: usize) -> bool {
-    count < 0x7FFF
-}
-
-/// v1 frame assembly — the frozen 0.3.x bytes (`tests/v1_golden.rs`).
-fn encode_tile_frame_v1(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result<Vec<u8>> {
-    // Cap the count one below the historical 0x7fff limit (see
-    // [`v1_layer_count_ok`]). No real tile comes within orders of magnitude
-    // of the limit, so only the error bound moves.
-    if !v1_layer_count_ok(layers.len()) {
+    if cfg.format_version != FORMAT_VERSION {
         return Err(Error::Other(format!(
-            "tile has {} layers, exceeds the {} frame limit",
-            layers.len(),
-            ALIGNED_FRAME_FLAG - 2
+            "unsupported format version {} (this writer emits {FORMAT_VERSION})",
+            cfg.format_version
         )));
     }
-    let mut out = Vec::new();
-    out.extend_from_slice(&(layers.len() as u16 | ALIGNED_FRAME_FLAG).to_le_bytes());
-    for layer in layers {
-        let name = layer.name.as_bytes();
-        if name.len() > u16::MAX as usize {
-            return Err(Error::Other("layer name too long".into()));
-        }
-        let ipc = encode_layer_cfg(layer, cfg)?;
-        let ipc_len = u32::try_from(ipc.len()).map_err(|_| {
-            Error::Other(format!(
-                "layer '{}' IPC stream is {} bytes, exceeding the frame's u32 length field",
-                layer.name,
-                ipc.len()
-            ))
-        })?;
-        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        out.extend_from_slice(name);
-        out.extend_from_slice(&ipc_len.to_le_bytes());
-        let pad = (FRAME_ALIGN - out.len() % FRAME_ALIGN) % FRAME_ALIGN;
-        out.extend_from_slice(&[0u8; FRAME_ALIGN][..pad]);
-        out.extend_from_slice(&ipc);
-    }
-    Ok(out)
+    encode_tile_frame_v2(layers, cfg)
 }
 
-/// Zero-pad `out` to the next [`FRAME_ALIGN`] boundary (v2 derived padding —
-/// like v1, the pad length is never stored).
+/// Zero-pad `out` to the next [`FRAME_ALIGN`] boundary — the pad length is
+/// derived on decode, never stored.
 fn pad_to_frame_align(out: &mut Vec<u8>) {
     let pad = (FRAME_ALIGN - out.len() % FRAME_ALIGN) % FRAME_ALIGN;
     out.extend_from_slice(&[0u8; FRAME_ALIGN][..pad]);

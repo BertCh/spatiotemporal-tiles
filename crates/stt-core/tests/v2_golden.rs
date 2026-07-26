@@ -87,7 +87,7 @@ fn golden_encoder_config(writer: &PackWriter) -> EncoderConfig {
         // Explicit (even though it's the default): the frames must stay v2, and
         // must reference templates through the WRITER's collector — a frame
         // whose template never reaches `manifest.schemas` is undecodable.
-        format_version: stt_core::arrow_tile::FORMAT_VERSION_V2,
+        format_version: stt_core::arrow_tile::FORMAT_VERSION,
         template_collector: Some(writer.template_collector()),
         ..EncoderConfig::default()
     }
@@ -223,7 +223,7 @@ fn build_v2_dataset(out: &Path, paging: Option<usize>) -> stt_core::Manifest {
     // with a readable message instead of a wall of byte diffs.
     assert_eq!(
         writer.format_version(),
-        stt_core::pack::PACKED_FORMAT_VERSION_V2,
+        stt_core::pack::PACKED_FORMAT_VERSION,
         "the v2 golden pins the writer's DEFAULT emission"
     );
     let cfg = golden_encoder_config(&writer);

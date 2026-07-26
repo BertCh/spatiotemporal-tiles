@@ -6,11 +6,10 @@
 //! [`RecordBatch`] every downstream consumer already expects.
 
 use super::frame::{
-    TemplateRegistry, TileMeta, ALIGNED_FRAME_FLAG, FRAME_ALIGN, FRAME_V2_ESCAPE, FRAME_V2_VERSION,
-    REF_KIND_INLINE, REF_KIND_NO_PROPS, REF_KIND_TEMPLATE_HASH, SECTION_CORE_BATCH,
-    SECTION_INLINE_SCHEMA_CORE, SECTION_INLINE_SCHEMA_PROPS, SECTION_PROPS_BATCH,
-    SECTION_TILE_META, TIME_OFFSET_MS_KEY, VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY,
-    VERTEX_VALUE_BUCKETS_KEY,
+    TemplateRegistry, TileMeta, FRAME_ALIGN, FRAME_V2_ESCAPE, FRAME_V2_VERSION, REF_KIND_INLINE,
+    REF_KIND_NO_PROPS, REF_KIND_TEMPLATE_HASH, SECTION_CORE_BATCH, SECTION_INLINE_SCHEMA_CORE,
+    SECTION_INLINE_SCHEMA_PROPS, SECTION_PROPS_BATCH, SECTION_TILE_META, TIME_OFFSET_MS_KEY,
+    VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY, VERTEX_VALUE_BUCKETS_KEY,
 };
 use super::quantize::{AttrQuant, STT_QUANT_ATTR_META_KEY};
 use crate::error::{Error, Result};
@@ -53,71 +52,41 @@ pub fn decode_layer(ipc: &[u8]) -> Result<RecordBatch> {
     }
 }
 
-/// Whether a tile payload carries the v2 sectioned frame (leading u16 is the
-/// [`FRAME_V2_ESCAPE`]). The manifest's `formatVersion` remains authoritative
-/// (★F6) — this sniff is defense-in-depth for the payload level.
+/// Whether a tile payload carries the sectioned layer frame (leading u16 is
+/// the [`FRAME_V2_ESCAPE`]). The manifest's `formatVersion` remains
+/// authoritative (★F6) — this sniff is defense-in-depth for the payload level,
+/// and rejects a payload that is not a frame at all.
 pub fn is_frame_v2(payload: &[u8]) -> bool {
     payload.len() >= 2 && u16::from_le_bytes([payload[0], payload[1]]) == FRAME_V2_ESCAPE
 }
 
 /// Decode a full tile payload (the layer frame) into its layers.
 ///
-/// Accepts the v1 frame in both shapes — aligned ([`ALIGNED_FRAME_FLAG`] set,
-/// derived padding before each IPC stream) and the legacy unpadded frame
-/// written before the flag existed — plus **self-contained** v2 frames
-/// (inline schema sections). A v2 frame that references templates by hash
-/// needs the dataset's registry: use [`decode_tile_with_templates`] (a hash
-/// reference here is a descriptive error, not a panic).
+/// Accepts **self-contained** frames (inline schema sections). A frame that
+/// references templates by hash needs the dataset's registry: use
+/// [`decode_tile_with_templates`] (a hash reference here is a descriptive
+/// error, not a panic).
 pub fn decode_tile(payload: &[u8]) -> Result<Vec<DecodedLayer>> {
-    if is_frame_v2(payload) {
-        return decode_tile_v2(payload, None);
+    if !is_frame_v2(payload) {
+        return Err(Error::Other(
+            "tile payload is not a layer frame (missing the frame escape)".into(),
+        ));
     }
-    decode_tile_v1(payload)
+    decode_tile_v2(payload, None)
 }
 
-/// [`decode_tile`] with the dataset's [`TemplateRegistry`], so v2 frames can
-/// resolve their 16-byte template-hash references. v1 frames decode
-/// unchanged (the registry is simply unused).
+/// [`decode_tile`] with the dataset's [`TemplateRegistry`], so frames can
+/// resolve their 16-byte template-hash references.
 pub fn decode_tile_with_templates(
     payload: &[u8],
     templates: &TemplateRegistry,
 ) -> Result<Vec<DecodedLayer>> {
-    if is_frame_v2(payload) {
-        return decode_tile_v2(payload, Some(templates));
-    }
-    decode_tile_v1(payload)
-}
-
-/// The v1 frame walk — UNCHANGED from the 0.3.x reader.
-fn decode_tile_v1(payload: &[u8]) -> Result<Vec<DecodedLayer>> {
-    if payload.len() < 2 {
+    if !is_frame_v2(payload) {
         return Err(Error::Other(
-            "tile payload too short for layer frame".into(),
+            "tile payload is not a layer frame (missing the frame escape)".into(),
         ));
     }
-    let raw_count = u16::from_le_bytes([payload[0], payload[1]]);
-    let aligned = raw_count & ALIGNED_FRAME_FLAG != 0;
-    let count = (raw_count & !ALIGNED_FRAME_FLAG) as usize;
-    let mut pos = 2usize;
-    // Cap the pre-allocation: `count` is attacker-controlled (up to 0x7FFE) and
-    // each real layer costs many wire bytes, so a doctored count must not force
-    // a giant up-front allocation. Mirrors the v2 walker.
-    let mut layers = Vec::with_capacity(count.min(64));
-    for _ in 0..count {
-        let name_len = read_u16(payload, &mut pos)? as usize;
-        let name = read_slice(payload, &mut pos, name_len)?;
-        let name = String::from_utf8(name.to_vec())
-            .map_err(|e| Error::Other(format!("layer name not utf8: {e}")))?;
-        let ipc_len = read_u32(payload, &mut pos)? as usize;
-        if aligned {
-            let pad = (FRAME_ALIGN - pos % FRAME_ALIGN) % FRAME_ALIGN;
-            read_slice(payload, &mut pos, pad)?;
-        }
-        let ipc = read_slice(payload, &mut pos, ipc_len)?;
-        let batch = decode_layer(ipc)?;
-        layers.push(DecodedLayer { name, batch });
-    }
-    Ok(layers)
+    decode_tile_v2(payload, Some(templates))
 }
 
 /// Splice a template onto a section tail and decode the resulting stream.

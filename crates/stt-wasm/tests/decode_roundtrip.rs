@@ -22,7 +22,7 @@ use arrow::ipc::reader::StreamReader;
 use stt_core::arrow_tile::{encode_tile_with, ColumnarLayer, GeometryColumn, PropertyColumn};
 use stt_core::curve::BlobOrdering;
 use stt_core::metadata::Metadata;
-use stt_core::pack::{PACKED_FORMAT_VERSION_V1, PACKED_FORMAT_VERSION_V2};
+use stt_core::pack::PACKED_FORMAT_VERSION;
 use stt_core::types::TimeRange;
 use stt_core::{PackWriter, PackedReader, TileId};
 use stt_wasm::{Archive, SttArchive};
@@ -164,7 +164,7 @@ fn batch_from_ipc(ipc: &[u8]) -> RecordBatch {
 /// The headline case: drive the EXPORTED wasm API end to end and get Arrow out.
 #[test]
 fn wasm_facade_decodes_a_real_tile() {
-    let dataset = build_dataset(PACKED_FORMAT_VERSION_V2, None);
+    let dataset = build_dataset(PACKED_FORMAT_VERSION, None);
     let root = dataset.path();
 
     let manifest_bytes = fs::read(root.join("manifest.json")).unwrap();
@@ -256,18 +256,13 @@ fn assert_parity(format_version: u32, paging: Option<usize>) {
 
 #[test]
 fn parity_v2_single_directory() {
-    assert_parity(PACKED_FORMAT_VERSION_V2, None);
+    assert_parity(PACKED_FORMAT_VERSION, None);
 }
 
 #[test]
 fn parity_v2_paged_directory() {
     // One entry per page, so the fixture really exercises the root + leaf walk.
-    assert_parity(PACKED_FORMAT_VERSION_V2, Some(1));
-}
-
-#[test]
-fn parity_v1_dataset() {
-    assert_parity(PACKED_FORMAT_VERSION_V1, None);
+    assert_parity(PACKED_FORMAT_VERSION, Some(1));
 }
 
 /// A short read is the commonest host bug (truncated range response, or a CDN
@@ -276,7 +271,7 @@ fn parity_v1_dataset() {
 /// pack", sending the reader after the wrong thing entirely.
 #[test]
 fn short_reads_blame_the_fetch_not_the_archive() {
-    let dataset = build_dataset(PACKED_FORMAT_VERSION_V2, None);
+    let dataset = build_dataset(PACKED_FORMAT_VERSION, None);
     let root = dataset.path();
 
     let manifest_bytes = fs::read(root.join("manifest.json")).unwrap();
@@ -297,7 +292,7 @@ fn short_reads_blame_the_fetch_not_the_archive() {
 /// so accepting it would silently misdecode every tile rather than fail.
 #[test]
 fn open_refuses_manifests_it_cannot_read() {
-    let dataset = build_dataset(PACKED_FORMAT_VERSION_V2, None);
+    let dataset = build_dataset(PACKED_FORMAT_VERSION, None);
     let manifest = fs::read(dataset.path().join("manifest.json")).unwrap();
     let text = String::from_utf8(manifest).unwrap();
 
@@ -328,7 +323,7 @@ fn open_refuses_manifests_it_cannot_read() {
 /// reads like archive corruption.
 #[test]
 fn wrong_object_in_the_whole_pack_path_is_named() {
-    let dataset = build_dataset(PACKED_FORMAT_VERSION_V2, None);
+    let dataset = build_dataset(PACKED_FORMAT_VERSION, None);
     let root = dataset.path();
     let archive = open_from_bytes(root);
 

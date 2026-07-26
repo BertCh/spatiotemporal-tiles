@@ -191,14 +191,6 @@ struct Args {
     #[arg(long)]
     no_clip: bool,
 
-    /// Restore legacy whole-feature placement for non-trajectory geometry
-    /// (polygons, timeless lines, multipoints land only in their
-    /// representative tile). Parity with `stt-build --whole-feature-placement`
-    /// — a file archive built with that flag and a live serve of the same
-    /// source must set BOTH or their tiles diverge.
-    #[arg(long)]
-    whole_feature_placement: bool,
-
     /// Minimum vertices required before a trajectory is clipped.
     #[arg(long, default_value = "2")]
     clip_min_vertices: usize,
@@ -747,6 +739,11 @@ fn metadata_json(
 ) -> Result<serde_json::Value> {
     let mut meta = serde_json::json!({
         "format": format,
+        // The layer-frame version this server emits. The serve protocol's
+        // version channel (packed-v2 design §7): frames are self-describing to
+        // `decode_tile`, but a client that pins a decoder needs to know before
+        // it fetches. Mirrors the packed manifest's `formatVersion`.
+        "formatVersion": stt_core::arrow_tile::FORMAT_VERSION,
         "name": name,
         "boundingBox": [
             [min_lon.unwrap_or(-180.0), min_lat.unwrap_or(-90.0)],
@@ -1150,13 +1147,13 @@ fn build_config(
         point_elevation_column: args.point_elevation_column.clone(),
     }
     .resolve()?;
-    // stt-serve STAYS on v1 layer frames (packed-v2 design §7): inline
-    // schemas are its only mode anyway (no manifest to carry templates) and
-    // responses are `no-store`, so template amortization buys nothing. The
-    // serve protocol has no version channel — a future serve-v2 must add
-    // `formatVersion` to `/metadata.json` FIRST. This also scopes the file≡DB
-    // byte-parity story: parity holds against a `--format-version 1` build.
-    encoder.format_version = stt_core::arrow_tile::FORMAT_VERSION_V1;
+    // stt-serve emits SELF-CONTAINED v2 frames: every layer carries its schema
+    // inline rather than referencing a template by hash, because a live server
+    // has no manifest to carry a `schemas` registry. `template_collector: None`
+    // is what selects that inline mode. Responses are `no-store`, so template
+    // amortization would buy nothing anyway. The emitted version is advertised
+    // as `formatVersion` on `/metadata.json`.
+    encoder.format_version = stt_core::arrow_tile::FORMAT_VERSION;
     encoder.template_collector = None;
     let mut enc_enabled: Vec<String> = Vec::new();
     if let Some(m) = encoder.quantize_coords_m {
@@ -1248,9 +1245,6 @@ fn build_config(
     } else if args.clip_min_vertices != 2 {
         active.push(format!("clip-min-vertices={}", args.clip_min_vertices));
     }
-    if args.whole_feature_placement {
-        active.push("whole-feature-placement".into());
-    }
     if args.simplify {
         active.push(format!("simplify(max-zoom={})", args.simplify_max_zoom));
     }
@@ -1301,7 +1295,6 @@ fn build_config(
         layer_name: args.layer.clone(),
         temporal_bucket_ms: bucket_ms,
         clip_trajectories: !args.no_clip,
-        clip_non_trajectory: !args.whole_feature_placement,
         clip_min_vertices: args.clip_min_vertices,
         simplify: args.simplify,
         simplify_max_zoom: args.simplify_max_zoom,

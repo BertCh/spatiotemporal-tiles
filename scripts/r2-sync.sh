@@ -66,9 +66,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${REPO_ROOT}/.env"
 # Source tree to sync. Defaults to the live showcase data dir; override with
-# STT_DATA_DIR to deploy the publish-build STAGING tree (data-publish/) straight
-# to R2 without a destructive local swap, e.g.
-#   STT_DATA_DIR=examples/showcase/public/data-publish scripts/r2-sync.sh
+# STT_DATA_DIR to deploy an alternate staging tree straight to R2 without a
+# destructive local swap, e.g.
+#   STT_DATA_DIR=examples/showcase/public/data-staging scripts/r2-sync.sh
+# NOTE: the tree must be COMPLETE — this script GCs remote objects that the
+# local tree doesn't reference, so syncing a partial tree deletes the rest.
 DATA_DIR="${STT_DATA_DIR:-${REPO_ROOT}/examples/showcase/public/data}"
 case "$DATA_DIR" in /*) ;; *) DATA_DIR="${REPO_ROOT}/${DATA_DIR}";; esac
 
