@@ -513,6 +513,51 @@ fn value_as_f64(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
+/// Infer the property kinds for a WHOLE DATASET, so every tile emits the same
+/// columns with the same types.
+///
+/// [`PropertyAccumulator`] sniffs types from the features of ONE tile, which is
+/// only safe when every tile sees the same evidence. It doesn't: a column whose
+/// values are all null in one tile vanishes from that tile's schema, and a
+/// column that happens to hold only numeric-looking strings in one tile but a
+/// real string in another flips between `Float64`/quantized and
+/// `Dictionary<UInt16, Utf8>`. Both drift the layer schema across tiles — the
+/// registry then carries one template per variant, and a consumer that styles
+/// on the column gets a different type depending on which tile it reads.
+///
+/// Feeding the result in as [`ColumnarOptions::property_types`] pins the kinds
+/// up front (declared keys bypass per-tile evidence at seal time, and are
+/// emitted in EVERY tile even where all their values are null). Database inputs
+/// already supply this from the source schema; file inputs derive it here.
+///
+/// The rule is deliberately IDENTICAL to the per-tile one — numeric iff every
+/// observed value across the dataset was a number or a numeric-looking string
+/// and nothing forced it categorical — so this only widens the evidence, never
+/// changes how a given body of evidence is classified.
+pub fn infer_property_types<'a>(
+    features: impl IntoIterator<Item = Option<&'a serde_json::Map<String, serde_json::Value>>>,
+    filter: &AttributeFilter,
+) -> PropertyTypes {
+    let mut acc = PropertyAccumulator::new(filter.clone(), Arc::new(PropertyTypes::new()));
+    for props in features {
+        acc.observe(props);
+    }
+    acc.seen
+        .iter()
+        .map(|(key, kind)| {
+            let numeric = (kind.has_number || kind.has_numeric_string) && !kind.has_other;
+            (
+                key.clone(),
+                if numeric {
+                    PropertyKind::Numeric
+                } else {
+                    PropertyKind::Categorical
+                },
+            )
+        })
+        .collect()
+}
+
 impl PropertyAccumulator {
     /// Construct with an opt-in user-property selection and the (possibly
     /// empty) authoritative schema kinds. Pass [`AttributeFilter::KeepAll`] +
@@ -838,6 +883,94 @@ mod tests {
     use super::*;
     use geojson::{Feature, Geometry, Value as GeomValue};
     use serde_json::json;
+
+    /// Dataset-wide inference pins a column's kind so every tile agrees.
+    ///
+    /// Two tiles' worth of features: in tile A `code` holds only
+    /// numeric-looking strings, in tile B it holds a real word. Sniffing each
+    /// tile separately makes `code` NUMERIC in A and CATEGORICAL in B — one
+    /// layer with two schemas, which is what `stt-validate` reports as schema
+    /// drift. The dataset-wide pass sees both and pins Categorical.
+    #[test]
+    fn dataset_wide_inference_pins_a_column_that_would_flip_per_tile() {
+        let tile_a = vec![
+            point_feature(0.0, 0.0, json!({ "code": "123" })),
+            point_feature(0.1, 0.1, json!({ "code": "456" })),
+        ];
+        let tile_b = vec![point_feature(9.0, 9.0, json!({ "code": "unknown" }))];
+
+        // Per-tile sniffing disagrees across the two tiles.
+        let kind_of = |feats: &[ParsedFeature], declared: Arc<PropertyTypes>| {
+            let refs: Vec<&ParsedFeature> = feats.iter().collect();
+            let layers = build_layers_from_features_with(
+                &refs,
+                "default",
+                ColumnarOptions {
+                    property_types: declared,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let (_, col) = layers[0]
+                .properties
+                .iter()
+                .find(|(n, _)| n == "code")
+                .expect("code column present");
+            matches!(col, PropertyColumn::Numeric(_))
+        };
+        assert!(
+            kind_of(&tile_a, Arc::default()),
+            "tile A alone sniffs numeric"
+        );
+        assert!(
+            !kind_of(&tile_b, Arc::default()),
+            "tile B alone sniffs categorical — the drift"
+        );
+
+        // Inferred over BOTH tiles, the column is categorical everywhere.
+        let all: Vec<ParsedFeature> = tile_a.iter().chain(tile_b.iter()).cloned().collect();
+        let declared = Arc::new(infer_property_types(
+            all.iter().map(|f| f.shared_properties.as_deref()),
+            &AttributeFilter::KeepAll,
+        ));
+        assert_eq!(declared.get("code"), Some(&PropertyKind::Categorical));
+        assert!(!kind_of(&tile_a, Arc::clone(&declared)));
+        assert!(!kind_of(&tile_b, Arc::clone(&declared)));
+    }
+
+    /// A column that is all-null in one tile must still appear there, with the
+    /// dataset's kind — otherwise that tile's schema is missing a column the
+    /// others have (the second drift class).
+    #[test]
+    fn dataset_wide_inference_keeps_an_all_null_column_present() {
+        let with_value = vec![point_feature(0.0, 0.0, json!({ "sst": 12.5 }))];
+        let all_null = vec![point_feature(9.0, 9.0, json!({ "other": 1 }))];
+        let all: Vec<ParsedFeature> = with_value.iter().chain(all_null.iter()).cloned().collect();
+        let declared = Arc::new(infer_property_types(
+            all.iter().map(|f| f.shared_properties.as_deref()),
+            &AttributeFilter::KeepAll,
+        ));
+
+        let refs: Vec<&ParsedFeature> = all_null.iter().collect();
+        let layers = build_layers_from_features_with(
+            &refs,
+            "default",
+            ColumnarOptions {
+                property_types: Arc::clone(&declared),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let names: Vec<&str> = layers[0]
+            .properties
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert!(
+            names.contains(&"sst"),
+            "an all-null column must still be emitted: {names:?}"
+        );
+    }
 
     fn point_feature(lon: f64, lat: f64, props: serde_json::Value) -> ParsedFeature {
         ParsedFeature {

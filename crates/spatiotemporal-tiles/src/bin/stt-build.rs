@@ -837,6 +837,45 @@ fn resolve_postgres_source(args: &Args) -> Result<InputSource> {
     })
 }
 
+/// Resolve the dataset-wide property kinds fed to every tile builder.
+///
+/// The input SCHEMA is authoritative where there is one (GeoParquet columns,
+/// Postgres/DuckDB column types). GeoJSON has no schema, so that path returns
+/// nothing and the tile builder would fall back to sniffing types from each
+/// tile's own features — which drifts the layer schema across tiles: a column
+/// whose values are all null in one tile disappears from it, and a column
+/// holding only numeric-looking strings in one tile but a real string in
+/// another flips between numeric and dictionary. Both leave the archive with
+/// several schemas for one layer (`stt-validate` reports "schema drift").
+///
+/// So when the schema yields nothing, infer the kinds ONCE across every loaded
+/// feature and pin them. The classification rule is the same either way; only
+/// the evidence widens from one tile to the whole dataset.
+fn resolve_property_types(
+    source: &InputSource,
+    args: &Args,
+    features: &[stt_build::input::ParsedFeature],
+    attribute_filter: &stt_build::columnar::AttributeFilter,
+) -> Arc<stt_build::columnar::PropertyTypes> {
+    let declared = source.property_kinds(&args.time_field, args.end_time_field.as_deref());
+    if !declared.is_empty() {
+        return declared;
+    }
+    let inferred = stt_build::columnar::infer_property_types(
+        features.iter().map(|f| f.shared_properties.as_deref()),
+        attribute_filter,
+    );
+    if inferred.is_empty() {
+        return declared;
+    }
+    info!(
+        "Inferred {} property kind(s) across the whole dataset (input carries no \
+         schema); tile schemas stay identical",
+        inferred.len()
+    );
+    Arc::new(inferred)
+}
+
 fn main() -> Result<()> {
     let matches = Args::command().get_matches();
     let mut args =
@@ -1044,6 +1083,8 @@ fn main() -> Result<()> {
         info!("Attribute control ENABLED (opt-in): {:?}", attribute_filter);
     }
 
+    let property_types = resolve_property_types(&source, &args, &features, &attribute_filter);
+
     let tile_config = tiler::TileConfig {
         min_zoom: args.min_zoom,
         max_zoom: args.max_zoom,
@@ -1063,7 +1104,7 @@ fn main() -> Result<()> {
         max_zoom_field: args.max_zoom_field.clone(),
         tile_budget,
         attribute_filter,
-        property_types: source.property_kinds(&args.time_field, args.end_time_field.as_deref()),
+        property_types,
     };
 
     if args.pre_tessellate {

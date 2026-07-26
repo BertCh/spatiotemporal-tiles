@@ -50,7 +50,9 @@ mod temporal;
 use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use schema::{check_tile_schema, layer_schema_signatures, schema_signature};
+use schema::{
+    check_tile_schema, classify_column_drift, layer_schema_columns, schema_signature, ColumnDrift,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -399,7 +401,7 @@ fn validate_entries(
     // zooms). Only a given layer's own column schema must stay stable — keying
     // on the tile-wide signature flagged every such dataset as drifting.
     let mut schemas: BTreeSet<String> = BTreeSet::new();
-    let mut first_layer_schema: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut first_layer_schema: BTreeMap<String, (String, Vec<(String, String)>)> = BTreeMap::new();
 
     // Interval-sanity tally across every decoded tile: one aggregate error
     // (count + first offender) instead of one error per bad feature.
@@ -552,24 +554,65 @@ fn validate_entries(
                     // signatures and flag the first tile that disagrees with
                     // an earlier one.
                     schemas.insert(schema_signature(&layers));
-                    for (name, sig) in layer_schema_signatures(&layers) {
-                        match first_layer_schema.get(&name) {
-                            None => {
-                                first_layer_schema
-                                    .insert(name, (format!("{:?}", entry.tile_id()), sig));
+                    for (name, cols) in layer_schema_columns(&layers) {
+                        let Some((first_tile, first_cols)) = first_layer_schema.get(&name) else {
+                            first_layer_schema
+                                .insert(name, (format!("{:?}", entry.tile_id()), cols));
+                            continue;
+                        };
+                        // Compare per COLUMN, and only report the ones that
+                        // actually disagree — a whole-signature diff buries the
+                        // one drifting column in the full column list.
+                        let lookup = |set: &[(String, String)], c: &str| {
+                            set.iter().find(|(n, _)| n == c).map(|(_, t)| t.clone())
+                        };
+                        let mut structural: Vec<String> = Vec::new();
+                        let mut adaptive: Vec<String> = Vec::new();
+                        let mut names: Vec<&str> =
+                            first_cols.iter().map(|(n, _)| n.as_str()).collect();
+                        for (n, _) in &cols {
+                            if !names.contains(&n.as_str()) {
+                                names.push(n);
                             }
-                            Some((first_tile, first_sig)) if *first_sig != sig => {
-                                push_err(
-                                    report,
-                                    args.fail_fast,
-                                    format!(
-                                        "schema drift: tile {:?} layer {name:?} differs from tile {first_tile}\n  {first_tile}: {first_sig}\n  {:?}: {sig}",
-                                        entry.tile_id(),
-                                        entry.tile_id()
-                                    ),
-                                )?;
+                        }
+                        for col in names {
+                            let a = lookup(first_cols, col);
+                            let b = lookup(&cols, col);
+                            if a == b {
+                                continue;
                             }
-                            Some(_) => {}
+                            let shown = format!(
+                                "{col}: {} vs {}",
+                                a.as_deref().unwrap_or("<absent>"),
+                                b.as_deref().unwrap_or("<absent>")
+                            );
+                            match classify_column_drift(col, a.as_deref(), b.as_deref()) {
+                                ColumnDrift::AdaptiveWidth => adaptive.push(shown),
+                                ColumnDrift::Structural => structural.push(shown),
+                            }
+                        }
+                        if !structural.is_empty() {
+                            push_err(
+                                report,
+                                args.fail_fast,
+                                format!(
+                                    "schema drift: tile {:?} layer {name:?} differs from tile \
+                                     {first_tile} — {}",
+                                    entry.tile_id(),
+                                    structural.join("; ")
+                                ),
+                            )?;
+                        } else if !adaptive.is_empty() {
+                            // Per-tile adaptive encoding widths: expected by
+                            // construction, and every reader handles both
+                            // shapes. Tallied as a warning, never a failure.
+                            let slot = warning_tally
+                                .entry(format!(
+                                    "layer {name:?}: adaptive encoding width varies by tile \
+                                     (expected — the encoding sizes itself per tile)"
+                                ))
+                                .or_insert_with(|| (0, adaptive.join("; ")));
+                            slot.0 += 1;
                         }
                     }
                 }

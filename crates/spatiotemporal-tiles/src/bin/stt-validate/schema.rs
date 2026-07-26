@@ -504,10 +504,25 @@ pub fn schema_signature(layers: &[DecodedLayer]) -> String {
 /// stay stable. Comparing whole-tile signatures conflated the two and reported
 /// every such dataset as drifting.
 pub fn layer_schema_signatures(layers: &[DecodedLayer]) -> Vec<(String, String)> {
+    layer_schema_columns(layers)
+        .into_iter()
+        .map(|(name, cols)| {
+            let joined: Vec<String> = cols
+                .into_iter()
+                .map(|(c, ty)| format!("{c}:{ty}"))
+                .collect();
+            (name, joined.join(","))
+        })
+        .collect()
+}
+
+/// Per-layer `(name, [(column, type)])` for one tile — the per-column form the
+/// drift check compares, so it can tell WHICH columns disagree and how.
+pub fn layer_schema_columns(layers: &[DecodedLayer]) -> Vec<(String, Vec<(String, String)>)> {
     layers
         .iter()
         .map(|layer| {
-            let cols: Vec<String> = layer
+            let cols: Vec<(String, String)> = layer
                 .batch
                 .schema()
                 .fields()
@@ -518,12 +533,57 @@ pub fn layer_schema_signatures(layers: &[DecodedLayer]) -> Vec<(String, String)>
                         .get(GEOARROW_EXT_KEY)
                         .map(|e| format!("[{e}]"))
                         .unwrap_or_default();
-                    format!("{}:{:?}{ext}", f.name(), f.data_type())
+                    (f.name().to_string(), format!("{:?}{ext}", f.data_type()))
                 })
                 .collect();
-            (layer.name.clone(), cols.join(","))
+            (layer.name.clone(), cols)
         })
         .collect()
+}
+
+/// How one column's type differs between two tiles of the same layer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ColumnDrift {
+    /// Same logical encoding, different integer WIDTH — expected, by design.
+    ///
+    /// Two encodings size themselves from the values in each tile: the
+    /// per-vertex time column ships as `List<UInt16>` deltas when the tile's
+    /// span fits, else absolute `List<Int64>`; a quantized attribute ships as
+    /// the narrowest of `UInt16`/`Int32`. Both are per-tile by construction —
+    /// that adaptivity IS the size win — and every reader handles both, so a
+    /// width difference is not a defect.
+    AdaptiveWidth,
+    /// A structural disagreement: the column is present in one tile and absent
+    /// from the other, or its type CLASS changed (dictionary vs numeric). A
+    /// consumer reading that column gets a different thing per tile.
+    Structural,
+}
+
+/// Classify the difference between one column's type in two tiles.
+pub fn classify_column_drift(column: &str, a: Option<&str>, b: Option<&str>) -> ColumnDrift {
+    let (Some(a), Some(b)) = (a, b) else {
+        return ColumnDrift::Structural;
+    };
+    if a == b {
+        return ColumnDrift::AdaptiveWidth; // not a difference at all
+    }
+    let int_widths = ["UInt16", "Int32", "Int64"];
+    let strip_widths = |t: &str| {
+        let mut out = t.to_string();
+        for w in int_widths {
+            out = out.replace(w, "INT");
+        }
+        out
+    };
+    // vertex_time: u16-delta vs absolute i64. Quantized attrs: UInt16 vs Int32.
+    let adaptive_column = column == "vertex_time"
+        || (int_widths.iter().any(|w| a.starts_with(w))
+            && int_widths.iter().any(|w| b.starts_with(w)));
+    if adaptive_column && strip_widths(a) == strip_widths(b) {
+        ColumnDrift::AdaptiveWidth
+    } else {
+        ColumnDrift::Structural
+    }
 }
 
 #[cfg(test)]
