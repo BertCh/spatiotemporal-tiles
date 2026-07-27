@@ -517,8 +517,8 @@ mod tests {
     fn test_density_max_zoom_dense_cluster_is_high() {
         // 2500 points packed into a ~0.01° x 0.01° box near San Francisco
         // (~1.1 km across). Inter-feature spacing is a few tens of meters, so the
-        // formula should land near the deepest supported zoom — past the old z14
-        // cap now that the window extends to z18.
+        // formula must land near the deepest supported zoom — well past z14,
+        // since the recommendable window extends to z18.
         let mut pts = Vec::new();
         let n = 50;
         for i in 0..n {

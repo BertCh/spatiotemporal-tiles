@@ -1,7 +1,9 @@
-//! STT v5 directory — a compact, range-request-friendly tile index.
+//! The STT tile directory at directory-codec version 5 (`DIRECTORY_VERSION`) —
+//! a compact, range-request-friendly tile index. Every bare vN below names a
+//! version on THAT axis, not the manifest's `formatVersion`.
 //!
-//! Replaces the v2/v3 Arrow-IPC index (fixed-width columns + IPC framing) with
-//! a columnar binary encoding inspired by PMTiles v3:
+//! A columnar binary encoding (directory versions 2 and 3 were an Arrow-IPC
+//! index: fixed-width columns + IPC framing), inspired by PMTiles v3:
 //!
 //! - **Columnar + delta + zig-zag varints.** Entries are sorted by
 //!   `(zoom, hilbert, time_start)`, so each column (zoom, hilbert, x, y,
@@ -103,8 +105,11 @@ impl TileEntry {
     }
 }
 
-/// Directory format tag (first byte of the buffer). Bumped independently of the
-/// archive `FORMAT_VERSION` so the directory codec can evolve on its own.
+/// Version of the DIRECTORY-CODEC axis, and the first byte of every directory
+/// buffer. Counted independently of the manifest's
+/// [`PACKED_FORMAT_VERSION`](crate::pack::PACKED_FORMAT_VERSION) and of the
+/// layer-frame version, so the directory codec can evolve without churning
+/// either.
 ///
 /// v5 adds the per-run `pack_id` column and makes the offset contiguity sentinel
 /// pack-relative (reset on every pack change). See the module docs.

@@ -43,7 +43,14 @@ const PLAIN_F64_NOTE: &str = "plain f64 (unquantized)";
 /// Core (non-property) tile columns the property rules skip: they are either
 /// structural or covered by their own levers (`--quantize-coords` for
 /// geometry, the vertex-time delta encoding), not by `--quantize-attr`.
-const RESERVED_COLUMNS: [&str; 8] = [
+///
+/// Keep in step with the encoder's reserved set (`stt_core::arrow_tile`'s
+/// `encode_layer`, mirrored in `stt-validate`'s `schema::is_reserved_column`).
+/// A core column missing here is silently attributed as a user PROPERTY: its
+/// bytes join the property-cost share the `raw-f64-column` rule is computed
+/// against, and `dead-columns` can recommend `--exclude`-ing a column the
+/// builder owns.
+const RESERVED_COLUMNS: [&str; 9] = [
     "id",
     "start_time",
     "end_time",
@@ -52,6 +59,7 @@ const RESERVED_COLUMNS: [&str; 8] = [
     "vertex_value",
     "vertex_value_matrix",
     "triangles",
+    "part_offsets",
 ];
 
 /// `raw-f64-column` only flags columns carrying at least this share of the
@@ -770,6 +778,7 @@ mod tests {
             ));
         }
         ColumnarLayer {
+            polygon_parts: None,
             name: "default".to_string(),
             feature_ids,
             start_times: vec![0; n],

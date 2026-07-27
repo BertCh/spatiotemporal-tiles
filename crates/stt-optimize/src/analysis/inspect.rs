@@ -208,8 +208,14 @@ fn encoding_note(field: &Field) -> String {
         return "dictionary-encoded".to_string();
     }
     if field.name() == "vertex_time" {
+        // Narrowest-first delta ladder, then the absolute fallback. Without the
+        // u32 rung a multi-day track dataset fell through to the generic f64
+        // note (or to an empty string), mislabelling the encoding it is on.
         if contains_leaf(field.data_type(), &DataType::UInt16) {
             return "u16 vertex-time deltas".to_string();
+        }
+        if contains_leaf(field.data_type(), &DataType::UInt32) {
+            return "u32 vertex-time deltas".to_string();
         }
         if contains_leaf(field.data_type(), &DataType::Int64) {
             return "i64 absolute vertex-time".to_string();
@@ -519,6 +525,7 @@ mod tests {
             .map(|_| (0..verts_per).map(|v| v as i64 * 50).collect())
             .collect();
         ColumnarLayer {
+            polygon_parts: None,
             name: "default".to_string(),
             feature_ids: (0..n as u64).map(|i| seed * 1000 + i).collect(),
             start_times: vec![0; n],

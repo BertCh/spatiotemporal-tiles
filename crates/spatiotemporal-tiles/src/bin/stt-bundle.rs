@@ -8,10 +8,9 @@
 //! `unpack` re-verifies the result with the same integrity pass
 //! `stt-validate` runs (any mismatch exits non-zero).
 //!
-//! Strictly an interchange profile (spec §13, packed-v2 design §6): the
-//! CDN/serving story remains the exploded layout — nothing serves bundles
-//! over HTTP ranges. The container is object-agnostic, so it carries any
-//! manifest `formatVersion` unchanged.
+//! Strictly an interchange profile (spec §13): the CDN/serving story is the
+//! exploded layout — nothing serves bundles over HTTP ranges. The container is
+//! object-agnostic, so it carries any manifest `formatVersion` unchanged.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -134,10 +133,9 @@ fn unpack(input: &Path, output: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Doc gate (naming-types-consistency F9): every visible long flag on
-    /// every subcommand must appear in the `stt-bundle` section of
-    /// `docs/api/cli-reference.md`, so a new flag fails the build until it
-    /// is documented.
+    /// Doc gate: every visible long flag on every subcommand must appear in the
+    /// `stt-bundle` section of `docs/api/cli-reference.md`, so a new flag fails
+    /// the build until it is documented.
     #[test]
     fn cli_flags_are_documented_in_cli_reference() {
         use clap::CommandFactory;
@@ -227,6 +225,7 @@ mod tests {
             let ids: Vec<u64> = (0..4).map(|i| k * 10 + i).collect();
             let n = ids.len();
             let payload = encode_tile(&[ColumnarLayer {
+                polygon_parts: None,
                 name: "default".to_string(),
                 feature_ids: ids,
                 start_times: vec![0; n],

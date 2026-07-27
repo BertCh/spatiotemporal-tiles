@@ -2,15 +2,15 @@
 //!
 //! This module provides standardized coordinate transformations
 //! for accurate Web Mercator projections, plus the pipeline's single
-//! [`MERCATOR_MAX_LAT`] and its single [`haversine_distance`] — both were
-//! previously copied per call site, and a copy that drifts is a tier that
+//! [`MERCATOR_MAX_LAT`] and its single [`haversine_distance`]. Both must stay
+//! single-sourced here: a per-call-site copy that drifts is a tier that
 //! disagrees with its neighbours about where (or whether) a feature exists.
 //!
 //! Web Mercator is the ONLY projection the tile pipeline needs — everything
 //! here is closed-form arithmetic with no CRS library behind it. Reprojecting
 //! non-4326 input is pushed down into SQL (`ST_Transform`, see the DB input
-//! adaptors and `stt-serve`), which is why an optional libproj dependency and
-//! its `projection` cargo feature were removed rather than kept as dead weight.
+//! adaptors and `stt-serve`), which is why there is no libproj dependency and
+//! no `projection` cargo feature to carry.
 
 use crate::error::{Error, Result};
 use geo_types::Point;
@@ -21,14 +21,13 @@ use geo_types::Point;
 /// here.
 ///
 /// THE single latitude limit for the whole pipeline, and the whole pipeline
-/// CLAMPS to it rather than rejecting beyond it. Both halves of that sentence
-/// fix a real disagreement: the native tier used to reject at a rounded
-/// `85.0511` while the Quadbin summary tier clamped at `85.051_128_78`, so a
-/// feature in the ~3.2 m band between the two values was aggregated by the
-/// summary tier and absent from the native tier — one dataset answering "does
-/// this feature exist?" two different ways. Clamping (not rejecting) is the
-/// side every other site was already on — the H3 anchor, the Quadbin cell, the
-/// trajectory supercover, and the TS renderer's `MAX_MERCATOR_LAT`
+/// CLAMPS to it rather than rejecting beyond it. Both halves are load-bearing:
+/// a tier that rejects at a rounded `85.0511` while another clamps at
+/// `85.051_128_78` puts every feature in the ~3.2 m band between the two values
+/// into the summary tier and out of the native tier — one dataset answering
+/// "does this feature exist?" two different ways. Clamping (not rejecting) is
+/// the side every site is on — the H3 anchor, the Quadbin cell, the trajectory
+/// supercover, and the TS renderer's `MAX_MERCATOR_LAT`
 /// (`packages/core/src/geo/mercator.ts`) — and it honours the no-thinning
 /// rule: a polar feature lands on the world's edge row instead of vanishing.
 ///
@@ -213,13 +212,13 @@ pub fn tile_coords_to_lonlat(
 /// Great-circle distance between two WGS84 points, in metres (haversine on a
 /// spherical Earth of radius 6 371 km).
 ///
-/// The pipeline's ONE copy. It used to be duplicated per call site in
-/// `stt-build` (`clip.rs` + `columnar.rs`); both copies fed *timestamp
-/// interpolation along a path*, so any drift between them would have shifted
-/// where a trip is drawn at a given instant depending only on which code path
-/// built it. Spherical (not ellipsoidal) is deliberate and sufficient: every
-/// consumer uses the value as a RATIO along a path, where the ~0.5% sphere-vs-
-/// WGS84 error cancels.
+/// The pipeline's ONE copy, and it must stay that way: the `stt-build` callers
+/// (`clip.rs` + `columnar.rs`) feed this into *timestamp interpolation along a
+/// path*, so any drift between duplicate implementations shifts where a trip is
+/// drawn at a given instant depending only on which code path built it.
+/// Spherical (not ellipsoidal) is deliberate and sufficient: every consumer
+/// uses the value as a RATIO along a path, where the ~0.5% sphere-vs-WGS84
+/// error cancels.
 pub fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     const EARTH_RADIUS: f64 = 6_371_000.0;
     let dlat = (lat2 - lat1).to_radians();
@@ -316,10 +315,11 @@ mod tests {
     }
 
     /// `MERCATOR_MAX_LAT` is `atan(sinh(π))` rounded INWARD — not the rounded
-    /// `85.0511` the pipeline used to carry (3.2 m short, and the exact width
-    /// of the band in which the native and summary tiers disagreed), and not
-    /// the nearest f64 either: that one projects to `y = -1.1e-16`, which a
-    /// consumer that floors and drops negative cells reads as "no tiles".
+    /// `85.0511` (3.2 m short, and the exact width of the band in which a
+    /// native and a summary tier would disagree about a feature's existence),
+    /// and not the nearest f64 either: that one projects to `y = -1.1e-16`,
+    /// which a consumer that floors and drops negative cells reads as
+    /// "no tiles".
     #[test]
     fn mercator_max_lat_is_the_true_limit_rounded_inward() {
         let nearest = std::f64::consts::PI.sinh().atan().to_degrees();

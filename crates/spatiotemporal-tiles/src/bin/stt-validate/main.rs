@@ -816,7 +816,7 @@ fn print_summary(report: &Report, metadata: &Metadata) {
 mod tests {
     use super::*;
 
-    /// Doc gate (naming-types-consistency F9): every visible long flag must
+    /// Doc gate: every visible long flag must
     /// appear in the `stt-validate` section of `docs/api/cli-reference.md`, so
     /// a new flag fails the build until it is documented.
     #[test]

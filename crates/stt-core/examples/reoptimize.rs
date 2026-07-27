@@ -45,7 +45,46 @@ const RESERVED: &[&str] = &[
     "vertex_value",
     "vertex_value_matrix",
     "triangles",
+    "part_offsets",
 ];
+
+/// The `manifest.capabilities` entries an [`EncoderConfig`] IMPLIES —
+/// required-to-understand declarations (packed spec §3.1) derived from the
+/// very config the tiles are encoded with, so a re-optimized archive can never
+/// USE a re-typing it fails to DECLARE. Each listed capability RE-TYPES an
+/// existing column, so a reader that lacks it silently misdecodes rather than
+/// erroring; the manifest key is the only thing that lets it refuse at open.
+///
+/// Mirrors `stt-build`'s `EncoderSettings::required_capabilities()` field for
+/// field; `stt-core` cannot depend on `stt-build` (the dependency runs the
+/// other way), so the derivation is repeated here — but it takes the
+/// `EncoderConfig` as INPUT, so it cannot drift from the settings the run
+/// actually encodes with the way a separately hand-maintained list did.
+/// Additive features (vector groups, vertex-time precision) are deliberately
+/// not capabilities.
+fn required_capabilities(cfg: &EncoderConfig) -> Vec<String> {
+    use stt_core::pack::{
+        CAPABILITY_ATTR_QUANT, CAPABILITY_COORD_QUANT, CAPABILITY_ELEVATION_FOLD,
+        CAPABILITY_TIME_DELTA, CAPABILITY_VERTEX_VALUE_QUANT,
+    };
+    let mut caps: Vec<String> = Vec::new();
+    if cfg.quantize_coords_m.is_some() {
+        caps.push(CAPABILITY_COORD_QUANT.to_string());
+    }
+    if !cfg.quantize_attrs.is_empty() || cfg.quantize_attrs_auto {
+        caps.push(CAPABILITY_ATTR_QUANT.to_string());
+    }
+    if !cfg.point_elevation_column.is_empty() {
+        caps.push(CAPABILITY_ELEVATION_FOLD.to_string());
+    }
+    if cfg.compact_times {
+        caps.push(CAPABILITY_TIME_DELTA.to_string());
+    }
+    if cfg.quantize_vertex_values {
+        caps.push(CAPABILITY_VERTEX_VALUE_QUANT.to_string());
+    }
+    caps
+}
 
 /// Metres per degree of latitude — the constant `world_grid_affine` sizes the
 /// coordinate grid from (`sx = sy = metres / M_PER_DEG_LAT`). Inverting it
@@ -167,7 +206,10 @@ fn read_geometry(batch: &RecordBatch, kind: &str) -> GeometryColumn {
 fn read_list_i64_vertex_time(batch: &RecordBatch) -> Option<Vec<Vec<i64>>> {
     let col = batch.column_by_name("vertex_time")?;
     let list = col.as_any().downcast_ref::<ListArray>()?;
-    // u16-delta encoding carries origin/step in schema metadata.
+    // The delta encodings carry origin/step in schema metadata. The encoder
+    // picks the narrowest delta width that fits the tile's span, so the leaf is
+    // UInt16 OR UInt32 — key the reconstruction off the metadata for "is it a
+    // delta" but off the LEAF TYPE for how to read it, or a wide tile panics.
     let meta = batch.schema().metadata().clone();
     let origin: Option<i64> = meta
         .get("stt:vertex_time_origin_ms")
@@ -182,13 +224,44 @@ fn read_list_i64_vertex_time(batch: &RecordBatch) -> Option<Vec<Vec<i64>>> {
             continue;
         }
         let v = list.value(i);
-        if let (Some(o), Some(st)) = (origin, step) {
-            let d = v.as_any().downcast_ref::<UInt16Array>().unwrap();
-            out.push((0..d.len()).map(|j| o + d.value(j) as i64 * st).collect());
-        } else {
-            let a = v.as_any().downcast_ref::<Int64Array>().unwrap();
-            out.push(a.values().to_vec());
+        match (origin, step) {
+            (Some(o), Some(st)) => {
+                if let Some(d) = v.as_any().downcast_ref::<UInt16Array>() {
+                    out.push((0..d.len()).map(|j| o + d.value(j) as i64 * st).collect());
+                } else if let Some(d) = v.as_any().downcast_ref::<UInt32Array>() {
+                    out.push((0..d.len()).map(|j| o + d.value(j) as i64 * st).collect());
+                } else {
+                    panic!(
+                        "vertex_time carries origin/step metadata but its leaf is {:?}, \
+                         which is not a delta width",
+                        v.data_type()
+                    );
+                }
+            }
+            _ => {
+                let a = v.as_any().downcast_ref::<Int64Array>().unwrap();
+                out.push(a.values().to_vec());
+            }
         }
+    }
+    Some(out)
+}
+
+/// Read the polygon multi-part boundary column back, so a re-optimized archive
+/// keeps its parts instead of collapsing every part after the first into a
+/// hole of part 0. Absent means "every feature is single-part".
+fn read_polygon_parts(batch: &RecordBatch) -> Option<Vec<Vec<u32>>> {
+    let col = batch.column_by_name("part_offsets")?;
+    let list = col.as_any().downcast_ref::<ListArray>()?;
+    let mut out = Vec::with_capacity(list.len());
+    for i in 0..list.len() {
+        if list.is_null(i) {
+            out.push(Vec::new());
+            continue;
+        }
+        let v = list.value(i);
+        let a = v.as_any().downcast_ref::<UInt32Array>()?;
+        out.push(a.values().to_vec());
     }
     Some(out)
 }
@@ -337,6 +410,7 @@ fn batch_to_columnar(batch: &RecordBatch, name: String) -> ColumnarLayer {
     let vertex_values = read_list_f32(batch, "vertex_value");
     let vertex_value_matrix = read_list_f32(batch, "vertex_value_matrix");
     let triangles = read_triangles(batch);
+    let polygon_parts = read_polygon_parts(batch);
 
     let mut properties = Vec::new();
     for idx in 0..batch.num_columns() {
@@ -348,6 +422,7 @@ fn batch_to_columnar(batch: &RecordBatch, name: String) -> ColumnarLayer {
     }
 
     ColumnarLayer {
+        polygon_parts,
         name,
         feature_ids: ids,
         start_times: start,
@@ -483,17 +558,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     set_quantize_coords_m(coord_m)?;
     set_quantize_attrs(attrs.clone());
     set_quantize_attrs_auto(auto);
+    // ONE source of truth for what this run encodes with: snapshot the globals
+    // set above into an explicit `EncoderConfig` FIRST, then derive both the
+    // manifest capabilities and the final per-tile encoder config from that
+    // same value. The two used to be hand-maintained in parallel, and drifted
+    // the moment `compact_times` (the `time-delta` capability) was added to
+    // `EncoderConfig::default()`: every re-optimized archive emitted
+    // `TILE_META.st`/`.et` while declaring only the quant capabilities, so an
+    // older reader silently placed every feature in January 1970 instead of
+    // refusing at open (packed spec §3.1).
+    let settings = EncoderConfig::from_globals();
     // Tiles are fully re-encoded, so the output's capability declarations
     // (spec §3.1) come from THIS run's settings, not the source manifest.
     // The elevation fold survives decode→re-encode as a 3-wide leaf, so that
-    // one is carried forward from the source.
-    let mut capabilities: Vec<String> = Vec::new();
-    if coord_m > 0.0 {
-        capabilities.push(stt_core::pack::CAPABILITY_COORD_QUANT.to_string());
-    }
-    if auto || !attrs.is_empty() {
-        capabilities.push(stt_core::pack::CAPABILITY_ATTR_QUANT.to_string());
-    }
+    // one is carried forward from the source — it is the only capability the
+    // re-encode preserves without a matching `settings` field.
+    let mut capabilities = required_capabilities(&settings);
     if reader
         .capabilities()
         .iter()
@@ -508,14 +588,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_capabilities(capabilities);
     // Explicit encoder config, mirroring stt-build's `pack_encoder_config`:
     // the frame version + template sink come FROM THE WRITER (which carries
-    // the source's formatVersion), layered over the process-wide quant
-    // globals set above — re-encoded frames and the output manifest can
-    // never disagree, and a v2 build's templates land in `manifest.schemas`.
+    // the source's formatVersion), layered over the SAME `settings` the
+    // capability list above was derived from — re-encoded frames and the
+    // output manifest can never disagree, and a v2 build's templates land in
+    // `manifest.schemas`.
     let encoder_cfg = EncoderConfig {
         format_version: writer.format_version(),
         template_collector: (writer.format_version() == stt_core::pack::PACKED_FORMAT_VERSION)
             .then(|| writer.template_collector()),
-        ..EncoderConfig::from_globals()
+        ..settings
     };
     // v2 sources resolve frame template hashes through the manifest registry.
     let templates = reader.templates().cloned();

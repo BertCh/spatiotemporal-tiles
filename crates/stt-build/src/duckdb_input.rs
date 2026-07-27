@@ -447,8 +447,8 @@ pub fn decode_query(
 /// no rows) and pin each property column's tile kind from its result type, so
 /// `TileConfig::property_types` keeps the layer schema stable when a column is
 /// all-NULL within one tile (per-tile value sniffing drops it there and the
-/// layer schema drifts across tiles; the file reader has pinned kinds from the
-/// Parquet schema since 0.1.1 — this brings the DB path to parity).
+/// layer schema drifts across tiles). The file reader pins kinds from the
+/// Parquet schema, and the DB path must reach the same schema.
 pub fn property_kinds(
     db_path: &str,
     spec: &QuerySpec,

@@ -71,6 +71,7 @@ fn build_points(dir: &Path, cfg_of: impl Fn(&PackWriter) -> EncoderConfig) -> Pa
         .with_format_version(PACKED_FORMAT_VERSION);
     for (id, [lon, lat], start, end, num, cat) in point_fixture() {
         let layer = ColumnarLayer {
+            polygon_parts: None,
             name: "default".to_string(),
             feature_ids: vec![id],
             start_times: vec![start],
@@ -541,6 +542,7 @@ fn multiple_layers_split_into_one_file_each() {
     let line: Vec<[f64; 2]> = vec![[-73.60, 45.50], [-73.58, 45.52], [-73.56, 45.51]];
     let layers = vec![
         ColumnarLayer {
+            polygon_parts: None,
             name: "points".to_string(),
             feature_ids: vec![10],
             start_times: vec![1_700_000_000_000],
@@ -553,6 +555,7 @@ fn multiple_layers_split_into_one_file_each() {
             properties: vec![],
         },
         ColumnarLayer {
+            polygon_parts: None,
             name: "tracks".to_string(),
             feature_ids: vec![20],
             start_times: vec![1_700_000_000_000],
@@ -688,6 +691,7 @@ fn vertex_times_are_absolute_and_derived_columns_are_dropped() {
     let line: Vec<[f64; 2]> = vec![[-73.60, 45.50], [-73.58, 45.52], [-73.56, 45.51]];
     let vtimes: Vec<i64> = vec![1_700_000_000_000, 1_700_000_030_000, 1_700_000_060_000];
     let layer = ColumnarLayer {
+        polygon_parts: None,
         name: "default".to_string(),
         feature_ids: vec![7],
         start_times: vec![vtimes[0]],

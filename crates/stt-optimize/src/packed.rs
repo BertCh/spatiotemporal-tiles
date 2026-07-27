@@ -153,6 +153,7 @@ mod tests {
         };
         encode_tile_with(
             &[ColumnarLayer {
+                polygon_parts: None,
                 name: "default".to_string(),
                 feature_ids: (0..n as u64).map(|i| seed * 100 + i).collect(),
                 start_times: vec![0; n],

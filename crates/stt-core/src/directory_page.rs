@@ -1,4 +1,5 @@
-//! Paged-directory container (Wave 2 — COPC/GeoParquet-1.1 steal).
+//! Paged-directory container, after COPC's hierarchy pages and GeoParquet
+//! 1.1's per-row-group bbox columns.
 //!
 //! The v5 directory ([`crate::directory`]) is a single whole-load blob: a cold
 //! reader must fetch and decode *every* entry before it can request one tile.
@@ -232,8 +233,9 @@ pub fn decode_root(bytes: &[u8]) -> Result<PagedRoot> {
             "paged root: unsupported version {version} (expected {PAGED_ROOT_VERSION})"
         )));
     }
-    // Read through the bounds-checked reader (a 1-byte root that is exactly
-    // `[PAGED_ROOT_VERSION]` used to index byte 1 unconditionally and panic).
+    // Read through the bounds-checked reader: a truncated 1-byte root that is
+    // exactly `[PAGED_ROOT_VERSION]` has no byte 1, so indexing it directly
+    // panics on untrusted input.
     let descriptor_kind = r.take(1)?[0];
     if descriptor_kind != DESCRIPTOR_GEO_BBOX {
         return Err(Error::InvalidArchive(format!(

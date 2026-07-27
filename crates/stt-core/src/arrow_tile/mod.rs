@@ -15,15 +15,18 @@
 //! | `end_time`    | `Int64`                                 | Unix ms, absolute             |
 //! | `geometry`    | GeoArrow point / linestring / polygon   | interleaved f64 lon/lat       |
 //! | `vertex_time` | `List<UInt16>` deltas or `List<Int64>` (nullable) | per-vertex Unix ms (optional; see [`build_vertex_time_array`]) |
-//! | `vertex_value`| `List<Float32>` (nullable)              | per-vertex scalar, e.g. SST (optional) |
+//! | `vertex_value`| `List<Float32>`, or `List<UInt16>` under a `TILE_META.vq` affine (nullable) | per-vertex scalar, e.g. SST (optional) |
+//! | `vertex_value_matrix` | as `vertex_value`               | per-vertex × per-bucket series (optional) |
 //! | `triangles`   | `List<UInt16>` or `List<UInt32>`        | pre-baked earcut indices, feature-local (optional; polygon only) |
+//! | `part_offsets`| `List<UInt32>`                          | per-feature MultiPolygon part boundaries as ring indices (optional; polygon only — absent ⇒ every feature is single-part) |
 //! | `<property>`  | `Float64` or `Dictionary<UInt16,Utf8>`   | one column per property       |
 //!
 //! All layers in one tile are concatenated with a tiny frame so a tile can
 //! carry, say, a linestring layer and a point layer side by side.
 //!
-//! The frame (`format_version: 2` — the payload side of the packed format's
-//! `manifest.formatVersion`; see `docs/spec/stt-packed-format.md` §9) is a
+//! The layer frame ([`LAYER_FRAME_VERSION`] — the payload-side version axis,
+//! pinned to the packed format's `manifest.formatVersion` but counted
+//! separately; see `docs/spec/stt-packed-format.md` §9) is a
 //! sectioned frame that hoists each layer's Arrow IPC *schema message* into a
 //! per-dataset **template** (referenced by blake3-128 hash, resolved through
 //! the manifest's `schemas` table) so the per-tile schema tax disappears, and
@@ -31,7 +34,7 @@
 //! section](TileMeta) instead of the schema:
 //!
 //! ```text
-//! u16  0xFFFF                    # v2 escape (see FRAME_V2_ESCAPE)
+//! u16  0xFFFF                    # layer-frame escape (see FRAME_V2_ESCAPE)
 //! u8   frame_version = 2
 //! u8   flags = 0                 # reserved, MUST be 0
 //! u16  layer_count
@@ -48,7 +51,8 @@
 //!   per section: [section bytes][pad to 8, derived]
 //! ```
 //!
-//! Reserved columns (`id`/times/geometry/vertex_*/`triangles`) form the CORE
+//! Reserved columns (`id`/times/geometry/vertex_*/`triangles`/`part_offsets`)
+//! form the CORE
 //! batch; property columns form the PROPS batch with its own schema/template
 //! (emitted only when properties exist). Each `*_BATCH` section is the IPC
 //! stream's **tail** — dictionary batch(es) + record batch + end-of-stream —
@@ -61,11 +65,11 @@
 //!
 //! ## Module layout
 //!
-//! This was one 4.8k-line file; it is now split by concern into private
-//! submodules, with every item re-exported here — `stt_core::arrow_tile::X`
-//! resolves exactly as it always did:
+//! Concerns live in private submodules and every item is re-exported here, so
+//! `stt_core::arrow_tile::X` is the single public path whichever submodule
+//! defines `X`:
 //!
-//! - `frame` — wire constants both directions agree on, the v2 schema
+//! - `frame` — wire constants both directions agree on, the schema
 //!   template tables ([`TemplateCollector`] / [`TemplateRegistry`]) and
 //!   [`TileMeta`].
 //! - `layer` — the in-memory model ([`ColumnarLayer`] and its columns).
@@ -73,8 +77,10 @@
 //!   fixed-point encoding.
 //! - `columns` — Arrow array construction, shared by both frame versions.
 //! - `config` — [`EncoderConfig`] and the surviving encoder globals.
-//! - `encode` — layer parts + v1/v2 frame assembly.
-//! - `decode` — the v1/v2 frame walks.
+//! - `encode` — layer parts, the standalone single-layer IPC stream, and
+//!   layer-frame assembly.
+//! - `decode` — the standalone single-layer IPC decode and the layer-frame
+//!   walk.
 
 mod columns;
 mod config;

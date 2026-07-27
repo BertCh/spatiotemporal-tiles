@@ -323,6 +323,7 @@ fn build_layer(subset: &[&SampledFeature], kind: GeomKind) -> ColumnarLayer {
         .collect();
 
     ColumnarLayer {
+        polygon_parts: None,
         name: "default".to_string(),
         feature_ids: ids,
         start_times: starts,

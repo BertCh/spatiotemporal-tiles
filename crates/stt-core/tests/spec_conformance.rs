@@ -40,6 +40,7 @@ const GEOARROW_EXT_KEY: &str = "ARROW:extension:name";
 
 fn polygon_layer(triangles: Option<Vec<Vec<u32>>>) -> ColumnarLayer {
     ColumnarLayer {
+        polygon_parts: None,
         name: "zones".to_string(),
         feature_ids: vec![42],
         start_times: vec![0],
@@ -229,6 +230,7 @@ fn vector_group_column_matches_spec_schema() {
     // the TS decoder can hand the contiguous child buffer to deck.gl zero-copy.
     use arrow::array::{Array, FixedSizeListArray};
     let layer = ColumnarLayer {
+        polygon_parts: None,
         name: "surfels".to_string(),
         feature_ids: vec![1, 2],
         start_times: vec![0, 10],
@@ -473,6 +475,7 @@ fn vertex_value_matrix_carries_consistent_bucket_count() {
 
     let buckets = 2usize;
     let layer = ColumnarLayer {
+        polygon_parts: None,
         name: "corridors".to_string(),
         feature_ids: vec![1, 2],
         start_times: vec![0, 0],

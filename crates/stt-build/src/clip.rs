@@ -198,8 +198,8 @@ fn lonlat_to_world_tile(lon: f64, lat: f64, zoom: u8) -> (f64, f64) {
 ///
 /// For a continental trajectory at zoom 14 this drops the candidate set from
 /// `O(bbox_w * bbox_h)` (~10k tiles for a coast-to-coast path) to the actual
-/// touched count (~hundreds), since we no longer enumerate the bounding box
-/// interior.
+/// touched count (~hundreds), because the bounding-box interior is never
+/// enumerated.
 ///
 /// The returned set is the union of tiles touched by all segments. Caller
 /// should still call `clip_trajectory_to_tile` per tile — the buffer the
@@ -1571,12 +1571,12 @@ mod tests {
     #[test]
     fn test_clip_trajectory_splits_at_antimeridian() {
         // A track that straddles the antimeridian with vertices well away from
-        // ±180° on each side (-170° → +165°). The old "both within 10° of the
-        // dateline" generator test missed exactly this shape, and the tiler
-        // would then sweep a straight line the long way across the whole map,
-        // baking a globe-spanning sliver into every tile column. The clipper
-        // must split such an edge so no output segment contains a |Δlon| > 180°
-        // jump.
+        // ±180° on each side (-170° → +165°). Proximity to the dateline is NOT
+        // the test — the edge between two far-from-±180 vertices still crosses
+        // it, and an unsplit crossing makes the tiler sweep a straight line the
+        // long way across the whole map, baking a globe-spanning sliver into
+        // every tile column. The clipper must split such an edge so no output
+        // segment contains a |Δlon| > 180° jump.
         let feature = make_linestring_feature(vec![
             vec![-163.0, 40.0],
             vec![-170.0, 41.0], // last point before the dateline (west side)

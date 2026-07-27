@@ -43,6 +43,7 @@ pub fn permute<T: Clone>(v: &[T], order: &[usize]) -> Vec<T> {
 /// not simply the first value (3000).
 pub fn point_fixture() -> ColumnarLayer {
     ColumnarLayer {
+        polygon_parts: None,
         name: "points".to_string(),
         feature_ids: vec![1, 2, 3],
         start_times: vec![3000, 1000, 2000],
@@ -73,6 +74,7 @@ pub fn point_fixture() -> ColumnarLayer {
 /// (`vertex_times`) drives the u16-delta vertex-time encoding path.
 pub fn line_fixture() -> ColumnarLayer {
     ColumnarLayer {
+        polygon_parts: None,
         name: "tracks".to_string(),
         feature_ids: vec![10, 11],
         start_times: vec![100, 0],
@@ -144,13 +146,13 @@ pub fn tile_payload(ids: Vec<u64>) -> Vec<u8> {
     encode_tile(std::slice::from_ref(&fuzz_layer(ids, n))).unwrap()
 }
 
-/// [`tile_payload`]'s layer, encoded as a SELF-CONTAINED **v2** frame
-/// (formatVersion 2, inline schema sections — decodable without a template
-/// registry), for the v2 never-panic decoder fuzzers.
+/// [`tile_payload`]'s layer, encoded as a SELF-CONTAINED layer frame (inline
+/// schema sections — decodable without a template registry), for the
+/// never-panic decoder fuzzers.
 pub fn tile_payload_v2(ids: Vec<u64>) -> Vec<u8> {
     let n = ids.len();
     let cfg = stt_core::arrow_tile::EncoderConfig {
-        format_version: stt_core::arrow_tile::FORMAT_VERSION,
+        format_version: stt_core::arrow_tile::LAYER_FRAME_VERSION,
         ..stt_core::arrow_tile::EncoderConfig::default()
     };
     stt_core::arrow_tile::encode_tile_with(std::slice::from_ref(&fuzz_layer(ids, n)), &cfg).unwrap()
@@ -158,6 +160,7 @@ pub fn tile_payload_v2(ids: Vec<u64>) -> Vec<u8> {
 
 fn fuzz_layer(ids: Vec<u64>, n: usize) -> ColumnarLayer {
     ColumnarLayer {
+        polygon_parts: None,
         name: "default".to_string(),
         feature_ids: ids,
         start_times: vec![0; n],

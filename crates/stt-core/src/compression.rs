@@ -1,6 +1,34 @@
-//! Compression utilities for tiles. The format is **zstd-only** — there is no
-//! gzip path (it was never shipped; zstd beats it on both ratio and browser
-//! decode). `Compression::None` exists only for already-incompressible blobs.
+//! Compression for tile payloads. The format is **zstd-only**: every blob is
+//! compressed independently (no shared dictionary) so any one decodes in
+//! isolation, and [`Compression::None`] covers already-incompressible blobs.
+//! zstd beats DEFLATE on both ratio and browser-side decode, so nothing else
+//! is offered.
+//!
+//! A packed archive names its codec as a **string** in `manifest.json` —
+//! `"zstd"` or `"none"`, enumerated in `docs/spec/manifest.schema.json`. No
+//! live STT format encodes the codec as a byte.
+//!
+//! # gzip
+//!
+//! The canonical account. [`crate::types::Compression`], `stt-build
+//! --compression`, and `@poopdeck.gl/core` defer here; three claims that are
+//! easy to conflate are kept apart:
+//!
+//! - **It was a real codec, not merely an accepted flag value.** The
+//!   single-file `.stt` archive that preceded the packed format defaulted to
+//!   gzip and wrote true DEFLATE frames, tagged `1` in that header's
+//!   compression byte.
+//! - **No release and no packed archive ever carried it.** The single-file
+//!   format is gone, its codec with it, and no packed writer has ever put
+//!   anything but `"zstd"` in a manifest. This crate has no DEFLATE
+//!   implementation — the gzip elsewhere in the workspace decompresses gzipped
+//!   *input* files (Parquet, CSV), never tile bytes.
+//! - **It cannot reappear silently.** `--compression gzip` is a hard error, and
+//!   a manifest claiming `"gzip"` is refused at open rather than assumed to be
+//!   zstd, which would fail late and opaquely inside the decoder.
+//!
+//! The codec number `1` stays unassigned: reusing it would let a byte salvaged
+//! from a single-file archive decode as a live codec.
 
 use crate::error::{Error, Result};
 use crate::types::Compression;
@@ -21,12 +49,11 @@ pub fn decompress(data: &[u8], compression: Compression) -> Result<Vec<u8>> {
     }
 }
 
-/// Default zstd level. Level 3 is zstd's documented "fast" sweet spot —
-/// roughly gzip-6 ratio at ~5x the encode speed; higher levels save a few
-/// percent at significant CPU cost.
-/// Default zstd level for the packed format — see the constant doc above.
-/// `compress_zstd_with_dict` and the writers use this unless an explicit level
-/// is threaded through (e.g. `stt-build --zstd-level`).
+/// Default zstd level for the packed format. Level 3 is zstd's documented
+/// "fast" sweet spot — roughly DEFLATE-6 ratio at ~5x the encode speed; higher
+/// levels save a few percent at significant CPU cost. `compress_zstd_with_dict`
+/// and the writers use this unless an explicit level is threaded through (e.g.
+/// `stt-build --zstd-level`).
 pub const ZSTD_LEVEL: i32 = 3;
 
 /// Highest level we expose. zstd defines 1..=22; level 19 is the practical

@@ -627,8 +627,9 @@ mod tests {
     fn test_metadata_summary_tier_quadbin_and_sub_buckets_roundtrip() {
         // The CARTO `quadbin` scheme and a non-default `sub_buckets` count must
         // survive the manifest JSON round-trip, and the scheme must serialize
-        // with its documented lowercase spelling. (Moved here from
-        // tests/spec_conformance.rs, whose remit is the per-layer Arrow schema.)
+        // with its documented lowercase spelling. Manifest-level, so it belongs
+        // here and not in tests/spec_conformance.rs, whose remit is the
+        // per-layer Arrow schema.
         let tier = SummaryTier {
             scheme: SummaryScheme::Quadbin,
             min_zoom: 0,
@@ -716,9 +717,9 @@ mod tests {
 
     #[test]
     fn test_metadata_ignores_unknown_fields() {
-        // Forward compat: metadata written by a newer builder (or carrying
-        // since-removed fields like the old `raster_tier` scaffold) must
-        // still decode — serde skips unknown keys by default.
+        // Forward compat: metadata carrying a key this build does not know
+        // (`raster_tier` here) must still decode — serde skips unknown keys by
+        // default.
         let metadata = Metadata::new("fwd");
         let mut v: serde_json::Value =
             serde_json::from_slice(&metadata.to_json_bytes().unwrap()).unwrap();

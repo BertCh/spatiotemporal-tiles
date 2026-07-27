@@ -17,19 +17,42 @@
 //! | `start_time`          | `Int64`                                     | yes |
 //! | `end_time`            | `Int64`                                     | yes |
 //! | `geometry`            | List/FixedSizeList w/ `geoarrow.*` ext name | yes |
-//! | `vertex_time`         | `List<UInt16>` (delta) or `List<Int64>`     | opt |
+//! | `vertex_time`         | `List<UInt16 \| UInt32>` (delta) or `List<Int64>` | opt |
 //! | `vertex_value`        | `List<Float32>`                             | opt |
 //! | `vertex_value_matrix` | `List<Float32>`                             | opt |
 //! | `triangles`           | `List<UInt16>` or `List<UInt32>`            | opt |
+//! | `part_offsets`        | `List<UInt32>`                              | opt |
 //! | `<property>`          | `Float64` or `Dictionary<UInt16,Utf8>`      | opt |
+//!
+//! `vertex_time` sizes itself per tile off a narrowest-first delta ladder
+//! (`UInt16` then `UInt32`, both at the finest step that fits) before falling
+//! back to absolute `Int64` — see `stt_core::arrow_tile::columns`. BOTH delta
+//! widths are the same logical encoding and both carry the origin/step
+//! metadata; only the `Int64` fallback is absolute.
+//!
+//! `part_offsets` is the polygon multi-part boundary column: one non-null
+//! `List<UInt32>` per feature holding ring indices relative to that feature's
+//! own first ring. It is emitted only when some feature in the tile has more
+//! than one part, so its presence legitimately varies tile to tile.
+//!
+//! Every `opt` row above behaves that way — the encoder emits each optional
+//! reserved column only when THAT tile's features carry the data (`triangles`
+//! only when some feature needs hole-aware tessellation, `vertex_time` /
+//! `vertex_value` / `vertex_value_matrix` only when the layer's features carry
+//! per-vertex arrays, `part_offsets` only when some feature is multi-part).
+//! One layer of one dataset therefore ships tiles that differ in WHICH
+//! optional columns they carry, by design. [`OPTIONAL_RESERVED_COLUMNS`] is
+//! the single list of those names (and their legal inner types), and
+//! [`classify_column_drift`] reads it so cross-tile drift detection does not
+//! mistake that adaptivity for producer drift.
 //!
 //! Beyond column shapes, the self-description metadata every reader depends on
 //! is enforced too: an `Int32`-leaf (quantized) geometry must carry a parseable
 //! `stt:quant` affine (and a `Float64`-leaf one must NOT), unquantized geometry
-//! the CRS84 `ARROW:extension:metadata`, a `List<UInt16>` (delta) `vertex_time`
-//! its `stt:vertex_time_origin_ms`/`step_ms` keys (which a `List<Int64>` one
-//! must NOT carry), and `stt:vertex_value_buckets` must be a positive integer
-//! consistent with the matrix column's row widths.
+//! the CRS84 `ARROW:extension:metadata`, a delta (`List<UInt16 | UInt32>`)
+//! `vertex_time` its `stt:vertex_time_origin_ms`/`step_ms` keys (which a
+//! `List<Int64>` one must NOT carry), and `stt:vertex_value_buckets` must be a
+//! positive integer consistent with the matrix column's row widths.
 //!
 //! Findings are split by severity ([`SchemaFindings`]): everything is an
 //! error except a *missing* CRS84 metadata on unquantized geometry, which is
@@ -82,6 +105,34 @@ const REQUIRED_SCALARS: &[(&str, DataType)] = &[
 
 /// The geometry column name `encode_layer` always uses.
 const GEOMETRY_COLUMN: &str = "geometry";
+
+/// The OPTIONAL reserved (non-property) columns and the inner types each may
+/// carry when present. **The single source of truth for that set** — three
+/// checks read it and must not disagree: the per-column type check
+/// ([`check_optional_list`]), the reserved-vs-property split
+/// ([`is_reserved_column`]), and cross-tile drift classification
+/// ([`classify_column_drift`], which treats their present-vs-absent variation
+/// as expected adaptivity rather than drift).
+///
+/// Per-column notes on the allowed widths:
+///
+/// - `vertex_time` — two delta widths (the narrowest-first ladder) plus the
+///   absolute fallback. `UInt32` is what lets a track dataset whose span needs
+///   a finer step than `UInt16` can express (~18.2 h at step 1 ms) validate at
+///   all.
+/// - `triangles` — feature-local indices, so `UInt16` unless a feature exceeds
+///   65,535 vertices.
+/// - `part_offsets` — ring indices relative to the feature's own first ring.
+const OPTIONAL_RESERVED_COLUMNS: &[(&str, &[DataType])] = &[
+    (
+        "vertex_time",
+        &[DataType::UInt16, DataType::UInt32, DataType::Int64],
+    ),
+    ("vertex_value", &[DataType::Float32]),
+    ("vertex_value_matrix", &[DataType::Float32]),
+    ("triangles", &[DataType::UInt16, DataType::UInt32]),
+    ("part_offsets", &[DataType::UInt32]),
+];
 
 /// Schema findings split by severity. `errors` fail validation; `warnings`
 /// flag tolerated legacy gaps (today only the missing-CRS84 case — see the
@@ -148,30 +199,12 @@ fn check_layer_schema(layer: &DecodedLayer, findings: &mut SchemaFindings) {
 
     let issues = &mut findings.errors;
 
-    // (c) optional per-vertex columns, when present, must carry the expected
-    // List<inner> types.
-    check_optional_list(
-        name,
-        &schema,
-        "vertex_time",
-        &[DataType::UInt16, DataType::Int64],
-        issues,
-    );
-    check_optional_list(name, &schema, "vertex_value", &[DataType::Float32], issues);
-    check_optional_list(
-        name,
-        &schema,
-        "vertex_value_matrix",
-        &[DataType::Float32],
-        issues,
-    );
-    check_optional_list(
-        name,
-        &schema,
-        "triangles",
-        &[DataType::UInt16, DataType::UInt32],
-        issues,
-    );
+    // (c) optional per-vertex / per-part columns, when present, must carry the
+    // expected List<inner> types. Absence is always legal — see
+    // OPTIONAL_RESERVED_COLUMNS.
+    for (col, allowed) in OPTIONAL_RESERVED_COLUMNS {
+        check_optional_list(name, &schema, col, allowed, issues);
+    }
 
     // (c') encodings that are only decodable through schema-level metadata:
     // the u16-delta vertex_time origin/step and the value-matrix bucket count.
@@ -283,31 +316,32 @@ fn crs_is_crs84(json: &str) -> bool {
         .is_some_and(|crs| crs == CRS84)
 }
 
-/// The u16-delta `vertex_time` shape is only decodable with its per-layer
+/// A delta-encoded `vertex_time` shape is only decodable with its per-layer
 /// `(origin, step)` schema metadata — the TS reader would otherwise silently
 /// reconstruct with `origin=0, step=1` (wrong timestamps, no error on either
-/// side). Whenever the column is `List<UInt16>`, both keys must be present
-/// with sane values (an integer Unix-ms origin and a positive integer step);
-/// an absolute `List<Int64>` column must NOT carry either key (a reader
-/// keying the encoding off the metadata would misdecode).
+/// side). Whenever the column is `List<UInt16>` **or** `List<UInt32>` (the two
+/// rungs of the delta ladder — same encoding, different width), both keys must
+/// be present with sane values (an integer Unix-ms origin and a positive
+/// integer step); an absolute `List<Int64>` column must NOT carry either key (a
+/// reader keying the encoding off the metadata would misdecode).
 fn check_vertex_time_metadata(layer: &DecodedLayer, issues: &mut Vec<String>) {
     let schema = layer.batch.schema();
     let name = &layer.name;
     let Ok(field) = schema.field_with_name("vertex_time") else {
         return;
     };
-    let is_u16_delta = match field.data_type() {
+    let is_delta = match field.data_type() {
         DataType::List(inner) | DataType::LargeList(inner) => {
-            inner.data_type() == &DataType::UInt16
+            matches!(inner.data_type(), DataType::UInt16 | DataType::UInt32)
         }
         _ => false,
     };
-    if !is_u16_delta {
+    if !is_delta {
         for key in [VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY] {
             if schema.metadata().contains_key(key) {
                 issues.push(format!(
                     "layer '{name}': absolute (List<Int64>) vertex_time must not carry \
-                     '{key}' (the key describes the u16-delta encoding)"
+                     '{key}' (the key describes the delta encoding)"
                 ));
             }
         }
@@ -320,7 +354,7 @@ fn check_vertex_time_metadata(layer: &DecodedLayer, issues: &mut Vec<String>) {
             "layer '{name}': '{VERTEX_TIME_ORIGIN_KEY}' is not an integer Unix-ms origin: {v:?}"
         )),
         None => issues.push(format!(
-            "layer '{name}': u16-delta vertex_time is missing '{VERTEX_TIME_ORIGIN_KEY}'"
+            "layer '{name}': delta vertex_time is missing '{VERTEX_TIME_ORIGIN_KEY}'"
         )),
     }
     match meta.get(VERTEX_TIME_STEP_KEY) {
@@ -329,7 +363,7 @@ fn check_vertex_time_metadata(layer: &DecodedLayer, issues: &mut Vec<String>) {
             "layer '{name}': '{VERTEX_TIME_STEP_KEY}' must be a positive integer ms step, got {v:?}"
         )),
         None => issues.push(format!(
-            "layer '{name}': u16-delta vertex_time is missing '{VERTEX_TIME_STEP_KEY}'"
+            "layer '{name}': delta vertex_time is missing '{VERTEX_TIME_STEP_KEY}'"
         )),
     }
 }
@@ -403,18 +437,33 @@ fn check_vertex_value_buckets(layer: &DecodedLayer, issues: &mut Vec<String>) {
     }
 }
 
-/// A reserved (non-property) column name the producer manages itself.
+/// A reserved (non-property) column name the producer manages itself: the
+/// always-present scalars, geometry, or one of the optional reserved columns.
+/// Derived from [`REQUIRED_SCALARS`] / [`GEOMETRY_COLUMN`] /
+/// [`OPTIONAL_RESERVED_COLUMNS`] rather than re-listing the names, so a column
+/// added to the contract cannot be reserved in one check and a "property" in
+/// another (exactly how `part_offsets` reached the drift classifier as a
+/// property).
 fn is_reserved_column(name: &str) -> bool {
-    matches!(
-        name,
-        "id" | "start_time"
-            | "end_time"
-            | "geometry"
-            | "vertex_time"
-            | "vertex_value"
-            | "vertex_value_matrix"
-            | "triangles"
-    )
+    name == GEOMETRY_COLUMN
+        || REQUIRED_SCALARS.iter().any(|(c, _)| *c == name)
+        || is_optional_reserved_column(name)
+}
+
+/// True for a reserved column whose PRESENCE is per-tile adaptive (the `opt`
+/// rows of the module-doc table).
+fn is_optional_reserved_column(name: &str) -> bool {
+    allowed_inner_types(name).is_some()
+}
+
+/// The inner types an optional reserved column may carry, or `None` if `name`
+/// is not one. More than one entry means the column also picks its WIDTH per
+/// tile — see [`classify_column_drift`].
+fn allowed_inner_types(name: &str) -> Option<&'static [DataType]> {
+    OPTIONAL_RESERVED_COLUMNS
+        .iter()
+        .find(|(c, _)| *c == name)
+        .map(|(_, types)| *types)
 }
 
 /// True for the list shapes geometry uses (`List` or `FixedSizeList`).
@@ -544,30 +593,66 @@ pub fn layer_schema_columns(layers: &[DecodedLayer]) -> Vec<(String, Vec<(String
 /// How one column's type differs between two tiles of the same layer.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ColumnDrift {
-    /// Same logical encoding, different integer WIDTH — expected, by design.
+    /// Expected per-tile adaptivity, not a defect. Two kinds:
     ///
-    /// Two encodings size themselves from the values in each tile: the
-    /// per-vertex time column ships as `List<UInt16>` deltas when the tile's
-    /// span fits, else absolute `List<Int64>`; a quantized attribute ships as
-    /// the narrowest of `UInt16`/`Int32`. Both are per-tile by construction —
-    /// that adaptivity IS the size win — and every reader handles both, so a
-    /// width difference is not a defect.
+    /// * **Different integer WIDTH, same logical encoding.** Two encodings size
+    ///   themselves from the values in each tile: the per-vertex time column
+    ///   ships as `List<UInt16>` deltas when the tile's span fits, else
+    ///   absolute `List<Int64>`; a quantized attribute ships as the narrowest
+    ///   of `UInt16`/`Int32`. That adaptivity IS the size win, and every reader
+    ///   handles both.
+    /// * **An OPTIONAL RESERVED column present in one tile, absent from the
+    ///   other** ([`OPTIONAL_RESERVED_COLUMNS`]). The encoder emits each only
+    ///   when that tile's features need it, and the contract for an absent one
+    ///   is defined ("no feature is multi-part", "no baked tessellation", "no
+    ///   per-vertex times"), so a reader is never handed a different meaning —
+    ///   it is handed the documented default.
     AdaptiveWidth,
-    /// A structural disagreement: the column is present in one tile and absent
-    /// from the other, or its type CLASS changed (dictionary vs numeric). A
-    /// consumer reading that column gets a different thing per tile.
+    /// A structural disagreement: a PROPERTY column present in one tile and
+    /// absent from the other, or any column whose type CLASS changed
+    /// (dictionary vs numeric). A consumer reading that column gets a different
+    /// thing per tile — the original purpose of the drift check.
     Structural,
 }
 
 /// Classify the difference between one column's type in two tiles.
+///
+/// Present-vs-absent splits on WHICH column it is: an optional reserved column
+/// (encoder-managed, documented absent-semantics) is expected adaptivity, while
+/// a property column vanishing between tiles of one layer really does mean a
+/// consumer gets a different thing per tile, and stays [`Structural`].
+///
+/// [`Structural`]: ColumnDrift::Structural
+///
+/// **Why presence folds into `AdaptiveWidth` instead of a third
+/// `OptionalPresence` verdict.** A third variant would let the report say
+/// "optional columns vary" separately from "encoding width varies", which reads
+/// better — but it buys no behaviour: this enum's only consumer branches
+/// `Structural` → error/exit code, everything else → an informational warning
+/// tally that already prints the offending column and both of its shapes
+/// verbatim (`part_offsets: <absent> vs List<UInt32>`), so a reader can still
+/// see exactly which optional column varied and where. Keeping the enum
+/// two-valued keeps that contract ("Structural is the only failing verdict")
+/// legible at every call site. If the two notes are ever worth separate
+/// wording, add `OptionalPresence` here plus a matching arm and tally headline
+/// in `main.rs`'s drift loop — nothing else consumes it.
 pub fn classify_column_drift(column: &str, a: Option<&str>, b: Option<&str>) -> ColumnDrift {
-    let (Some(a), Some(b)) = (a, b) else {
-        return ColumnDrift::Structural;
+    let (a, b) = match (a, b) {
+        (Some(a), Some(b)) => (a, b),
+        // Neither tile has it: not a difference at all.
+        (None, None) => return ColumnDrift::AdaptiveWidth,
+        // Present in one tile, absent from the other.
+        _ if is_optional_reserved_column(column) => return ColumnDrift::AdaptiveWidth,
+        _ => return ColumnDrift::Structural,
     };
     if a == b {
         return ColumnDrift::AdaptiveWidth; // not a difference at all
     }
-    let int_widths = ["UInt16", "Int32", "Int64"];
+    // Longest-first, and the `U`-prefixed names BEFORE their unsigned-less
+    // substrings: "UInt32" contains "Int32", so replacing "Int32" first would
+    // turn "UInt32" into "UINT" while "UInt16" became "INT" — two different
+    // strings for the same logical encoding, i.e. a spurious Structural verdict.
+    let int_widths = ["UInt16", "UInt32", "Int32", "Int64"];
     let strip_widths = |t: &str| {
         let mut out = t.to_string();
         for w in int_widths {
@@ -575,8 +660,18 @@ pub fn classify_column_drift(column: &str, a: Option<&str>, b: Option<&str>) -> 
         }
         out
     };
-    // vertex_time: u16-delta vs absolute i64. Quantized attrs: UInt16 vs Int32.
-    let adaptive_column = column == "vertex_time"
+    // Which columns legitimately change integer WIDTH from tile to tile:
+    //
+    // * any optional reserved column the contract gives more than one legal
+    //   inner type — `vertex_time`'s u16/u32-delta-then-absolute-i64 ladder,
+    //   and `triangles`, whose index width is picked per tile from that tile's
+    //   largest feature-local index (`<= u16::MAX` → UInt16, else UInt32).
+    //   Read from OPTIONAL_RESERVED_COLUMNS rather than named here: hardcoding
+    //   `vertex_time` is what left `triangles`' own per-tile width choice
+    //   classified as Structural;
+    // * a quantized property attribute, which ships as the narrower of
+    //   UInt16/Int32 — its type string IS the leaf, so it starts with a width.
+    let adaptive_column = allowed_inner_types(column).is_some_and(|types| types.len() > 1)
         || (int_widths.iter().any(|w| a.starts_with(w))
             && int_widths.iter().any(|w| b.starts_with(w)));
     if adaptive_column && strip_widths(a) == strip_widths(b) {
@@ -601,6 +696,7 @@ mod tests {
     /// real producer schema.
     fn good_point_layer() -> ColumnarLayer {
         ColumnarLayer {
+            polygon_parts: None,
             name: "default".into(),
             feature_ids: vec![1, 2, 3],
             start_times: vec![10, 20, 30],
@@ -646,6 +742,7 @@ mod tests {
         // A line layer carrying u16-delta vertex_time and Float32 vertex_value —
         // both optional List columns the contract accepts.
         let layer = ColumnarLayer {
+            polygon_parts: None,
             name: "tracks".into(),
             feature_ids: vec![1],
             start_times: vec![0],
@@ -942,6 +1039,7 @@ mod tests {
         // A tight-span line layer encodes vertex_time as u16 deltas; stripping
         // the schema metadata must flag BOTH missing keys.
         let layer = ColumnarLayer {
+            polygon_parts: None,
             name: "tracks".into(),
             feature_ids: vec![1],
             start_times: vec![0],
@@ -995,10 +1093,14 @@ mod tests {
 
     #[test]
     fn absolute_vertex_time_must_not_carry_delta_keys() {
-        // A span far beyond the u16-delta step ceiling forces the absolute
+        // A span far beyond EVERY delta tier's step ceiling forces the absolute
         // List<Int64> encoding, which legitimately carries no origin/step.
-        let span_ms: i64 = 100_000_000_000;
+        // The widest tier is u32 at a 1000 ms ceiling, so the span has to
+        // exceed 1000 * u32::MAX ≈ 4.295e12 ms before the ladder gives up;
+        // 5e12 ms (~158 years) needs a 1165 ms step and so lands on Int64.
+        let span_ms: i64 = 5_000_000_000_000;
         let layer = ColumnarLayer {
+            polygon_parts: None,
             name: "tracks".into(),
             feature_ids: vec![1],
             start_times: vec![0],
@@ -1040,9 +1142,218 @@ mod tests {
     }
 
     #[test]
+    fn u32_delta_vertex_time_is_accepted_and_still_needs_origin_and_step() {
+        // The middle rung of the ladder: a span past u16's ~18.2 h reach at
+        // step 1 ms but well inside u32's. Any multi-day track dataset lands
+        // here, so the validator MUST accept List<UInt32> and MUST still
+        // demand the origin/step metadata that makes it decodable.
+        let span_ms: i64 = 3 * 24 * 60 * 60 * 1000; // 3 days
+        let layer = ColumnarLayer {
+            polygon_parts: None,
+            name: "tracks".into(),
+            feature_ids: vec![1],
+            start_times: vec![0],
+            end_times: vec![span_ms],
+            geometry: GeometryColumn::LineString(vec![vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]]),
+            vertex_times: Some(vec![vec![0, span_ms / 2, span_ms]]),
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![],
+        };
+        let decoded = decode(&[layer]);
+        let vt = decoded[0]
+            .batch
+            .schema()
+            .field_with_name("vertex_time")
+            .unwrap()
+            .data_type()
+            .clone();
+        assert!(
+            matches!(&vt, DataType::List(inner) if inner.data_type() == &DataType::UInt32),
+            "expected the u32 delta tier, got {vt:?}"
+        );
+        let issues = all_findings(&decoded);
+        assert!(issues.is_empty(), "unexpected schema issues: {issues:?}");
+
+        // Stripping the metadata must still be reported — the u32 rung is a
+        // delta encoding, not the absolute fallback.
+        let stripped = with_schema_metadata(&decoded[0], HashMap::new());
+        let issues = check_tile_schema(&[stripped]).errors;
+        for key in [VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY] {
+            assert!(
+                issues
+                    .iter()
+                    .any(|i| i.contains(key) && i.contains("missing")),
+                "no 'missing' issue for {key}; issues were: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vertex_time_width_drift_across_tiles_is_adaptive_not_structural() {
+        // A dataset whose tiles straddle the u16→u32 threshold ships both
+        // widths. That is the ladder working as designed, not producer drift.
+        for (a, b) in [
+            (
+                "List(Field { data_type: UInt16 })",
+                "List(Field { data_type: UInt32 })",
+            ),
+            (
+                "List(Field { data_type: UInt32 })",
+                "List(Field { data_type: Int64 })",
+            ),
+        ] {
+            assert_eq!(
+                classify_column_drift("vertex_time", Some(a), Some(b)),
+                ColumnDrift::AdaptiveWidth,
+                "{a} vs {b} should be an adaptive width difference"
+            );
+        }
+    }
+
+    #[test]
+    fn triangle_index_width_drift_across_tiles_is_adaptive_not_structural() {
+        // `triangles` picks UInt16 vs UInt32 from each tile's largest
+        // feature-local index, exactly like vertex_time picks its delta width —
+        // so a polygon layer with one dense tile ships both, and neither is
+        // drift. Only vertex_time was named in the width rule, so this pair
+        // read as Structural.
+        assert_eq!(
+            classify_column_drift(
+                "triangles",
+                Some("List(Field { data_type: UInt16 })"),
+                Some("List(Field { data_type: UInt32 })"),
+            ),
+            ColumnDrift::AdaptiveWidth
+        );
+        // The relaxation is width-only: a different type CLASS is still drift.
+        assert_eq!(
+            classify_column_drift(
+                "triangles",
+                Some("List(Field { data_type: UInt16 })"),
+                Some("List(Field { data_type: Float32 })"),
+            ),
+            ColumnDrift::Structural
+        );
+        // A single-type optional column has no width to adapt: Float32 vs
+        // anything else is real drift.
+        assert_eq!(
+            classify_column_drift(
+                "vertex_value",
+                Some("List(Field { data_type: Float32 })"),
+                Some("List(Field { data_type: UInt16 })"),
+            ),
+            ColumnDrift::Structural
+        );
+    }
+
+    #[test]
+    fn optional_reserved_column_presence_drift_is_adaptive_not_structural() {
+        // Every optional reserved column is emitted per TILE, only when that
+        // tile's features need it (`part_offsets` only for a multi-part
+        // feature, `triangles` only when some feature needs hole-aware
+        // tessellation, the vertex columns only when per-vertex arrays exist).
+        // A layer whose tiles differ in which ones they carry is the encoder
+        // working as documented, not producer drift — reporting it Structural
+        // hard-failed every mixed polygon dataset.
+        for (col, ty) in [
+            ("part_offsets", "List(Field { data_type: UInt32 })"),
+            ("triangles", "List(Field { data_type: UInt16 })"),
+            ("vertex_time", "List(Field { data_type: UInt16 })"),
+            ("vertex_value", "List(Field { data_type: Float32 })"),
+            ("vertex_value_matrix", "List(Field { data_type: Float32 })"),
+        ] {
+            assert!(is_optional_reserved_column(col), "{col} must be optional");
+            for (a, b) in [(None, Some(ty)), (Some(ty), None)] {
+                assert_eq!(
+                    classify_column_drift(col, a, b),
+                    ColumnDrift::AdaptiveWidth,
+                    "{col}: {a:?} vs {b:?} should be expected adaptivity"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn property_column_presence_and_type_class_drift_stay_structural() {
+        // The check's original purpose: a PROPERTY column that appears in one
+        // tile and not the other, or flips encoding class, hands a consumer a
+        // different thing per tile.
+        for (a, b) in [
+            (None, Some("Float64")),
+            (Some("Float64"), None),
+            (Some("Dictionary(UInt16, Utf8)"), Some("Float64")),
+        ] {
+            assert_eq!(
+                classify_column_drift("speed", a, b),
+                ColumnDrift::Structural,
+                "property 'speed': {a:?} vs {b:?} should be structural drift"
+            );
+        }
+        // Geometry is reserved but NOT optional — it can never go missing.
+        assert!(is_reserved_column(GEOMETRY_COLUMN));
+        assert!(!is_optional_reserved_column(GEOMETRY_COLUMN));
+        assert_eq!(
+            classify_column_drift(
+                GEOMETRY_COLUMN,
+                None,
+                Some("List(Field { data_type: Float64 })")
+            ),
+            ColumnDrift::Structural
+        );
+    }
+
+    #[test]
+    fn multi_part_polygon_part_offsets_column_is_reserved_and_typed() {
+        // `part_offsets` is a reserved CORE column, not a property: it must
+        // pass the List<UInt32> check and must NOT be reported as an
+        // unencodable property column.
+        let outer = |dx: f64| {
+            vec![
+                [dx, 0.0],
+                [dx + 1.0, 0.0],
+                [dx + 1.0, 1.0],
+                [dx, 1.0],
+                [dx, 0.0],
+            ]
+        };
+        let layer = ColumnarLayer {
+            // Two disjoint squares in one feature → parts start at rings 0 and 1.
+            polygon_parts: Some(vec![vec![0, 1]]),
+            name: "areas".into(),
+            feature_ids: vec![1],
+            start_times: vec![0],
+            end_times: vec![100],
+            geometry: GeometryColumn::Polygon(vec![vec![outer(0.0), outer(10.0)]]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![],
+        };
+        let decoded = decode(&[layer]);
+        let parts = decoded[0]
+            .batch
+            .schema()
+            .field_with_name("part_offsets")
+            .expect("multi-part polygon layer carries part_offsets")
+            .data_type()
+            .clone();
+        assert!(
+            matches!(&parts, DataType::List(inner) if inner.data_type() == &DataType::UInt32),
+            "expected List<UInt32> part offsets, got {parts:?}"
+        );
+        assert!(is_reserved_column("part_offsets"));
+        let issues = all_findings(&decoded);
+        assert!(issues.is_empty(), "unexpected schema issues: {issues:?}");
+    }
+
+    #[test]
     fn vertex_value_buckets_must_be_positive_and_match_matrix_width() {
         // 3-vertex + 2-vertex lines, 2 buckets each → rows of 6 and 4 values.
         let layer = ColumnarLayer {
+            polygon_parts: None,
             name: "corridors".into(),
             feature_ids: vec![1, 2],
             start_times: vec![0, 0],
@@ -1153,6 +1464,7 @@ mod tests {
 
         // A polygon layer has a different geometry shape + extension name.
         let poly = ColumnarLayer {
+            polygon_parts: None,
             name: "default".into(),
             feature_ids: vec![1],
             start_times: vec![0],

@@ -54,6 +54,45 @@ fn encoder_config(format_version: u32) -> EncoderConfig {
     }
 }
 
+/// The `manifest.capabilities` entries an [`EncoderConfig`] IMPLIES —
+/// required-to-understand declarations (packed spec §3.1), derived from the
+/// one config this fixture actually encodes with so the archive can never USE
+/// a re-typing it fails to DECLARE. Without this the fixture would ship
+/// `TILE_META.st`/`.et` (compact times are on by default) under a manifest
+/// with no `capabilities` key, i.e. a NON-CONFORMANT archive pinned as the
+/// cross-implementation golden — exactly the silent-misdecode the key exists
+/// to prevent.
+///
+/// Mirrors `stt-build`'s `EncoderSettings::required_capabilities()` field for
+/// field; `stt-core` cannot depend on `stt-build` (the dependency runs the
+/// other way), so the derivation is repeated here but is still driven by the
+/// SAME `EncoderConfig` value the encoder receives, not by a hand-kept
+/// parallel list. Additive features (vector groups, vertex-time precision)
+/// are deliberately not capabilities.
+fn required_capabilities(cfg: &EncoderConfig) -> Vec<String> {
+    use stt_core::pack::{
+        CAPABILITY_ATTR_QUANT, CAPABILITY_COORD_QUANT, CAPABILITY_ELEVATION_FOLD,
+        CAPABILITY_TIME_DELTA, CAPABILITY_VERTEX_VALUE_QUANT,
+    };
+    let mut caps: Vec<String> = Vec::new();
+    if cfg.quantize_coords_m.is_some() {
+        caps.push(CAPABILITY_COORD_QUANT.to_string());
+    }
+    if !cfg.quantize_attrs.is_empty() || cfg.quantize_attrs_auto {
+        caps.push(CAPABILITY_ATTR_QUANT.to_string());
+    }
+    if !cfg.point_elevation_column.is_empty() {
+        caps.push(CAPABILITY_ELEVATION_FOLD.to_string());
+    }
+    if cfg.compact_times {
+        caps.push(CAPABILITY_TIME_DELTA.to_string());
+    }
+    if cfg.quantize_vertex_values {
+        caps.push(CAPABILITY_VERTEX_VALUE_QUANT.to_string());
+    }
+    caps
+}
+
 /// Build the deterministic payload for tile index `k`. `id_seed` lets the
 /// deduped tiles (k=4, k=9) reuse k=0's identity bytes.
 fn payload_for(id_seed: u64, cfg: &EncoderConfig) -> Vec<u8> {
@@ -61,6 +100,7 @@ fn payload_for(id_seed: u64, cfg: &EncoderConfig) -> Vec<u8> {
     let n = ids.len();
     encode_tile_with(
         &[ColumnarLayer {
+            polygon_parts: None,
             name: "default".to_string(),
             feature_ids: ids,
             start_times: vec![1000 * id_seed as i64; n],
@@ -128,7 +168,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SpatialMajor keeps the order deterministic + independent of the Auto
     // heuristic, so the content hashes are stable across builds.
     let mut w = PackWriter::create(&out_dir, BlobOrdering::SpatialMajor, 4 * 1024)?
-        .with_format_version(format_version);
+        .with_format_version(format_version)
+        // Declared from `cfg`, the very config the payloads below are encoded
+        // with — a fixture that used a re-typing without declaring it would
+        // pin a spec violation as the reference bytes.
+        .with_capabilities(required_capabilities(&cfg));
 
     // `encode_tile` is NOT byte-deterministic across separate calls (Arrow IPC
     // framing), so build each distinct payload exactly ONCE and CLONE it for the
@@ -212,6 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // only the directory container differs.
         let mut gw = PackWriter::create(&dir, BlobOrdering::SpatialMajor, 8 * 1024)?
             .with_format_version(format_version)
+            .with_capabilities(required_capabilities(&cfg))
             .with_paging(paging);
         for (id, ts, te, payload) in &grid {
             gw.add_tile_full(id, *ts, *te, Some(*ts), 3, Some(3_600_000), payload)?;

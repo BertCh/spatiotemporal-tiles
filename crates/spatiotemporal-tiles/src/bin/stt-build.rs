@@ -127,8 +127,7 @@ struct Args {
     /// temp file inside the output directory (removed on success and failure
     /// alike) and are read back during finalize — per-tile directory metadata
     /// stays in RAM. Purely a memory-behaviour lever: output bytes are
-    /// IDENTICAL at any budget. `0` = unlimited (hold every payload in RAM,
-    /// the legacy behaviour).
+    /// IDENTICAL at any budget. `0` = unlimited (hold every payload in RAM).
     #[arg(long, default_value = "512", value_name = "MIB")]
     pack_memory_budget: u64,
 
@@ -475,6 +474,34 @@ struct Args {
     /// quantized to the same ground precision). Default: none (plain 2D points).
     #[arg(long = "point-elevation-column", value_name = "NAME")]
     point_elevation_column: Option<String>,
+
+    /// Kill switch for the compact feature-time columns (ON by default, the
+    /// `time-delta` capability). Enabled, each tile layer stores `start_time`
+    /// as a `UInt32` millisecond offset from the layer's own minimum
+    /// (`TILE_META.t0`) and `end_time` as a `UInt32` duration — or omits
+    /// `end_time` entirely when every feature is instantaneous, which is 100%
+    /// of features on most event datasets. Measured: the two columns are 33%
+    /// of `nyc-taxi-points` and 17% of `earthquakes-v2` per-column cost. Both
+    /// reference readers re-inflate absolute `Int64` columns, so nothing
+    /// downstream can tell. Pass this to emit the historical absolute `Int64`
+    /// pair instead (and suppress the capability) for byte-compat with a
+    /// reader that predates it.
+    #[arg(long = "no-compact-times", default_value_t = false)]
+    no_compact_times: bool,
+
+    /// Store the per-vertex value columns (`vertex_value`,
+    /// `vertex_value_matrix`) as `UInt16` indices under a per-column
+    /// range-adaptive affine instead of raw `Float32` — half the bytes, and
+    /// the `vertex-value-quant` capability. Those two are the only
+    /// `List<Float32>` columns the format carries and they had NO size lever
+    /// at all (`--quantize-attr` / `--quantize-attrs-auto` cover per-feature
+    /// scalar properties only), while measuring 64.2% of `nyc-taxi-flows` and
+    /// 93.7% of `bixi-corridors` tile bytes. The `NaN` "no value at this
+    /// vertex" marker survives via a reserved index. Off by default because
+    /// it is genuinely lossy (16 bits across the column's own range) on data
+    /// a map colours by — unlike the exact `--quantize-coords`-free defaults.
+    #[arg(long = "quantize-vertex-values", default_value_t = false)]
+    quantize_vertex_values: bool,
 
     /// Escape hatch: do NOT declare required-to-understand features in
     /// `manifest.capabilities` (restores the pre-capabilities manifest bytes
@@ -948,6 +975,8 @@ fn main() -> Result<()> {
         quantize_attrs_auto: args.quantize_attrs_auto,
         vector_group: args.vector_group.clone(),
         point_elevation_column: args.point_elevation_column.clone(),
+        no_compact_times: args.no_compact_times,
+        quantize_vertex_values: args.quantize_vertex_values,
     };
     let encoder_config = encoder_settings.resolve()?;
     let enabled = encoder_settings.enabled_summary()?;
@@ -1430,7 +1459,7 @@ fn main() -> Result<()> {
     if let Some(metadata_path) = args.metadata_output {
         info!("Writing metadata JSON to {}...", metadata_path.display());
         // The packed dataset is addressed by its manifest, so the dataset
-        // "filename" is now `<dir>/manifest.json`.
+        // "filename" is `<dir>/manifest.json`.
         let manifest_rel = out_dir.join("manifest.json");
         let metadata_json = serde_json::json!({
             "filename": format!(
@@ -1478,9 +1507,9 @@ fn main() -> Result<()> {
 /// Resolve the `-o/--output` value into a packed-dataset directory.
 ///
 /// The packed format is a directory tree (`manifest.json` + `index/` +
-/// `packs/`). For convenience a path ending in `.stt` (the old single-file
-/// extension) has that extension stripped, so `-o foo.stt` -> `foo/`. Any other
-/// path is used verbatim as the dataset directory.
+/// `packs/`), never a single file. For convenience a path ending in `.stt` has
+/// that extension stripped, so `-o foo.stt` -> `foo/`. Any other path is used
+/// verbatim as the dataset directory.
 fn packed_output_dir(output: &std::path::Path) -> PathBuf {
     let is_stt = output
         .extension()
@@ -1748,9 +1777,12 @@ fn aligned_time_range(
     stt_core::types::TimeRange::new(start, tr.end)
 }
 
-/// The packed format compresses per-blob with zstd (no shared dict, so the
-/// TS reader can decode it); the vestigial `gzip`/`none` choices were
-/// removed — they were already ignored-with-warning.
+/// The packed format compresses per-blob with zstd (no shared dict, so the TS
+/// reader can decode any blob in isolation). `zstd` is the only accepted value.
+///
+/// `gzip` and `none` are rejected loudly rather than ignored: `gzip` names a
+/// codec no packed archive can contain, and silently accepting either would
+/// produce a zstd archive that misreports what the caller asked for.
 fn parse_compression(s: &str) -> Result<stt_core::types::Compression> {
     match s.to_lowercase().as_str() {
         "zstd" | "zstandard" => Ok(stt_core::types::Compression::Zstd),
@@ -2021,7 +2053,7 @@ mod tests {
         assert!(Args::try_parse_from(argv).is_err());
     }
 
-    /// Doc gate (naming-types-consistency F9): every visible long flag must
+    /// Doc gate: every visible long flag must
     /// appear in THIS binary's section of `docs/api/cli-reference.md`, so a new
     /// flag fails the build until it is documented. Scoped to the section so a
     /// flag documented under another binary can't satisfy the gate.

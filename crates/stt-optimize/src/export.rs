@@ -95,10 +95,16 @@ const PROVENANCE_COLUMNS: [&str; 3] = ["stt_zoom", "stt_x", "stt_y"];
 /// Reserved tile columns that are pre-baked *renderer* state rather than data:
 /// `triangles` is the earcut tessellation of the polygon in the same row, so
 /// exporting it would ship a derived index buffer no GeoParquet reader can use
-/// and that any tessellator can regenerate.
-const DERIVED_COLUMNS: [&str; 1] = ["triangles"];
+/// and that any tessellator can regenerate. `part_offsets` is the same kind of
+/// thing for multi-part polygons — ring indices into the row's own geometry,
+/// which the WKB below flattens, so the numbers would name nothing a Parquet
+/// consumer can address. (The better use of that column is to emit a real WKB
+/// `MultiPolygon` instead of one `Polygon` with the extra parts masquerading as
+/// holes; that is a separate change to the geometry writer, tracked as a
+/// follow-up — the flattening predates the column.)
+const DERIVED_COLUMNS: [&str; 2] = ["triangles", "part_offsets"];
 
-/// Schema-metadata keys of the u16-delta `vertex_time` encoding. Private in
+/// Schema-metadata keys of the delta `vertex_time` encoding. Private in
 /// `stt_core::arrow_tile`, mirrored here because the exporter must reconstruct
 /// absolute per-vertex times (`origin + delta * step`) — shipping raw deltas
 /// would export a column whose numbers mean nothing outside this format.
@@ -362,9 +368,16 @@ fn plan_column(
         return ColumnPlan::EpochMillis;
     }
     if name == "vertex_time" {
-        // Only the u16-delta encoding needs reconstruction; a `List<Int64>`
-        // vertex_time is already absolute.
-        let is_delta = matches!(field.data_type(), DataType::List(child) if child.data_type() == &DataType::UInt16);
+        // Only the delta encodings need reconstruction; a `List<Int64>`
+        // vertex_time is already absolute. The encoder picks the narrowest
+        // delta width that fits the tile's span (`UInt16`, then `UInt32`), so
+        // BOTH must be reconstructed — matching only `UInt16` here silently
+        // exported a wider tile's raw deltas as if they were epoch millis.
+        let is_delta = matches!(
+            field.data_type(),
+            DataType::List(child)
+                if matches!(child.data_type(), DataType::UInt16 | DataType::UInt32)
+        );
         if is_delta {
             let origin = schema_meta
                 .get(VERTEX_TIME_ORIGIN_KEY)

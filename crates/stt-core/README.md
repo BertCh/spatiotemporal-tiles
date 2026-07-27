@@ -8,7 +8,7 @@ small immutable objects are what make a dataset edge-cacheable on a plain
 CDN. This crate owns the format end to end: `PackWriter` / `PackedReader`
 and the `Manifest`, Arrow-IPC tile payloads with GeoArrow geometry
 (`arrow_tile`), the run-length + paged tile directory, Hilbert/temporal blob
-ordering (`curve`), zstd/gzip compression, and timestamp normalization.
+ordering (`curve`), per-blob zstd compression, and timestamp normalization.
 
 > **Internal implementation crate** of
 > [`spatiotemporal-tiles`](https://crates.io/crates/spatiotemporal-tiles) —

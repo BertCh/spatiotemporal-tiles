@@ -447,7 +447,7 @@ def generate(
         avc.run_stt_build(map_line_pq, out_dir / "map_line", "map_line",
                           stt_build=stt_build, max_zoom=18)
 
-    # --- lightweight ego polyline for the ego-follow camera (av-cockpit.md §3d).
+    # --- lightweight ego polyline for the ego-follow camera (spec/sidecar-assets.md §3.1).
     # Same lon/lat/t samples as the ego trips archive above → the follow path
     # tracks the rendered ego trail exactly. ~40–80 pts; pure JSON, no rebuild.
     ego_path = avc.downsample_ego_path(ego_t, ego_lon, ego_lat)

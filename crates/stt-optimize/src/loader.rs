@@ -645,8 +645,8 @@ fn prop_value_at(col: &dyn Array, row: usize) -> Option<PropValue> {
 ///
 /// Each slot is `Some(unix_ms)` for a valid timestamp, or `None` for a null
 /// cell or (string columns) an unparseable value. `None` rows are excluded from
-/// the temporal min/max rather than coerced to epoch 0, which used to pin
-/// `min_time` to 1970 and inflate the reported duration by decades.
+/// the temporal min/max rather than coerced to epoch 0 — coercing pins
+/// `min_time` to 1970 and inflates the reported duration by decades.
 fn extract_timestamps_from_batch(
     batch: &arrow::record_batch::RecordBatch,
     col_idx: usize,
@@ -912,7 +912,7 @@ mod tests {
         let bytes = wkb(&Geometry::Polygon(Polygon::new(exterior, vec![interior])));
         let (geom_type, vertices, _, _) = parse_wkb_info(&bytes).unwrap();
         assert_eq!(geom_type, GeometryType::Polygon);
-        // 5 exterior + 5 interior vertices (the old parser reported 5).
+        // 5 exterior + 5 interior vertices: holes count toward the total.
         assert_eq!(vertices, 10);
     }
 
@@ -929,7 +929,7 @@ mod tests {
         let bytes = wkb(&Geometry::MultiPolygon(MultiPolygon(vec![tri_a, tri_b])));
         let (geom_type, vertices, _, _) = parse_wkb_info(&bytes).unwrap();
         assert_eq!(geom_type, GeometryType::MultiPolygon);
-        // 4 + 4 vertices (the old parser reported the first ring only = 4).
+        // 4 + 4 vertices: every part counts, not just the first ring.
         assert_eq!(vertices, 8);
     }
 
@@ -1033,9 +1033,9 @@ mod tests {
 
     #[test]
     fn bad_timestamp_and_geometry_rows_do_not_poison_bounds_or_time() {
-        // Regression: a null/unparseable timestamp must not pin min_time to
-        // epoch 0, and a parse-failure geometry must not fold a phantom (0, 0)
-        // into the spatial bounds (nor survive as a feature).
+        // A null/unparseable timestamp must not pin min_time to epoch 0, and a
+        // parse-failure geometry must not fold a phantom (0, 0) into the
+        // spatial bounds (nor survive as a feature).
         use arrow::array::{BinaryArray, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
         use parquet::arrow::ArrowWriter;

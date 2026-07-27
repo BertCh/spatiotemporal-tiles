@@ -35,6 +35,7 @@ const BUCKET: i64 = 3_600_000;
 /// null — the shapes that exercise the property-column decode paths.
 fn points_layer() -> ColumnarLayer {
     ColumnarLayer {
+        polygon_parts: None,
         name: "points".to_string(),
         feature_ids: vec![1, 2, 3],
         start_times: vec![T0 + 3000, T0 + 1000, T0 + 2000],
@@ -65,6 +66,7 @@ fn points_layer() -> ColumnarLayer {
 /// see a multi-layer frame rather than the trivial one-layer case.
 fn tracks_layer() -> ColumnarLayer {
     ColumnarLayer {
+        polygon_parts: None,
         name: "tracks".to_string(),
         feature_ids: vec![10, 11],
         start_times: vec![T0 + 100, T0],

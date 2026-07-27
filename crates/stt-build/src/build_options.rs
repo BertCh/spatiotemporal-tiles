@@ -157,6 +157,15 @@ pub struct EncoderSettings {
     pub vector_group: Vec<String>,
     /// `--point-elevation-column NAME` (fold a property into POINT z).
     pub point_elevation_column: Option<String>,
+    /// `--no-compact-times`: the kill switch for the compact feature-time
+    /// columns. `false` (the default) leaves the feature ON, which is also
+    /// what declares the `time-delta` capability.
+    pub no_compact_times: bool,
+    /// `--quantize-vertex-values`: store the `vertex_value` /
+    /// `vertex_value_matrix` leaves as `UInt16` under a per-column
+    /// range-adaptive affine (the `vertex-value-quant` capability). Opt-in
+    /// because it is lossy; off by default.
+    pub quantize_vertex_values: bool,
 }
 
 impl EncoderSettings {
@@ -187,6 +196,10 @@ impl EncoderSettings {
             enabled.push("quantize-attrs-auto".to_string());
         }
 
+        if self.quantize_vertex_values {
+            enabled.push("quantize-vertex-values".to_string());
+        }
+
         if !self.vector_group.is_empty() {
             enabled.push(format!(
                 "vector-groups={}",
@@ -198,6 +211,12 @@ impl EncoderSettings {
             if !col.is_empty() {
                 enabled.push(format!("point-elevation-column={col}"));
             }
+        }
+
+        // Reported inverted (the feature is ON by default), so the log line
+        // names the non-default state exactly like every other entry here.
+        if self.no_compact_times {
+            enabled.push("no-compact-times".to_string());
         }
 
         Ok(enabled)
@@ -231,6 +250,8 @@ impl EncoderSettings {
                 .vertex_time_precision
                 .unwrap_or(stt_core::arrow_tile::DEFAULT_VERTEX_TIME_MAX_STEP_MS)
                 .max(1),
+            compact_times: !self.no_compact_times,
+            quantize_vertex_values: self.quantize_vertex_values,
             // The format-v2 fields (`format_version`, `template_collector`)
             // default to v1 / no-collector; the PACK WRITER overrides both from
             // its own `--format-version` (`PackWriter::encoder_config`), so
@@ -259,6 +280,17 @@ impl EncoderSettings {
             .is_some_and(|c| !c.is_empty())
         {
             caps.push(stt_core::pack::CAPABILITY_ELEVATION_FOLD.to_string());
+        }
+        // Declared whenever the feature is ENABLED (i.e. unless
+        // `--no-compact-times`), not only when a tile actually took a compact
+        // form: the choice is per layer per tile, so "some tile in this
+        // dataset may carry `TILE_META.st`/`.et`" is the only claim a
+        // dataset-level manifest key can honestly make.
+        if !self.no_compact_times {
+            caps.push(stt_core::pack::CAPABILITY_TIME_DELTA.to_string());
+        }
+        if self.quantize_vertex_values {
+            caps.push(stt_core::pack::CAPABILITY_VERTEX_VALUE_QUANT.to_string());
         }
         caps
     }
@@ -382,10 +414,12 @@ mod tests {
 
     #[test]
     fn required_capabilities_from_settings() {
-        // No re-typing feature → no capabilities (the manifest key is omitted).
-        assert!(EncoderSettings::default()
-            .required_capabilities()
-            .is_empty());
+        // Compact feature times are ON by default, so the DEFAULT settings
+        // declare exactly that one capability and nothing else.
+        assert_eq!(
+            EncoderSettings::default().required_capabilities(),
+            ["time-delta"]
+        );
 
         // Each re-typing feature declares its registry entry.
         let all = EncoderSettings {
@@ -396,25 +430,68 @@ mod tests {
         };
         assert_eq!(
             all.required_capabilities(),
-            ["coord-quant", "attr-quant", "elevation-fold"]
+            ["coord-quant", "attr-quant", "elevation-fold", "time-delta"]
         );
 
         // Auto attr-quantization alone also re-types columns.
         let auto = EncoderSettings {
             quantize_attrs_auto: true,
+            no_compact_times: true,
             ..Default::default()
         };
         assert_eq!(auto.required_capabilities(), ["attr-quant"]);
 
-        // Additive features (vector groups, vertex-time precision) and an
+        // Additive features (vector groups, vertex-time precision — including
+        // its `List<UInt32>` delta tier, which `vt` already describes) and an
         // empty elevation column never need a capability.
         let additive = EncoderSettings {
             vector_group: vec!["rgba=r,g,b,a:u8".into()],
             vertex_time_precision: Some(50),
             point_elevation_column: Some(String::new()),
+            no_compact_times: true,
             ..Default::default()
         };
         assert!(additive.required_capabilities().is_empty());
+    }
+
+    /// `--no-compact-times` is the single switch behind BOTH the encoder
+    /// setting and the capability declaration: they can never disagree.
+    #[test]
+    fn no_compact_times_suppresses_the_encoder_flag_and_the_capability() {
+        let off = EncoderSettings {
+            no_compact_times: true,
+            ..Default::default()
+        };
+        assert!(!off.resolve().unwrap().compact_times);
+        assert!(off.required_capabilities().is_empty());
+        assert_eq!(off.enabled_summary().unwrap(), ["no-compact-times"]);
+
+        let on = EncoderSettings::default();
+        assert!(on.resolve().unwrap().compact_times);
+        assert_eq!(on.required_capabilities(), ["time-delta"]);
+        assert!(on.enabled_summary().unwrap().is_empty());
+    }
+
+    /// `--quantize-vertex-values` is the single switch behind BOTH the encoder
+    /// setting and its capability declaration, and it is OFF by default (it is
+    /// the one lossy encoding in this set).
+    #[test]
+    fn quantize_vertex_values_drives_the_encoder_flag_and_the_capability() {
+        let off = EncoderSettings::default();
+        assert!(!off.resolve().unwrap().quantize_vertex_values);
+        assert_eq!(off.required_capabilities(), ["time-delta"]);
+        assert!(off.enabled_summary().unwrap().is_empty());
+
+        let on = EncoderSettings {
+            quantize_vertex_values: true,
+            ..Default::default()
+        };
+        assert!(on.resolve().unwrap().quantize_vertex_values);
+        assert_eq!(
+            on.required_capabilities(),
+            ["time-delta", "vertex-value-quant"]
+        );
+        assert_eq!(on.enabled_summary().unwrap(), ["quantize-vertex-values"]);
     }
 
     #[test]

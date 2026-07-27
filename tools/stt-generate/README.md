@@ -23,7 +23,7 @@ built publish-quality.
 >
 > `cargo build` / `cargo test` at the repo root do NOT cover this crate. Run
 > them from `tools/stt-generate` (or with `--manifest-path
-> tools/stt-generate/Cargo.toml`).
+tools/stt-generate/Cargo.toml`).
 
 ## Example
 

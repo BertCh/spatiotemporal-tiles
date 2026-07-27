@@ -7,7 +7,7 @@
 //! explicitly instead.
 
 use super::columns::DEFAULT_VERTEX_TIME_MAX_STEP_MS;
-use super::frame::{TemplateCollector, FORMAT_VERSION};
+use super::frame::{TemplateCollector, LAYER_FRAME_VERSION};
 use super::layer::VectorElem;
 use super::quantize::validate_quantize_coords_m;
 use crate::error::Result;
@@ -142,17 +142,16 @@ pub fn point_elevation_column() -> String {
 /// encode time (coordinate + attribute quantization, vector grouping, the
 /// point-elevation fold, vertex-time precision, frame version, template sink).
 ///
-/// Historically these lived only in process-wide mutable statics set via the
-/// `set_*` functions above; that made a new encode caller silently inherit
-/// whatever the last `set_*` left behind (the origin of the `stt-serve` parity
-/// bug, where one dataset's quantization bled into the tiles served for
-/// another) and made it impossible to encode two different configurations in
-/// one process (blocking multi-dataset serve + parallel per-config tests).
-/// Passing an `EncoderConfig` explicitly to
-/// [`encode_tile_with`](crate::arrow_tile::encode_tile_with) removes both
-/// problems, and it is how BOTH shipping producers now encode: `stt-build`
+/// Encoder settings must travel EXPLICITLY, through
+/// [`encode_tile_with`](crate::arrow_tile::encode_tile_with), rather than
+/// through the process-wide mutable statics behind the `set_*` functions above.
+/// A caller that reads the globals silently inherits whatever the last `set_*`
+/// left behind — that is how one dataset's quantization bleeds into the tiles
+/// `stt-serve` returns for another — and two configurations cannot coexist in
+/// one process at all, which rules out multi-dataset serve and parallel
+/// per-config tests. Both shipping producers pass a config: `stt-build`
 /// carries one on its [`crate::PackWriter`], `stt-serve` one per dataset. The
-/// surviving globals + the no-arg [`encode_tile`](crate::arrow_tile::encode_tile) /
+/// globals + the no-arg [`encode_tile`](crate::arrow_tile::encode_tile) /
 /// [`encode_layer`](crate::arrow_tile::encode_layer) wrappers (snapshotted by
 /// [`EncoderConfig::from_globals`]) serve only external
 /// one-shot callers; nothing in this workspace's build path mutates them.
@@ -169,9 +168,50 @@ pub struct EncoderConfig {
     pub vector_groups: Vec<VectorGroup>,
     /// Property folded into POINT geometry as the z coordinate (empty = none).
     pub point_elevation_column: String,
-    /// Ceiling (ms) on the per-vertex time u16-delta quantization step.
+    /// Ceiling (ms) on the per-vertex time delta quantization step.
     pub vertex_time_max_step_ms: u32,
-    /// Layer-frame format version. Only [`FORMAT_VERSION`] is accepted; the
+    /// Compact the per-feature time columns (default ON, the `time-delta`
+    /// manifest capability). Per layer, from that layer's own data:
+    /// `start_time` becomes a non-null `UInt32` offset from `TILE_META.t0`
+    /// when every offset fits, and `end_time` becomes a non-null `UInt32`
+    /// DURATION — or is omitted outright when `end == start` for every
+    /// feature. `TILE_META.st` / `.et` record the choice and both reference
+    /// readers re-inflate absolute `Int64` columns, so nothing downstream of
+    /// the decoder can tell the difference.
+    ///
+    /// Only the FRAME path (`encode_tile*`) compacts. The standalone
+    /// `encode_layer*` shape has no `TILE_META` section to carry `st`/`et`
+    /// and its `decode_layer` counterpart performs no re-inflation, so
+    /// emitting the compact form there would silently re-type a column with
+    /// no way to read it back.
+    ///
+    /// Deliberately NOT a process-wide global (like `format_version` and
+    /// `template_collector`): it is a per-build/per-request choice that has to
+    /// travel with the writer that declares the capability.
+    pub compact_times: bool,
+    /// Quantize the per-vertex value columns (`vertex_value` and
+    /// `vertex_value_matrix`) to a `UInt16` leaf under a per-column
+    /// range-adaptive affine — the opt-in `vertex-value-quant` manifest
+    /// capability, half the bytes of the raw `List<Float32>`.
+    ///
+    /// Those two are the format's ONLY `List<Float32>` columns and they had no
+    /// size lever at all (`stt:qa` re-types scalar per-feature property columns
+    /// only), while measuring 64.2% of `nyc-taxi-flows` and 93.7% of
+    /// `bixi-corridors` tile bytes. The affines ride `TILE_META.vq`; the
+    /// reserved index
+    /// [`VERTEX_VALUE_QUANT_SENTINEL`](super::quantize::VERTEX_VALUE_QUANT_SENTINEL)
+    /// carries the `NaN` "no value here" marker across, and both reference
+    /// readers re-inflate `Float32`.
+    ///
+    /// Default OFF, and opt-in rather than automatic because it is genuinely
+    /// LOSSY (16 bits across the column's own range) on data a map colours by,
+    /// unlike the compact-time and delta encodings which are exact.
+    ///
+    /// Like [`Self::compact_times`] this is only sound on the FRAME path: the
+    /// affine's only channel is `TILE_META`, which the standalone
+    /// `encode_layer*` shape does not have.
+    pub quantize_vertex_values: bool,
+    /// Layer-frame format version. Only [`LAYER_FRAME_VERSION`] is accepted; the
     /// field is retained so a frame-format revision has an explicit, checked
     /// channel rather than a silent assumption at the encode boundary.
     pub format_version: u32,
@@ -192,7 +232,9 @@ impl Default for EncoderConfig {
             vector_groups: Vec::new(),
             point_elevation_column: String::new(),
             vertex_time_max_step_ms: DEFAULT_VERTEX_TIME_MAX_STEP_MS,
-            format_version: FORMAT_VERSION,
+            compact_times: true,
+            quantize_vertex_values: false,
+            format_version: LAYER_FRAME_VERSION,
             template_collector: None,
         }
     }

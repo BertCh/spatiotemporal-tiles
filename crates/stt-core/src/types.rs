@@ -100,8 +100,14 @@ impl TimeRange {
     }
 }
 
-/// Compression method for tiles. The format ships **zstd-only**; `None` is for
-/// already-incompressible blobs. (gzip was never shipped and is gone.)
+/// Compression codec for tile payloads. The format is **zstd-only**; `None` is
+/// for already-incompressible blobs.
+///
+/// The variants deliberately carry no explicit discriminants: this is an
+/// in-memory tag, and a packed archive names its codec with a manifest string
+/// (`"zstd"` / `"none"`), never a number. For the retired gzip codec — what it
+/// was, and why its number is not reused — see the [`crate::compression`]
+/// module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Compression {
     /// No compression.

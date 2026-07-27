@@ -289,6 +289,7 @@ mod tests {
                 let id = TileId::new(10, 4_000 + x, 5_000, t as u64);
                 // Distinct ids per tile so no two blobs dedup to one.
                 let payload = encode_tile(&[ColumnarLayer {
+                    polygon_parts: None,
                     name: "default".to_string(),
                     feature_ids: vec![u64::from(x) * 1_000 + b as u64],
                     start_times: vec![t],

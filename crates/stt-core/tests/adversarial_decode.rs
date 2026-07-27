@@ -72,6 +72,7 @@ fn arb_point_layer() -> impl Strategy<Value = ColumnarLayer> {
                     kinds[0] = Some("a".to_string());
                 }
                 ColumnarLayer {
+                    polygon_parts: None,
                     name: "points".to_string(),
                     feature_ids: ids,
                     start_times: starts,
@@ -112,6 +113,7 @@ fn arb_linestring_layer() -> impl Strategy<Value = ColumnarLayer> {
                     .map(|verts| verts.iter().map(|(x, y)| [*x, *y]).collect())
                     .collect();
                 ColumnarLayer {
+                    polygon_parts: None,
                     name: "tracks".to_string(),
                     feature_ids: ids,
                     start_times: starts,

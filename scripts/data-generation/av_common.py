@@ -130,7 +130,7 @@ def utm_to_lonlat(easting, northing, epsg: int):
 
 
 # ── Object taxonomy ──────────────────────────────────────────────────────────
-# The canonical 10-class category set (av-cockpit.md §2c). Adapters map their
+# The canonical 10-class category set (spec/sidecar-assets.md §3.1). Adapters map their
 # native taxonomy onto this set via ``map_category``; anything unrecognised
 # falls back to ``OTHER_CATEGORY``.
 CATEGORIES: tuple[str, ...] = (
@@ -500,7 +500,7 @@ def write_lidar_points(
     scan_phase=None,
     home_zoom=None,
 ) -> int:
-    """Write the ``lidar/`` POINT GeoParquet (av-cockpit.md §2a).
+    """Write the ``lidar/`` POINT GeoParquet (spec/sidecar-assets.md §3.1).
 
     Columns: ``geometry`` (WKB Point), ``timestamp`` (Int64 unix-ms),
     ``height_band`` (Utf8 categorical range label), ``z`` (Float64). NOTE:
@@ -733,7 +733,7 @@ def write_ego_trips(
     vertex_values,
     vehicle: str = "ego",
 ) -> int:
-    """Write the ``ego/`` LineString GeoParquet (av-cockpit.md §2b).
+    """Write the ``ego/`` LineString GeoParquet (spec/sidecar-assets.md §3.1).
 
     One LineString = the ego path. Columns: ``geometry`` (WKB LineString),
     ``timestamp`` (Int64 track start), ``end_timestamp`` (Int64 track end),
@@ -903,7 +903,7 @@ def write_objects_points(
     extra_categorical: Mapping[str, object] | None = None,
     extra_numeric: Mapping[str, object] | None = None,
 ) -> int:
-    """Write the ``objects/`` POINT GeoParquet (av-cockpit.md §2c).
+    """Write the ``objects/`` POINT GeoParquet (spec/sidecar-assets.md §3.1).
 
     One point per object per annotated sample. Columns: ``geometry`` (WKB
     Point), ``timestamp`` (Int64 unix-ms), ``category`` (Utf8 categorical),
@@ -1568,7 +1568,7 @@ def downsample_ego_path(ego_t, ego_lon, ego_lat, target: int = 60):
     rendered ego trail — never a recomputed path. Picks ~``target`` evenly-spaced
     vertices and always keeps the first and last (so the polyline spans the full
     timeRange). ~40–80 points keeps ego-follow smooth while staying a few KB in
-    scene.json (av-cockpit.md §3d).
+    scene.json (spec/sidecar-assets.md §3).
     """
     n = len(ego_t)
     if n <= target:
@@ -1659,7 +1659,7 @@ def write_telemetry_json(
     hz: float,
     fields: Mapping[str, Mapping],
 ) -> None:
-    """Write ``telemetry.json`` (av-cockpit.md §2d).
+    """Write ``telemetry.json`` (spec/sidecar-assets.md §3.2).
 
     ``fields`` maps a field id (e.g. ``"speed"``) → ``{"unit", "label",
     "samples"}`` where ``samples`` is a list of ``[t_ms, value]`` pairs. Samples
@@ -1689,7 +1689,7 @@ def write_cameras_json(
     camera: str,
     frames: Iterable[Mapping],
 ) -> None:
-    """Write ``cameras.json`` (av-cockpit.md §2e).
+    """Write ``cameras.json`` (spec/sidecar-assets.md §3.2).
 
     ``frames`` is an iterable of ``{"t": t_ms, "url": "cam/0001.jpg"}`` (url
     relative to the scene dir). Frames are sorted by ``t``; an empty list emits a
@@ -1723,7 +1723,7 @@ def write_scene_json(
     streams: Mapping[str, Mapping],
     lidar_colors: Mapping[str, Sequence[int]] | None = None,
 ) -> None:
-    """Write ``scene.json`` (av-cockpit.md §2f) — the cockpit source of truth.
+    """Write ``scene.json`` (spec/sidecar-assets.md §3) — the cockpit source of truth.
 
     ``streams`` is the present-streams map (e.g. ``{"lidar": {"url":
     "lidar/manifest.json", "points": 280000}, "ego": {"url":

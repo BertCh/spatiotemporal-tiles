@@ -260,8 +260,8 @@ fn auto_choice(samples: &[TileSample]) -> BlobOrdering {
     BlobOrdering::choose(space_bits, time_bits)
 }
 
-/// The pre-simulation fallback: the old access-shape heuristic, used only when
-/// too few native tiles are synthesized to trust the range-read simulation
+/// The fallback: a coarse access-shape guess, used only when too few native
+/// tiles are synthesized to trust the range-read simulation
 /// (`Localized` + short window -> `spatial`, `Global`/`Regional` + long window ->
 /// `time-major`; anything else keeps `auto`). Low confidence — it is a guess.
 fn blob_ordering_advice_heuristic(result: &AnalysisResult) -> Option<Advice> {
@@ -528,8 +528,9 @@ mod tests {
             features.push(analyzable(-72.0, 45.0, ts));
         }
         let data = synthetic_data_with_features(features);
-        // Localized/short so the OLD heuristic would have said "spatial" too, but
-        // this path must reach the SIMULATION (48 tiles ≥ the floor), not the fallback.
+        // Localized/short, so the heuristic fallback would answer "spatial" too;
+        // the `why` assertions below are what pin this to the SIMULATION path
+        // (48 tiles ≥ the floor), since the VALUE alone cannot tell them apart.
         let result = synthetic_result(SpatialDistribution::Regional, 24 * HOUR_MS, 100 << 20, None);
 
         let advice = advise(&result, &data).unwrap();

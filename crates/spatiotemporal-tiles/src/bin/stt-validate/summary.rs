@@ -135,6 +135,7 @@ mod tests {
     fn summary_layers(name: &str, ids: Vec<u64>) -> Vec<DecodedLayer> {
         let n = ids.len();
         let layer = ColumnarLayer {
+            polygon_parts: None,
             name: name.into(),
             feature_ids: ids,
             start_times: vec![0; n],

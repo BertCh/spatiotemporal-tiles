@@ -1,20 +1,25 @@
-//! Tile decoding — the v1 and v2 frame walks.
+//! Tile decoding — the layer-frame walk plus the standalone single-layer IPC
+//! decode.
 //!
 //! Bounds-checked byte reads throughout, so arbitrary or truncated input
-//! errors instead of panicking. A v2 layer is spliced back together from its
-//! schema template + batch tail and merged into the v1-shaped single
-//! [`RecordBatch`] every downstream consumer already expects.
+//! errors instead of panicking. A framed layer is spliced back together from
+//! its schema template + batch tail and merged into the single flat
+//! [`RecordBatch`] every downstream consumer already expects — the same shape
+//! [`decode_layer`] returns.
 
 use super::frame::{
-    TemplateRegistry, TileMeta, FRAME_ALIGN, FRAME_V2_ESCAPE, FRAME_V2_VERSION, REF_KIND_INLINE,
-    REF_KIND_NO_PROPS, REF_KIND_TEMPLATE_HASH, SECTION_CORE_BATCH, SECTION_INLINE_SCHEMA_CORE,
-    SECTION_INLINE_SCHEMA_PROPS, SECTION_PROPS_BATCH, SECTION_TILE_META, TIME_OFFSET_MS_KEY,
-    VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY, VERTEX_VALUE_BUCKETS_KEY,
+    EndTimeForm, StartTimeForm, TemplateRegistry, TileMeta, FRAME_ALIGN, FRAME_V2_ESCAPE,
+    FRAME_V2_VERSION, REF_KIND_INLINE, REF_KIND_NO_PROPS, REF_KIND_TEMPLATE_HASH,
+    SECTION_CORE_BATCH, SECTION_INLINE_SCHEMA_CORE, SECTION_INLINE_SCHEMA_PROPS,
+    SECTION_PROPS_BATCH, SECTION_TILE_META, TIME_OFFSET_MS_KEY, VERTEX_TIME_ORIGIN_KEY,
+    VERTEX_TIME_STEP_KEY, VERTEX_VALUE_BUCKETS_KEY,
 };
-use super::quantize::{AttrQuant, STT_QUANT_ATTR_META_KEY};
+use super::quantize::{AttrQuant, STT_QUANT_ATTR_META_KEY, VERTEX_VALUE_QUANT_SENTINEL};
 use crate::error::{Error, Result};
-use arrow::array::{ArrayRef, RecordBatch};
-use arrow::datatypes::{Field, Schema};
+use arrow::array::{
+    Array, ArrayRef, Float32Array, Int64Array, ListArray, RecordBatch, UInt16Array, UInt32Array,
+};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -54,8 +59,9 @@ pub fn decode_layer(ipc: &[u8]) -> Result<RecordBatch> {
 
 /// Whether a tile payload carries the sectioned layer frame (leading u16 is
 /// the [`FRAME_V2_ESCAPE`]). The manifest's `formatVersion` remains
-/// authoritative (★F6) — this sniff is defense-in-depth for the payload level,
-/// and rejects a payload that is not a frame at all.
+/// authoritative — a reader dispatches on it, so a frame disagreeing with the
+/// manifest is a hard error — while this sniff is defense-in-depth at the
+/// payload level, rejecting a payload that is not a frame at all.
 pub fn is_frame_v2(payload: &[u8]) -> bool {
     payload.len() >= 2 && u16::from_le_bytes([payload[0], payload[1]]) == FRAME_V2_ESCAPE
 }
@@ -91,7 +97,7 @@ pub fn decode_tile_with_templates(
 
 /// Splice a template onto a section tail and decode the resulting stream.
 ///
-/// Normative guards (design §3.4): the tail is EXACTLY the TOC-declared bytes
+/// Normative guards: the tail is EXACTLY the TOC-declared bytes
 /// (the caller sliced it that way) and MUST begin with the `0xFFFFFFFF`
 /// continuation marker — stray zero bytes make arrow-rs silently return an
 /// EMPTY tile (they parse as a legacy 4-byte end-of-stream), so a malformed
@@ -115,7 +121,7 @@ pub(crate) fn splice_decode(template: &[u8], tail: &[u8], what: &str) -> Result<
     decode_layer(&buf)
 }
 
-/// Resolve a v2 layer's schema template: inline section or registry lookup.
+/// Resolve a framed layer's schema template: inline section or registry lookup.
 fn resolve_template<'a>(
     ref_kind: u8,
     hash: Option<[u8; 16]>,
@@ -157,11 +163,247 @@ fn hex_16(hash: &[u8; 16]) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Merge a v2 layer's decoded CORE + PROPS batches back into the v1-shaped
-/// single batch, RE-INJECTING the TILE_META values into schema/field metadata
-/// with the exact v1 formatting — so every downstream consumer (validator,
-/// stt-optimize, tests, renderers) sees v1-equivalent decoded layers with
-/// zero changes.
+/// Re-inflate the compact feature-time columns declared by `TILE_META.st` /
+/// `.et` into the absolute, non-null `Int64` `start_time` / `end_time` pair
+/// every consumer of a decoded layer already expects.
+///
+/// This is the whole reason the compact encoding needs no downstream change:
+/// the merged batch is INDISTINGUISHABLE from a non-compact tile's, right down
+/// to column order — a synthesized `end_time` (`et: "zero"`) is inserted
+/// immediately after `start_time`, its canonical index, rather than appended.
+///
+/// Operates on the CORE prefix, before property columns are appended, and is a
+/// no-op for any tile that declares neither key.
+fn reinflate_compact_times(
+    fields: &mut Vec<Arc<Field>>,
+    columns: &mut Vec<ArrayRef>,
+    meta: &TileMeta,
+) -> Result<()> {
+    if meta.st.is_none() && meta.et.is_none() {
+        return Ok(());
+    }
+    let start_idx = fields
+        .iter()
+        .position(|f| f.name() == "start_time")
+        .ok_or_else(|| {
+            Error::Other(
+                "TILE_META declares a compact time encoding but the layer has no \
+                 'start_time' column"
+                    .into(),
+            )
+        })?;
+
+    if meta.st == Some(StartTimeForm::U32Offset) {
+        let t0 = meta.t0.ok_or_else(|| {
+            Error::Other(
+                "TILE_META declares st=\"u32\" (start_time as a u32 offset) but carries \
+                 no 't0' anchor to reconstruct against"
+                    .into(),
+            )
+        })?;
+        let offsets = columns[start_idx]
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "TILE_META declares st=\"u32\" but 'start_time' is {}",
+                    columns[start_idx].data_type()
+                ))
+            })?;
+        // `saturating_add`, not `+`: a crafted TILE_META (`t0` near i64::MAX)
+        // must not panic a debug-build decoder on an overflowing sum.
+        let values: Vec<i64> = offsets
+            .values()
+            .iter()
+            .map(|&o| t0.saturating_add(o as i64))
+            .collect();
+        columns[start_idx] = Arc::new(Int64Array::new(values.into(), offsets.nulls().cloned()));
+        fields[start_idx] = Arc::new(
+            fields[start_idx]
+                .as_ref()
+                .clone()
+                .with_data_type(DataType::Int64),
+        );
+    }
+
+    let Some(et) = meta.et else {
+        return Ok(());
+    };
+    // Both end forms are relative to the (now absolute) start column.
+    let start_col = columns[start_idx].clone();
+    let starts = start_col
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "TILE_META declares a compact 'end_time' but 'start_time' is {} \
+                 (expected Int64 after re-inflation)",
+                start_col.data_type()
+            ))
+        })?;
+
+    match et {
+        EndTimeForm::Zero => {
+            if fields.iter().any(|f| f.name() == "end_time") {
+                return Err(Error::Other(
+                    "TILE_META declares et=\"zero\" (the end_time column is omitted) but \
+                     the layer carries an 'end_time' column"
+                        .into(),
+                ));
+            }
+            fields.insert(
+                start_idx + 1,
+                Arc::new(Field::new("end_time", DataType::Int64, false)),
+            );
+            // `end == start` for every feature, so the reconstructed column IS
+            // the start column — shared, not copied.
+            columns.insert(start_idx + 1, start_col.clone());
+        }
+        EndTimeForm::Dur32 => {
+            let end_idx = fields
+                .iter()
+                .position(|f| f.name() == "end_time")
+                .ok_or_else(|| {
+                    Error::Other(
+                        "TILE_META declares et=\"dur32\" but the layer has no 'end_time' \
+                         column"
+                            .into(),
+                    )
+                })?;
+            let durations = columns[end_idx]
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "TILE_META declares et=\"dur32\" but 'end_time' is {}",
+                        columns[end_idx].data_type()
+                    ))
+                })?;
+            if durations.len() != starts.len() {
+                return Err(Error::Other(format!(
+                    "compact time columns disagree on length: start_time {} vs end_time {}",
+                    starts.len(),
+                    durations.len()
+                )));
+            }
+            let values: Vec<i64> = starts
+                .values()
+                .iter()
+                .zip(durations.values())
+                .map(|(&s, &d)| s.saturating_add(d as i64))
+                .collect();
+            columns[end_idx] = Arc::new(Int64Array::new(values.into(), durations.nulls().cloned()));
+            fields[end_idx] = Arc::new(
+                fields[end_idx]
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::Int64),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The `TILE_META.vq` keys a reader will act on. Anything else in the map is a
+/// crafted/corrupt section, not an additive extension: the affine RE-TYPES a
+/// named column, so applying one to a column outside this set could only
+/// corrupt it.
+const QUANTIZABLE_VERTEX_VALUE_COLUMNS: [&str; 2] = ["vertex_value", "vertex_value_matrix"];
+
+/// Re-inflate the per-vertex value columns declared by `TILE_META.vq` from
+/// their `UInt16` leaf back to the `List<Float32>` shape every consumer of a
+/// decoded layer already expects (`value = o + q*s`, with the reserved
+/// [`VERTEX_VALUE_QUANT_SENTINEL`] index becoming `NaN`).
+///
+/// The sibling of [`reinflate_compact_times`], and the reason the quantization
+/// needs no downstream change: the merged batch is INDISTINGUISHABLE from a
+/// non-quantized tile's — same column, same position, same Arrow type, same
+/// list offsets and null buffers.
+///
+/// Operates on the CORE prefix, and is a no-op for every archive built without
+/// the flag (`vq` absent).
+fn reinflate_quantized_vertex_values(
+    fields: &mut [Arc<Field>],
+    columns: &mut [ArrayRef],
+    meta: &TileMeta,
+) -> Result<()> {
+    let Some(vq) = meta.vq.as_ref() else {
+        return Ok(());
+    };
+    for (name, &(o, s)) in vq {
+        if !QUANTIZABLE_VERTEX_VALUE_COLUMNS.contains(&name.as_str()) {
+            return Err(Error::Other(format!(
+                "TILE_META.vq names column '{name}', which is not a per-vertex value column \
+                 (this reader knows {QUANTIZABLE_VERTEX_VALUE_COLUMNS:?})"
+            )));
+        }
+        let idx = fields
+            .iter()
+            .position(|f| f.name() == name)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "TILE_META.vq carries an affine for '{name}' but the layer has no such \
+                     column"
+                ))
+            })?;
+        let list = columns[idx]
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "TILE_META.vq declares '{name}' quantized but the column is {} \
+                     (expected a List)",
+                    columns[idx].data_type()
+                ))
+            })?;
+        let child = list
+            .values()
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "TILE_META.vq declares '{name}' quantized but its list leaf is {} \
+                     (expected UInt16)",
+                    list.values().data_type()
+                ))
+            })?;
+        // The sentinel is the format's `NaN` (no value at this vertex); every
+        // other index is the affine applied in f64 and narrowed once, exactly
+        // mirroring the encoder.
+        let values: Vec<f32> = child
+            .values()
+            .iter()
+            .map(|&q| {
+                if q == VERTEX_VALUE_QUANT_SENTINEL {
+                    f32::NAN
+                } else {
+                    (o + q as f64 * s) as f32
+                }
+            })
+            .collect();
+        let child_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let inflated = ListArray::new(
+            child_field,
+            list.offsets().clone(),
+            Arc::new(Float32Array::new(values.into(), child.nulls().cloned())),
+            list.nulls().cloned(),
+        );
+        fields[idx] = Arc::new(
+            fields[idx]
+                .as_ref()
+                .clone()
+                .with_data_type(inflated.data_type().clone()),
+        );
+        columns[idx] = Arc::new(inflated);
+    }
+    Ok(())
+}
+
+/// Merge a framed layer's decoded CORE + PROPS batches back into the single
+/// flat batch, RE-INJECTING the TILE_META values into schema/field metadata
+/// with the exact formatting the standalone `encode_layer` path writes — so
+/// every downstream consumer (validator, stt-optimize, tests, renderers) sees
+/// ONE decoded-layer shape and never branches on how the tile was framed.
 pub(crate) fn merge_v2_layer(
     core: RecordBatch,
     props: Option<RecordBatch>,
@@ -170,6 +412,14 @@ pub(crate) fn merge_v2_layer(
     let mut fields: Vec<Arc<Field>> = core.schema().fields().iter().cloned().collect();
     let mut columns: Vec<ArrayRef> = core.columns().to_vec();
     let mut schema_meta: HashMap<String, String> = core.schema().metadata().clone();
+
+    // Re-inflate the compact time columns FIRST, while `fields`/`columns` are
+    // still exactly the CORE prefix, so a synthesized `end_time` lands at its
+    // canonical index instead of after the property columns.
+    reinflate_compact_times(&mut fields, &mut columns, meta)?;
+    // Index-independent (it looks its columns up by name), so it is unaffected
+    // by the `end_time` the step above may have inserted.
+    reinflate_quantized_vertex_values(&mut fields, &mut columns, meta)?;
 
     if let Some(props) = props {
         if props.num_rows() != core.num_rows() {
@@ -181,7 +431,8 @@ pub(crate) fn merge_v2_layer(
         }
         for (field, column) in props.schema().fields().iter().zip(props.columns()) {
             // Re-inject the hoisted attribute-quantization affine
-            // (byte-identical to the v1 field metadata: `to_json` is a pure
+            // (byte-identical to the Arrow field metadata the standalone
+            // encode path writes: `to_json` is a pure
             // function of the `[o, s]` pair TILE_META carries).
             let field = match meta.qa.as_ref().and_then(|qa| qa.get(field.name())) {
                 Some(&(o, s)) => {
@@ -199,7 +450,7 @@ pub(crate) fn merge_v2_layer(
         }
     }
 
-    // Schema-level re-injection, mirroring the v1 assembler's formatting.
+    // Schema-level re-injection, mirroring the standalone assembler's formatting.
     if let Some(t0) = meta.t0 {
         schema_meta.insert(TIME_OFFSET_MS_KEY.to_string(), t0.to_string());
     }
@@ -212,11 +463,14 @@ pub(crate) fn merge_v2_layer(
     }
 
     let schema = Arc::new(Schema::new_with_metadata(fields, schema_meta));
-    RecordBatch::try_new(schema, columns)
-        .map_err(|e| Error::Other(format!("failed to merge v2 CORE/PROPS batches: {e}")))
+    RecordBatch::try_new(schema, columns).map_err(|e| {
+        Error::Other(format!(
+            "failed to merge layer-frame CORE/PROPS batches: {e}"
+        ))
+    })
 }
 
-/// The v2 frame walk. Bounds-checked byte reads throughout (`read_slice`), so
+/// The layer-frame walk. Bounds-checked byte reads throughout (`read_slice`), so
 /// arbitrary/truncated input errors instead of panicking; unknown section
 /// tags are skipped via their TOC length (additive evolution).
 fn decode_tile_v2(
@@ -344,7 +598,7 @@ fn decode_tile_v2(
     Ok(layers)
 }
 
-/// Walk ONLY a v2 frame's header structure — escape/version/flags/count,
+/// Walk ONLY a layer frame's header structure — escape/version/flags/count,
 /// per-layer name + schema ref_kinds (+ their 16-byte hashes), TOC-driven
 /// section skips; **no Arrow decode, no section parse** — and return every
 /// template hash the frame references. The packed-format validators use this

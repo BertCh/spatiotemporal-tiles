@@ -17,6 +17,19 @@
 //! parsed by `stt_build::build_options`, so a served tile matches the offline
 //! tile for the same `(z, x, y, t)` and the same source rows.
 //!
+//! ONE default deliberately diverges: **compact feature times** (the
+//! `time-delta` capability) are ON in `stt-build` and OPT-IN here
+//! (`--compact-times`), so the default served tile matches an offline
+//! `--no-compact-times` build. A capability re-types a column, so a reader
+//! that lacks it misdecodes SILENTLY rather than failing; a packed archive
+//! declares its capabilities in `manifest.capabilities` and an old reader
+//! refuses at open, but a served tile has no such gate — `/metadata.json`
+//! carries an advisory `capabilities` array (derived from the same
+//! `EncoderSettings`), and nothing forces a client to read it before fetching.
+//! Trading a few payload bytes on a dynamic server for "no silent garbage" is
+//! the right side of that deal; `--compact-times` restores full byte parity
+//! for anyone who controls their clients.
+//!
 //! What is NOT servable per single-tile request (each cleanly rejected at
 //! startup): `--summary-tier` (cross-tile H3/quadbin aggregation) and
 //! `--adaptive-temporal` (windows sized across a cell's whole time range).
@@ -283,6 +296,24 @@ struct Args {
     /// Fold a numeric property into POINT geometry as the z coordinate.
     #[arg(long = "point-elevation-column", value_name = "NAME")]
     point_elevation_column: Option<String>,
+
+    /// OPT-IN compact feature times (`TILE_META.st`/`.et`: `start_time` as a
+    /// UInt32 offset from `t0`, `end_time` as a UInt32 duration or omitted) —
+    /// the `time-delta` capability, which `stt-build` enables by DEFAULT.
+    ///
+    /// Serve defaults it OFF, unlike the offline build, because the two have
+    /// different safety nets. A packed archive declares its capabilities in
+    /// `manifest.capabilities`, so a reader that predates the re-typing
+    /// refuses the dataset AT OPEN. A served tile has no such gate: the
+    /// protocol's `/metadata.json` `capabilities` array is advisory (nothing
+    /// makes a client read it before fetching), so an older
+    /// `@poopdeck.gl/core` pointed at this server would read millisecond
+    /// offsets as absolute Unix times and place every feature in January 1970
+    /// — silent garbage, the format's worst failure mode. The few bytes this
+    /// saves on a dev/dynamic server are not worth that, so it is opt-in here
+    /// and the declaration on `/metadata.json` follows this flag.
+    #[arg(long)]
+    compact_times: bool,
 
     // --- Whole-dataset metadata --------------------------------------------
     /// Feature property driving the HeatmapLayer weight. Its [min, 95th
@@ -739,11 +770,27 @@ fn metadata_json(
 ) -> Result<serde_json::Value> {
     let mut meta = serde_json::json!({
         "format": format,
-        // The layer-frame version this server emits. The serve protocol's
-        // version channel (packed-v2 design §7): frames are self-describing to
-        // `decode_tile`, but a client that pins a decoder needs to know before
-        // it fetches. Mirrors the packed manifest's `formatVersion`.
-        "formatVersion": stt_core::arrow_tile::FORMAT_VERSION,
+        // The LAYER-FRAME version this server emits — the serve protocol's
+        // version channel. Frames are self-describing to `decode_tile`, but a
+        // client that pins a decoder needs to know before it fetches. Named
+        // `formatVersion` to match the packed manifest key a client reads for
+        // the same purpose; the two axes are pinned to the same number.
+        "formatVersion": stt_core::arrow_tile::LAYER_FRAME_VERSION,
+        // The serve protocol's CAPABILITY channel, the twin of the packed
+        // manifest's `capabilities` (packed spec §3.1) and derived from the
+        // same `EncoderSettings::required_capabilities()` the offline build
+        // declares with. Each entry names an encoder feature that RE-TYPES an
+        // existing tile column, so a client that does not implement one would
+        // not error on a tile — it would silently misdecode it. A packed
+        // archive lets such a client refuse at open; a served tile gave it no
+        // channel at all until this key, which is why the re-typing features
+        // are additionally opt-in here (`--compact-times`) rather than on by
+        // default as they are offline.
+        //
+        // Always present (an empty array when the server encodes the legacy,
+        // capability-free shape) so its absence unambiguously means "server
+        // too old to declare", not "declares nothing".
+        "capabilities": encoder_settings(args).required_capabilities(),
         "name": name,
         "boundingBox": [
             [min_lon.unwrap_or(-180.0), min_lat.unwrap_or(-90.0)],
@@ -1113,6 +1160,42 @@ fn resolve_source(args: &Args) -> Result<(String, String)> {
     }
 }
 
+/// The [`EncoderSettings`] this dataset encodes with — the SINGLE source of
+/// truth for both halves of the encoder contract:
+///
+/// * [`build_config`] resolves it into the `EncoderConfig` every tile response
+///   is encoded with, and
+/// * [`metadata_json`] derives the `capabilities` array `/metadata.json`
+///   advertises from `EncoderSettings::required_capabilities()`.
+///
+/// Deriving both from one value is the point. A capability names a feature
+/// that RE-TYPES an existing tile column, so a reader that lacks it does not
+/// error — it silently misdecodes. A packed archive is protected by
+/// `manifest.capabilities`; the serve protocol had no capability channel at
+/// all, so a hand-maintained second list here (or none) would be exactly the
+/// silent-misdecode hole the manifest key exists to close.
+fn encoder_settings(args: &Args) -> EncoderSettings {
+    EncoderSettings {
+        vertex_time_precision: Some(args.vertex_time_precision),
+        quantize_coords_m: args.quantize_coords,
+        quantize_attr: args.quantize_attr.clone(),
+        quantize_attrs_auto: args.quantize_attrs_auto,
+        vector_group: args.vector_group.clone(),
+        point_elevation_column: args.point_elevation_column.clone(),
+        // Compact times are OPT-IN on serve (`--compact-times`) and ON by
+        // default offline — see the flag's own doc comment for why the two
+        // defaults deliberately differ. Consequence: without the flag a
+        // served tile is byte-identical to an offline
+        // `stt-build --no-compact-times` tile, not to a default build's.
+        no_compact_times: !args.compact_times,
+        // The LOSSY per-vertex value quantization stays OFF (the `stt-build`
+        // default). If a `--quantize-vertex-values` twin is ever added here it
+        // must come through this struct, so `required_capabilities()` picks it
+        // up on `/metadata.json` in the same change.
+        quantize_vertex_values: false,
+    }
+}
+
 /// Build the full per-tile [`TileConfig`] from the CLI flags, sharing the exact
 /// builders the offline CLI uses, plus a resolved [`EncoderConfig`] passed
 /// EXPLICITLY to the encoder per request (no process-wide globals — so the
@@ -1138,22 +1221,14 @@ fn build_config(
 
     // Resolve encoder settings into an EXPLICIT config (parses + validates the
     // specs) — no process-wide globals are touched.
-    let mut encoder = EncoderSettings {
-        vertex_time_precision: Some(args.vertex_time_precision),
-        quantize_coords_m: args.quantize_coords,
-        quantize_attr: args.quantize_attr.clone(),
-        quantize_attrs_auto: args.quantize_attrs_auto,
-        vector_group: args.vector_group.clone(),
-        point_elevation_column: args.point_elevation_column.clone(),
-    }
-    .resolve()?;
-    // stt-serve emits SELF-CONTAINED v2 frames: every layer carries its schema
+    let mut encoder = encoder_settings(args).resolve()?;
+    // stt-serve emits SELF-CONTAINED layer frames: every layer carries its schema
     // inline rather than referencing a template by hash, because a live server
     // has no manifest to carry a `schemas` registry. `template_collector: None`
     // is what selects that inline mode. Responses are `no-store`, so template
     // amortization would buy nothing anyway. The emitted version is advertised
     // as `formatVersion` on `/metadata.json`.
-    encoder.format_version = stt_core::arrow_tile::FORMAT_VERSION;
+    encoder.format_version = stt_core::arrow_tile::LAYER_FRAME_VERSION;
     encoder.template_collector = None;
     let mut enc_enabled: Vec<String> = Vec::new();
     if let Some(m) = encoder.quantize_coords_m {
@@ -1180,8 +1255,22 @@ fn build_config(
             encoder.vertex_time_max_step_ms
         ));
     }
+    // Named because it is the one setting whose serve default (OFF) diverges
+    // from the offline build's (ON), so the log has to say which shape the
+    // process is emitting.
+    if encoder.compact_times {
+        enc_enabled.push("compact-times".into());
+    }
     if !enc_enabled.is_empty() {
         tracing::info!("Encoder settings ENABLED: {}", enc_enabled.join(", "));
+    }
+    if encoder.compact_times {
+        tracing::warn!(
+            "--compact-times: served tiles carry TILE_META.st/.et (the `time-delta` \
+             capability, advertised on /metadata.json). A client whose decoder \
+             predates it reads offsets as absolute Unix times — check your clients \
+             before enabling this on a shared endpoint"
+        );
     }
 
     // Temporal LOD: parse + validate against the base bucket (same invariants
@@ -1486,10 +1575,10 @@ async fn build_dataset_state(args: &Args) -> Result<(String, ServerState)> {
 /// The multi-dataset route table (`--config` mode): a catalog plus per-dataset
 /// metadata/tile routes under `/{dataset}/…`.
 ///
-/// Extracted from `main` so the route table can be built without a running
+/// Separate from `main` so the route table can be built without a running
 /// process. `docs/spec/stt-serve-protocol.md` is a published WIRE contract
-/// (paths, status codes, headers) — while the only way to obtain a `Router` was
-/// to run `main`, nothing could pin any of it, and the handler unit tests below
+/// (paths, status codes, headers); if obtaining a `Router` required running
+/// `main`, nothing could pin any of it, and the handler unit tests below would
 /// exercise arithmetic that no route has to be wired to.
 fn multi_dataset_router(registry: Arc<Registry>) -> Router {
     Router::new()
@@ -1718,8 +1807,8 @@ mod tests {
     fn metadata_json_is_uniformly_camel_case() {
         // /metadata.json is a loaders.gl TileSource-style runtime descriptor:
         // every top-level key (core AND advisory) must be camelCase so the
-        // object has one casing convention. This locks the heatmap_domain →
-        // heatmapDomain / temporal_lod → temporalLod fix against regression.
+        // object has one casing convention — a snake_case key here (e.g.
+        // `heatmap_domain`, `temporal_lod`) is what clients silently miss.
         let args = Args::parse_from(["stt-serve", "--table", "t"]);
         let domain = HeatmapDomain {
             classes: vec![HeatmapClassDomain {
@@ -1760,6 +1849,93 @@ mod tests {
         assert!(!obj.contains_key("heatmap_domain"));
     }
 
+    /// `/metadata.json` must DECLARE every encoder feature that re-types a
+    /// tile column, and the declaration must come from the settings the server
+    /// really encodes with. A capability is "required to understand": a client
+    /// that lacks one does not fail, it silently misdecodes. The packed
+    /// archive path is guarded by `manifest.capabilities`; this is the serve
+    /// protocol's equivalent channel.
+    #[test]
+    fn metadata_declares_the_capabilities_the_encoder_uses() {
+        let caps = |extra: &[&str]| -> Vec<String> {
+            let mut argv = vec!["stt-serve", "--table", "obs"];
+            argv.extend_from_slice(extra);
+            let args = Args::parse_from(argv);
+            let meta = metadata_json(
+                "obs",
+                &args,
+                3_600_000,
+                "stt-duckdb-dynamic",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                None,
+            )
+            .expect("metadata_json");
+            serde_json::from_value(meta["capabilities"].clone()).expect("capabilities is string[]")
+        };
+
+        // Default: the LEGACY absolute-Int64 time shape, nothing re-typed —
+        // the key is present but empty, so its ABSENCE stays a reliable
+        // "server predates the capability channel" signal.
+        assert_eq!(caps(&[]), Vec::<String>::new());
+
+        // Every re-typing flag lands in the declaration…
+        assert_eq!(caps(&["--compact-times"]), vec!["time-delta".to_string()]);
+        assert_eq!(
+            caps(&["--quantize-coords", "1.0"]),
+            vec!["coord-quant".to_string()]
+        );
+        assert_eq!(
+            caps(&["--quantize-attrs-auto"]),
+            vec!["attr-quant".to_string()]
+        );
+        assert_eq!(
+            caps(&["--point-elevation-column", "alt"]),
+            vec!["elevation-fold".to_string()]
+        );
+        // …and they compose.
+        assert_eq!(
+            caps(&["--compact-times", "--quantize-coords", "1.0"]),
+            vec!["coord-quant".to_string(), "time-delta".to_string()]
+        );
+        // An ADDITIVE feature is not a capability (a reader that ignores a
+        // vector group still decodes every other column correctly).
+        assert_eq!(caps(&["--vector-group", "v=a,b"]), Vec::<String>::new());
+    }
+
+    /// The declaration and the BYTES come from one `EncoderSettings`, so the
+    /// advertised capability set can never drift from the tile shape. This
+    /// pins both ends of `--compact-times` against the resolved config the
+    /// encoder is actually handed.
+    #[test]
+    fn compact_times_is_opt_in_on_serve() {
+        let default = Args::parse_from(["stt-serve", "--table", "obs"]);
+        let (_cfg, enc) = build_config(&default, 3_600_000).expect("build_config");
+        assert!(
+            !enc.compact_times,
+            "serve must default to the LEGACY time shape: an archive's manifest lets an \
+             old reader refuse at open, but a served tile gives it no such chance, so the \
+             re-typing has to be opt-in here even though `stt-build` defaults it ON"
+        );
+        assert!(!encoder_settings(&default)
+            .required_capabilities()
+            .iter()
+            .any(|c| c == stt_core::pack::CAPABILITY_TIME_DELTA));
+
+        let opted = Args::parse_from(["stt-serve", "--table", "obs", "--compact-times"]);
+        let (_cfg, enc) = build_config(&opted, 3_600_000).expect("build_config");
+        assert!(enc.compact_times);
+        assert!(encoder_settings(&opted)
+            .required_capabilities()
+            .iter()
+            .any(|c| c == stt_core::pack::CAPABILITY_TIME_DELTA));
+    }
+
     #[test]
     fn build_config_validates_temporal_lod() {
         // 30m is NOT a multiple of a 1h base → error.
@@ -1771,7 +1947,7 @@ mod tests {
         assert_eq!(cfg.temporal_lod.len(), 2);
     }
 
-    /// Doc gate (naming-types-consistency F9): every visible long flag must
+    /// Doc gate: every visible long flag must
     /// appear in the `stt-serve` section of `docs/api/cli-reference.md`, so a
     /// new flag fails the build until it is documented.
     #[test]
@@ -2051,6 +2227,11 @@ mod tests {
                 "temporalBucketMs",
                 "featureCount",
                 "tileUrlTemplate",
+                // §4 — the capability channel. Always present (empty when the
+                // server encodes the legacy shape) so a client can tell "this
+                // server declares nothing" from "this server is too old to
+                // declare".
+                "capabilities",
             ] {
                 assert!(meta.get(key).is_some(), "missing '{key}' in {meta}");
             }
@@ -2208,9 +2389,9 @@ mod tests {
             assert_eq!(reply.text(), "zoom 1 outside served range 2..=10");
         }
 
-        /// §2 — per-dataset ENCODER ISOLATION, the bug the `ServerState::encoder`
-        /// docstring names: two datasets with different encoder settings served
-        /// from one process must each keep their own.
+        /// Per-dataset ENCODER ISOLATION (see the `ServerState::encoder`
+        /// docstring): two datasets with different encoder settings served from
+        /// one process must each keep their own.
         ///
         /// Resolving one dataset's settings must not disturb another's, and each
         /// request must encode with ITS dataset's config — which is why the

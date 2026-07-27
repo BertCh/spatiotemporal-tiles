@@ -146,6 +146,27 @@ pub struct ColumnarLayer {
     /// Only meaningful for `GeometryColumn::Polygon`. Encoders that set this
     /// on a non-polygon layer will have it dropped at encode time.
     pub triangles: Option<Vec<Vec<u32>>>,
+    /// Optional per-feature PART boundaries for polygon features: the RING
+    /// INDEX (relative to that feature's own first ring) at which each part of
+    /// a MultiPolygon begins.
+    ///
+    /// Part 0 always starts at ring 0, so a single-part `Polygon`'s entry is
+    /// `[0]`; a two-part MultiPolygon whose first part is a square with one
+    /// hole is `[0, 2]`. When present, `polygon_parts.len() == feature_count`.
+    ///
+    /// This is the one thing `geoarrow.polygon` (`List<List<FixedSizeList>>` —
+    /// one flat ring list per feature) cannot express: the builder flattens a
+    /// MultiPolygon's parts into that ring list, after which part-vs-hole is
+    /// unrecoverable and every conformant GeoArrow consumer reads parts 2..n
+    /// as holes of part 1.
+    ///
+    /// Encoded as the optional `part_offsets` `List<UInt32>` column, and ONLY
+    /// when at least one feature in the layer has more than one part — the
+    /// column's ABSENCE means every feature is single-part. Purely additive
+    /// (an older reader ignores an unknown column), so it needs no manifest
+    /// capability. Like [`Self::triangles`] it is dropped at encode time for
+    /// non-polygon layers.
+    pub polygon_parts: Option<Vec<Vec<u32>>>,
     /// Property columns, keyed by name. Each column has one value per feature.
     pub properties: Vec<(String, PropertyColumn)>,
 }
@@ -182,6 +203,46 @@ impl ColumnarLayer {
         }
         if let Some(tri) = &self.triangles {
             check("triangles", tri.len())?;
+        }
+        if let Some(parts) = &self.polygon_parts {
+            check("polygon_parts", parts.len())?;
+            // Ring counts to bound the part starts against — only a polygon
+            // layer has them, and only a polygon layer keeps the column.
+            let rings_per_feature: Option<Vec<usize>> = match &self.geometry {
+                GeometryColumn::Polygon(polys) => Some(polys.iter().map(|f| f.len()).collect()),
+                _ => None,
+            };
+            for (i, starts) in parts.iter().enumerate() {
+                // An EMPTY entry is tolerated (it encodes as the single-part
+                // `[0]`); a malformed non-empty one is not, because it would
+                // silently mis-split the feature on every reader.
+                if starts.is_empty() {
+                    continue;
+                }
+                if starts[0] != 0 {
+                    return Err(Error::Other(format!(
+                        "tile layer '{}': polygon_parts[{}] starts at ring {} — part 0 must \
+                         start at ring 0",
+                        self.name, i, starts[0]
+                    )));
+                }
+                if !starts.windows(2).all(|w| w[0] < w[1]) {
+                    return Err(Error::Other(format!(
+                        "tile layer '{}': polygon_parts[{}] = {:?} is not strictly increasing",
+                        self.name, i, starts
+                    )));
+                }
+                if let Some(rings) = &rings_per_feature {
+                    let last = *starts.last().expect("checked non-empty") as usize;
+                    if rings[i] > 0 && last >= rings[i] {
+                        return Err(Error::Other(format!(
+                            "tile layer '{}': polygon_parts[{}] starts a part at ring {} but \
+                             the feature only has {} ring(s)",
+                            self.name, i, last, rings[i]
+                        )));
+                    }
+                }
+            }
         }
         for (name, col) in &self.properties {
             match col {

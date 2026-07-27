@@ -8,11 +8,18 @@
 
 use crate::error::{Error, Result};
 use std::cmp::Ordering;
+use std::fmt;
+
+/// Deepest addressable zoom level. Coordinates are bounded by `1u32 << z`, so a
+/// zoom above 31 shifts past the width of `u32` and [`TileId::validate`] stops
+/// rejecting out-of-range tiles; 22 also keeps the `2 * z`-bit Hilbert index
+/// well inside `u64`.
+pub const MAX_ZOOM: u8 = 22;
 
 /// Unique identifier for a spatiotemporal tile
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileId {
-    /// Zoom level (0-22)
+    /// Zoom level, `0..=`[`MAX_ZOOM`]
     pub z: u8,
     /// X coordinate
     pub x: u32,
@@ -42,12 +49,10 @@ impl TileId {
     /// Uses the integer (`discrete`) Hilbert curve at the tile's own zoom
     /// order, so neighbouring tiles never collide on the directory sort key.
     ///
-    /// The previous implementation normalised `(x, y)` to f64 `[0,1)` and
-    /// multiplied by `u64::MAX`. f64 has only a 52-bit mantissa, so at
-    /// zoom ≥ 14 the per-axis precision was already at the mantissa limit and
-    /// the post-multiply discarded trailing bits — neighbouring tiles could
-    /// collide on the same `hilbert_index`, silently degrading the archive's
-    /// range-coalescing locality. The integer variant is also ~10× faster.
+    /// f64 carries only a 52-bit mantissa, so normalising `(x, y)` to `[0,1)`
+    /// and scaling by `u64::MAX` collides for neighbouring tiles at zoom ≥ 14
+    /// and silently degrades the archive's range-coalescing locality. The
+    /// integer curve has no such limit and is ~10× faster.
     pub fn hilbert_index(&self) -> u64 {
         // `xy2h_discrete` requires `order >= 1`. At zoom 0 the only valid
         // coordinates are (0, 0) and the index is trivially 0.
@@ -79,7 +84,7 @@ impl TileId {
 
     /// Get child tiles at zoom level z+1
     pub fn children(&self) -> Vec<TileId> {
-        if self.z >= 22 {
+        if self.z >= MAX_ZOOM {
             return vec![];
         }
         vec![
@@ -89,10 +94,12 @@ impl TileId {
             TileId::new(self.z + 1, self.x * 2 + 1, self.y * 2 + 1, self.t),
         ]
     }
+}
 
-    /// Convert to string format: z/x/y/t
-    pub fn to_string(&self) -> String {
-        format!("{}/{}/{}/{}", self.z, self.x, self.y, self.t)
+/// Canonical textual tile address: `z/x/y/t`.
+impl fmt::Display for TileId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}/{}/{}", self.z, self.x, self.y, self.t)
     }
 }
 
@@ -104,7 +111,12 @@ impl PartialOrd for TileId {
 
 impl Ord for TileId {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Sort by: zoom, hilbert index, time
+        // Sort by: zoom, hilbert index, time.
+        //
+        // `hilbert_index()` is recomputed on both operands of every comparison
+        // and costs O(z), so sorting a large tile list through this comparator
+        // pays it O(n log n) times. Callers ordering many tiles should key on
+        // `(z, hilbert_index(), t)` once per tile instead.
         self.z
             .cmp(&other.z)
             .then(self.hilbert_index().cmp(&other.hilbert_index()))
@@ -142,6 +154,25 @@ mod tests {
         assert_eq!(children[0].z, 11);
     }
 
+    /// The address is `z/x/y/t` through both `Display` and the blanket
+    /// `ToString`, which is what makes `format!("{tile}")` and
+    /// `tile.to_string()` interchangeable.
+    #[test]
+    fn tile_id_display_is_z_x_y_t() {
+        let tile = TileId::new(10, 512, 384, 1609459200000);
+        assert_eq!(format!("{tile}"), "10/512/384/1609459200000");
+        assert_eq!(tile.to_string(), "10/512/384/1609459200000");
+    }
+
+    /// `children()` stops at the deepest addressable zoom rather than minting
+    /// tiles whose coordinates no longer fit the format's bounds.
+    #[test]
+    fn children_stop_at_max_zoom() {
+        let deepest = TileId::new(MAX_ZOOM, 0, 0, 0);
+        assert!(deepest.children().is_empty());
+        assert_eq!(TileId::new(MAX_ZOOM - 1, 0, 0, 0).children().len(), 4);
+    }
+
     #[test]
     fn test_tile_id_ordering() {
         let t1 = TileId::new(10, 512, 384, 1609459200000);
@@ -152,10 +183,10 @@ mod tests {
         assert!(t1 < t3); // Different zoom
     }
 
-    /// Regression: at zoom ≥ 14 the previous f64-normalised Hilbert collapsed
-    /// neighbouring tiles to the same index, breaking range coalescing. The
-    /// integer variant must produce distinct indices for every distinct tile
-    /// at every supported zoom.
+    /// `hilbert_index` must produce distinct indices for distinct tiles at
+    /// every supported zoom. Collisions among neighbours break the directory
+    /// sort key and with it range coalescing; an f64-normalised curve loses
+    /// exactly this property at zoom ≥ 14.
     #[test]
     fn hilbert_index_is_distinct_for_distinct_tiles_at_high_zoom() {
         for &z in &[14u8, 16, 18, 20, 22] {

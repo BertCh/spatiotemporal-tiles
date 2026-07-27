@@ -7,11 +7,13 @@
 
 use super::config::VectorGroup;
 use super::layer::{GeometryColumn, PropertyColumn};
-use super::quantize::QuantAffine;
+use super::quantize::{
+    quantize_vertex_value, vertex_value_affine, QuantAffine, VERTEX_VALUE_QUANT_SENTINEL,
+};
 use crate::error::{Error, Result};
 use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, Float32Builder, Float64Array, Int32Array, Int64Builder,
-    ListArray, ListBuilder, UInt16Builder,
+    ListArray, ListBuilder, UInt16Builder, UInt32Builder,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field};
@@ -311,22 +313,83 @@ pub(crate) fn build_dictionary_indices(
 /// that lets the reader reconstruct absolute timestamps.
 pub(crate) struct VertexTimeColumn {
     pub(crate) array: ArrayRef,
-    /// `(origin_ms, step_ms)` when the column is u16-delta-encoded. `None`
+    /// `(origin_ms, step_ms)` when the column is delta-encoded (EITHER the
+    /// `List<UInt16>` or the `List<UInt32>` tier — the `vt` contract is
+    /// width-agnostic and the Arrow child type is self-describing). `None`
     /// when the column kept its absolute `List<Int64>` shape (the exact
     /// fallback path, used for layers whose temporal span would need a step
     /// beyond the configured ceiling — see [`DEFAULT_VERTEX_TIME_MAX_STEP_MS`]).
     pub(crate) encoding: Option<(i64, u32)>,
 }
 
+/// Build one feature-per-row `List<UInt16>` delta column
+/// (`delta = (t - origin) / step`). Features with no timestamps append a null
+/// list, exactly like the `List<Int64>` fallback.
+fn delta_list_u16(vt: &[Vec<i64>], feature_count: usize, min: i64, step: u32) -> ArrayRef {
+    let mut builder = ListBuilder::new(UInt16Builder::new());
+    for i in 0..feature_count {
+        match vt.get(i) {
+            Some(times) if !times.is_empty() => {
+                for &t in times {
+                    // Saturate at the width max — for a sensibly chosen step
+                    // this branch can only fire on inputs that disagree with
+                    // the (min,max) scan (e.g. `vertex_times` longer than
+                    // feature_count).
+                    let delta = ((t - min) as u64 / step as u64).min(u16::MAX as u64) as u16;
+                    builder.values().append_value(delta);
+                }
+                builder.append(true);
+            }
+            _ => builder.append(false),
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+/// The `List<UInt32>` twin of [`delta_list_u16`] — half the bytes of the
+/// absolute `List<Int64>` shape, and (for any span under 49.7 days) at
+/// `step = 1`, i.e. EXACT millisecond precision.
+fn delta_list_u32(vt: &[Vec<i64>], feature_count: usize, min: i64, step: u32) -> ArrayRef {
+    let mut builder = ListBuilder::new(UInt32Builder::new());
+    for i in 0..feature_count {
+        match vt.get(i) {
+            Some(times) if !times.is_empty() => {
+                for &t in times {
+                    let delta = ((t - min) as u64 / step as u64).min(u32::MAX as u64) as u32;
+                    builder.values().append_value(delta);
+                }
+                builder.append(true);
+            }
+            _ => builder.append(false),
+        }
+    }
+    Arc::new(builder.finish())
+}
+
 /// Build the optional per-vertex time column.
 ///
-/// v3 attempts to encode timestamps as `List<UInt16>` deltas relative to
-/// a per-layer origin and step (`absolute = origin + delta * step`), with
-/// the step bounded by `max_step_ms` (see
-/// [`DEFAULT_VERTEX_TIME_MAX_STEP_MS`]). When the layer's temporal span
-/// would need a coarser step than that, the column keeps the exact v2
-/// `List<Int64>` shape instead — bounded quantization or no quantization,
-/// never a silent precision cliff.
+/// Timestamps are stored as deltas relative to a per-layer origin and step
+/// (`absolute = origin + delta * step`), with the step bounded by
+/// `max_step_ms` (see [`DEFAULT_VERTEX_TIME_MAX_STEP_MS`]). Three tiers are
+/// tried in width order, each at the SMALLEST step that fits its width:
+///
+/// | tier | delta ceiling | exact-ms span | bytes/vertex |
+/// |---|---|---|---|
+/// | `List<UInt16>` | 65 535 | 65.5 s (18.2 h at the 1 s default step) | 2 |
+/// | `List<UInt32>` | 4 294 967 295 | **49.7 days** | 4 |
+/// | `List<Int64>` (absolute) | — | unbounded | 8 |
+///
+/// The u32 tier exists because falling from u16 straight to absolute `Int64`
+/// doubles the column for every layer spanning more than ~18 h (14.3% of
+/// `nyc-taxi-flows`' tile bytes) even though a 4-byte delta at step 1 is both
+/// smaller AND lossless. `Int64` is reached only when even a u32 delta would
+/// need a step coarser than the ceiling (a span beyond ~136 years at the 1 s
+/// default) — bounded quantization or no quantization, never a silent
+/// precision cliff.
+///
+/// No manifest capability is needed for the u32 tier: `vt` already tells the
+/// reader the column is delta-coded, and a reader that ignored the Arrow child
+/// type would already have been broken on the u16 tier.
 pub(crate) fn build_vertex_time_array(
     vertex_times: &Option<Vec<Vec<i64>>>,
     feature_count: usize,
@@ -353,52 +416,47 @@ pub(crate) fn build_vertex_time_array(
     }
 
     if any && max >= min {
-        // Pick the smallest step (in ms) that keeps every (t - min) inside
-        // u16::MAX. step=1 means "exact ms granularity"; larger steps trade
-        // precision (bounded by step ms) for a 4x payload shrink vs i64.
         let span = (max - min) as u64;
-        // Computed in u64 and compared BEFORE narrowing: a pathological span
-        // whose step overflows u32 must hit the i64 path, not wrap small.
-        let step = if span <= u16::MAX as u64 {
-            1u64
-        } else {
-            ((span + u16::MAX as u64 - 1) / u16::MAX as u64).max(1)
-        };
-        // Step ceiling: beyond it the quantization error would exceed the
-        // configured precision, so take the exact i64 path below instead.
-        if step <= max_step_ms as u64 {
-            let step = step as u32;
-            let mut builder = ListBuilder::new(UInt16Builder::new());
-            for i in 0..feature_count {
-                match vt.get(i) {
-                    Some(times) if !times.is_empty() => {
-                        for &t in times {
-                            // Saturate at u16::MAX — for a sensibly chosen
-                            // step this branch can only fire on inputs that
-                            // disagree with the (min,max) scan above (e.g.
-                            // a `vertex_times` longer than feature_count).
-                            let delta =
-                                ((t - min) as u64 / step as u64).min(u16::MAX as u64) as u16;
-                            builder.values().append_value(delta);
-                        }
-                        builder.append(true);
-                    }
-                    _ => builder.append(false),
-                }
+        // Try each delta width narrowest-first, at the smallest step that
+        // keeps every (t - min) inside that width. step=1 means "exact ms
+        // granularity"; larger steps trade precision (bounded by step ms) for
+        // payload. Everything is computed in u64 and compared BEFORE
+        // narrowing: a pathological span whose step overflows u32 must hit the
+        // i64 path, not wrap small.
+        let mut widest_step = 0u64;
+        for max_delta in [u16::MAX as u64, u32::MAX as u64] {
+            let step = if span <= max_delta {
+                1u64
+            } else {
+                span.div_ceil(max_delta).max(1)
+            };
+            widest_step = step;
+            // Step ceiling: beyond it the quantization error would exceed the
+            // configured precision, so try the next (wider, hence
+            // finer-stepped) tier, and ultimately the exact i64 path below.
+            if step <= max_step_ms as u64 {
+                let step = step as u32;
+                let array = if max_delta == u16::MAX as u64 {
+                    delta_list_u16(vt, feature_count, min, step)
+                } else {
+                    delta_list_u32(vt, feature_count, min, step)
+                };
+                return Some(VertexTimeColumn {
+                    array,
+                    encoding: Some((min, step)),
+                });
             }
-            return Some(VertexTimeColumn {
-                array: Arc::new(builder.finish()),
-                encoding: Some((min, step)),
-            });
         }
         // Reached the exact-Int64 fallback because the span needs a coarser
-        // step than the ceiling. Warn once per process (not per tile).
+        // step than the ceiling even at the widest (u32) delta. Warn once per
+        // process (not per tile).
         if !VERTEX_TIME_FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
             tracing::warn!(
-                "vertex-time span {}ms exceeds u16-delta ceiling (step {}ms > max {}ms); \
-                 falling back to exact Int64 — payload keeps full precision but is ~4x larger",
+                "vertex-time span {}ms exceeds every delta tier's ceiling (u32 step {}ms > \
+                 max {}ms); falling back to exact Int64 — payload keeps full precision but \
+                 is 2-4x larger",
                 span,
-                step,
+                widest_step,
                 max_step_ms
             );
         }
@@ -424,33 +482,152 @@ pub(crate) fn build_vertex_time_array(
     })
 }
 
-/// Build the optional per-vertex scalar column as a nullable `List<Float32>`.
+/// Built per-vertex value column, alongside the affine (when any) a reader
+/// needs to reconstruct `Float32` from the quantized `UInt16` leaf.
+pub(crate) struct VertexValueColumn {
+    pub(crate) array: ArrayRef,
+    /// `(o, s)` of the range-adaptive affine when the leaf is `UInt16`
+    /// (`value = o + q*s`, index [`VERTEX_VALUE_QUANT_SENTINEL`] ⇒ `NaN`);
+    /// `None` for the historical raw `List<Float32>` shape.
+    pub(crate) quant: Option<(f64, f64)>,
+}
+
+/// Build the optional per-vertex scalar column.
 ///
-/// Unlike `vertex_time`, there's no delta/origin/step encoding — the values are
-/// producer-defined scalars (e.g. sea-surface temperature) with a small range
-/// where f32 precision is ample. A feature with no per-vertex values appends a
-/// null list; `NaN` entries within a list mark individual vertices with no value.
-/// Returns `None` when no feature carries any value, so the column is omitted.
+/// **Default (`quantize = false`) — byte-identical to the historical encoder:**
+/// a nullable `List<Float32>` holding the producer's values verbatim. Unlike
+/// `vertex_time` there is no delta/origin/step encoding — the values are
+/// producer-defined scalars (e.g. sea-surface temperature) where f32 precision
+/// is ample. A feature with no per-vertex values appends a null list; `NaN`
+/// entries within a list mark individual vertices with no value.
+///
+/// **`quantize = true` (opt-in, the `vertex-value-quant` capability):** a
+/// nullable `List<UInt16>` at HALF the bytes, under the column's own
+/// range-adaptive affine ([`vertex_value_affine`]). `vertex_value` /
+/// `vertex_value_matrix` are the only `List<Float32>` columns the format
+/// carries and they had NO size lever at all (`stt:qa` covers scalar property
+/// columns only) — measured at 64.2% of `nyc-taxi-flows` and 93.7% of
+/// `bixi-corridors` tile bytes. Non-finite entries (the `NaN` no-value marker,
+/// and `±inf`, which no renderer can draw either) become
+/// [`VERTEX_VALUE_QUANT_SENTINEL`] and decode back to `NaN`.
+///
+/// Returns `None` when no feature carries any value, so the column is omitted
+/// (identical trigger in both modes).
 pub(crate) fn build_vertex_value_array(
     vertex_values: &Option<Vec<Vec<f32>>>,
     feature_count: usize,
-) -> Option<ArrayRef> {
+    quantize: bool,
+) -> Option<VertexValueColumn> {
     let vv = vertex_values.as_ref()?;
     let any = vv.iter().take(feature_count).any(|v| !v.is_empty());
     if !any {
         return None;
     }
-    let mut builder = ListBuilder::new(Float32Builder::new());
+    if !quantize {
+        let mut builder = ListBuilder::new(Float32Builder::new());
+        for i in 0..feature_count {
+            match vv.get(i) {
+                Some(values) if !values.is_empty() => {
+                    for &v in values {
+                        builder.values().append_value(v);
+                    }
+                    builder.append(true);
+                }
+                _ => builder.append(false),
+            }
+        }
+        return Some(VertexValueColumn {
+            array: Arc::new(builder.finish()),
+            quant: None,
+        });
+    }
+
+    // One scan for the finite range the affine is sized from. Computed in f64
+    // (the affine's own precision) so the reconstruction math matches the
+    // decoder's exactly.
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut finite = 0usize;
+    for values in vv.iter().take(feature_count) {
+        for &v in values {
+            let v = v as f64;
+            if !v.is_finite() {
+                continue;
+            }
+            finite += 1;
+            min = min.min(v);
+            max = max.max(v);
+        }
+    }
+    let affine = vertex_value_affine(min, max, finite);
+
+    let mut builder = ListBuilder::new(UInt16Builder::new());
     for i in 0..feature_count {
         match vv.get(i) {
             Some(values) if !values.is_empty() => {
                 for &v in values {
-                    builder.values().append_value(v);
+                    let v = v as f64;
+                    let q = if v.is_finite() {
+                        quantize_vertex_value(&affine, v)
+                    } else {
+                        VERTEX_VALUE_QUANT_SENTINEL
+                    };
+                    builder.values().append_value(q);
                 }
                 builder.append(true);
             }
             _ => builder.append(false),
         }
+    }
+    Some(VertexValueColumn {
+        array: Arc::new(builder.finish()),
+        quant: Some((affine.o, affine.s)),
+    })
+}
+
+/// Build the optional `part_offsets` column: per polygon feature, the RING
+/// INDEX (relative to that feature's own first ring) at which each of its
+/// parts begins. Part 0 always starts at ring 0, so a single-part feature's
+/// list is `[0]`.
+///
+/// Returns `None` — the column is then OMITTED, which a reader MUST read as
+/// "every feature is single-part" — unless at least one feature has more than
+/// one part. That is the only case where the column carries information, and
+/// keeping it out of single-part layers costs nothing and forks no template.
+///
+/// **Why this column exists.** `geoarrow.polygon` is
+/// `List<List<FixedSizeList>>`: one flat ring list per feature, exterior first
+/// then holes. A MultiPolygon's parts are flattened into that same ring list,
+/// so part-vs-hole is UNRECOVERABLE from the wire — every conformant GeoArrow
+/// consumer (GeoPandas, lonboard, geoarrow-rs, `@geoarrow/deck.gl-layers`)
+/// reads parts 2..n as holes of part 1. This is not exotic input: the tiler
+/// emits a MultiPolygon whenever clipping cuts one source polygon into several
+/// pieces inside a tile. The column is purely ADDITIVE — an older reader
+/// ignores an unknown column — so it needs no capability and no
+/// `formatVersion` bump.
+pub(crate) fn build_part_offsets_array(
+    polygon_parts: &Option<Vec<Vec<u32>>>,
+    geometry: &GeometryColumn,
+    feature_count: usize,
+) -> Option<ArrayRef> {
+    if !matches!(geometry, GeometryColumn::Polygon(_)) {
+        return None;
+    }
+    let pp = polygon_parts.as_ref()?;
+    if !pp.iter().take(feature_count).any(|f| f.len() > 1) {
+        return None;
+    }
+    let mut builder = ListBuilder::new(UInt32Builder::new());
+    for i in 0..feature_count {
+        // A feature with no recorded parts is single-part by definition.
+        let starts: &[u32] = match pp.get(i) {
+            Some(v) if !v.is_empty() => v.as_slice(),
+            _ => &[0],
+        };
+        for &s in starts {
+            builder.values().append_value(s);
+        }
+        builder.append(true);
     }
     Some(Arc::new(builder.finish()))
 }

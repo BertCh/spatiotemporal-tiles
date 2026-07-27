@@ -1,8 +1,11 @@
 //! Build Arrow [`ColumnarLayer`]s from parsed features and clipped segments.
 //!
-//! Geometry is stored as real WGS84 lon/lat (`f64`) — no quantization, no
-//! delta encoding. Arrow IPC + gzip handle compression, and the payload is
-//! consumable directly by GeoArrow-aware renderers.
+//! This stage emits geometry as real WGS84 lon/lat (`f64`), unquantized and
+//! undelta'd; coordinate quantization, if enabled, happens later at encode
+//! time. Nothing here compresses — the encoder writes Arrow IPC and the pack
+//! writer applies per-blob zstd (the only tile codec; see
+//! `stt_core::compression`). The payload stays consumable directly by
+//! GeoArrow-aware renderers.
 
 use crate::clip::ClippedSegment;
 use crate::input::ParsedFeature;
@@ -144,11 +147,29 @@ pub fn build_layers_from_features_with(
     if !points.is_empty() {
         layers.push(build_point_layer(&points, name_for("points"), &opts)?);
     }
+    // A geometry kind whose features are ALL unusable must not take the other
+    // kinds down with it: the line/polygon builders fail only when every one of
+    // their features had geometry that could not be read (see
+    // `extract_or_drop`), which says nothing about the points sharing the tile.
+    // Log the loss and keep going — the tiler applies the same rule one level
+    // up, and an empty layer list simply collapses the tile.
     if !lines.is_empty() {
-        layers.push(build_line_layer(&lines, name_for("lines"), &opts)?);
+        match build_line_layer(&lines, name_for("lines"), &opts) {
+            Ok(layer) => layers.push(layer),
+            Err(e) => tracing::warn!(
+                "layer {layer_name:?}: dropping {} line feature(s); {e}",
+                lines.len()
+            ),
+        }
     }
     if !polygons.is_empty() {
-        layers.push(build_polygon_layer(&polygons, name_for("polygons"), &opts)?);
+        match build_polygon_layer(&polygons, name_for("polygons"), &opts) {
+            Ok(layer) => layers.push(layer),
+            Err(e) => tracing::warn!(
+                "layer {layer_name:?}: dropping {} polygon feature(s); {e}",
+                polygons.len()
+            ),
+        }
     }
     Ok(layers)
 }
@@ -232,6 +253,7 @@ pub fn build_layer_from_segments(
     }
 
     Ok(ColumnarLayer {
+        polygon_parts: None,
         name: layer_name.to_string(),
         feature_ids,
         start_times,
@@ -276,6 +298,7 @@ fn build_point_layer(
     }
     let geometry: Vec<Coord> = features.iter().map(|f| [f.lon, f.lat]).collect();
     Ok(ColumnarLayer {
+        polygon_parts: None,
         name,
         feature_ids: ids,
         start_times: start,
@@ -294,6 +317,13 @@ fn build_line_layer(
     name: String,
     opts: &ColumnarOptions,
 ) -> Result<ColumnarLayer> {
+    // Geometry FIRST, and only then the id/time/property columns: a feature
+    // whose geometry cannot be read is DROPPED here (never fabricated), and
+    // every other column has to be built over the survivors so the rows stay
+    // aligned.
+    let (features, coords_per_feature) =
+        extract_or_drop(features, "line", &name, extract_line_coords)?;
+    let features = &features[..];
     let (ids, start, end, props) = common_columns(features, opts);
 
     let mut geometry: Vec<Vec<Coord>> = Vec::with_capacity(features.len());
@@ -305,8 +335,7 @@ fn build_line_layer(
     let mut any_matrix = false;
     let mut length_mismatch_warned = false;
 
-    for f in features {
-        let coords = extract_line_coords(f)?;
+    for (f, coords) in features.iter().zip(coords_per_feature) {
         // Priority for per-vertex times, in order:
         //   1. Producer-supplied `vertex_timestamps` (e.g. OSRM annotations) —
         //      real per-segment timing reflecting street class.
@@ -369,6 +398,7 @@ fn build_line_layer(
     }
 
     Ok(ColumnarLayer {
+        polygon_parts: None,
         name,
         feature_ids: ids,
         start_times: start,
@@ -394,35 +424,76 @@ fn build_polygon_layer(
     name: String,
     opts: &ColumnarOptions,
 ) -> Result<ColumnarLayer> {
+    // Geometry FIRST — see `build_line_layer`. `parts[i].part_starts` is the
+    // per-feature PART boundary list (the ring index each part of a
+    // MultiPolygon begins at); it drives the tessellator below AND is what the
+    // `part_offsets` wire column is built from.
+    let (features, parts) = extract_or_drop(features, "polygon", &name, extract_polygon_rings)?;
+    let features = &features[..];
     let (ids, start, end, props) = common_columns(features, opts);
-    let mut geometry: Vec<Vec<Vec<Coord>>> = Vec::with_capacity(features.len());
-    for f in features {
-        geometry.push(extract_polygon_rings(f)?);
-    }
+
     // Build the triangle index sidecar by running earcut over each feature's
-    // rings. The same coords feed both the geometry column and the tessellator —
-    // indices are local to the feature.
+    // rings, PART BY PART. The same coords feed both the geometry column and
+    // the tessellator — indices are local to the feature.
     //
     // We bake triangles when explicitly requested (`--pre-tessellate`) OR
-    // whenever ANY feature is multi-ring (a polygon with holes, or a perimeter
-    // carrying interior rings). Multi-ring polygons CANNOT render correctly
-    // through deck.gl's binary earcut path: with `_normalize:false` and no
-    // index buffer it triangulates the feature's concatenated ring run as a
-    // SINGLE boundary, bridging disjoint rings with spanning triangles — the
-    // storm-radar isoband streaks and wildfire-perimeter spikes. Supplying the
-    // baked, hole-aware `indices` buffer makes the renderer skip earcut, so the
-    // sidecar is MANDATORY for these layers, not just a perf win. Layers whose
-    // every feature is a single ring stay lean (no sidecar).
-    let needs_triangles = opts.pre_tessellate || geometry.iter().any(|rings| rings.len() > 1);
-    let triangles = if needs_triangles {
-        let mut tris: Vec<Vec<u32>> = Vec::with_capacity(geometry.len());
-        for rings in &geometry {
-            tris.push(tessellate_polygon(rings));
-        }
-        Some(tris)
-    } else {
-        None
-    };
+    // whenever ANY feature has more than one ring (a polygon with holes, a
+    // perimeter carrying interior rings, or a multi-part MultiPolygon — which
+    // is also what the tiler emits when clipping cuts one polygon into several
+    // pieces inside a tile). Such features CANNOT render correctly through
+    // deck.gl's binary earcut path: with `_normalize:false` and no index buffer
+    // it triangulates the feature's concatenated ring run as a SINGLE boundary,
+    // bridging disjoint rings with spanning triangles — the storm-radar isoband
+    // streaks and wildfire-perimeter spikes. Supplying the baked, hole-aware
+    // `indices` buffer makes the renderer skip earcut, so the sidecar is
+    // MANDATORY for these layers, not just a perf win. Layers whose every
+    // feature is a single ring stay lean (no sidecar).
+    //
+    // ALL-OR-NOTHING PER LAYER, deliberately. The triangle column is 40-45% of
+    // the wire bytes of a polygon-heavy tile (measured on storm-field and
+    // storm4d-cloudtop), and most of that is spent on single-ring features that
+    // every renderer could earcut itself — so it is tempting to emit an EMPTY
+    // list for those and keep the baked indices only for the features that need
+    // them. That is NOT safe against the current readers, all three of which
+    // branch on whether the LAYER has a triangle column and then trust each
+    // feature's slice verbatim, with no per-feature fallback:
+    //   - packages/layers/.../animated-polygon-layer.ts binds `binary.triangles`
+    //     as ONE whole-layer index buffer, so a feature missing from it is
+    //     simply never drawn;
+    //   - packages/core/src/render/geometry.ts `tessellateFeature` returns the
+    //     empty slice (maplibre draws nothing for that feature);
+    //   - packages/three/src/layers/polygon-buffers.ts takes its `hasPreBaked`
+    //     branch per LAYER and pushes no cap triangles for an empty range.
+    // Mixing empty and non-empty lists therefore makes single-ring polygons
+    // vanish. Unlocking the saving needs a reader-side change first (the
+    // cheapest is a backfill in the decoder: earcut a feature's single ring when
+    // its baked list is empty, in packages/core/src/tile.ts) — until then every
+    // feature in a triangle-bearing layer gets a real triangulation.
+    let needs_triangles = opts.pre_tessellate || parts.iter().any(PolygonParts::needs_triangles);
+    let triangles = needs_triangles.then(|| parts.iter().map(tessellate_parts).collect::<Vec<_>>());
+
+    // The PART boundaries the geometry column is about to erase. `geoarrow.
+    // polygon` is one flat ring list per feature, so once the parts are
+    // flattened nothing on the wire distinguishes "part 2's exterior" from
+    // "part 1's hole" — and every conformant GeoArrow consumer (GeoPandas,
+    // lonboard, geoarrow-rs, @geoarrow/deck.gl-layers) reads the former as the
+    // latter. `part_offsets` is the sidecar that keeps them separable; the
+    // encoder emits the column only when some feature really is multi-part, so
+    // a plain-Polygon layer carries nothing extra.
+    let any_multipart = parts.iter().any(|p| p.part_starts.len() > 1);
+    let polygon_parts = any_multipart.then(|| {
+        parts
+            .iter()
+            .map(|p| {
+                p.part_starts
+                    .iter()
+                    .map(|&s| s as u32)
+                    .collect::<Vec<u32>>()
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let geometry: Vec<Vec<Vec<Coord>>> = parts.into_iter().map(|p| p.rings).collect();
     Ok(ColumnarLayer {
         name,
         feature_ids: ids,
@@ -432,6 +503,7 @@ fn build_polygon_layer(
         vertex_times: None,
         vertex_values: None,
         triangles,
+        polygon_parts,
         vertex_value_matrix: None,
         properties: props,
     })
@@ -739,14 +811,85 @@ pub fn determine_geometry_type(feature: &ParsedFeature) -> Result<GeometryType> 
     })
 }
 
+/// A short, human-readable identity for one feature, for diagnostics only —
+/// so a dropped feature can be found in the source rather than just counted.
+fn feature_label(feature: &ParsedFeature) -> String {
+    use geojson::feature::Id;
+    match &feature.geojson.id {
+        Some(Id::String(s)) => format!("id {s:?} at ({:.6}, {:.6})", feature.lon, feature.lat),
+        Some(Id::Number(n)) => format!("id {n} at ({:.6}, {:.6})", feature.lon, feature.lat),
+        None => format!("at ({:.6}, {:.6})", feature.lon, feature.lat),
+    }
+}
+
+/// Run a per-feature geometry extractor over a group, DROPPING the features it
+/// rejects instead of writing something made up in their place.
+///
+/// An extractor must never paper over unusable geometry with a
+/// plausible-looking placeholder — a single-point "line", a one-vertex "ring"
+/// at the feature's centroid. Both produce a row that every downstream consumer
+/// (validators, feature counts, pickers) treats as real data while rendering as
+/// nothing, so a broken source looks like a healthy build. Dropping is the
+/// honest answer: the feature is gone, it is counted, and the reason for the
+/// first one is logged.
+///
+/// Returns the surviving features alongside their extracted geometry, in the
+/// same order, so the caller can build every other column over exactly those
+/// rows. Errors only when NOTHING survived — the caller decides whether that is
+/// fatal (it isn't: `build_layers_from_features_with` logs and skips the layer).
+fn extract_or_drop<'a, T>(
+    features: &[&'a ParsedFeature],
+    kind: &str,
+    layer: &str,
+    extract: impl Fn(&ParsedFeature) -> Result<T>,
+) -> Result<(Vec<&'a ParsedFeature>, Vec<T>)> {
+    let mut kept: Vec<&'a ParsedFeature> = Vec::with_capacity(features.len());
+    let mut extracted: Vec<T> = Vec::with_capacity(features.len());
+    let mut first_error: Option<String> = None;
+    for f in features {
+        match extract(f) {
+            Ok(value) => {
+                kept.push(*f);
+                extracted.push(value);
+            }
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
+            }
+        }
+    }
+    let dropped = features.len() - kept.len();
+    let reason = first_error.as_deref().unwrap_or("unknown");
+    if kept.is_empty() {
+        // Every feature was unusable — the caller turns this into a skipped
+        // layer, so the rest of the tile still builds.
+        anyhow::bail!("all {dropped} {kind} feature(s) had unusable geometry; first: {reason}");
+    }
+    if dropped > 0 {
+        // Aggregated per layer build (one line per tile at worst), matching the
+        // `vertex_timestamps` mismatch warning above. NOTE: there is no
+        // build-wide total — that counter lives in the tiler's
+        // `PlacementCounters`, which this module cannot reach.
+        tracing::warn!(
+            "layer {layer:?}: dropped {dropped} of {} {kind} feature(s) with unusable \
+             geometry — NOT written to this tile (first: {reason})",
+            features.len()
+        );
+    }
+    Ok((kept, extracted))
+}
+
 /// Extract a flat vertex list for a (multi)linestring feature.
+///
+/// Errors — rather than inventing a one-vertex line at the feature's
+/// representative point — when the geometry is not a (multi)linestring or
+/// carries no usable position. See [`extract_or_drop`].
 fn extract_line_coords(feature: &ParsedFeature) -> Result<Vec<Coord>> {
     use geojson::Value as GeomValue;
-    let geom = feature
-        .geojson
-        .geometry
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("feature has no geometry"))?;
+    let geom = feature.geojson.geometry.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("line feature {} has no geometry", feature_label(feature))
+    })?;
     let coords: Vec<Coord> = match &geom.value {
         GeomValue::LineString(pts) => pts
             .iter()
@@ -759,45 +902,167 @@ fn extract_line_coords(feature: &ParsedFeature) -> Result<Vec<Coord>> {
             .filter(|c| c.len() >= 2)
             .map(|c| [c[0], c[1]])
             .collect(),
-        _ => vec![[feature.lon, feature.lat]],
+        // Routed here as a line by `determine_geometry_type` (a
+        // GeometryCollection whose first member is a line) but not readable as
+        // one. There is no line to extract, and a synthesised single-point one
+        // is not a line either.
+        other => anyhow::bail!(
+            "line feature {} carries {} geometry, which holds no line vertices",
+            feature_label(feature),
+            other.type_name()
+        ),
     };
     if coords.is_empty() {
-        Ok(vec![[feature.lon, feature.lat]])
-    } else {
-        Ok(coords)
+        anyhow::bail!(
+            "line feature {} has no position with both x and y",
+            feature_label(feature)
+        );
+    }
+    Ok(coords)
+}
+
+/// A polygon feature's rings, flattened PART-MAJOR, plus the part boundaries
+/// that the flattening would otherwise erase.
+///
+/// GeoArrow `ring_offsets` keep the individual RINGS separable on the wire, but
+/// they cannot say where one PART of a MultiPolygon ends and the next begins —
+/// and that distinction is load-bearing, because ring 0 of a part is an
+/// EXTERIOR ring while every later ring of the SAME part is a hole. Keeping
+/// `part_starts` alongside the rings lets the tessellator treat each part as
+/// its own polygon (see [`tessellate_parts`]) instead of folding parts 2..n
+/// into part 1's hole list.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct PolygonParts {
+    /// Every usable ring of the feature, in part-major order — exactly the
+    /// order (and the flattened vertex run) the geometry column is written in.
+    pub(crate) rings: Vec<Vec<Coord>>,
+    /// Ring index at which each part begins. Always starts at 0, strictly
+    /// increasing, one entry per part: `[0]` for a plain `Polygon`, and
+    /// `part_starts.len()` is the part count. Part `p` owns
+    /// `rings[part_starts[p] .. part_starts[p + 1]]` (the last runs to
+    /// `rings.len()`).
+    pub(crate) part_starts: Vec<usize>,
+}
+
+impl PolygonParts {
+    /// Ring index ranges, one per part.
+    fn part_ranges(&self) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+        let starts = &self.part_starts;
+        let total = self.rings.len();
+        starts.iter().enumerate().map(move |(i, &start)| {
+            let end = starts.get(i + 1).copied().unwrap_or(total);
+            start..end
+        })
+    }
+
+    /// True when this feature cannot survive a renderer's own single-boundary
+    /// earcut and therefore needs baked triangle indices: it has a hole, or it
+    /// has more than one part.
+    fn needs_triangles(&self) -> bool {
+        self.rings.len() > 1 || self.part_starts.len() > 1
     }
 }
 
-/// Extract polygon rings (ring 0 is the exterior). MultiPolygon rings are
-/// flattened — `ring_offsets` semantics in GeoArrow keep them separable.
-fn extract_polygon_rings(feature: &ParsedFeature) -> Result<Vec<Vec<Coord>>> {
-    use geojson::Value as GeomValue;
-    let geom = feature
-        .geojson
-        .geometry
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("feature has no geometry"))?;
-    let to_ring = |ring: &Vec<Vec<f64>>| -> Vec<Coord> {
-        ring.iter()
+/// Append one polygon PART (its exterior ring first, then its holes) to `out`,
+/// keeping only rings with enough positions to bound an area.
+///
+/// A part whose EXTERIOR ring is unusable contributes nothing at all: promoting
+/// one of its holes to exterior — which is what a flat ring filter did — turns
+/// a hole into a solid slab.
+fn push_polygon_part(out: &mut PolygonParts, part: &[Vec<Vec<f64>>]) {
+    let mut rings: Vec<Vec<Coord>> = Vec::with_capacity(part.len());
+    for (i, ring) in part.iter().enumerate() {
+        let coords: Vec<Coord> = ring
+            .iter()
             .filter(|c| c.len() >= 2)
             .map(|c| [c[0], c[1]])
-            .collect()
-    };
-    let rings: Vec<Vec<Coord>> = match &geom.value {
-        GeomValue::Polygon(rings) => rings.iter().map(to_ring).filter(|r| r.len() >= 4).collect(),
-        GeomValue::MultiPolygon(polys) => polys
-            .iter()
-            .flat_map(|p| p.iter().map(to_ring))
-            .filter(|r| r.len() >= 4)
-            .collect(),
-        _ => vec![],
-    };
-    if rings.is_empty() {
-        // Degenerate fallback: a zero-area ring at the centroid.
-        Ok(vec![vec![[feature.lon, feature.lat]]])
-    } else {
-        Ok(rings)
+            .collect();
+        // A closed ring needs 4 positions (3 distinct corners + the repeat of
+        // the first); anything shorter bounds no area.
+        if coords.len() < 4 {
+            if i == 0 {
+                return; // no exterior ring ⇒ the whole part is unusable
+            }
+            continue; // drop just this hole
+        }
+        rings.push(coords);
     }
+    if rings.is_empty() {
+        return;
+    }
+    out.part_starts.push(out.rings.len());
+    out.rings.extend(rings);
+}
+
+/// Extract a polygon feature's rings, part-major, with the part boundaries.
+///
+/// Errors — rather than inventing a zero-area ring at the feature's centroid —
+/// when no usable ring survives. See [`extract_or_drop`].
+fn extract_polygon_rings(feature: &ParsedFeature) -> Result<PolygonParts> {
+    use geojson::Value as GeomValue;
+    let geom = feature.geojson.geometry.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("polygon feature {} has no geometry", feature_label(feature))
+    })?;
+    let mut parts = PolygonParts::default();
+    match &geom.value {
+        GeomValue::Polygon(rings) => push_polygon_part(&mut parts, rings),
+        GeomValue::MultiPolygon(polys) => {
+            for poly in polys {
+                push_polygon_part(&mut parts, poly);
+            }
+        }
+        // Routed here as a polygon by `determine_geometry_type` (its catch-all
+        // arm for GeometryCollection) but not readable as one.
+        other => anyhow::bail!(
+            "polygon feature {} carries {} geometry, which holds no rings",
+            feature_label(feature),
+            other.type_name()
+        ),
+    }
+    if parts.rings.is_empty() {
+        anyhow::bail!(
+            "polygon feature {} has no ring with at least 4 positions",
+            feature_label(feature)
+        );
+    }
+    Ok(parts)
+}
+
+/// Tessellate one polygon feature into feature-LOCAL triangle indices, one PART
+/// at a time.
+///
+/// Each part is earcut on its own and its indices are shifted by the running
+/// vertex count, so the result indexes the feature's flattened, part-major
+/// coordinate run — precisely the run the geometry column writes and both
+/// reference readers rebuild.
+///
+/// Handing the whole flattened ring list to [`tessellate_polygon`] instead
+/// passes rings 1..n as earcut HOLE indices, which is right for a `Polygon` and
+/// wrong for a `MultiPolygon`: two disjoint unit squares came back as
+/// `[0,1,2,2,3,0]` — the 2 triangles of the FIRST square, with the second part
+/// missing from the index buffer entirely. Since the renderers bind `triangles`
+/// as the GPU index buffer when it is present, those parts rendered invisible.
+/// This is not an exotic input: the tiler emits a `MultiPolygon` whenever
+/// clipping cuts one source polygon into several pieces inside a tile.
+fn tessellate_parts(parts: &PolygonParts) -> Vec<u32> {
+    // Single part — every plain `Polygon`, holes included. Byte-identical to
+    // the pre-fix path.
+    if parts.part_starts.len() <= 1 {
+        return tessellate_polygon(&parts.rings);
+    }
+    let mut indices: Vec<u32> = Vec::new();
+    let mut vertex_base: u32 = 0;
+    for range in parts.part_ranges() {
+        let part = &parts.rings[range];
+        let vertices: u32 = part.iter().map(|r| r.len() as u32).sum();
+        indices.extend(
+            tessellate_polygon(part)
+                .into_iter()
+                .map(|i| i + vertex_base),
+        );
+        vertex_base += vertices;
+    }
+    indices
 }
 
 /// Synthesise per-vertex timestamps by cumulative distance along a path.
@@ -1160,8 +1425,8 @@ mod tests {
             }
             _ => panic!("label should be categorical"),
         }
-        // Regression guard: the boolean column must be present (not dropped)
-        // and carried as a "true"/"false" categorical.
+        // The boolean column must be present (not dropped) and carried as a
+        // "true"/"false" categorical.
         match col("active").expect("boolean column must be present, not dropped") {
             PropertyColumn::Categorical(v) => {
                 assert_eq!(v[0].as_deref(), Some("true"));
@@ -1171,9 +1436,8 @@ mod tests {
         }
     }
 
-    /// The keystone producer-drift fix: a property a generator encoded as
-    /// numeric *strings* (the line/polygon writer bug that flattened flights'
-    /// altitude) must still be classified numeric so it can drive ramps and
+    /// Producers do encode numbers as strings, so a property whose every value
+    /// parses as a number is classified NUMERIC and can drive ramps and
     /// elevation — while a genuinely non-numeric string column stays categorical.
     #[test]
     fn numeric_strings_are_promoted_to_numeric() {
@@ -1303,9 +1567,9 @@ mod tests {
 
     /// Declared property kinds pin the tile schema: a column that is all-null
     /// within one tile still yields a (all-null) column of the declared kind
-    /// there, instead of vanishing — the cross-tile schema-drift regression a
-    /// GeoParquet input with a sparsely-populated column hits (e.g. AIS `sog`
-    /// null for every row that lands in one tile).
+    /// there, instead of vanishing. Without the pin, a GeoParquet input with a
+    /// sparsely-populated column drifts schema from tile to tile (e.g. AIS
+    /// `sog` null for every row that lands in one tile).
     #[test]
     fn declared_property_kinds_pin_schema_for_all_null_tiles() {
         // Tile A's features: `sog` present. Tile B's: `sog` all-null (absent
@@ -1632,6 +1896,297 @@ mod tests {
         );
     }
 
+    /// Build a MultiPolygon feature from explicit parts (each part a ring list).
+    fn multipolygon_feature(parts: Vec<Vec<Vec<[f64; 2]>>>) -> ParsedFeature {
+        let value: Vec<Vec<Vec<Vec<f64>>>> = parts
+            .iter()
+            .map(|part| {
+                part.iter()
+                    .map(|ring| ring.iter().map(|c| vec![c[0], c[1]]).collect())
+                    .collect()
+            })
+            .collect();
+        let first = parts[0][0][0];
+        ParsedFeature {
+            geojson: Feature {
+                bbox: None,
+                geometry: Some(Geometry::new(GeomValue::MultiPolygon(value))),
+                id: None,
+                properties: None,
+                foreign_members: None,
+            },
+            shared_properties: None,
+            timestamp: 1000,
+            end_timestamp: None,
+            vertex_timestamps: None,
+            vertex_values: None,
+            vertex_value_matrix: None,
+            lon: first[0],
+            lat: first[1],
+        }
+    }
+
+    /// A closed square ring, counter-clockwise, at `corner` with side `size`.
+    fn square_ring(corner: [f64; 2], size: f64) -> Vec<[f64; 2]> {
+        let [x, y] = corner;
+        vec![
+            [x, y],
+            [x + size, y],
+            [x + size, y + size],
+            [x, y + size],
+            [x, y],
+        ]
+    }
+
+    /// Total area covered by a feature's baked triangles, computed from the
+    /// feature's OWN flattened coordinate run (the same run the readers rebuild
+    /// from the geometry column). This is the assertion that actually pins
+    /// tessellation correctness: bridged parts, dropped parts and un-subtracted
+    /// holes all move the number.
+    fn triangulated_area(rings: &[Vec<Coord>], triangles: &[u32]) -> f64 {
+        let flat: Vec<Coord> = rings.iter().flatten().copied().collect();
+        assert_eq!(
+            triangles.len() % 3,
+            0,
+            "index count must be a multiple of 3"
+        );
+        let mut area = 0.0;
+        for t in triangles.chunks(3) {
+            let a = flat[t[0] as usize];
+            let b = flat[t[1] as usize];
+            let c = flat[t[2] as usize];
+            area += ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs() / 2.0;
+        }
+        area
+    }
+
+    /// Every part of a MultiPolygon is tessellated on its own. Flattening the
+    /// parts into ONE ring list and handing that to earcut treats rings 1..n as
+    /// HOLES, so part 2 of two disjoint squares is subtracted from part 1
+    /// rather than triangulated and vanishes from the index buffer (invisible
+    /// on screen, because the renderers bind `triangles` as the GPU index
+    /// buffer when present). The tiler emits exactly this shape whenever
+    /// clipping cuts a polygon into several pieces inside one tile.
+    #[test]
+    fn multipolygon_parts_are_each_tessellated() {
+        let f = multipolygon_feature(vec![
+            vec![square_ring([0.0, 0.0], 1.0)],
+            vec![square_ring([10.0, 10.0], 1.0)],
+        ]);
+        let layers = build_layers_from_features(&[&f], "default").unwrap();
+        let rings = match &layers[0].geometry {
+            GeometryColumn::Polygon(polys) => &polys[0],
+            other => panic!("expected a polygon layer, got {other:?}"),
+        };
+        assert_eq!(rings.len(), 2, "one exterior ring per part");
+        let tri = layers[0]
+            .triangles
+            .as_ref()
+            .expect("a multi-part feature must carry baked triangles")[0]
+            .clone();
+
+        // Both unit squares triangulated: 2 triangles each.
+        assert_eq!(
+            tri.len(),
+            12,
+            "both parts must be triangulated, got {tri:?}"
+        );
+        // Pre-fix this was 2.0 → 1.0 (only the first square survived).
+        assert!(
+            (triangulated_area(rings, &tri) - 2.0).abs() < 1e-9,
+            "both unit squares must be covered exactly once: {tri:?}"
+        );
+        // Every index stays inside the feature (5 vertices per closed ring).
+        assert!(tri.iter().all(|&i| (i as usize) < 10));
+        // …and the second part is genuinely referenced.
+        assert!(
+            tri.iter().any(|&i| i >= 5),
+            "no index reaches part 2: {tri:?}"
+        );
+    }
+
+    /// The counterpart guard: rings 1..n of a SINGLE part are still holes, and
+    /// must still be subtracted. A 4×4 square with a 1×1 hole covers 15, not 16.
+    #[test]
+    fn polygon_hole_is_still_subtracted() {
+        let f = polygon_feature_with_hole();
+        let layers = build_layers_from_features(&[&f], "default").unwrap();
+        let rings = match &layers[0].geometry {
+            GeometryColumn::Polygon(polys) => &polys[0],
+            other => panic!("expected a polygon layer, got {other:?}"),
+        };
+        assert_eq!(rings.len(), 2, "exterior + hole");
+        let tri = &layers[0]
+            .triangles
+            .as_ref()
+            .expect("a holed feature must carry baked triangles")[0];
+        assert!(
+            (triangulated_area(rings, tri) - 15.0).abs() < 1e-9,
+            "the hole must be subtracted (16 - 1), got {}",
+            triangulated_area(rings, tri)
+        );
+    }
+
+    /// A MultiPolygon part keeps its OWN holes: two squares, the first holed.
+    /// Cross-part hole assignment would show up as a different covered area.
+    #[test]
+    fn multipolygon_holes_stay_with_their_part() {
+        let f = multipolygon_feature(vec![
+            vec![square_ring([0.0, 0.0], 4.0), square_ring([1.0, 1.0], 1.0)],
+            vec![square_ring([10.0, 10.0], 2.0)],
+        ]);
+        let layers = build_layers_from_features(&[&f], "default").unwrap();
+        let rings = match &layers[0].geometry {
+            GeometryColumn::Polygon(polys) => &polys[0],
+            other => panic!("expected a polygon layer, got {other:?}"),
+        };
+        let tri = &layers[0].triangles.as_ref().unwrap()[0];
+        // (16 - 1) + 4 = 19.
+        assert!(
+            (triangulated_area(rings, tri) - 19.0).abs() < 1e-9,
+            "got {}",
+            triangulated_area(rings, tri)
+        );
+    }
+
+    /// Contract pin for the triangle sidecar: it is ALL-OR-NOTHING per layer.
+    /// Every reader branches on whether the LAYER carries triangles and then
+    /// trusts each feature's slice verbatim — deck binds one whole-layer index
+    /// buffer, `tessellateFeature` returns the empty slice, three's polygon
+    /// buffers push no cap triangles — so a per-feature EMPTY list makes that
+    /// polygon disappear. A layer that bakes triangles must bake them for every
+    /// feature, single-ring ones included.
+    #[test]
+    fn every_feature_in_a_triangle_bearing_layer_gets_indices() {
+        let multipart = multipolygon_feature(vec![
+            vec![square_ring([0.0, 0.0], 1.0)],
+            vec![square_ring([5.0, 5.0], 1.0)],
+        ]);
+        let holed = polygon_feature_with_hole();
+        let simple = polygon_feature([20.0, 20.0], 1.0);
+        let layers = build_layers_from_features(&[&multipart, &holed, &simple], "default").unwrap();
+        let tri = layers[0]
+            .triangles
+            .as_ref()
+            .expect("a layer with a multi-part / holed feature bakes triangles");
+        assert_eq!(tri.len(), 3, "one list per feature");
+        for (i, t) in tri.iter().enumerate() {
+            assert!(
+                !t.is_empty() && t.len() % 3 == 0,
+                "feature {i} must carry a real triangulation, got {t:?}"
+            );
+        }
+        // The single-ring feature is tessellated too, not left empty.
+        assert_eq!(tri[2].len(), 6);
+    }
+
+    /// An unreadable polygon is DROPPED, never replaced by a one-vertex ring at
+    /// the feature's representative point — such a row counts as a feature,
+    /// passes validation and renders nothing. The surviving rows stay aligned
+    /// across every column.
+    #[test]
+    fn degenerate_polygon_is_dropped_not_fabricated() {
+        // A "polygon" with a 2-position ring: no area, nothing to extract.
+        let mut broken = polygon_feature([0.0, 0.0], 1.0);
+        broken.geojson.geometry = Some(Geometry::new(GeomValue::Polygon(vec![vec![
+            vec![0.0, 0.0],
+            vec![1.0, 1.0],
+        ]])));
+        broken.shared_properties = json!({ "name": "broken" })
+            .as_object()
+            .map(|m| std::sync::Arc::new(m.clone()));
+        let mut good = polygon_feature([10.0, 10.0], 1.0);
+        good.shared_properties = json!({ "name": "good" })
+            .as_object()
+            .map(|m| std::sync::Arc::new(m.clone()));
+
+        let layers = build_layers_from_features(&[&broken, &good], "default").unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(
+            layers[0].feature_count(),
+            1,
+            "the broken feature is dropped"
+        );
+        // Column alignment: the surviving row's property is the GOOD one.
+        match &layers[0]
+            .properties
+            .iter()
+            .find(|(n, _)| n == "name")
+            .expect("name column")
+            .1
+        {
+            PropertyColumn::Categorical(v) => assert_eq!(v, &vec![Some("good".to_string())]),
+            other => panic!("expected a categorical name column, got {other:?}"),
+        }
+        // Geometry is the real square, never a 1-vertex placeholder.
+        match &layers[0].geometry {
+            GeometryColumn::Polygon(polys) => {
+                assert_eq!(polys.len(), 1);
+                assert_eq!(polys[0][0].len(), 5);
+            }
+            other => panic!("expected a polygon layer, got {other:?}"),
+        }
+
+        // When NOTHING survives the layer is skipped, not filled with phantoms.
+        let empty = build_layers_from_features(&[&broken], "default").unwrap();
+        assert!(empty.is_empty(), "no layer is emitted for {empty:?}");
+    }
+
+    /// Same for lines: an empty LineString is dropped, never turned into a
+    /// single-point "line" at the representative point.
+    #[test]
+    fn degenerate_line_is_dropped_not_fabricated() {
+        let mut broken = line_feature(vec![[0.0, 0.0], [1.0, 1.0]], 1000, None);
+        broken.geojson.geometry = Some(Geometry::new(GeomValue::LineString(vec![])));
+        let good = line_feature(vec![[5.0, 5.0], [6.0, 6.0]], 1000, None);
+
+        let layers = build_layers_from_features(&[&broken, &good], "default").unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].feature_count(), 1);
+        match &layers[0].geometry {
+            GeometryColumn::LineString(lines) => {
+                assert_eq!(lines[0], vec![[5.0, 5.0], [6.0, 6.0]]);
+            }
+            other => panic!("expected a line layer, got {other:?}"),
+        }
+
+        let empty = build_layers_from_features(&[&broken], "default").unwrap();
+        assert!(empty.is_empty());
+    }
+
+    /// One kind's total failure must not take the other kinds down with it —
+    /// the points sharing the tile are perfectly good data.
+    #[test]
+    fn a_fully_unusable_kind_does_not_drop_the_other_layers() {
+        let pt = point_feature(0.0, 0.0, json!({ "ok": 1 }));
+        let mut broken = line_feature(vec![[0.0, 0.0], [1.0, 1.0]], 1000, None);
+        broken.geojson.geometry = Some(Geometry::new(GeomValue::LineString(vec![])));
+        let layers = build_layers_from_features(&[&pt, &broken], "default").unwrap();
+        let names: Vec<&str> = layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, vec!["default_points"], "the point layer survives");
+        assert_eq!(layers[0].feature_count(), 1);
+    }
+
+    /// A part whose EXTERIOR ring is unusable is dropped whole — its holes must
+    /// not be promoted to exteriors (which would render a hole as a solid).
+    #[test]
+    fn a_part_without_a_usable_exterior_is_dropped_whole() {
+        let f = multipolygon_feature(vec![
+            // Unusable exterior (2 positions) + an otherwise valid inner ring.
+            vec![vec![[0.0, 0.0], [1.0, 1.0]], square_ring([0.2, 0.2], 0.5)],
+            vec![square_ring([10.0, 10.0], 1.0)],
+        ]);
+        let layers = build_layers_from_features(&[&f], "default").unwrap();
+        let rings = match &layers[0].geometry {
+            GeometryColumn::Polygon(polys) => &polys[0],
+            other => panic!("expected a polygon layer, got {other:?}"),
+        };
+        assert_eq!(rings.len(), 1, "only the intact part survives: {rings:?}");
+        assert_eq!(rings[0][0], [10.0, 10.0]);
+        // Single surviving part, single ring ⇒ no triangle sidecar needed.
+        assert!(layers[0].triangles.is_none());
+    }
+
     #[test]
     fn pre_tessellate_option_bakes_triangle_indices_per_feature() {
         let p1 = polygon_feature([0.0, 0.0], 1.0);
@@ -1659,5 +2214,53 @@ mod tests {
         for &i in &tri[0] {
             assert!(i < 5);
         }
+    }
+
+    /// The PART boundaries the geometry column erases must survive into
+    /// `ColumnarLayer::polygon_parts` — the value the encoder writes as the
+    /// `part_offsets` column. Without them nothing on the wire distinguishes
+    /// "part 2's exterior" from "part 1's hole", and every conformant GeoArrow
+    /// consumer reads the former as the latter.
+    #[test]
+    fn multipolygon_layer_carries_its_part_boundaries() {
+        // Feature 0: two parts, the first with a hole → ring layout
+        // [ext0, hole0, ext1] ⇒ part starts [0, 2].
+        let multi = multipolygon_feature(vec![
+            vec![square_ring([0.0, 0.0], 4.0), square_ring([1.0, 1.0], 1.0)],
+            vec![square_ring([10.0, 10.0], 1.0)],
+        ]);
+        // Feature 1: a plain single-part Polygon in the SAME layer ⇒ [0].
+        let single = polygon_feature([20.0, 20.0], 1.0);
+        let layers = build_layers_from_features(&[&multi, &single], "default").unwrap();
+
+        assert_eq!(
+            layers[0].polygon_parts.as_deref(),
+            Some(&[vec![0u32, 2], vec![0]][..]),
+            "ring indices are relative to each feature's own first ring"
+        );
+        // The part starts must index the geometry column's actual ring runs.
+        let rings = match &layers[0].geometry {
+            GeometryColumn::Polygon(polys) => polys,
+            other => panic!("expected a polygon layer, got {other:?}"),
+        };
+        assert_eq!(rings[0].len(), 3);
+        assert_eq!(rings[0][2][0], [10.0, 10.0], "ring 2 is part 1's exterior");
+        assert_eq!(rings[1].len(), 1);
+        // …and the layer still validates as an encodable tile layer.
+        stt_core::arrow_tile::encode_tile(&layers).expect("multi-part layer must encode");
+    }
+
+    /// A layer whose every feature is single-part records nothing: the encoder
+    /// then omits the column entirely, and its ABSENCE is what tells a reader
+    /// every feature is single-part. Holes do NOT make a feature multi-part.
+    #[test]
+    fn single_part_polygon_layer_records_no_part_boundaries() {
+        let plain = polygon_feature([0.0, 0.0], 1.0);
+        let holed = polygon_feature_with_hole();
+        let layers = build_layers_from_features(&[&plain, &holed], "default").unwrap();
+        assert!(
+            layers[0].polygon_parts.is_none(),
+            "a single-part layer must not pay for the column"
+        );
     }
 }

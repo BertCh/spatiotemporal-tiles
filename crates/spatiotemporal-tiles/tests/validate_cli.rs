@@ -40,6 +40,7 @@ use stt_core::{BlobOrdering, Manifest, PackWriter, TileId};
 /// Build a point layer of `n` features whose times fall inside [start, end].
 fn point_layer(name: &str, base_id: u64, n: usize, start: i64, end: i64) -> ColumnarLayer {
     ColumnarLayer {
+        polygon_parts: None,
         name: name.into(),
         feature_ids: (0..n as u64).map(|i| base_id + i).collect(),
         start_times: vec![start; n],
@@ -172,6 +173,302 @@ fn sample_larger_than_archive_decodes_everything() {
     assert!(ok, "report: {report}");
     assert_eq!(report["tiles_decoded"], 3, "N >= total decodes all tiles");
     assert_eq!(report["sampled"], true);
+}
+
+/// Every payload shape the encoder can emit must be *accepted* by the
+/// validator, not merely decodable by it. `stt-validate` is a closed allow-list
+/// (column names, leaf types, required metadata), so an encoder that grows a
+/// column or a leaf width WITHOUT the matching entry here turns every rebuilt
+/// archive red — one error per layer per tile — while the archive itself is
+/// perfectly fine. That failure mode is invisible to the encoder's own unit
+/// tests, which never run the validator, so it belongs here.
+///
+/// This archive deliberately carries, in one dataset:
+///   * `part_offsets` — a two-part polygon (`List<UInt32>`, reserved column);
+///   * a `List<UInt32>` `vertex_time` — a track spanning 3 days, i.e. past the
+///     u16 delta tier's ~18.2 h reach at the 1 ms step ceiling;
+///   * quantized per-vertex values (`--quantize-vertex-values`), which the
+///     merge re-inflate must make invisible (the validator should see
+///     `List<Float32>`, never the `UInt16` wire leaf).
+#[test]
+fn every_encoder_payload_shape_passes_the_validator() {
+    use arrow::datatypes::DataType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("shapes");
+
+    let day = 24 * 60 * 60 * 1000i64;
+    let t_start = 1_700_000_000_000i64;
+    let t_end = t_start + 3 * day;
+
+    let mut writer = PackWriter::create(&archive, BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
+    let cfg = EncoderConfig {
+        format_version: writer.format_version(),
+        template_collector: Some(writer.template_collector()),
+        // The one lossy, opt-in encoding — on here precisely because the
+        // validator must NOT be able to tell.
+        quantize_vertex_values: true,
+        ..EncoderConfig::default()
+    };
+
+    // Tile 1: a multi-part polygon (two disjoint squares in one feature, the
+    // second square holed) → `part_offsets` + `triangles`.
+    let square =
+        |x: f64, y: f64, s: f64| vec![[x, y], [x + s, y], [x + s, y + s], [x, y + s], [x, y]];
+    let polygons = ColumnarLayer {
+        // Part 0 = ring 0; part 1 = rings 1..2 (exterior + hole).
+        polygon_parts: Some(vec![vec![0, 1]]),
+        name: "areas".into(),
+        feature_ids: vec![1],
+        start_times: vec![t_start],
+        end_times: vec![t_end],
+        geometry: GeometryColumn::Polygon(vec![vec![
+            square(0.0, 0.0, 1.0),
+            square(10.0, 0.0, 1.0),
+            square(10.25, 0.25, 0.5),
+        ]]),
+        vertex_times: None,
+        vertex_values: None,
+        triangles: None,
+        vertex_value_matrix: None,
+        properties: vec![],
+    };
+
+    // Tile 2: a 3-day track → u32 vertex-time deltas, plus per-vertex values
+    // (quantized on the wire) and a 2-bucket value matrix.
+    let tracks = ColumnarLayer {
+        polygon_parts: None,
+        name: "tracks".into(),
+        feature_ids: vec![2],
+        start_times: vec![t_start],
+        end_times: vec![t_end],
+        geometry: GeometryColumn::LineString(vec![vec![
+            [0.0, 0.0],
+            [0.5, 0.5],
+            [1.0, 1.0],
+            [1.5, 1.5],
+        ]]),
+        vertex_times: Some(vec![vec![t_start, t_start + day, t_start + 2 * day, t_end]]),
+        vertex_values: Some(vec![vec![1.0, 2.5, f32::NAN, 9.75]]),
+        triangles: None,
+        vertex_value_matrix: Some(vec![vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]]),
+        properties: vec![("speed".into(), PropertyColumn::Numeric(vec![Some(12.5)]))],
+    };
+
+    for (i, layer) in [polygons, tracks].into_iter().enumerate() {
+        let id = TileId::new(8, i as u32, 0, t_start as u64);
+        let payload = encode_tile_with(&[layer], &cfg).unwrap();
+        writer
+            .add_tile_full(&id, t_start, t_end, None, 1, None, &payload)
+            .unwrap();
+    }
+    let mut meta = Metadata::new("shapes")
+        .with_time_range(TimeRange::new(t_start as u64, t_end as u64))
+        .with_zoom_levels(8, 8);
+    meta.feature_count = 2;
+    meta.tile_count = 2;
+    writer.finalize(&meta).unwrap();
+
+    let (ok, report) = run_json(&archive, &[]);
+    assert!(
+        ok,
+        "an archive using every encoder payload shape must validate clean; report: {report}"
+    );
+    assert_eq!(
+        report["errors"].as_array().unwrap().len(),
+        0,
+        "report: {report}"
+    );
+    assert_eq!(report["tiles_decoded"], 2);
+    assert_eq!(report["feature_count_decoded"].as_u64().unwrap(), 2);
+
+    // Guard the guard. A clean report proves nothing if the corpus quietly
+    // stopped producing the shapes it is supposed to cover — so re-decode the
+    // archive and assert each one is really on the wire.
+    let reader = stt_core::PackedReader::open(archive.join("manifest.json")).unwrap();
+    let registry = reader.templates().expect("v2 archive exposes templates");
+    let mut saw_part_offsets = false;
+    let mut saw_u32_vertex_time = false;
+    let mut saw_float32_vertex_value = false;
+    for entry in reader.entries() {
+        let payload = reader.read_payload(entry).unwrap();
+        for layer in stt_core::arrow_tile::decode_tile_with_templates(&payload, registry).unwrap() {
+            let schema = layer.batch.schema();
+            let leaf = |col: &str| match schema.field_with_name(col).map(|f| f.data_type().clone())
+            {
+                Ok(DataType::List(inner)) => Some(inner.data_type().clone()),
+                _ => None,
+            };
+            if leaf("part_offsets") == Some(DataType::UInt32) {
+                saw_part_offsets = true;
+            }
+            if leaf("vertex_time") == Some(DataType::UInt32) {
+                saw_u32_vertex_time = true;
+            }
+            // Quantized on the wire, Float32 after the merge re-inflate.
+            if leaf("vertex_value") == Some(DataType::Float32) {
+                saw_float32_vertex_value = true;
+            }
+        }
+    }
+    assert!(saw_part_offsets, "corpus lost its multi-part polygon");
+    assert!(saw_u32_vertex_time, "corpus lost its u32 vertex-time tier");
+    assert!(
+        saw_float32_vertex_value,
+        "quantized vertex values must re-inflate to List<Float32> before any \
+         consumer (including the validator) sees them"
+    );
+}
+
+/// Write one tile per supplied layer (z8, x = index, one shared time bucket).
+///
+/// Unlike [`write_dataset`] the caller controls each tile's layer wholesale,
+/// which is what the schema-drift tests need: two tiles carrying the SAME layer
+/// NAME whose column sets (or column types) differ. Drift detection is keyed on
+/// the layer name, so tiles holding differently-named layers are never compared
+/// against each other.
+fn write_tiles_of(archive: &Path, layers: Vec<ColumnarLayer>) {
+    let t_start = 1_700_000_000_000i64;
+    let t_end = t_start + 60_000;
+    let mut writer = PackWriter::create(archive, BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
+    let cfg = EncoderConfig {
+        format_version: writer.format_version(),
+        template_collector: Some(writer.template_collector()),
+        ..EncoderConfig::default()
+    };
+    let tile_count = layers.len() as u64;
+    let mut features = 0u64;
+    for (i, layer) in layers.into_iter().enumerate() {
+        let n = layer.feature_ids.len() as u32;
+        features += u64::from(n);
+        let payload = encode_tile_with(&[layer], &cfg).unwrap();
+        writer
+            .add_tile_full(
+                &TileId::new(8, i as u32, 0, t_start as u64),
+                t_start,
+                t_end,
+                None,
+                n,
+                None,
+                &payload,
+            )
+            .unwrap();
+    }
+    let mut meta = Metadata::new("drift")
+        .with_time_range(TimeRange::new(t_start as u64, t_end as u64))
+        .with_zoom_levels(8, 8);
+    meta.feature_count = features;
+    meta.tile_count = tile_count;
+    writer.finalize(&meta).unwrap();
+}
+
+/// A closed square ring, so the polygon fixtures below read as shapes.
+fn square(x: f64, y: f64, s: f64) -> Vec<[f64; 2]> {
+    vec![[x, y], [x + s, y], [x + s, y + s], [x, y + s], [x, y]]
+}
+
+/// One layer, two tiles, `part_offsets` in only ONE of them → must PASS.
+///
+/// Every OPTIONAL reserved column is emitted per TILE, only when that tile's
+/// features need it: `part_offsets` only when some feature is multi-part,
+/// `triangles` only when some feature needs hole-aware tessellation, the vertex
+/// columns only when per-vertex arrays exist. A polygon dataset therefore ships
+/// tiles of ONE layer that disagree about which of those columns are present —
+/// the common case, since the tiler emits a MultiPolygon exactly where clipping
+/// cuts a source polygon into pieces, i.e. in some tiles and not others.
+///
+/// The drift check classified either side being absent as `Structural` and hard
+/// -failed the whole archive (`schema drift: ... — part_offsets: <absent> vs
+/// List(...UInt32...)`), contradicting the schema module's own documentation.
+/// The presence variation must instead be reported as an informational
+/// WARNING — visible, never fatal — so this asserts both halves.
+#[test]
+fn optional_reserved_column_present_in_only_one_tile_passes() {
+    use arrow::datatypes::DataType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("mixed-parts");
+
+    let t_start = 1_700_000_000_000i64;
+    let t_end = t_start + 60_000;
+    // Same layer NAME, same geometry kind, same properties: `part_offsets` is
+    // the only thing that can differ between these two tiles.
+    let areas = |id: u64, rings: Vec<Vec<[f64; 2]>>, parts: Vec<u32>| ColumnarLayer {
+        polygon_parts: Some(vec![parts]),
+        name: "areas".into(),
+        feature_ids: vec![id],
+        start_times: vec![t_start],
+        end_times: vec![t_end],
+        geometry: GeometryColumn::Polygon(vec![rings]),
+        vertex_times: None,
+        vertex_values: None,
+        triangles: None,
+        vertex_value_matrix: None,
+        properties: vec![(
+            "speed".into(),
+            PropertyColumn::Numeric(vec![Some(id as f64)]),
+        )],
+    };
+    write_tiles_of(
+        &archive,
+        vec![
+            // Tile 0: two disjoint squares in one feature → parts at rings 0, 1.
+            areas(
+                1,
+                vec![square(0.0, 0.0, 1.0), square(10.0, 0.0, 1.0)],
+                vec![0, 1],
+            ),
+            // Tile 1: a single square → single-part, so no `part_offsets`.
+            areas(2, vec![square(20.0, 0.0, 1.0)], vec![0]),
+        ],
+    );
+
+    let (ok, report) = run_json(&archive, &[]);
+    assert!(
+        ok,
+        "a layer whose tiles differ only in an OPTIONAL reserved column must \
+         validate clean; report: {report}"
+    );
+    assert_eq!(errors_of(&report).len(), 0, "report: {report}");
+    assert_eq!(report["tiles_decoded"], 2);
+
+    // The variation must stay VISIBLE: informational, not silently swallowed.
+    let warnings: Vec<String> = report["warnings"]
+        .as_array()
+        .expect("report carries a warnings array")
+        .iter()
+        .map(|w| w.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        warnings.iter().any(|w| w.contains("part_offsets")),
+        "the presence variation must still be reported (as a warning); \
+         warnings were: {warnings:#?}"
+    );
+
+    // Guard the guard: a green report proves nothing if the fixture stopped
+    // producing the mixed-presence corpus it exists to cover.
+    let reader = stt_core::PackedReader::open(archive.join("manifest.json")).unwrap();
+    let registry = reader.templates().expect("v2 archive exposes templates");
+    let mut with_parts = 0;
+    let mut without_parts = 0;
+    for entry in reader.entries() {
+        let payload = reader.read_payload(entry).unwrap();
+        for layer in stt_core::arrow_tile::decode_tile_with_templates(&payload, registry).unwrap() {
+            assert_eq!(layer.name, "areas", "both tiles must share one layer name");
+            match layer.batch.schema().field_with_name("part_offsets") {
+                Ok(f) => {
+                    assert!(matches!(f.data_type(), DataType::List(_)));
+                    with_parts += 1;
+                }
+                Err(_) => without_parts += 1,
+            }
+        }
+    }
+    assert_eq!(
+        (with_parts, without_parts),
+        (1, 1),
+        "fixture must carry part_offsets in exactly one of its two tiles"
+    );
 }
 
 #[test]
@@ -360,6 +657,7 @@ fn write_summary_dataset(out_dir: &Path, ids: &[u64]) {
     let (t_start, t_end) = (1_000i64, 2_000i64);
     let n = ids.len();
     let layer = ColumnarLayer {
+        polygon_parts: None,
         name: "summary".into(),
         feature_ids: ids.to_vec(),
         start_times: vec![t_start; n],
@@ -492,6 +790,55 @@ fn feature_count_disagreeing_with_decoded_rows_fails() {
     );
     assert_eq!(report["feature_count_index"], 15);
     assert_eq!(report["feature_count_decoded"], 12);
+}
+
+/// (f) A PROPERTY column that changes encoding class between two tiles of one
+/// layer.
+///
+/// The counterpart to `optional_reserved_column_present_in_only_one_tile_passes`
+/// above, and the reason that relaxation is scoped to reserved columns: a
+/// property arriving as `Dictionary<UInt16,Utf8>` in one tile and `Float64` in
+/// the next hands every consumer a different thing per tile (a string category
+/// vs a number), with no documented default to fall back on. Widening the drift
+/// check must not launder THIS.
+#[test]
+fn property_column_type_drift_across_tiles_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("prop-drift");
+
+    let t_start = 1_700_000_000_000i64;
+    let t_end = t_start + 60_000;
+    // One layer name, one geometry kind; only `speed`'s encoding differs.
+    let layer = |id: u64, speed: PropertyColumn| ColumnarLayer {
+        polygon_parts: None,
+        name: "default".into(),
+        feature_ids: vec![id],
+        start_times: vec![t_start],
+        end_times: vec![t_end],
+        geometry: GeometryColumn::Point(vec![[id as f64, 1.0]]),
+        vertex_times: None,
+        vertex_values: None,
+        triangles: None,
+        vertex_value_matrix: None,
+        properties: vec![("speed".into(), speed)],
+    };
+    write_tiles_of(
+        &archive,
+        vec![
+            layer(1, PropertyColumn::Numeric(vec![Some(12.5)])),
+            layer(2, PropertyColumn::Categorical(vec![Some("fast".into())])),
+        ],
+    );
+
+    let (ok, report) = run_json(&archive, &[]);
+    let errors = assert_failed_with(ok, &report, "schema drift");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("schema drift") && e.contains("speed")),
+        "the drift error must name the offending property column; errors: {errors:#?}"
+    );
+    assert_eq!(report["distinct_schemas"], 2, "report: {report}");
 }
 
 /// `--skip-decode` must not silently launder a corrupt archive: the cheap tier

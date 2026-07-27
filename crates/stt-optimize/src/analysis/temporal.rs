@@ -304,9 +304,9 @@ const MIN_FEATURES_PER_BUCKET: u64 = 10;
 /// (`TARGET_PLAYBACK_SECONDS × PLAYBACK_FPS`, scaled by the distribution), then
 /// bounded by the two data facts the caller actually measured — never bucket
 /// finer than there are distinct timestamps, nor so fine that the average bucket
-/// falls below [`MIN_FEATURES_PER_BUCKET`] features. (These two inputs were
-/// previously ignored, so the recommendation reacts to neither timestamp
-/// resolution nor feature density; now it does.)
+/// falls below [`MIN_FEATURES_PER_BUCKET`] features. Drop either bound and the
+/// recommendation stops reacting to timestamp resolution or feature density
+/// and just echoes the playback target.
 fn recommend_bucket_size(
     duration_ms: u64,
     unique_timestamps: usize,
@@ -345,7 +345,7 @@ fn recommend_bucket_size(
     };
     let mut target_buckets = (TARGET_PLAYBACK_SECONDS * PLAYBACK_FPS * frame_factor).round() as u64;
 
-    // Bound by measured data facts (the previously-ignored inputs):
+    // Bound by measured data facts:
     //  - never more buckets than distinct timestamps (finer is empty resolution);
     //  - never so fine the average bucket dips below MIN_FEATURES_PER_BUCKET.
     if unique_timestamps > 0 {
@@ -454,7 +454,7 @@ mod tests {
     fn test_bucket_size_respects_unique_timestamps() {
         // Same span/features, but only 100 distinct timestamps: the target can't
         // exceed that, so the bucket must be COARSER than with many timestamps
-        // (proves unique_timestamps is no longer ignored).
+        // — `unique_timestamps` has to reach the result.
         let span = 365 * 86_400_000u64; // 1 year
         let (many, _) =
             recommend_bucket_size(span, 100_000, 1_000_000, &TemporalDistribution::Uniform);
@@ -469,7 +469,7 @@ mod tests {
     fn test_bucket_size_respects_feature_density() {
         // A tiny feature count caps buckets so they don't average < 10 features,
         // forcing a coarser bucket than a dense dataset over the same span
-        // (proves feature_count is no longer ignored).
+        // — `feature_count` has to reach the result.
         let span = 365 * 86_400_000u64; // 1 year
         let (dense, _) =
             recommend_bucket_size(span, 100_000, 1_000_000, &TemporalDistribution::Uniform);

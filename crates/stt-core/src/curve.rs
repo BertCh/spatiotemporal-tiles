@@ -83,9 +83,9 @@ impl BlobOrdering {
     pub fn choose(space_bits: u32, time_bits: u32) -> BlobOrdering {
         if time_bits <= 1 {
             // Shallow time (≤2 buckets): no temporal axis worth interleaving —
-            // a pure 2D spatial Hilbert keeps space contiguous. (Previously this
-            // fell through to a degenerate Hilbert3 whose collapsed time axis
-            // only hurt locality.)
+            // a pure 2D spatial Hilbert keeps space contiguous. A 3D Hilbert
+            // over a collapsed time axis is degenerate here: the dead axis buys
+            // nothing and costs spatial locality.
             BlobOrdering::SpatialMajor
         } else if time_bits > space_bits + ORDERING_BALANCE_BITS {
             // Time dominates — keep each cell's whole timeline contiguous.
@@ -355,13 +355,14 @@ mod tests {
     #[test]
     fn bits_zero_is_safe() {
         // zoom 0 + single time bucket -> curve_bits == 0; the curves must return
-        // 0, not panic on `1 << (bits-1)` (BUG-1 regression).
+        // 0, not panic on `1 << (bits-1)`.
         assert_eq!(curve_bits(0, 0), 0);
         assert_eq!(hilbert3(0, 0, 0, 0), 0);
         assert_eq!(morton3(0, 0, 0, 0), 0);
         let k = space_time_key(BlobOrdering::Hilbert3, 0, 0, 0, 0, 0, 0, 0, 0);
         assert_eq!(k, (0, 0, 0, 0));
-        // absurd zoom must not overflow-shift either (BUG-2: checked_shr).
+        // absurd zoom must not overflow-shift either: the axis narrowing is a
+        // checked shift, so a zoom past the key's bit budget saturates.
         let _ = space_time_key(BlobOrdering::Hilbert3, 60, 1 << 30, 1 << 30, 0, 0, 0, 0, 0);
     }
 
@@ -405,8 +406,8 @@ mod tests {
             BlobOrdering::choose(10, 10 + ORDERING_BALANCE_BITS + 1),
             BlobOrdering::SpatialMajor
         );
-        // F2: shallow time (a snapshot — 1 or 2 buckets) → spatial-major, even
-        // when space is wide. (Previously these degenerated to hilbert3.)
+        // Shallow time (a snapshot — 1 or 2 buckets) → spatial-major, even when
+        // space is wide: a 3D curve over a collapsed time axis is degenerate.
         assert_eq!(BlobOrdering::choose(10, 0), BlobOrdering::SpatialMajor);
         assert_eq!(BlobOrdering::choose(10, 1), BlobOrdering::SpatialMajor);
     }

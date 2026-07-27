@@ -283,9 +283,10 @@ impl<'a> TileFeature<'a> {
 /// spam) — the "no silent drops" guarantee for the placement stage.
 #[derive(Debug, Default)]
 struct PlacementCounters {
-    /// Placements dropped because the position could not be projected
-    /// (previously `unwrap_or((0, 0))` filed these into the top-left world
-    /// tile as phantom features). Counted per (feature, zoom).
+    /// Placements dropped because the position could not be projected.
+    /// Counted per (feature, zoom) — a projection failure must be counted and
+    /// dropped, never defaulted to `(0, 0)`, which files phantom features into
+    /// the top-left world tile.
     ///
     /// A POLAR latitude is not one of these: it is clamped to
     /// `stt_core::projection::MERCATOR_MAX_LAT` and kept, the same as in the
@@ -654,11 +655,9 @@ pub fn generate_tiles_streaming<W: TileWriter + Send>(
 
 /// Build a rayon thread pool scoped to a single build run.
 ///
-/// The previous implementation called `build_global()` and silently swallowed
-/// the error if some other caller (or a previous build in the same process)
-/// had already initialised the global pool, so `--workers N` was effectively
-/// ignored after the first run. This builds a fresh local pool so the worker
-/// count is always honoured.
+/// Must be a fresh LOCAL pool, never `build_global()`: the global pool can be
+/// initialised only once per process, so a second build in the same process
+/// would silently keep the first run's worker count and ignore `--workers N`.
 fn build_pool(workers: usize) -> Result<rayon::ThreadPool> {
     let threads = workers.max(1);
     rayon::ThreadPoolBuilder::new()
@@ -1051,10 +1050,10 @@ fn place_polyline<'a>(
     if !(min_lon.is_finite() && min_lat.is_finite() && max_lon.is_finite() && max_lat.is_finite()) {
         return place_whole_feature(feature, zoom, counters);
     }
-    // Fast path: fully inside the representative tile's buffered rect —
-    // legacy single placement, byte-identical to the old behaviour. (No
-    // antimeridian bbox heuristic for lines: the trajectory clipper already
-    // splits runs at >180° longitude jumps.)
+    // Fast path: fully inside the representative tile's buffered rect, so the
+    // whole feature goes into that one tile unclipped. (No antimeridian bbox
+    // heuristic for lines: the trajectory clipper already splits runs at >180°
+    // longitude jumps.)
     if let Ok((fx, fy)) = projection::lonlat_to_tile(feature.lon, feature.lat, zoom) {
         let (bl, bb, br, bt) =
             crate::clip::buffered_tile_bounds(fx, fy, zoom, clip_config.buffer_degrees);
@@ -1671,11 +1670,11 @@ const ENCODE_CHUNK: usize = 1024;
 /// This is the shared engine behind every `PackWriter` write loop (plain,
 /// LOD-tagged, streaming). Parallelism cannot change output bytes:
 /// `encode_tile_with` is deterministic per tile, the v2 schema-template
-/// collector snapshot is sorted + deduped regardless of insertion order
-/// (packed-v2 design ★F1), and `add_tile_full` is called in exactly the
-/// sequential order of `tiles` (and the writer's finalize re-sorts by the
-/// total space-time key anyway). `on_written` fires once per tile after its
-/// ordered hand-off (progress reporting).
+/// collector snapshot is sorted + deduped regardless of insertion order, and
+/// `add_tile_full` is called in exactly the sequential order of `tiles` (and
+/// the writer's finalize re-sorts by the total space-time key anyway).
+/// `on_written` fires once per tile after its ordered hand-off (progress
+/// reporting).
 ///
 /// The writer's `--pack-memory-budget` covers the payloads it has BUFFERED,
 /// but a full [`ENCODE_CHUNK`] would additionally hold up to 1024 encoded
@@ -3049,15 +3048,15 @@ mod tests {
     /// A latitude beyond the Web-Mercator limit is CLAMPED into the edge tile
     /// row and KEPT — never dropped.
     ///
-    /// The summary tier has always clamped-and-kept such a feature while the
-    /// native tier dropped it, so one dataset answered "does this feature
-    /// exist?" two different ways depending on which tier you asked. Both tiers
-    /// now clamp to the single `stt_core::projection::MERCATOR_MAX_LAT`.
+    /// Every tier clamps to the single
+    /// `stt_core::projection::MERCATOR_MAX_LAT`. A tier that drops instead of
+    /// clamping makes one dataset answer "does this feature exist?" two
+    /// different ways depending on which tier you ask.
     #[test]
     fn polar_latitudes_are_clamped_into_the_edge_row_not_dropped() {
         let sf = point(-122.4194, 37.7749, 1_700_000_000_000);
-        // Far beyond the limit, and beyond the ~3 m band between the old
-        // rounded native limit and the old Quadbin one.
+        // Far beyond the limit, and far beyond the ~3 m band in which a
+        // rounded `85.0511` and the exact limit disagree.
         let polar = point(0.0, 89.9, 1_700_000_000_000);
         let config = TileConfig {
             min_zoom: 2,
@@ -3244,14 +3243,13 @@ mod tests {
 
     #[test]
     fn antimeridian_multipolygon_keeps_noncrossing_part() {
-        // Regression (Wave-2 A1 review): a MultiPolygon with ONE dateline-crossing
-        // part (Fiji-like, 177 → -177) plus one ordinary NON-crossing part near
-        // lon 0 must keep BOTH — the crossing part splits across the dateline
-        // while the non-crossing part still tiles at its own interior column.
-        // The feature-wide `crosses` flag used to route the whole feature through
-        // the splitter, which flat-mapped over every part and silently dropped the
-        // non-crosser (a USA MultiPolygon would lose CONUS when the Aleutians cross
-        // ±180). Now each part is routed independently.
+        // A MultiPolygon with ONE dateline-crossing part (Fiji-like, 177 → -177)
+        // plus one ordinary NON-crossing part near lon 0 must keep BOTH — the
+        // crossing part splits across the dateline while the non-crossing part
+        // still tiles at its own interior column. Antimeridian routing is
+        // therefore PER PART: a feature-wide `crosses` flag would push every
+        // part through the splitter, which flat-maps and drops the non-crossers
+        // (a USA MultiPolygon would lose CONUS because the Aleutians cross ±180).
         let crossing_part = vec![vec![
             vec![177.0, 10.0],
             vec![-177.0, 10.0],
@@ -3485,9 +3483,9 @@ mod tests {
         }
     }
 
-    /// Regression: the pre-existing antimeridian split tests must stay green
-    /// even with simplification enabled — the split runs BEFORE simplify, so a
-    /// dateline polygon still lands, valid, on both sides at a simplified zoom.
+    /// The antimeridian split runs BEFORE simplify, so a dateline polygon still
+    /// lands, valid, on both sides at a simplified zoom. Simplifying first would
+    /// hand the splitter a ring whose ±180 seam has already been smoothed away.
     #[test]
     fn antimeridian_split_holds_with_simplify_enabled() {
         let crossing_ring = vec![

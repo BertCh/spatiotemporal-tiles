@@ -668,10 +668,9 @@ fn write_or_print(rendered: &str, output: Option<PathBuf>) -> Result<()> {
 mod cli_doc_tests {
     use super::*;
 
-    /// Doc gate (naming-types-consistency F9): every visible long flag on every
-    /// subcommand must appear in the `stt-optimize` section of
-    /// `docs/api/cli-reference.md`, so a new flag fails the build until it is
-    /// documented.
+    /// Doc gate: every visible long flag on every subcommand must appear in the
+    /// `stt-optimize` section of `docs/api/cli-reference.md`, so a new flag
+    /// fails the build until it is documented.
     #[test]
     fn cli_flags_are_documented_in_cli_reference() {
         use clap::CommandFactory;

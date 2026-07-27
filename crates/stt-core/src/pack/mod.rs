@@ -58,28 +58,32 @@ pub const PACKED_FORMAT: &str = "stt-packed";
 /// (`manifest.schemas`). See
 /// `docs/roadmap/stt-packed-format-decisions.md`.
 ///
-/// The transitional 0.3.x format (formatVersion 1) was removed once the
-/// published fleet was migrated; a v1 manifest is now a hard open error.
+/// A manifest declaring formatVersion 1 (the transitional 0.3.x shape) is a
+/// hard open error: this toolchain cannot read it, and refusing loudly is what
+/// keeps it from being misdecoded as a formatVersion-2 dataset.
 pub const PACKED_FORMAT_VERSION: u32 = 2;
 
 // ----------------------------------------------------------------------------
-// v2 object magic (`.sttp` / `.sttd` self-identification, spec §9.2)
+// Object magic (`.sttp` / `.sttd` self-identification, spec §9.2)
 // ----------------------------------------------------------------------------
 
 /// First 4 bytes of a formatVersion-2 pack object.
 pub const PACK_MAGIC: [u8; 4] = *b"STTP";
 /// First 4 bytes of a formatVersion-2 directory object.
 pub const DIRECTORY_MAGIC: [u8; 4] = *b"STTD";
-/// Length of the v2 object magic prelude: 4-byte tag + u8 version(2) + 3 zero
-/// bytes. Blob offsets in a v2 directory are object-absolute, so a pack's
-/// first blob sits at offset 8; the manifest `length` fields and every blake3
-/// content address cover the ENTIRE object including this prelude (★F5).
-/// v1 objects carry no magic (byte-frozen).
+/// Length of the object magic prelude: 4-byte tag + u8 object version + 3 zero
+/// bytes. Blob offsets in a formatVersion-2 directory are object-absolute, so a
+/// pack's first blob sits at offset 8; the manifest `length` fields and every
+/// blake3 content address cover the ENTIRE object, prelude included, so a reader
+/// that hashed only the post-prelude bytes would reject every object it opens.
+/// formatVersion-1 objects carry no magic at all.
 pub const OBJECT_MAGIC_LEN: usize = 8;
-/// Version byte inside the v2 object magic prelude.
+/// Version of the OBJECT-PRELUDE axis: the byte at offset 4 of every `.sttp` /
+/// `.sttd`. Counted independently of [`PACKED_FORMAT_VERSION`] (manifest schema)
+/// and of the layer-frame version, so a prelude revision need not disturb either.
 const OBJECT_MAGIC_VERSION: u8 = 2;
 
-/// The full 8-byte magic prelude for a v2 object kind.
+/// The full 8-byte magic prelude for an object kind.
 fn object_magic(kind: [u8; 4]) -> [u8; OBJECT_MAGIC_LEN] {
     [
         kind[0],
@@ -93,7 +97,7 @@ fn object_magic(kind: [u8; 4]) -> [u8; OBJECT_MAGIC_LEN] {
     ]
 }
 
-/// Validate a v2 object's 8-byte magic prelude and return the bytes after it.
+/// Validate an object's 8-byte magic prelude and return the bytes after it.
 fn strip_object_magic<'a>(bytes: &'a [u8], kind: [u8; 4], what: &str) -> Result<&'a [u8]> {
     let tag = std::str::from_utf8(&kind).expect("magic tags are ASCII");
     if bytes.len() < OBJECT_MAGIC_LEN || bytes[0..4] != kind {
@@ -117,8 +121,9 @@ fn strip_object_magic<'a>(bytes: &'a [u8], kind: [u8; 4], what: &str) -> Result<
     Ok(&bytes[OBJECT_MAGIC_LEN..])
 }
 
-/// A directory object's codec bytes: the whole object under v1, the
-/// post-magic slice under v2. (`rootLength` keeps meaning the root frame's
+/// A directory object's codec bytes: the whole object under formatVersion 1,
+/// the post-magic slice under formatVersion 2. (`rootLength` keeps meaning the
+/// root frame's
 /// at-rest length — a paged root fetch is `bytes=0..(8+rootLength-1)` — so
 /// all downstream paged math is unchanged once the magic is stripped.)
 /// Public so out-of-band directory consumers (e.g. `stt-validate`'s direct
@@ -142,6 +147,18 @@ pub const CAPABILITY_ATTR_QUANT: &str = "attr-quant";
 /// `manifest.capabilities` entry: point-elevation fold (a property folded into
 /// POINT geometry z — the point leaf becomes 3 components instead of 2).
 pub const CAPABILITY_ELEVATION_FOLD: &str = "elevation-fold";
+/// `manifest.capabilities` entry: compact feature times (`TILE_META.st` /
+/// `.et` re-type `start_time` to a `UInt32` offset from `t0`, and `end_time`
+/// to a `UInt32` duration — or omit it entirely when every feature is
+/// instantaneous). A reader that ignores the two keys would read millisecond
+/// offsets as absolute Unix times, i.e. place every feature in January 1970.
+pub const CAPABILITY_TIME_DELTA: &str = "time-delta";
+/// `manifest.capabilities` entry: per-vertex value quantization
+/// (`TILE_META.vq` re-types the `vertex_value` / `vertex_value_matrix` list
+/// leaf from `Float32` to `UInt16` indices). A reader that ignores the key
+/// would render raw 0..65534 indices as physical values — e.g. a −2..32 °C
+/// sea-surface temperature ramp saturated everywhere.
+pub const CAPABILITY_VERTEX_VALUE_QUANT: &str = "vertex-value-quant";
 /// Every `manifest.capabilities` value this toolchain implements — the
 /// required-to-understand feature registry (`docs/spec/stt-packed-format.md`
 /// §3.1). Each capability RE-TYPES existing columns, so a reader that lacks it
@@ -152,6 +169,8 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     CAPABILITY_COORD_QUANT,
     CAPABILITY_ATTR_QUANT,
     CAPABILITY_ELEVATION_FOLD,
+    CAPABILITY_TIME_DELTA,
+    CAPABILITY_VERTEX_VALUE_QUANT,
 ];
 
 /// Default pack target size — 64 MiB. Well under the 512 MB CDN per-object cap,
@@ -207,7 +226,7 @@ pub struct DirectoryRef {
     /// `length` always describe the at-rest bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
-    /// Container layout. `Some("paged")` = a root page + leaf pages (Wave 2);
+    /// Container layout. `Some("paged")` = a root page + leaf pages;
     /// absent or `Some("single")` = the single whole-load object. Readers that
     /// don't know `"paged"` fail loudly (the root's first byte isn't a valid v5
     /// directory version), which is why readers ship before any paged dataset.
@@ -267,7 +286,7 @@ pub struct SchemaTemplateRef {
 /// Decode + hash-validate a manifest's `schemas` table into the decode-side
 /// [`TemplateRegistry`]. Every entry must base64-decode and blake3-hash to
 /// its declared `hash` — the loud, dataset-level failure mode for corrupt
-/// manifests (design §2.2).
+/// manifests, raised before a single tile is fetched.
 fn build_template_registry(schemas: &[SchemaTemplateRef]) -> Result<TemplateRegistry> {
     use base64::Engine as _;
     let mut registry = TemplateRegistry::new();
@@ -518,7 +537,7 @@ pub struct PackWriter {
     /// explicit, checked channel. Set via
     /// [`with_format_version`](Self::with_format_version).
     format_version: u32,
-    /// v2 schema-template sink: the encoder records each layer's stripped
+    /// Schema-template sink: the encoder records each layer's stripped
     /// schema prefix here (wired automatically by
     /// [`encoder_config`](Self::encoder_config) → [`crate::arrow_tile::
     /// EncoderConfig::template_collector`]); finalize publishes the snapshot
@@ -529,12 +548,13 @@ pub struct PackWriter {
     /// [`with_encoder_config`](Self::with_encoder_config)). The frame version
     /// and template sink are NOT taken from here — `encoder_config()` always
     /// overrides them with the writer's own, so a dataset's frames and its
-    /// manifest can never disagree (design §1 ★F6). Default = the plain
+    /// manifest can never disagree — readers reject a mixed-version dataset
+    /// outright. Default = the plain
     /// encoder, byte-identical to a build that sets nothing.
     encoder: crate::arrow_tile::EncoderConfig,
     /// In-memory budget (bytes) for buffered UNCOMPRESSED tile payloads.
     /// `0` (the default) = unlimited — every payload stays in RAM until
-    /// finalize, the legacy behaviour. Non-zero: once buffered payload bytes
+    /// finalize. Non-zero: once buffered payload bytes
     /// would exceed the budget, further payloads are appended to a temp spill
     /// file in `out_dir` and read back record-by-record during finalize.
     /// A pure memory-behaviour lever: output bytes are identical either way.
@@ -602,7 +622,7 @@ impl PackWriter {
 
     /// Seed the writer's schema-template collector from an existing dataset's
     /// registry — the VERBATIM-repack path (pack-cover, repair tools). Copied
-    /// v2 payloads reference templates by 16-byte hash but are never
+    /// payloads reference templates by 16-byte hash but are never
     /// re-encoded, so nothing records their templates; without seeding, the
     /// repacked `manifest.schemas` comes out empty and every tile read fails
     /// template resolution. Recording is content-addressed (sorted + deduped
@@ -624,18 +644,19 @@ impl PackWriter {
         self
     }
 
-    /// The packed format version this writer will emit (`1` | `2`). Encode
-    /// callers derive their frame version from this so a dataset can never
-    /// mix frame and manifest versions (design §1 ★F6).
+    /// The manifest `formatVersion` this writer will emit. Encode callers
+    /// derive their LAYER-FRAME version from this, so a dataset can never mix
+    /// frame and manifest versions — which readers reject outright.
     pub fn format_version(&self) -> u32 {
         self.format_version
     }
 
-    /// The writer's schema-template sink for a v2 build. Normally taken care
-    /// of by [`encoder_config`](Self::encoder_config), which installs it on
+    /// The writer's schema-template sink. Normally taken care of by
+    /// [`encoder_config`](Self::encoder_config), which installs it on
     /// [`crate::arrow_tile::EncoderConfig::template_collector`] so every
-    /// template a v2 frame references ends up in `manifest.schemas` at
-    /// [`finalize`](Self::finalize). Unused (and empty) under v1.
+    /// template a layer frame references ends up in `manifest.schemas` at
+    /// [`finalize`](Self::finalize). Unused (and empty) when the writer emits
+    /// manifest formatVersion 1, whose frames reference no templates.
     pub fn template_collector(&self) -> Arc<TemplateCollector> {
         Arc::clone(&self.templates)
     }
@@ -658,8 +679,8 @@ impl PackWriter {
     ///
     /// That override is the single coupling point keeping a dataset's frames
     /// and its manifest declaration in lockstep — mixed versions are a reader
-    /// hard error (packed-v2 design §1 ★F6), and a v2 frame whose templates
-    /// were never recorded fails template resolution at read time.
+    /// hard error, and a template-referencing frame whose templates were never
+    /// recorded fails template resolution at read time.
     pub fn encoder_config(&self) -> crate::arrow_tile::EncoderConfig {
         crate::arrow_tile::EncoderConfig {
             format_version: self.format_version,
@@ -671,9 +692,9 @@ impl PackWriter {
 
     /// Opt into a **paged** directory: the `.sttd` becomes a root page + leaf
     /// pages of ≤ `page_entries` entries each, so a cold reader fetches only the
-    /// leaves its viewport/time-window touches (Wave 2). `None` (the default)
-    /// emits the single whole-load v5 directory — byte-identical output to a
-    /// pre-paging build. `Some(0)` is clamped to 1.
+    /// leaves its viewport/time-window touches. `None` (the default) emits the
+    /// single whole-load v5 directory — byte-identical output to a build that
+    /// never enables paging. `Some(0)` is clamped to 1.
     pub fn with_paging(mut self, page_entries: Option<usize>) -> Self {
         self.page_entries = page_entries.map(|k| k.max(1));
         self
@@ -684,8 +705,9 @@ impl PackWriter {
     /// The packed format is write-once / serve-many, so the higher build CPU of
     /// a level like 19 is paid once while the smaller bytes are paid on every
     /// fetch (measured −10..19% vs the level-3 default; decode is unaffected).
-    /// Clamped to zstd's valid 1..=22 range. The default
-    /// ([`compression::ZSTD_LEVEL`]) reproduces byte-identical pre-existing builds.
+    /// Clamped to zstd's valid 1..=22 range. At the default
+    /// ([`compression::ZSTD_LEVEL`]) the bytes match a build that never calls
+    /// this, so an already-published archive keeps its content addresses.
     pub fn with_zstd_level(mut self, level: i32) -> Self {
         self.zstd_level = level.clamp(1, compression::ZSTD_LEVEL_MAX);
         self
@@ -695,8 +717,8 @@ impl PackWriter {
     /// (`manifest.capabilities`, spec §3.1) — e.g. [`CAPABILITY_COORD_QUANT`]
     /// when coordinate quantization re-types the geometry column. Canonicalized
     /// (sorted + deduped) so the manifest bytes never depend on call order.
-    /// Empty (the default) omits the key entirely, keeping the manifest
-    /// byte-identical to a pre-capabilities build.
+    /// Empty (the default) omits the key entirely, so the manifest bytes match
+    /// a build that declares nothing.
     pub fn with_capabilities(mut self, mut capabilities: Vec<String>) -> Self {
         capabilities.sort_unstable();
         capabilities.dedup();
@@ -709,7 +731,7 @@ impl PackWriter {
     /// per-ordering range-read cost over the native-tier tiles
     /// ([`crate::ordering_sim`]) instead of the `auto` cardinality heuristic.
     /// When `on`, the `ordering` passed to [`create`](Self::create) is ignored.
-    /// `false` (the default) reproduces byte-identical pre-existing builds.
+    /// `false` (the default) emits the bytes a build that never calls this does.
     pub fn with_measured_ordering(mut self, on: bool) -> Self {
         self.measured_ordering = on;
         self
@@ -732,10 +754,10 @@ impl PackWriter {
         payload: &[u8],
     ) -> Result<()> {
         check_payload_len(id, payload.len() as u64)?;
-        // Frame/manifest version coherence (design §1 ★F6): readers hard-
-        // reject mixed-version datasets, so a frame of the OTHER version
-        // would brick the output on first read. Refuse it at add time,
-        // naming the tile — both directions.
+        // Frame/manifest version coherence: readers hard-reject mixed-version
+        // datasets, so a layer frame of the OTHER version would brick the
+        // output on first read. Refuse it at add time, naming the tile —
+        // both directions.
         let v2_frame = crate::arrow_tile::is_frame_v2(payload);
         if v2_frame != (self.format_version == PACKED_FORMAT_VERSION) {
             return Err(Error::Other(format!(
@@ -816,8 +838,9 @@ impl PackWriter {
                  (this writer emits {PACKED_FORMAT_VERSION})"
             )));
         }
-        // (v2 objects carry an 8-byte magic prelude and blob offsets are
-        // object-absolute — the first blob of a pack sits at offset 8 (★F5);
+        // (formatVersion-2 objects carry an 8-byte magic prelude and blob
+        // offsets are object-absolute — the first blob of a pack sits at
+        // offset 8, and content addresses cover the prelude too;
         // `PackStreamWriter` below owns that math.)
 
         // --- Blob ordering (identical to finalize_buffered) ---------------
@@ -842,7 +865,8 @@ impl PackWriter {
         // Occupied spatial extent over the native (max-zoom) tier only — coarse
         // LOD tiers have artificially small x/y ranges. Measuring the OCCUPIED
         // bbox (not the raw 2^zoom grid) makes the space axis symmetric with the
-        // time axis, so `choose` no longer overstates space for sparse data (F1).
+        // time axis; the raw grid overstates space for sparse data and pushes
+        // `choose` to the wrong ordering.
         let native_z = pending.iter().map(|p| p.z).max().unwrap_or(0);
         let (mut x_min, mut x_max, mut y_min, mut y_max) = (u32::MAX, 0u32, u32::MAX, 0u32);
         for p in pending.iter().filter(|p| p.z == native_z) {
@@ -1035,8 +1059,9 @@ impl PackWriter {
                 } else {
                     let i = blobs.len();
                     let crc = crc32c_tag(&compressed);
-                    // v1: offsets are pack-relative from 0. v2: object-
-                    // absolute — the magic prelude occupies [0, 8), so blobs
+                    // formatVersion 1: offsets are pack-relative from 0.
+                    // formatVersion 2: object-absolute — the magic prelude
+                    // occupies [0, 8), so blobs
                     // start at 8 and readers slice `[offset..offset+length]`
                     // off the whole object unchanged.
                     let (pack_id, offset) = stream.append(&compressed)?;
@@ -1092,7 +1117,7 @@ impl PackWriter {
         // `feature_count` = sum of per-entry counts (the same total
         // stt-validate reports as `feature_count_index`). Deriving here keeps
         // manifest and directory consistent by construction for every writer
-        // path — historically no caller set these and manifests shipped 0s.
+        // path; a caller that forgot to set them would otherwise ship 0s.
         let mut metadata = metadata.clone();
         metadata.tile_count = entries.len() as u64;
         metadata.feature_count = entries.iter().map(|e| u64::from(e.feature_count)).sum();
@@ -1126,7 +1151,7 @@ impl PackWriter {
             let bytes = compression::compress_zstd_with_dict_level(&index_plain, None, zstd_level)?;
             (bytes, (None, None, None, None))
         };
-        // v2: the object is magic + frames; `rootLength` keeps meaning the
+        // formatVersion 2: the object is magic + frames; `rootLength` keeps meaning the
         // root frame's at-rest length (a paged reader fetches
         // `bytes=0..(8+rootLength-1)`), so the DirectoryRef fields above need
         // no adjustment — only the object bytes gain the prelude.
@@ -1143,9 +1168,9 @@ impl PackWriter {
 
         let (layout, root_length, page_count, page_entries_field) = directory_ref_fields;
 
-        // v2: publish the collected schema templates. The collector snapshot
-        // is sorted by hash and deduped by construction, so the manifest
-        // bytes are independent of encode order/parallelism (★F1).
+        // formatVersion 2: publish the collected schema templates. The
+        // collector snapshot is sorted by hash and deduped by construction, so
+        // the manifest bytes are independent of encode order/parallelism.
         let schemas: Vec<SchemaTemplateRef> = if format_version == PACKED_FORMAT_VERSION {
             use base64::Engine as _;
             templates
@@ -1159,8 +1184,9 @@ impl PackWriter {
         } else {
             if !templates.is_empty() {
                 return Err(Error::Other(
-                    "template collector is non-empty on a formatVersion-1 build: v2-encoded \
-                     payloads were fed to a v1 writer (mixed-version dataset)"
+                    "template collector is non-empty on a formatVersion-1 build: \
+                     layer-frame-v2 payloads were fed to a formatVersion-1 writer \
+                     (mixed-version dataset)"
                         .into(),
                 ));
             }
@@ -1272,7 +1298,8 @@ struct PackStreamWriter {
     format_version: u32,
     pack_target_bytes: u64,
     /// Object-absolute offset of the first blob (`OBJECT_MAGIC_LEN` under
-    /// v2, 0 under v1) — the "empty pack" length.
+    /// manifest formatVersion 2, 0 under formatVersion 1) — the "empty pack"
+    /// length.
     data_start: u64,
     current: Option<OpenPack>,
     next_pack_id: u32,
@@ -1337,7 +1364,7 @@ impl PackStreamWriter {
     }
 
     /// Start a new pack: unique temp file (pack ids are unique per run) with
-    /// the v2 magic prelude already written and hashed.
+    /// the object magic prelude already written and hashed.
     fn open(&mut self) -> Result<()> {
         let tmp_path = self.packs_dir.join(format!(
             ".tmp-{}-pack-{}",
@@ -1444,7 +1471,7 @@ pub fn verify_packed_objects<P: AsRef<Path>>(manifest_path: P) -> Result<Vec<Str
 
     // Each content-addressed object: name must equal blake3-128 of its bytes,
     // and on-disk length must equal the declared length. Content addresses
-    // cover the ENTIRE object — magic prelude included on v2 — so this check
+    // cover the ENTIRE object — magic prelude included on formatVersion 2 — so this check
     // is version-independent; the magic itself is validated separately below.
     fn check_object(
         root: &Path,
@@ -1498,8 +1525,9 @@ pub fn verify_packed_objects<P: AsRef<Path>>(manifest_path: P) -> Result<Vec<Str
         }
     }
 
-    // Directory must decode (through its v2 magic prelude, at-rest encoding +
-    // container layout) and reference only packs that exist. Under v2, the
+    // Directory must decode (through its magic prelude, at-rest encoding +
+    // container layout) and reference only packs that exist. Under
+    // formatVersion 2, the
     // decoded entries additionally drive the frame → manifest.schemas
     // reference check (a dataset whose frames reference a missing template
     // is undecodable and must not verify clean).
@@ -1585,10 +1613,10 @@ fn parse_schema_hash_hex(s: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
-/// v2 deep check shared by both verifiers: every template hash any tile frame
+/// Layer-frame deep check shared by both verifiers: every template hash a tile frame
 /// references must resolve in `manifest.schemas` — otherwise the dataset
 /// "verifies clean" while no tile can decode. Walks each UNIQUE blob (dedup by
-/// `(pack_id, offset)`), decompresses it, parses ONLY the v2 frame header
+/// `(pack_id, offset)`), decompresses it, parses ONLY the layer-frame header
 /// (escape/version/count, per-layer ref_kinds + 16-byte hashes — no Arrow
 /// decode; [`crate::arrow_tile::frame_v2_template_refs`]) and reports each
 /// missing hash once, with an example tile. `pack_object` returns a pack's
@@ -1679,7 +1707,7 @@ fn verify_v2_frame_template_refs<F>(
                 }
             }
             Err(err) => issues.push(format!(
-                "tile {:?}: v2 frame header parse failed: {err}",
+                "tile {:?}: layer-frame header parse failed: {err}",
                 e.tile_id()
             )),
         }
@@ -1723,10 +1751,11 @@ pub struct PackedReader {
     /// The manifest's authoritative `formatVersion` (1 | 2). Decides object
     /// magic expectations and which layer-frame shape
     /// [`read_layers`](Self::read_layers) accepts — mixed-version datasets
-    /// are hard errors both ways (design §1 ★F6).
+    /// are hard errors both ways.
     format_version: u32,
-    /// v2 only: the hash-validated schema-template registry decoded from
-    /// `manifest.schemas` at open. `None` on v1 datasets.
+    /// formatVersion-2 only: the hash-validated schema-template registry
+    /// decoded from `manifest.schemas` at open. `None` on formatVersion-1
+    /// datasets.
     templates: Option<TemplateRegistry>,
     /// `Some` iff this reader was opened via
     /// [`open_bundle`](Self::open_bundle): the whole `.sttb` is one mapping
@@ -1759,10 +1788,10 @@ fn manifest_open_checks(manifest: &Manifest) -> Result<Compression> {
     // A future breaking manifest revision must fail loudly at open, not
     // misdecode downstream (the directory codec has its own version byte;
     // this guards the manifest schema itself). `formatVersion` is the
-    // AUTHORITATIVE discriminator (★F6) — the frame escape is only
-    // defense-in-depth. A formatVersion-1 (0.3.x) archive lands here too: that
-    // format was removed after the fleet migration, so it is a hard error
-    // rather than a silent misdecode.
+    // AUTHORITATIVE discriminator — the layer-frame escape is only
+    // defense-in-depth. A formatVersion-1 (0.3.x) archive lands here too: this
+    // toolchain cannot read it, so it is a hard error rather than a silent
+    // misdecode.
     if manifest.format_version != PACKED_FORMAT_VERSION {
         return Err(Error::InvalidArchive(format!(
             "unsupported packed formatVersion {} (this reader supports {PACKED_FORMAT_VERSION})",
@@ -1808,15 +1837,15 @@ impl PackedReader {
         let manifest_bytes = fs::read(manifest_path)?;
         let manifest = Manifest::from_json_bytes(&manifest_bytes)?;
         let compression = manifest_open_checks(&manifest)?;
-        // v2: decode + hash-validate the manifest-embedded schema templates
+        // formatVersion 2: decode + hash-validate the manifest-embedded schema templates
         // into the registry every tile decode resolves against. Fails the
         // whole open (dataset-level) on any corrupt entry.
         let templates = (manifest.format_version == PACKED_FORMAT_VERSION)
             .then(|| build_template_registry(&manifest.schemas))
             .transpose()?;
 
-        // Load + decode the directory object (validating + stripping the v2
-        // magic prelude first). The single (whole-load) shape unwraps the
+        // Load + decode the directory object (validating + stripping its
+        // object magic prelude first). The single (whole-load) shape unwraps the
         // at-rest encoding then runs the v5 codec; the paged shape decodes the
         // root + every leaf (local load-all — a mmap'd file has no cold-start
         // cost). Both branches return the same full entry list.
@@ -1906,7 +1935,7 @@ impl PackedReader {
             Ok((offset, length))
         };
 
-        // v2: registry from the embedded manifest, then per-object magic
+        // formatVersion 2: registry from the embedded manifest, then per-object magic
         // validation on every window before anything decodes through it.
         let templates = (manifest.format_version == PACKED_FORMAT_VERSION)
             .then(|| build_template_registry(&manifest.schemas))
@@ -2029,8 +2058,8 @@ impl PackedReader {
                     pack.length
                 )));
             }
-            // v2 objects self-identify; validate once per mapping. (Blob
-            // offsets are object-absolute under v2, so the slice math below
+            // formatVersion-2 objects self-identify; validate once per
+            // mapping. (Blob offsets are object-absolute there, so the slice math below
             // is version-independent.)
             if self.format_version == PACKED_FORMAT_VERSION {
                 strip_object_magic(&mmap, PACK_MAGIC, &format!("pack {}", pack.path.display()))?;
@@ -2099,10 +2128,10 @@ impl PackedReader {
 
     /// Decode a tile payload under this dataset's declared `formatVersion`.
     ///
-    /// The manifest is authoritative (design §1 ★F6): a v2 frame inside a
-    /// v1-declared dataset is a hard error, and vice versa — never a silent
-    /// best-effort decode of a mixed-version dataset. v2 frames resolve their
-    /// template references through the registry built at open.
+    /// The manifest is authoritative: a v2 layer frame inside a
+    /// formatVersion-1 dataset is a hard error, and vice versa — never a
+    /// silent best-effort decode of a mixed-version dataset. A v2 layer frame
+    /// resolves its template references through the registry built at open.
     pub fn decode_payload(&self, payload: &[u8]) -> Result<Vec<crate::arrow_tile::DecodedLayer>> {
         let v2_frame = crate::arrow_tile::is_frame_v2(payload);
         if self.format_version == PACKED_FORMAT_VERSION {
@@ -2116,7 +2145,7 @@ impl PackedReader {
             let templates = self
                 .templates
                 .as_ref()
-                .expect("v2 open always builds the template registry");
+                .expect("formatVersion-2 open always builds the template registry");
             crate::arrow_tile::decode_tile_with_templates(payload, templates)
         } else {
             if v2_frame {
@@ -2138,8 +2167,8 @@ impl PackedReader {
         self.format_version
     }
 
-    /// The v2 schema-template registry decoded from `manifest.schemas`
-    /// (`None` on v1 datasets). Exposed so tools that fetch payloads through
+    /// The schema-template registry decoded from `manifest.schemas` (`None` on
+    /// formatVersion-1 datasets). Exposed so tools that fetch payloads through
     /// [`read_payload`](Self::read_payload) can decode them out-of-band via
     /// [`crate::arrow_tile::decode_tile_with_templates`].
     pub fn templates(&self) -> Option<&TemplateRegistry> {
@@ -2164,12 +2193,13 @@ mod tests {
     use super::*;
     use crate::arrow_tile::{
         encode_tile, encode_tile_with, ColumnarLayer, EncoderConfig, GeometryColumn,
-        PropertyColumn, FORMAT_VERSION,
+        PropertyColumn, LAYER_FRAME_VERSION,
     };
 
     fn point_layer(name: &str, ids: Vec<u64>, t0: i64) -> ColumnarLayer {
         let n = ids.len();
         ColumnarLayer {
+            polygon_parts: None,
             name: name.to_string(),
             feature_ids: ids,
             start_times: vec![t0; n],
@@ -2389,11 +2419,11 @@ mod tests {
         assert_eq!(static_entries[0].offset, static_entries[1].offset);
     }
 
-    /// F1: `auto` measures the OCCUPIED spatial extent, not the raw max zoom. A
+    /// `auto` measures the OCCUPIED spatial extent, not the raw max zoom. A
     /// dataset at a high zoom but a tiny spatial bbox over a deep-ish timeline
-    /// resolves to spatial-major — which only holds when choose() sees the
+    /// resolves to spatial-major — which only holds when `choose` sees the
     /// occupied bbox (~2 bits) rather than the 14-bit zoom (which would pick
-    /// hilbert3). Also records the resolved order in the manifest (F4a).
+    /// hilbert3). The resolved order is also recorded in the manifest.
     #[test]
     fn auto_resolves_from_occupied_extent_not_max_zoom() {
         let dir = tempfile::tempdir().unwrap();
@@ -2453,10 +2483,10 @@ mod tests {
     /// is clean. Separately, a paged and a single build of the same input must
     /// agree byte-for-byte on everything except the directory object's
     /// container shape: identical pack content addresses and identical decoded
-    /// entries. (Cross-finalize blob bytes ARE reproducible — the encoder feeds
+    /// entries. Cross-finalize blob bytes ARE reproducible — the encoder feeds
     /// sorted metadata to Arrow ≥59's sorted-order IPC writer, guarded by
-    /// `reproducible_build.rs` — so the old arrow-54 "compare only address
-    /// keys" softening no longer applies.)
+    /// `reproducible_build.rs` — so this compares the content addresses
+    /// themselves, not a weaker key-set match.
     #[test]
     fn paged_directory_writer_roundtrips_and_matches_single() {
         let bucket = 3_600_000i64;
@@ -2560,6 +2590,7 @@ mod tests {
         // few small ones, with a target smaller than the big blob.
         let big_ids: Vec<u64> = (0..4000).collect();
         let big = encode_tile(&[ColumnarLayer {
+            polygon_parts: None,
             name: "default".to_string(),
             feature_ids: big_ids.clone(),
             start_times: vec![0; big_ids.len()],
@@ -3352,11 +3383,13 @@ mod tests {
     // ---- formatVersion 2 (template-referencing frames + object magic) ------
 
     /// A quantized point layer with numeric + categorical properties — the
-    /// shape whose per-tile `stt:qa`/`stt:time_offset_ms` variance v2 hoists
-    /// into TILE_META. `seed` shifts values so every tile's affines differ.
+    /// shape whose per-tile `stt:qa`/`stt:time_offset_ms` variance the layer
+    /// frame hoists into TILE_META. `seed` shifts values so every tile's
+    /// affines differ.
     fn v2_point_layer(seed: u64, n: usize) -> ColumnarLayer {
         let base = 1_700_000_000_000i64 + seed as i64 * 60_000;
         ColumnarLayer {
+            polygon_parts: None,
             name: "default".to_string(),
             feature_ids: (0..n as u64).map(|i| seed * 100 + i).collect(),
             start_times: (0..n as i64).map(|i| base + i * 1000).collect(),
@@ -3389,7 +3422,7 @@ mod tests {
         }
     }
 
-    /// The layer set the v2 fixture builds: quantized point tiles with
+    /// The layer set the formatVersion-2 fixture builds: quantized point tiles with
     /// per-tile-varying affines plus an EMPTY tile (0 rows, dictionary
     /// column intact).
     fn v2_fixture_layers() -> Vec<ColumnarLayer> {
@@ -3402,13 +3435,13 @@ mod tests {
         EncoderConfig {
             quantize_coords_m: Some(1.0),
             quantize_attrs_auto: true,
-            format_version: FORMAT_VERSION,
+            format_version: LAYER_FRAME_VERSION,
             template_collector: Some(w.template_collector()),
             ..EncoderConfig::default()
         }
     }
 
-    /// Build a small v2 dataset (encoder wired to the writer's template
+    /// Build a small formatVersion-2 dataset (encoder wired to the writer's template
     /// collector) into `out`, returning the manifest and the input layers in
     /// tile order.
     fn build_v2_dataset(out: &Path, paging: Option<usize>) -> (Manifest, Vec<ColumnarLayer>) {
@@ -3438,10 +3471,10 @@ mod tests {
         (manifest, layers)
     }
 
-    /// End-to-end v2: magic on every object, schemas embedded (sorted,
-    /// hash-valid), verify clean, and every tile decodes through the registry
-    /// to EXACTLY what the v1 frame of the same layer decodes to (metadata
-    /// re-injection contract).
+    /// End-to-end formatVersion 2: magic on every object, schemas embedded
+    /// (sorted, hash-valid), verify clean, and every tile decodes through the
+    /// registry to EXACTLY what the same layer's SELF-CONTAINED (inline-schema)
+    /// frame decodes to — the metadata re-injection contract.
     #[test]
     fn v2_dataset_roundtrips_with_templates_magic_and_v1_equivalence() {
         let dir = tempfile::tempdir().unwrap();
@@ -3449,9 +3482,14 @@ mod tests {
         let (manifest, layers) = build_v2_dataset(&out, None);
 
         assert_eq!(manifest.format_version, PACKED_FORMAT_VERSION);
-        // Templates collected: one CORE + one PROPS schema for the shared
-        // layer shape (constancy: five differing tiles, ONE template pair).
-        assert_eq!(manifest.schemas.len(), 2, "expected core+props templates");
+        // Templates collected: TWO CORE + one PROPS schema. The five
+        // populated tiles share one CORE template (constancy: they differ
+        // only in per-tile metadata, which lives in TILE_META); the
+        // empty-bucket tile has a second one because a zero-feature layer has
+        // no `t0` to anchor compact `start_time` offsets against and so keeps
+        // the absolute Int64 pair (see `choose_time_forms`). All six share the
+        // single PROPS template.
+        assert_eq!(manifest.schemas.len(), 3, "expected core+props templates");
         let hashes: Vec<&str> = manifest.schemas.iter().map(|s| s.hash.as_str()).collect();
         assert!(
             hashes.windows(2).all(|w| w[0] < w[1]),
@@ -3487,7 +3525,8 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        // Decode parity: each tile equals the v1 decode of the same layer.
+        // Decode parity: each tile equals the self-contained (inline-schema)
+        // decode of the same layer.
         for (k, layer) in layers.iter().enumerate() {
             let e = reader
                 .entries()
@@ -3495,7 +3534,7 @@ mod tests {
                 .find(|e| e.x == k as u32)
                 .expect("entry present");
             let got = reader.read_layers(e).unwrap();
-            let v1 = crate::arrow_tile::decode_tile(
+            let inline = crate::arrow_tile::decode_tile(
                 &encode_tile_with(
                     std::slice::from_ref(layer),
                     &EncoderConfig {
@@ -3507,11 +3546,12 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-            assert_eq!(got.len(), v1.len());
-            assert_eq!(got[0].name, v1[0].name);
+            assert_eq!(got.len(), inline.len());
+            assert_eq!(got[0].name, inline[0].name);
             assert_eq!(
-                got[0].batch, v1[0].batch,
-                "tile {k}: v2 decode must equal the v1 decode after re-injection"
+                got[0].batch, inline[0].batch,
+                "tile {k}: template-referencing decode must equal the inline-schema \
+                 decode after re-injection"
             );
         }
     }
@@ -3544,7 +3584,7 @@ mod tests {
         );
     }
 
-    /// Corrupting a v2 object's magic prelude is caught at open/read AND by
+    /// Corrupting an object's magic prelude is caught at open/read AND by
     /// the verifier (which also still reports the content-address mismatch).
     #[test]
     fn corrupt_v2_object_magic_is_detected() {
@@ -3589,7 +3629,7 @@ mod tests {
         assert!(err.to_string().contains("STTD"), "got: {err}");
     }
 
-    /// The paged directory container works identically under v2 (magic
+    /// The paged directory container works identically under formatVersion 2 (magic
     /// stripped before the root/leaf math; `rootLength` still means the root
     /// frame's at-rest length).
     #[test]
@@ -3611,8 +3651,8 @@ mod tests {
         }
     }
 
-    /// v2 bundles: pack → verify → open → unpack → re-verify, all through
-    /// the embedded v2 manifest (design §6's open item).
+    /// Bundles: pack → verify → open → unpack → re-verify, all driven by the
+    /// manifest embedded in the bundle header.
     #[test]
     fn v2_bundle_roundtrips_and_verifies() {
         let dir = tempfile::tempdir().unwrap();
@@ -3643,12 +3683,12 @@ mod tests {
             verify_packed_objects(unpacked.join("manifest.json"))
                 .unwrap()
                 .is_empty(),
-            "unpacked v2 dataset must re-verify"
+            "unpacked dataset must re-verify"
         );
     }
 
     /// The verbatim-repack path (pack-cover / repair tools): payloads copied
-    /// from a v2 source MUST carry the source's formatVersion forward and
+    /// from a formatVersion-2 source MUST carry the source's formatVersion forward and
     /// seed the new writer's template collector from the source registry —
     /// the repacked dataset round-trips readable, tile for tile.
     #[test]
@@ -3663,7 +3703,11 @@ mod tests {
             .unwrap()
             .with_format_version(reader.format_version())
             .with_capabilities(reader.capabilities().to_vec())
-            .with_seeded_templates(reader.templates().expect("v2 source has a registry"));
+            .with_seeded_templates(
+                reader
+                    .templates()
+                    .expect("formatVersion-2 source has a registry"),
+            );
         for e in reader.entries() {
             let payload = reader.read_payload(e).unwrap();
             w.add_tile_full(
@@ -3701,7 +3745,7 @@ mod tests {
         }
     }
 
-    /// F4: a v2 dataset whose frames reference a template MISSING from
+    /// A formatVersion-2 dataset whose frames reference a template MISSING from
     /// `manifest.schemas` is undecodable — both validators must flag the
     /// absent hash instead of verifying clean (every object still hashes to
     /// its content address and the remaining schemas table is valid).
@@ -3710,7 +3754,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("dataset");
         let (manifest, _) = build_v2_dataset(&out, None);
-        assert_eq!(manifest.schemas.len(), 2, "core + props templates");
+        // Two CORE (populated + empty-bucket, see the roundtrip test) + one
+        // PROPS template.
+        assert_eq!(manifest.schemas.len(), 3, "core + props templates");
         let manifest_path = out.join("manifest.json");
         assert!(verify_packed_objects(&manifest_path).unwrap().is_empty());
 

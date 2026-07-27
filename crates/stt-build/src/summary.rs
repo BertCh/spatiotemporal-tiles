@@ -435,7 +435,7 @@ fn build_summary_layer(
     let mut properties: Vec<(String, PropertyColumn)> = Vec::new();
     properties.push(("count".to_string(), PropertyColumn::Numeric(counts)));
 
-    // Per-sub-bucket numeric columns (Phase C). When sub_buckets > 1, each
+    // Per-sub-bucket numeric columns. When sub_buckets > 1, each
     // cell row carries N additional `bucket_<i>` columns with the count
     // observed in that fine-grained sub-bucket. The renderer reads them as
     // standard numericProps and indexes via a `currentSubBucket` uniform —
@@ -470,6 +470,7 @@ fn build_summary_layer(
     }
 
     ColumnarLayer {
+        polygon_parts: None,
         name: name.to_string(),
         feature_ids,
         start_times,

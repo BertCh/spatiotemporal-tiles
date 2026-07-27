@@ -9,6 +9,7 @@ use stt_core::arrow_tile::{
 fn point_layer(n: usize) -> ColumnarLayer {
     let kinds = ["car", "bus", "bike", "tram"];
     ColumnarLayer {
+        polygon_parts: None,
         name: "default".to_string(),
         feature_ids: (0..n as u64).collect(),
         start_times: (0..n as i64)
@@ -44,6 +45,7 @@ fn point_layer(n: usize) -> ColumnarLayer {
 /// A linestring layer with `n` features of `verts` vertices each.
 fn line_layer(n: usize, verts: usize) -> ColumnarLayer {
     ColumnarLayer {
+        polygon_parts: None,
         name: "tracks".to_string(),
         feature_ids: (0..n as u64).collect(),
         start_times: vec![1_600_000_000_000; n],

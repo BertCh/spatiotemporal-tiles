@@ -117,13 +117,14 @@ fn calculate_confidence(result: &AnalysisResult) -> u8 {
 
 /// Convert recommendations to a build config JSON structure.
 ///
-/// The original scalar recipe (`min_zoom`/`max_zoom`/`temporal_bucket_ms`/
-/// `confidence`/`explanations`) is preserved unchanged, plus the richer signals
-/// downstream consumers (the MCP `recommend_build` tool) previously had to
-/// recompute or do without: `temporal_bucket_human`, `dominant_type`, the full
-/// evidence-based `advice` array (with its `lossy`/`confidence` markers), and
-/// the ready-to-run `command` assembled by [`to_command`] (non-lossy advisor
-/// flags already appended). Purely additive — no existing key changes shape.
+/// Carries the scalar recipe (`min_zoom`/`max_zoom`/`temporal_bucket_ms`/
+/// `confidence`/`explanations`) alongside the richer signals a downstream
+/// consumer (the MCP `recommend_build` tool) would otherwise recompute or do
+/// without: `temporal_bucket_human`, `dominant_type`, the full evidence-based
+/// `advice` array (with its `lossy`/`confidence` markers), and the ready-to-run
+/// `command` assembled by [`to_command`] (non-lossy advisor flags already
+/// appended). The shape is append-only: consumers pin the scalar keys, so new
+/// signals go alongside them and never reshape an existing key.
 pub fn to_build_config(
     recommendations: &Recommendations,
     input: &Path,

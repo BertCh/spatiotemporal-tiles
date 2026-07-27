@@ -572,9 +572,9 @@ fn is_property_column(
 /// are reported by the EOF drop accounting.
 fn property_kind_for(dt: &DataType) -> Option<PropertyKind> {
     match dt {
-        // Floats + every signed/unsigned integer width. Unsigned and narrow
-        // integers used to fall through to `None`, silently dropping common
-        // columns (e.g. a UInt32 id/count) from every tile.
+        // Floats + every signed/unsigned integer width. Every width must be
+        // listed: a type that falls through to `None` here silently drops the
+        // whole column (e.g. a UInt32 id/count) from every tile.
         DataType::Float64
         | DataType::Float32
         | DataType::Int64
@@ -1443,7 +1443,7 @@ fn extract_property_value(
     }
     // Unsigned integers: a `serde_json::Number` holds each width natively (u64
     // as u64), so these round-trip through `value_as_f64` without loss for the
-    // common cases. Previously dropped entirely.
+    // common cases.
     if let Some(arr) = column.as_any().downcast_ref::<arrow::array::UInt8Array>() {
         return Some(serde_json::json!(arr.value(row_idx)));
     }
@@ -1689,15 +1689,15 @@ mod tests {
         assert!(parse_iso8601("").is_err());
     }
 
-    // ---- property type coverage (finding: silent column drop) ----
+    // ---- property type coverage (no silent column drops) ----
 
     use crate::columnar::PropertyKind;
     use arrow::datatypes::{DataType, Field, Schema};
 
     #[test]
     fn property_kind_covers_unsigned_narrow_date_and_largeutf8() {
-        // Types that previously fell through to `None` and silently dropped the
-        // whole column from every tile.
+        // A type that maps to `None` here silently drops the whole column from
+        // every tile, so each of these must map to a kind.
         for dt in [
             DataType::UInt8,
             DataType::UInt16,
@@ -1758,7 +1758,7 @@ mod tests {
         assert_eq!(super::extract_property_value(&batch, 2, 1), None);
     }
 
-    // ---- coordinate-column narrowing (finding: real x/lat attrs dropped) ----
+    // ---- coordinate-column narrowing (real x/lat attrs must survive) ----
 
     #[test]
     fn wkb_geometry_keeps_named_coordinate_attributes() {

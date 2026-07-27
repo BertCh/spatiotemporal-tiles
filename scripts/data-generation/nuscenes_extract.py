@@ -440,7 +440,7 @@ def extract(nusc, scene, dataroot: Path, origin_lat: float, origin_lon: float,
 def extract_can(nusc_can, scene_name: str):
     """Pull CAN-bus telemetry for a scene, or None if absent.
 
-    Gauges the contract wants (av-cockpit.md §2d), each from its best-fidelity
+    Gauges the contract wants (spec/sidecar-assets.md §3.2), each from its best-fidelity
     CAN stream — every field carries its own sample series, so mixed rates are
     fine (the cockpit binary-searches each at the playhead):
 
@@ -712,7 +712,7 @@ def generate(args):
         if layer not in map_layers:
             map_layers.append(layer)
 
-    # --- lightweight ego polyline for the ego-follow camera (av-cockpit.md §3d).
+    # --- lightweight ego polyline for the ego-follow camera (spec/sidecar-assets.md §3.1).
     # Same lon/lat/t samples as the ego trips archive → the follow path tracks the
     # rendered ego trail exactly. ~40–80 pts; pure JSON, no rebuild.
     ego_path = avc.downsample_ego_path(ego_t, ego_lon, ego_lat)

@@ -98,6 +98,7 @@ mod tests {
     fn layer(name: &str, starts: Vec<i64>, ends: Vec<i64>) -> ColumnarLayer {
         let n = starts.len();
         ColumnarLayer {
+            polygon_parts: None,
             name: name.into(),
             feature_ids: (1..=n as u64).collect(),
             start_times: starts,

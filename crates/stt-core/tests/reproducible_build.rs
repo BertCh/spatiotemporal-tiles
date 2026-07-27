@@ -192,8 +192,8 @@ fn same_tile_encodes_byte_identically() {
     }
 }
 
-/// The byte-identity contract extended to a whole **formatVersion-2 dataset**
-/// (packed-v2 design §1): two builds of the same input — with the tiles added
+/// The byte-identity contract extended to a whole **formatVersion-2 dataset**:
+/// two builds of the same input — with the tiles added
 /// in DIFFERENT orders, standing in for encode parallelism — produce a
 /// byte-identical manifest (including the sorted, deduped `schemas` table)
 /// and byte-identical directory + pack objects. Template hashes are
@@ -222,11 +222,15 @@ fn v2_dataset_rebuild_is_byte_identical_including_schemas() {
 
     let build = |dir: &std::path::Path, reversed: bool| {
         let mut writer = PackWriter::create(dir, BlobOrdering::Auto, 8 * 1024).unwrap();
-        assert_eq!(writer.format_version(), 2, "v2 is the writer default");
+        assert_eq!(
+            writer.format_version(),
+            2,
+            "manifest formatVersion 2 is the writer default"
+        );
         let cfg = EncoderConfig {
             quantize_coords_m: Some(1.0),
             quantize_attrs_auto: true,
-            format_version: FORMAT_VERSION,
+            format_version: LAYER_FRAME_VERSION,
             template_collector: Some(writer.template_collector()),
             ..EncoderConfig::default()
         };
@@ -258,7 +262,7 @@ fn v2_dataset_rebuild_is_byte_identical_including_schemas() {
 
     assert!(
         !manifest_a.schemas.is_empty(),
-        "v2 manifest must carry templates"
+        "formatVersion-2 manifest must carry templates"
     );
     let hashes: Vec<&str> = manifest_a.schemas.iter().map(|s| s.hash.as_str()).collect();
     assert!(
