@@ -24,13 +24,13 @@ use rayon::prelude::*;
 
 use arrow::array::{
     Array, DictionaryArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    ListArray, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
+    ListArray, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::datatypes::{DataType, UInt16Type};
 use stt_core::arrow_tile::{
     decode_tile, decode_tile_with_templates, encode_tile_with, set_quantize_attrs,
     set_quantize_attrs_auto, set_quantize_coords_m, AttrQuant, ColumnarLayer, Coord, EncoderConfig,
-    GeometryColumn, PropertyColumn, QuantAffine, STT_QUANT_ATTR_META_KEY,
+    GeometryColumn, PropertyColumn, QuantAffine, VectorElem, STT_QUANT_ATTR_META_KEY,
 };
 use stt_core::pack::{PackWriter, PackedReader};
 use stt_core::tile::TileId;
@@ -291,8 +291,22 @@ fn read_triangles(batch: &RecordBatch) -> Option<Vec<Vec<u32>>> {
             out.push(Vec::new());
         } else {
             let v = list.value(i);
-            let a = v.as_any().downcast_ref::<UInt32Array>().unwrap();
-            out.push(a.values().to_vec());
+            // BOTH leaf widths are legal: the encoder narrows `triangles` to
+            // `UInt16` when every index fits and only widens to `UInt32`
+            // otherwise (encode.rs, `max_index <= u16::MAX`). Downcasting to
+            // `UInt32` alone therefore panicked on every SMALL polygon tile —
+            // which is most of them; it was the narrow case, not an old one.
+            let vals: Vec<u32> = if let Some(a) = v.as_any().downcast_ref::<UInt32Array>() {
+                a.values().to_vec()
+            } else if let Some(a) = v.as_any().downcast_ref::<UInt16Array>() {
+                a.values().iter().map(|&x| x as u32).collect()
+            } else {
+                panic!(
+                    "'triangles' list leaf is {:?}, expected UInt16 or UInt32",
+                    v.data_type()
+                )
+            };
+            out.push(vals);
         }
     }
     Some(out)
@@ -365,6 +379,38 @@ fn read_property(batch: &RecordBatch, idx: usize) -> (String, PropertyColumn) {
                     .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
                     .collect(),
             )
+        }
+        // Vector property ([`PropertyColumn::Vector`]) — a fixed-width
+        // interleaved per-feature attribute: packed RGBA, a surfel quaternion,
+        // an in-plane scale pair. Without this arm the whole CLASS panics, and
+        // it is not a rare one: every AV LiDAR archive carries `point_rgba` as
+        // `FixedSizeList<UInt8,4>`, so re-optimizing one was impossible.
+        //
+        // Values round-trip through `f32` because that is what `Vector.values`
+        // stores; a `U8` leaf is re-rounded and clamped to `[0,255]` at encode,
+        // so an unmodified read→write is a no-op on the bytes.
+        DataType::FixedSizeList(child, width) => {
+            let fsl = col.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+            let width = *width as usize;
+            let leaf = fsl.values();
+            let (elem, values) = match child.data_type() {
+                DataType::UInt8 => {
+                    let a = leaf.as_any().downcast_ref::<UInt8Array>().unwrap();
+                    let v: Vec<f32> = (0..a.len()).map(|i| a.value(i) as f32).collect();
+                    (VectorElem::U8, v)
+                }
+                DataType::Float32 => {
+                    let a = leaf.as_any().downcast_ref::<Float32Array>().unwrap();
+                    let v: Vec<f32> = (0..a.len()).map(|i| a.value(i)).collect();
+                    (VectorElem::F32, v)
+                }
+                other => panic!("vector property '{name}' has unsupported leaf {other:?}"),
+            };
+            PropertyColumn::Vector {
+                width,
+                elem,
+                values,
+            }
         }
         other => panic!("property '{name}' has unsupported type {other:?}"),
     };

@@ -3079,7 +3079,7 @@ def run_stt_build(
     min_zoom_field: str | None = None,
     max_zoom_field: str | None = None,
     static_full_range: bool = False,
-    blob_ordering: str | None = None,
+    blob_ordering: str | None = "time-major",
     publish: bool = True,
 ) -> None:
     """Run ``stt-build`` on one archive's GeoParquet → a packed STT directory.
@@ -3120,12 +3120,19 @@ def run_stt_build(
       in *degrees*, so at mid latitudes ``1.0`` snaps longitude to ~0.75 m
       (visible jitter on a ~4.5 m car) — use ``<= 0.1`` (~7.5 cm) for AV.
 
-    ``blob_ordering`` (when set) is passed straight through as
-    ``--blob-ordering``. PROJECT RULE: multi-cell PLAYBACK archives must pass
-    ``"time-major"`` explicitly — ``auto`` may pick spatial ordering, which
+    ``blob_ordering`` is passed straight through as ``--blob-ordering``, and
+    **defaults to** ``"time-major"``. PROJECT RULE: multi-cell PLAYBACK archives
+    must not be left to ``auto``, which may pick spatial ordering — that
     silently yields empty buffered time ranges and stalls playback (the
-    rain-flood-2019 gotcha). Leave ``None`` only for static/whole-window
-    archives (HD-map) where playback order is irrelevant.
+    rain-flood-2019 gotcha). Every AV bundle is a playback demo, so the rule is
+    the DEFAULT here rather than an opt-in each extractor has to remember:
+    stating it per call site is exactly what ``av_synthetic`` / ``argoverse`` /
+    ``comma`` all forgot, and `formatVersion: 1` had no ``blobOrdering`` field,
+    so the reconcile gate could not see the resulting `spatial` archives until
+    they were migrated to v2. Pass ``None`` to fall back to the builder's
+    ``auto`` — reasonable only for a static/whole-window archive, and even then
+    the reconcile test rejects a `spatial` result on any demo that authors
+    ``targetPlaybackSeconds``.
     """
     valid = ("point", "trips", "map_poly", "map_line", "line")
     if kind not in valid:
