@@ -1,0 +1,26 @@
+# Neural-State Atlas generator (neural_atlas.py) — see
+# docs/roadmap/neural-atlas-2026-07.md §14.
+#
+#   /opt/homebrew/bin/python3.12 -m venv .venv-atlas
+#   ./.venv-atlas/bin/pip install -r requirements-atlas.txt
+#
+# Python 3.12, NOT the system 3.14: torch has no 3.14 wheels. No CUDA needed —
+# the pipeline runs on MPS (or CPU with --device cpu); the whole run is ~35 min
+# on an M3 Pro at the shipped defaults.
+torch
+transformers
+safetensors
+huggingface_hub
+datasets
+numpy
+scipy
+scikit-learn
+pyarrow
+shapely
+# Leiden on the multiplex affinity graph.
+python-igraph
+leidenalg
+# 2-D embedding of the region/family CENTROIDS only (the L2 layout is a per-family
+# PCA, so nothing ever re-projects the whole 294,912-node set). Optional —
+# --no-umap falls back to PCA throughout.
+umap-learn
