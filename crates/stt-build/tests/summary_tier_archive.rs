@@ -3,7 +3,6 @@
 //! and confirm both tiers are addressable through the same directory.
 
 use geojson::{Feature, Geometry, Value as GeomValue};
-use std::sync::Arc;
 use stt_build::input::ParsedFeature;
 use stt_build::summary::{build_summary_tier, parse_summary_columns, SummaryConfig};
 use stt_build::tiler::{generate_tiles_streaming, TileConfig};
@@ -14,7 +13,7 @@ fn point(lon: f64, lat: f64, ts: u64, mag: f64) -> ParsedFeature {
     let props = serde_json::json!({ "magnitude": mag })
         .as_object()
         .cloned()
-        .map(Arc::new);
+        .and_then(stt_build::props::FeatureProperties::from_map);
     ParsedFeature {
         geojson: Feature {
             bbox: None,

@@ -1800,6 +1800,7 @@ pub fn run(args: Args) -> Result<()> {
         no_clip: false,
         quantize_coords: Some(10.0),
         quantize_attrs: Vec::new(),
+            blob_ordering: None,
     })?;
     let build_elapsed = t_build.elapsed();
 

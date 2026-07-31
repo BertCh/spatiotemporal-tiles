@@ -45,7 +45,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // manifest's schemas table — copied frames reference templates by hash
     // but never re-encode, so nothing else would record them.
     let mut writer = PackWriter::create(out_dir, ordering, pack_size_mb * 1024 * 1024)?
-        .with_format_version(reader.format_version())
         .with_capabilities(reader.capabilities().to_vec());
     if let Some(templates) = reader.templates() {
         writer = writer.with_seeded_templates(templates);

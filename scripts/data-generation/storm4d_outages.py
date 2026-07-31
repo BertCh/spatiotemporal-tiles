@@ -53,8 +53,37 @@ EAGLEI_URL = "https://ndownloader.figshare.com/files/53581661"
 EAGLEI_NAME = "eaglei_outages_2024.csv"
 COUNTY_URL = "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_county_20m.zip"
 
-STATE_NAMES = {"IA": "Iowa", "MO": "Missouri"}
-STATE_FIPS = {"IA": "19", "MO": "29"}
+# CONUS. EAGLE-I names states in full; the Census cartographic-boundary file
+# keys them by FIPS. Both tables are needed because the outage feed and the
+# county geometry are joined across that gap.
+STATE_NAMES = {
+    "AL": "Alabama", "AR": "Arkansas", "AZ": "Arizona", "CA": "California",
+    "CO": "Colorado", "CT": "Connecticut", "DC": "District of Columbia",
+    "DE": "Delaware", "FL": "Florida", "GA": "Georgia", "IA": "Iowa",
+    "ID": "Idaho", "IL": "Illinois", "IN": "Indiana", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "MA": "Massachusetts",
+    "MD": "Maryland", "ME": "Maine", "MI": "Michigan", "MN": "Minnesota",
+    "MO": "Missouri", "MS": "Mississippi", "MT": "Montana",
+    "NC": "North Carolina", "ND": "North Dakota", "NE": "Nebraska",
+    "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico",
+    "NV": "Nevada", "NY": "New York", "OH": "Ohio", "OK": "Oklahoma",
+    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island",
+    "SC": "South Carolina", "SD": "South Dakota", "TN": "Tennessee",
+    "TX": "Texas", "UT": "Utah", "VA": "Virginia", "VT": "Vermont",
+    "WA": "Washington", "WI": "Wisconsin", "WV": "West Virginia",
+    "WY": "Wyoming",
+}
+STATE_FIPS = {
+    "AL": "01", "AZ": "04", "AR": "05", "CA": "06", "CO": "08", "CT": "09",
+    "DE": "10", "DC": "11", "FL": "12", "GA": "13", "ID": "16", "IL": "17",
+    "IN": "18", "IA": "19", "KS": "20", "KY": "21", "LA": "22", "ME": "23",
+    "MD": "24", "MA": "25", "MI": "26", "MN": "27", "MS": "28", "MO": "29",
+    "MT": "30", "NE": "31", "NV": "32", "NH": "33", "NJ": "34", "NM": "35",
+    "NY": "36", "NC": "37", "ND": "38", "OH": "39", "OK": "40", "OR": "41",
+    "PA": "42", "RI": "44", "SC": "45", "SD": "46", "TN": "47", "TX": "48",
+    "UT": "49", "VT": "50", "VA": "51", "WA": "53", "WV": "54", "WI": "55",
+    "WY": "56",
+}
 
 FIFTEEN_MIN_MS = 15 * 60 * 1000
 

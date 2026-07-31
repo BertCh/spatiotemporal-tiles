@@ -11,7 +11,7 @@
 //! - Arc-wrapped properties for zero-copy sharing across segments
 //! - Optional line simplification for lower zoom levels
 
-use crate::input::SharedProperties;
+use crate::props::FeatureProperties;
 use crate::simplify::{simplify_for_zoom_with, simplify_td_tr_for_zoom_with};
 use geojson::{Feature, Geometry, Value as GeomValue};
 use std::collections::HashSet;
@@ -43,7 +43,7 @@ pub struct ClippedSegment {
     /// End timestamp of this segment
     pub end_time: u64,
     /// Shared reference to original properties (zero-copy via Arc)
-    pub properties: Option<SharedProperties>,
+    pub properties: Option<FeatureProperties>,
     /// Original feature ID for client-side reconnection
     pub feature_id: Option<geojson::feature::Id>,
 }
@@ -718,7 +718,7 @@ fn slice_segment_temporally(segment: ClippedSegment, granularity_ms: u64) -> Vec
 /// A vector of clipped segments, one for each tile the trajectory intersects
 pub fn clip_trajectory(
     feature: &Feature,
-    shared_properties: Option<SharedProperties>,
+    shared_properties: Option<FeatureProperties>,
     start_time: u64,
     end_time: u64,
     zoom: u8,

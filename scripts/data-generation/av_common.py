@@ -3075,7 +3075,6 @@ def run_stt_build(
     quantize_coords: float | None = None,
     quantize_attrs: dict[str, float] | None = None,
     vector_groups: list[tuple[str, list[str], str]] | None = None,
-    point_elevation_column: str | None = None,
     min_zoom_field: str | None = None,
     max_zoom_field: str | None = None,
     static_full_range: bool = False,
@@ -3182,12 +3181,24 @@ def run_stt_build(
             if elem and elem != "f32":
                 spec += f":{elem}"
             cmd += ["--vector-group", spec]
-    # 3D POINT geometry: fold a numeric column (LiDAR `z`) into the geometry's
-    # 3rd coordinate so the renderer binds 3D positions zero-copy (no pad-to-3D
-    # on the main thread). POINT clouds only (ScatterplotLayer/AnimatedPointLayer);
-    # surfel bundles keep 2D + a separate elevation attribute.
-    if point_elevation_column:
-        cmd += ["--point-elevation-column", point_elevation_column]
+    # NO `--point-elevation-column` HERE, DELIBERATELY. Elevation ships as the
+    # quantized numeric `z` COLUMN (`lidar_quantize_attrs`), which the client
+    # lifts into the position's z via the layer's `elevationProperty` /
+    # `elevationScale` props. Folding z into the geometry's 3rd coordinate is
+    # the alternative, and it costs more than the pad it saves:
+    #
+    #   * It is not round-trip-safe. Any tool that walks point coords assuming
+    #     the 2-wide `xy` leaf reads a 3-wide `xyz` leaf at the wrong stride —
+    #     which is how the 2026-07-27 re-encode sweep silently flattened AND
+    #     scrambled 106 AV archives (~2 of every 3 points thrown to ±180/±90).
+    #     Every variant that kept z as a column — surfel / world / stage / iso —
+    #     came through the same sweep untouched.
+    #   * It makes flat↔3D a REBUILD instead of a prop. With a column, the
+    #     depth is `elevationScale`; baked, it is a re-encode of the fleet.
+    #
+    # See the emergent-geometry rule in docs/roadmap (start flat; ship depth as
+    # a renderer prop over a column). The stt-build flag itself still exists and
+    # is tested — this generator path just never reaches for it.
     # Additive-octree LOD: confine each feature to a single zoom level read from a
     # per-feature numeric column (lod_home_zoom writes `home_zoom`). With min ==
     # max field the point lands in EXACTLY that zoom's tiles, so the per-zoom

@@ -1215,7 +1215,6 @@ def generate(args):
                 quantize_coords=LIDAR_QUANTIZE_M,
                 quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M),
                 vector_groups=avc.lidar_vector_groups(surfel=False, colored=True),
-                point_elevation_column="z",
                 min_zoom_field="home_zoom", max_zoom_field="home_zoom")
             tier_pq.unlink(missing_ok=True)  # drop the big full-density intermediate
         lidar_densities.append({
@@ -1253,8 +1252,7 @@ def generate(args):
                                   min_zoom=LIDAR_MIN_ZOOM, quantize_coords=LIDAR_QUANTIZE_M,
                                   quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M),
                                   vector_groups=avc.lidar_vector_groups(
-                                      surfel=False, colored=True),
-                                  point_elevation_column="z")
+                                      surfel=False, colored=True))
             lidar_densities.append({"id": tier_id, "label": label, "points": int(n),
                                     "url": f"{dname}/manifest.json",
                                     "radius": radius_px, "radiusMinPixels": radius_min_px})

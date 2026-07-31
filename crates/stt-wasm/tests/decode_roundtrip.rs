@@ -22,7 +22,6 @@ use arrow::ipc::reader::StreamReader;
 use stt_core::arrow_tile::{encode_tile_with, ColumnarLayer, GeometryColumn, PropertyColumn};
 use stt_core::curve::BlobOrdering;
 use stt_core::metadata::Metadata;
-use stt_core::pack::PACKED_FORMAT_VERSION;
 use stt_core::types::TimeRange;
 use stt_core::{PackWriter, PackedReader, TileId};
 use stt_wasm::{Archive, SttArchive};
@@ -84,12 +83,11 @@ fn tracks_layer() -> ColumnarLayer {
 }
 
 /// Write a two-tile dataset with the real writer. `paging` opts into the paged
-/// directory container; `format_version` selects the manifest/frame version.
-fn build_dataset(format_version: u32, paging: Option<usize>) -> TempDir {
+/// directory container.
+fn build_dataset(paging: Option<usize>) -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     let mut writer = PackWriter::create(dir.path(), BlobOrdering::SpatialMajor, 64 * 1024)
         .unwrap()
-        .with_format_version(format_version)
         .with_paging(paging);
 
     // The encoder settings MUST come from the writer: frame version and
@@ -166,7 +164,7 @@ fn batch_from_ipc(ipc: &[u8]) -> RecordBatch {
 /// The headline case: drive the EXPORTED wasm API end to end and get Arrow out.
 #[test]
 fn wasm_facade_decodes_a_real_tile() {
-    let dataset = build_dataset(PACKED_FORMAT_VERSION, None);
+    let dataset = build_dataset(None);
     let root = dataset.path();
 
     let manifest_bytes = fs::read(root.join("manifest.json")).unwrap();
@@ -228,8 +226,8 @@ fn wasm_facade_decodes_a_real_tile() {
 /// refusals, the template registry and the frame-version dispatch are private
 /// to `pack.rs`, so the wasm reader re-states them. Any drift between the two
 /// shows up here as a decode difference instead of as a wrong map.
-fn assert_parity(format_version: u32, paging: Option<usize>) {
-    let dataset = build_dataset(format_version, paging);
+fn assert_parity(paging: Option<usize>) {
+    let dataset = build_dataset(paging);
     let root = dataset.path();
 
     let reference = PackedReader::open(root.join("manifest.json")).unwrap();
@@ -258,13 +256,13 @@ fn assert_parity(format_version: u32, paging: Option<usize>) {
 
 #[test]
 fn parity_v2_single_directory() {
-    assert_parity(PACKED_FORMAT_VERSION, None);
+    assert_parity(None);
 }
 
 #[test]
 fn parity_v2_paged_directory() {
     // One entry per page, so the fixture really exercises the root + leaf walk.
-    assert_parity(PACKED_FORMAT_VERSION, Some(1));
+    assert_parity(Some(1));
 }
 
 /// A short read is the commonest host bug (truncated range response, or a CDN
@@ -273,7 +271,7 @@ fn parity_v2_paged_directory() {
 /// pack", sending the reader after the wrong thing entirely.
 #[test]
 fn short_reads_blame_the_fetch_not_the_archive() {
-    let dataset = build_dataset(PACKED_FORMAT_VERSION, None);
+    let dataset = build_dataset(None);
     let root = dataset.path();
 
     let manifest_bytes = fs::read(root.join("manifest.json")).unwrap();
@@ -294,7 +292,7 @@ fn short_reads_blame_the_fetch_not_the_archive() {
 /// so accepting it would silently misdecode every tile rather than fail.
 #[test]
 fn open_refuses_manifests_it_cannot_read() {
-    let dataset = build_dataset(PACKED_FORMAT_VERSION, None);
+    let dataset = build_dataset(None);
     let manifest = fs::read(dataset.path().join("manifest.json")).unwrap();
     let text = String::from_utf8(manifest).unwrap();
 
@@ -325,7 +323,7 @@ fn open_refuses_manifests_it_cannot_read() {
 /// reads like archive corruption.
 #[test]
 fn wrong_object_in_the_whole_pack_path_is_named() {
-    let dataset = build_dataset(PACKED_FORMAT_VERSION, None);
+    let dataset = build_dataset(None);
     let root = dataset.path();
     let archive = open_from_bytes(root);
 

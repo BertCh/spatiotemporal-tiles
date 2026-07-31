@@ -8,8 +8,11 @@ cosmos_drive_dreams.py"), and the section numbers in the comments below cite it.
 WHAT IT BUILDS (four archives, §5.2 + the geometry note below)
 
     neural-atlas-anatomy       POINT    the frozen semantic geography.
-                                        X/Y = layout, Z = transformer layer
-                                        (--point-elevation-column), T = the whole
+                                        X/Y/Z = one isotropic embedding, with Z
+                                        riding the `z_embed_m` COLUMN (never
+                                        --point-elevation-column, so flat↔3D is
+                                        a renderer prop — see §14.9 and the note
+                                        above `_pca`), T = the whole
                                         trace interval (§4.3 "feature intervals"),
                                         zoom band = the cluster tree
                                         (--min-zoom-field/--max-zoom-field).

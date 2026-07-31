@@ -281,6 +281,7 @@ fn run_nodes(
             no_clip: false,
             quantize_coords: None,
             quantize_attrs: Vec::new(),
+            blob_ordering: None,
         })?;
         let _ = std::fs::remove_file(intermediate);
     }
@@ -531,6 +532,7 @@ fn run_changesets(
             no_clip: false,
             quantize_coords: None,
             quantize_attrs: Vec::new(),
+            blob_ordering: None,
         })?;
         let _ = std::fs::remove_file(intermediate);
     }

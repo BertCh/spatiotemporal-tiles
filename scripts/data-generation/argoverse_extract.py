@@ -1161,8 +1161,7 @@ def generate(args):
                               stt_build=args.stt_build, temporal_bucket=args.temporal_bucket,
                               min_zoom=LIDAR_MIN_ZOOM, quantize_coords=LIDAR_QUANTIZE_M,
                               quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M),
-                              vector_groups=avc.lidar_vector_groups(surfel=False, colored=True),
-                              point_elevation_column="z")
+                              vector_groups=avc.lidar_vector_groups(surfel=False, colored=True))
             tier_pq.unlink(missing_ok=True)
         lidar_densities.append({"id": "scan", "label": "Sweep", "points": int(n),
                                 "url": "lidar/manifest.json"})
@@ -1311,7 +1310,6 @@ def generate(args):
                 quantize_coords=LIDAR_QUANTIZE_M,
                 quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M),
                 vector_groups=avc.lidar_vector_groups(surfel=False, colored=True),
-                point_elevation_column="z",
                 min_zoom_field="home_zoom", max_zoom_field="home_zoom")
             tier_pq.unlink(missing_ok=True)
         lidar_densities.append({
@@ -1343,8 +1341,7 @@ def generate(args):
                                   min_zoom=LIDAR_MIN_ZOOM, quantize_coords=LIDAR_QUANTIZE_M,
                                   quantize_attrs=avc.lidar_quantize_attrs(LIDAR_QUANTIZE_M),
                                   vector_groups=avc.lidar_vector_groups(
-                                      surfel=False, colored=True),
-                                  point_elevation_column="z")
+                                      surfel=False, colored=True))
                 tier_pq.unlink(missing_ok=True)  # drop the big intermediate (raw log is deleted anyway)
             lidar_densities.append({"id": tier_id, "label": label, "points": int(n),
                                     "url": f"{dname}/manifest.json",

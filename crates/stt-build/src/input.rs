@@ -1,6 +1,7 @@
 //! GeoParquet input parsing and feature loading
 
 use crate::columnar::{PropertyKind, PropertyTypes};
+use crate::props::FeatureProperties;
 use anyhow::{Context, Result};
 use arrow::array::{
     Array, BinaryViewArray, Float32Array, Float64Array, Int64Array, LargeBinaryArray, ListArray,
@@ -17,15 +18,19 @@ use std::path::Path;
 use std::sync::Arc;
 use stt_core::types::{BoundingBox, TimeRange};
 
-/// Shared properties map to avoid cloning per-segment
+/// Shared properties map to avoid cloning per-segment. Still the payload of
+/// [`FeatureProperties::Owned`] — the representation used by the DB readers and
+/// by synthesised features, where there is no batch to build a column over.
 pub type SharedProperties = Arc<serde_json::Map<String, serde_json::Value>>;
 
 /// Parsed feature with geometry and temporal information
 #[derive(Debug, Clone)]
 pub struct ParsedFeature {
     pub geojson: Feature,
-    /// Shared properties reference (avoids cloning during clipping)
-    pub shared_properties: Option<SharedProperties>,
+    /// This feature's properties — either a handle into its batch's columnar
+    /// table (the GeoParquet path) or an owned map. Cloning is a refcount bump
+    /// either way, so clipping still shares rather than copies.
+    pub shared_properties: Option<FeatureProperties>,
     pub timestamp: u64,
     /// End timestamp for features with time ranges (if provided)
     pub end_timestamp: Option<u64>,
@@ -101,6 +106,16 @@ impl TimeFormat {
     }
 }
 
+/// Total rows a Parquet file declares in its footer, for pre-sizing the feature
+/// vector. `None` when the file cannot be opened or read as Parquet — the
+/// caller then falls back to a growing vector, and the real error surfaces from
+/// [`stream_features`] a moment later with its own context.
+fn parquet_row_count(path: &Path) -> Option<usize> {
+    let file = File::open(path).ok()?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+    usize::try_from(builder.metadata().file_metadata().num_rows()).ok()
+}
+
 pub fn load_features(
     path: &Path,
     time_field: &str,
@@ -109,7 +124,16 @@ pub fn load_features(
     time_strictness: InputStrictness,
     geometry_strictness: InputStrictness,
 ) -> Result<Vec<ParsedFeature>> {
-    let mut features = Vec::new();
+    // Reserve from the footer's row count rather than growing by doubling.
+    // `ParsedFeature` is 328 bytes, so at national point-cloud scale the final
+    // doubling alone would transiently hold the old vector AND the new one —
+    // tens of gigabytes of pure copy overhead at the moment of reallocation,
+    // for a figure the file already knows. Rows that fail geometry parsing just
+    // leave the reservation slightly over.
+    let mut features = match parquet_row_count(path) {
+        Some(rows) => Vec::with_capacity(rows),
+        None => Vec::new(),
+    };
     let mut row_count = 0usize;
     stream_features(
         path,
@@ -403,6 +427,37 @@ fn parse_batch(
         .map(|idx| extract_vertex_values_from_batch(batch, idx))
         .transpose()?;
 
+    // Properties, columnar, once per batch — NOT one `serde_json::Map` per row.
+    // A `BTreeMap` allocates a full leaf node (~630 B for `(String, Value)`)
+    // even for a single key, and every row also cloned every key name and paid
+    // an `Arc`; that alone put peak memory near a kilobyte per feature and is
+    // what stopped national-scale point clouds from tiling at all. See
+    // [`crate::props`].
+    //
+    // Indexed by BATCH row, so rows skipped below for unusable geometry simply
+    // leave an unread entry — the alternative (indexing by surviving feature)
+    // would shear the table against the batch on the first dropped row.
+    let prop_names: Vec<String> = property_cols
+        .iter()
+        .map(|&idx| schema.field(idx).name().clone())
+        .collect();
+    let prop_table = if prop_names.is_empty() {
+        None
+    } else {
+        let mut builder = crate::props::PropertyTableBuilder::new(prop_names, batch.num_rows());
+        for i in 0..batch.num_rows() {
+            for (pc, &col_idx) in property_cols.iter().enumerate() {
+                let value = extract_property_value(batch, col_idx, i);
+                if value.is_some() {
+                    seen_props[pc] = true;
+                }
+                builder.push(pc, value.as_ref());
+            }
+            builder.end_row();
+        }
+        Some(Arc::new(builder.finish()))
+    };
+
     let mut features = Vec::with_capacity(batch.num_rows());
     let mut geometry_failures = 0usize;
     for i in 0..batch.num_rows() {
@@ -439,22 +494,16 @@ fn parse_batch(
             .as_ref()
             .and_then(|v| v.get(i).cloned().flatten());
 
-        // Build properties from non-meta columns. We only materialise this
-        // map when the row actually has property values; an empty map is
-        // dropped so empty rows pay no allocation.
-        let mut properties = serde_json::Map::new();
-        for (pc, &col_idx) in property_cols.iter().enumerate() {
-            if let Some(value) = extract_property_value(batch, col_idx, i) {
-                seen_props[pc] = true;
-                let name = schema.field(col_idx).name();
-                properties.insert(name.clone(), value);
-            }
-        }
-        let shared_properties = if properties.is_empty() {
-            None
-        } else {
-            Some(Arc::new(properties))
-        };
+        // Properties come from the batch's columnar table (built above). A row
+        // whose every property is null gets `None`, exactly as the old empty
+        // map did — an all-null row must stay indistinguishable from a row with
+        // no property columns at all.
+        let shared_properties = prop_table.as_ref().and_then(|t| {
+            t.row_has_values(i).then(|| FeatureProperties::Row {
+                table: Arc::clone(t),
+                row: i as u32,
+            })
+        });
 
         let feature = Feature {
             bbox: None,

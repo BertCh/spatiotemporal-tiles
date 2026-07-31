@@ -33,7 +33,7 @@ cargo run --release -p stt-core --example packed-stats -- my-dataset/manifest.js
 ```
 
 See [`examples/README.md`](./examples/README.md) for the full list
-(`packed-stats`, `reoptimize`, `encoding-experiment`, …).
+(`packed-stats`, `encoding-experiment`, …).
 
 ## Relation to the other crates
 

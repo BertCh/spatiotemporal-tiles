@@ -87,27 +87,24 @@ fn collect_property_values(features: &[ParsedFeature]) -> Vec<(String, PropertyV
     // BTreeMap: deterministic property order in the emitted block.
     let mut collectors: BTreeMap<String, Collector> = BTreeMap::new();
     for feature in features.iter().step_by(stride) {
-        let Some(props) = feature.shared_properties.as_deref() else {
+        let Some(props) = feature.shared_properties.as_ref() else {
             continue;
         };
-        for (name, value) in props {
-            match value {
-                serde_json::Value::Number(n) => {
-                    if let Some(v) = n.as_f64().filter(|v| v.is_finite()) {
-                        let c = collectors.entry(name.clone()).or_default();
-                        c.numeric_seen += 1;
-                        c.numeric.push(v);
-                    }
+        // `as_f64` is numbers-only (a numeric-looking STRING stays a string
+        // here, as it did when this matched `Value::Number` directly), and
+        // `iter` never yields nulls — so bool/null/array/object still
+        // contribute no styling signal.
+        for (name, value) in props.iter() {
+            if let Some(v) = value.as_f64().filter(|v| v.is_finite()) {
+                let c = collectors.entry(name.to_string()).or_default();
+                c.numeric_seen += 1;
+                c.numeric.push(v);
+            } else if let Some(s) = value.as_str() {
+                let c = collectors.entry(name.to_string()).or_default();
+                c.string_seen += 1;
+                if c.strings.len() < MAX_DISTINCT_VALUES {
+                    c.strings.insert(s.to_string());
                 }
-                serde_json::Value::String(s) => {
-                    let c = collectors.entry(name.clone()).or_default();
-                    c.string_seen += 1;
-                    if c.strings.len() < MAX_DISTINCT_VALUES {
-                        c.strings.insert(s.clone());
-                    }
-                }
-                // bool/null/array/object: no styling signal.
-                _ => {}
             }
         }
     }
@@ -173,7 +170,6 @@ fn layer_hint(features: &[ParsedFeature]) -> Option<&'static str> {
 mod tests {
     use super::*;
     use geojson::{Feature, Geometry, Value};
-    use std::sync::Arc;
 
     fn feature(
         geometry: Value,
@@ -190,7 +186,10 @@ mod tests {
                 properties: None,
                 foreign_members: None,
             },
-            shared_properties: props.as_object().map(|m| Arc::new(m.clone())),
+            shared_properties: props
+                .as_object()
+                .cloned()
+                .and_then(crate::props::FeatureProperties::from_map),
             timestamp,
             end_timestamp,
             vertex_timestamps,

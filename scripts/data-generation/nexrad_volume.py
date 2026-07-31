@@ -85,6 +85,11 @@ REF_LAT, REF_LON = 41.305, -94.461
 # Smoke window for pipeline validation (§9.0).
 SMOKE_START, SMOKE_END = "2024-05-21T20:00:00Z", "2024-05-21T20:30:00Z"
 
+# The archive's temporal bucket, in ms — MUST equal `--temporal-bucket` in
+# run_stt_build (5m). It is the time axis of the LOD thinning grid, not just a
+# build flag: see lod_min_zoom.
+LOD_BUCKET_MS = 300_000
+
 EARTH_R = 6_371_000.0
 
 # ── contract band labels (§9.1 — byte-for-byte, FE colorMapping keys match) ──
@@ -482,9 +487,10 @@ def vel_band_column(vel: np.ndarray) -> pa.Array:
 
 # ── stratified LOD min-zoom assignment ────────────────────────────────────────
 def lod_min_zoom(lon: np.ndarray, lat: np.ndarray, alt: np.ndarray, dbz: np.ndarray,
+                 t: np.ndarray, bucket_ms: int,
                  min_zoom: int, max_zoom: int,
                  cell_deg_top: float, cell_alt_top: float) -> np.ndarray:
-    """Assign each gate the coarsest zoom at which it survives a nested 3D-grid
+    """Assign each gate the coarsest zoom at which it survives a nested 4D-grid
     thinning, so `--min-zoom-field` yields a real spatial LOD pyramid for a
     homogeneous point cloud (where `--maximum-tile-features --drop-densest` is a
     no-op — every single-vertex gate scores equally, so the cap just truncates
@@ -497,11 +503,31 @@ def lod_min_zoom(lon: np.ndarray, lat: np.ndarray, alt: np.ndarray, dbz: np.ndar
     coarsest zoom where it wins its cell; gates that never win default to
     `max_zoom` → the deepest tier stays lossless (every gate present). Deterministic
     (stable argsort on dBZ). Returns an int16 column.
+
+    THE CELL IS 4D, NOT 3D — `bucket_ms` (pass the build's `--temporal-bucket`)
+    is part of the key, and leaving it out is the difference between an LOD
+    pyramid and a broken one. The renderer draws ONE temporal bucket at a time,
+    so what matters is how much of a BUCKET survives, not how much of the
+    dataset. Thinning on space alone lets one gate claim a cell for the whole
+    9.5-hour window: the storm sweeps over the same ground repeatedly, the
+    strongest pass wins, and every other pass through that cell is demoted to
+    `max_zoom`. The coarse tiers then hold a temporally incoherent scatter —
+    the union of ~100 scans' peak echoes, of which any single bucket owns a
+    handful. Measured on the Greenfield archive, space-only thinning left the
+    z8 tier showing a MEDIAN 13% of the visible bucket's gates and some buckets
+    0% — nothing on screen at all at the demo's own framing zoom, with the full
+    18.3 M gates arriving only at z9. Keying the bucket in lifts the same z8
+    tier to a median 85% (worst bucket 69%) at the same cell size, because each
+    scan now thins against itself. Cell sizes are then free to be tuned for
+    SCREEN resolution (see `--lod-cell-deg`) rather than fighting this.
     """
     n = len(lon)
     alt = np.nan_to_num(alt.astype(np.float64), nan=0.0)
     dbz = np.nan_to_num(dbz.astype(np.float64), nan=-99.0)
     lon0, lat0, alt0 = lon.min(), lat.min(), alt.min()
+    # Bucket index, densified so the mixing multiply below stays in range.
+    _, ct = np.unique((t.astype(np.int64) // max(bucket_ms, 1)), return_inverse=True)
+    ct = ct.astype(np.int64)
     order = np.argsort(-dbz, kind="stable")          # strongest echoes win cells
     min_z = np.full(n, max_zoom, dtype=np.int16)
     for z in range(min_zoom, max_zoom):
@@ -510,7 +536,11 @@ def lod_min_zoom(lon: np.ndarray, lat: np.ndarray, alt: np.ndarray, dbz: np.ndar
         cx = ((lon - lon0) / cd).astype(np.int64)
         cy = ((lat - lat0) / cd).astype(np.int64)
         cz = ((alt - alt0) / ca).astype(np.int64)
-        code = (cx << 40) ^ (cy << 20) ^ cz
+        # Shift-packed space key (the three spans fit their fields for any cell
+        # size a radar domain uses), then mixed with the bucket by an odd
+        # multiply — `np.unique` only needs the key to be INJECTIVE, and a
+        # multiply keeps that without needing a fourth free bit field.
+        code = ((cx << 40) ^ (cy << 20) ^ cz) * np.int64(1000003) + ct
         _, first = np.unique(code[order], return_index=True)
         np.minimum.at(min_z, order[first], z)        # rep of this z-cell
     return min_z
@@ -537,10 +567,14 @@ def run_stt_build(parquet: Path, out_dir: Path, stt_build: str,
     if min_zoom_field:
         # Stratified LOD pyramid (§5, §9.1 reduced-tier amendment): each gate's
         # `min_zoom` column names the coarsest zoom it appears at. Coarse zooms
-        # carry a spatially-uniform, strongest-echo-first skeleton; the deepest
-        # zoom stays LOSSLESS (every gate present). Cuts per-bucket resident
-        # gates ~7× at the framing zoom AND shrinks the archive ~2.5× — with
-        # zero data loss, since full detail is one zoom-in away.
+        # carry a spatially-uniform, strongest-echo-first skeleton of EACH
+        # temporal bucket; the deepest zoom stays LOSSLESS (every gate
+        # present), so full detail is always one zoom-in away.
+        #
+        # `--temporal-bucket` above and `lod_min_zoom`'s `bucket_ms` must name
+        # the SAME window. The thinning grid is 4D and the bucket is its time
+        # axis — see the long note in lod_min_zoom for what a mismatch (or a
+        # missing time axis) does to the coarse tiers.
         cmd += ["--min-zoom-field", min_zoom_field]
     if quantize:
         cmd += ["--quantize-coords", "100", "--quantize-attrs-auto"]
@@ -573,13 +607,24 @@ def main() -> int:
     ap.add_argument("--couplet-min-dv", type=float, default=30.0,
                     help="min gate-to-gate azimuthal Δv (m/s) for a couplet peak")
     # Stratified LOD pyramid (lossless — deepest zoom keeps every gate). The two
-    # cell knobs set the grid at the top LOD tier (z8); shrink them to densify
-    # the coarse-zoom skeleton (higher fidelity at the framing zoom, less perf).
+    # cell knobs set the grid at the top LOD tier (z8) and DOUBLE per zoom out,
+    # so they set the whole ladder; shrink them to densify the coarse-zoom
+    # skeleton (higher fidelity at the framing zoom, bigger archive).
+    #
+    # Sized against SCREEN resolution, which is the only thing that decides
+    # whether a thinned tier looks thinned. At the storm's latitude a z8 pixel
+    # is ~460 m of ground, ≈0.005° of latitude — so a 0.005° cell keeps roughly
+    # one gate per pixel at z8 and halves the linear density per zoom out. On
+    # the Greenfield archive that ladder runs 0.7% → 2.7% → 10% → 32% → 65% →
+    # 100% of each bucket over z4–z9: a smooth ~3× per level with no cliff, and
+    # a framing zoom that already reads as the full cloud. (These defaults are
+    # only meaningful together with the 4D thinning grid — under the old
+    # space-only key, cells this size left the coarse tiers nearly empty.)
     ap.add_argument("--no-lod", action="store_true",
                     help="disable the min-zoom LOD pyramid (legacy full-duplication build)")
-    ap.add_argument("--lod-cell-deg", type=float, default=0.0015,
+    ap.add_argument("--lod-cell-deg", type=float, default=0.005,
                     help="horizontal LOD cell (deg) at the z8 tier; doubles per zoom out")
-    ap.add_argument("--lod-cell-alt", type=float, default=250.0,
+    ap.add_argument("--lod-cell-alt", type=float, default=400.0,
                     help="vertical LOD cell (m) at the z8 tier; doubles per zoom out")
     ap.add_argument("--workers", type=int, default=6,
                     help="volume-decode processes (each ~1.5 GB peak)")
@@ -667,13 +712,24 @@ def main() -> int:
     }
     if not args.no_lod:
         mz = lod_min_zoom(gates["lon"], gates["lat"], gates["alt"], gates["dbz"],
+                          gates["t"], LOD_BUCKET_MS,
                           min_zoom=4, max_zoom=9,
                           cell_deg_top=args.lod_cell_deg, cell_alt_top=args.lod_cell_alt)
         cols["min_zoom"] = pa.array(mz, type=pa.int16())
         cum = np.cumsum(np.bincount(mz - 4, minlength=6))
-        print("  LOD min-zoom pyramid (gates loaded at each zoom / % of full):")
+        # Report the PER-BUCKET share as well as the dataset-wide one: the
+        # renderer shows one bucket at a time, so the per-bucket column is the
+        # one that predicts what the demo looks like at a given zoom. A large
+        # gap between the two columns means the thinning is not seeing the time
+        # axis (see lod_min_zoom).
+        _, binv = np.unique(gates["t"].astype(np.int64) // LOD_BUCKET_MS,
+                            return_inverse=True)
+        btot = np.bincount(binv)
+        print("  LOD min-zoom pyramid (dataset-wide / median share of ONE bucket):")
         for i, z in enumerate(range(4, 10)):
-            print(f"    z{z}: {cum[i]:>10,}  ({100.0 * cum[i] / max(len(mz), 1):5.1f}%)")
+            share = 100.0 * np.bincount(binv[mz <= z], minlength=len(btot)) / np.maximum(btot, 1)
+            print(f"    z{z}: {cum[i]:>10,}  ({100.0 * cum[i] / max(len(mz), 1):5.1f}% of all)"
+                  f"   bucket median {np.median(share):5.1f}%  worst {share.min():5.1f}%")
     table = pa.table(cols)
     vol_pq = args.out_dir / "storm4d-volume.parquet"
     pq.write_table(table, vol_pq, compression="snappy")

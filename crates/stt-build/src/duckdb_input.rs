@@ -25,7 +25,6 @@ use anyhow::{Context, Result};
 use duckdb::types::{TimeUnit, ValueRef};
 use duckdb::{AccessMode, Config, Connection, Row};
 use geojson::Feature;
-use std::sync::Arc;
 
 use crate::db_input_common::{
     apply_int_time_format, decimal_string_to_json, json_number_or_null, warn_dropped_columns,
@@ -356,8 +355,8 @@ where
                 // the feature moves into the batch (stop once all have).
                 if seen_props.len() < schema.props.len() {
                     if let Some(props) = &f.shared_properties {
-                        for k in props.keys() {
-                            seen_props.insert(k.clone());
+                        for (k, _) in props.iter() {
+                            seen_props.insert(k.to_string());
                         }
                     }
                 }
@@ -729,11 +728,9 @@ impl RowSchema {
                 }
             }
         }
-        let shared_properties = if properties.is_empty() {
-            None
-        } else {
-            Some(Arc::new(properties))
-        };
+        // DB rows have no batch to build a column over, so they keep the
+        // owned-map representation.
+        let shared_properties = crate::props::FeatureProperties::from_map(properties);
 
         let feature = Feature {
             bbox: None,
@@ -1136,10 +1133,13 @@ mod tests {
         assert_eq!(f.timestamp, expected);
 
         let props = f.shared_properties.expect("properties present");
-        assert_eq!(props.get("val"), Some(&serde_json::Value::from(7i64)));
         assert_eq!(
-            props.get("name"),
-            Some(&serde_json::Value::String("hi".into()))
+            props.get("val").map(|v| v.to_json()),
+            Some(serde_json::Value::from(7i64))
+        );
+        assert_eq!(
+            props.get("name").map(|v| v.to_json()),
+            Some(serde_json::Value::String("hi".into()))
         );
     }
 
@@ -1178,8 +1178,11 @@ mod tests {
             panic!("expected a decoded feature");
         };
         let props = f.shared_properties.expect("properties present");
-        assert_eq!(props.get("price"), Some(&serde_json::Value::from(12.34)));
-        assert_eq!(props.get("fee"), None, "NULL decimal drops the key");
+        assert_eq!(
+            props.get("price").map(|v| v.to_json()),
+            Some(serde_json::Value::from(12.34))
+        );
+        assert!(props.get("fee").is_none(), "NULL decimal drops the key");
     }
 
     /// Live smoke test of the actual spatial SQL the server emits — exercises
@@ -1236,8 +1239,13 @@ mod tests {
         );
         assert!((feats[0].lat - 40.7).abs() < 1e-6, "lat {}", feats[0].lat);
         assert_eq!(
-            feats[0].shared_properties.as_ref().unwrap().get("mag"),
-            Some(&serde_json::Value::from(3.5))
+            feats[0]
+                .shared_properties
+                .as_ref()
+                .unwrap()
+                .get("mag")
+                .map(|v| v.to_json()),
+            Some(serde_json::Value::from(3.5))
         );
 
         // Reproject path: store a Web-Mercator (3857) geometry, transform back.

@@ -275,16 +275,7 @@ fn fetch_wildfire_data(args: &Args) -> Result<Vec<Feature>> {
     let mut all_features = Vec::new();
     let mut offset = 0;
 
-    let mut where_clauses = vec![
-        format!("FIRE_YEAR >= {} AND FIRE_YEAR <= {}", args.start_year, args.end_year),
-        format!("GIS_ACRES >= {}", args.min_acres),
-    ];
-
-    if args.wildfires_only {
-        where_clauses.push("FEATURE_CA = 'Wildfire'".to_string());
-    }
-
-    let where_clause = where_clauses.join(" AND ");
+    let where_clause = nifc_where_clause(args);
     println!("🔍 Query filter: {}", where_clause);
 
     // Get count first
@@ -427,22 +418,50 @@ fn convert_to_geojson(arcgis: &ArcGISFeature) -> Vec<Feature> {
         .collect()
 }
 
+/// The ArcGIS `where` filter both fetch paths query with.
+///
+/// Two bugs lived in the duplicated copies of this, fixed 2026-07-29:
+///
+/// - `FIRE_YEAR` is an `esriFieldTypeString` on this service, so the numeric
+///   range was a STRING comparison. It read as a year filter and is not one.
+///   `FIRE_YEAR_INT` (`esriFieldTypeSmallInteger`) is the same value, typed.
+/// - `FEATURE_CA = 'Wildfire'` matched one of the FIVE values the field
+///   carries. Probing the service on 2026-07-29 returns `Wildfire`,
+///   `Wildfire Final Fire Perimeter`, `Wildfire for Resource Benefit`,
+///   `Prescribed Fire`, and null — so the equality dropped the two dominant
+///   wildfire spellings, i.e. `--wildfires-only` excluded most wildfires.
+///   `LIKE 'Wildfire%'` keeps all three and still excludes prescribed burns.
+///
+/// ⚠️ Fixing the filter does NOT make this dataset reproducible. The shipped
+/// `examples/showcase/public/data/wildfires` archive holds ~460 fires; the
+/// same service on 2026-07-29 returns 98,168 records overall but only 297 for
+/// 2020–2023, of which 10 clear `--min-acres 1000` as wildfires. Upstream
+/// coverage for those years collapsed, so a regeneration produces a nearly
+/// empty archive and would DESTROY the shipped one. Verify the fetch count
+/// against the existing archive before overwriting it.
+fn nifc_where_clause(args: &Args) -> String {
+    let mut where_clauses = vec![
+        format!(
+            "FIRE_YEAR_INT >= {} AND FIRE_YEAR_INT <= {}",
+            args.start_year, args.end_year
+        ),
+        format!("GIS_ACRES >= {}", args.min_acres),
+    ];
+
+    if args.wildfires_only {
+        where_clauses.push("FEATURE_CA LIKE 'Wildfire%'".to_string());
+    }
+
+    where_clauses.join(" AND ")
+}
+
 /// Fetch wildfire data directly to GeoParquet format (streaming)
 fn fetch_wildfire_data_parquet(args: &Args, output: &PathBuf) -> Result<usize> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
 
-    let mut where_clauses = vec![
-        format!("FIRE_YEAR >= {} AND FIRE_YEAR <= {}", args.start_year, args.end_year),
-        format!("GIS_ACRES >= {}", args.min_acres),
-    ];
-
-    if args.wildfires_only {
-        where_clauses.push("FEATURE_CA = 'Wildfire'".to_string());
-    }
-
-    let where_clause = where_clauses.join(" AND ");
+    let where_clause = nifc_where_clause(args);
     println!("🔍 Query filter: {}", where_clause);
 
     // Get count first

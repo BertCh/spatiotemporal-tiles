@@ -895,7 +895,7 @@ fn resolve_property_types(
     let declared = source.property_kinds(&args.time_field, args.end_time_field.as_deref());
     let (merged, filled) = stt_build::columnar::fill_property_type_gaps(
         &declared,
-        features.iter().map(|f| f.shared_properties.as_deref()),
+        features.iter().map(|f| f.shared_properties.as_ref()),
         attribute_filter,
     );
     if filled.is_empty() {
@@ -1549,13 +1549,13 @@ fn compute_heatmap_domain(
 
     fn extract_f64(f: &input::ParsedFeature, name: &str) -> Option<f64> {
         f.shared_properties
-            .as_deref()?
+            .as_ref()?
             .get(name)
             .and_then(|v| v.as_f64())
     }
     fn extract_str(f: &input::ParsedFeature, name: &str) -> Option<String> {
         f.shared_properties
-            .as_deref()?
+            .as_ref()?
             .get(name)
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())

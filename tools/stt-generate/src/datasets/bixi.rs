@@ -474,6 +474,7 @@ pub fn run(args: Args) -> Result<()> {
         // (relaxed `--min-trips`) network stays affordable on the wire.
         quantize_coords: bundle.as_ref().map(|_| 1.0),
         quantize_attrs: Vec::new(),
+            blob_ordering: None,
     })?;
 
     println!("\n✅ BIXI flowmap built: {}", args.output.display());
@@ -928,6 +929,7 @@ fn generate_streets(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Result<()
         no_clip: false,
         quantize_coords: None,
         quantize_attrs: Vec::new(),
+            blob_ordering: None,
     })?;
 
     println!("\n✅ BIXI street network built: {}", args.output.display());
@@ -1107,6 +1109,7 @@ fn generate_merged_paths(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Resu
         no_clip: false,
         quantize_coords: Some(1.0),
         quantize_attrs: Vec::new(),
+            blob_ordering: None,
     })?;
 
     println!("\n✅ BIXI merged corridors built: {}", args.output.display());
@@ -1208,6 +1211,7 @@ fn generate_flow_network(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Resu
         no_clip: false,
         quantize_coords: Some(1.0),
         quantize_attrs: Vec::new(),
+            blob_ordering: None,
     })?;
 
     println!("\n✅ BIXI flow network built: {}", args.output.display());

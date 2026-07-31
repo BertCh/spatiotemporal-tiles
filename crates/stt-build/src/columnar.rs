@@ -9,6 +9,7 @@
 
 use crate::clip::ClippedSegment;
 use crate::input::ParsedFeature;
+use crate::props::FeatureProperties;
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -245,11 +246,11 @@ pub fn build_layer_from_segments(
         vertex_times.push(times);
         vertex_values.push(vals);
 
-        props.observe(seg.properties.as_deref());
+        props.observe(seg.properties.as_ref());
     }
     // Second pass fills one value per feature for every discovered property.
     for seg in segments {
-        props.push_row(seg.properties.as_deref());
+        props.push_row(seg.properties.as_ref());
     }
 
     Ok(ColumnarLayer {
@@ -526,10 +527,10 @@ fn common_columns(
         ids.push(determine_feature_id(f));
         start.push(f.timestamp as i64);
         end.push(f.end_timestamp.unwrap_or(f.timestamp) as i64);
-        props.observe(f.shared_properties.as_deref());
+        props.observe(f.shared_properties.as_ref());
     }
     for f in features {
-        props.push_row(f.shared_properties.as_deref());
+        props.push_row(f.shared_properties.as_ref());
     }
     (ids, start, end, props.finish())
 }
@@ -607,7 +608,7 @@ fn value_as_f64(v: &serde_json::Value) -> Option<f64> {
 /// and nothing forced it categorical — so this only widens the evidence, never
 /// changes how a given body of evidence is classified.
 pub fn infer_property_types<'a>(
-    features: impl IntoIterator<Item = Option<&'a serde_json::Map<String, serde_json::Value>>>,
+    features: impl IntoIterator<Item = Option<&'a FeatureProperties>>,
     filter: &AttributeFilter,
 ) -> PropertyTypes {
     let mut acc = PropertyAccumulator::new(filter.clone(), Arc::new(PropertyTypes::new()));
@@ -646,7 +647,7 @@ pub fn infer_property_types<'a>(
 /// caller can report them.
 pub fn fill_property_type_gaps<'a>(
     declared: &PropertyTypes,
-    features: impl IntoIterator<Item = Option<&'a serde_json::Map<String, serde_json::Value>>>,
+    features: impl IntoIterator<Item = Option<&'a FeatureProperties>>,
     filter: &AttributeFilter,
 ) -> (PropertyTypes, Vec<String>) {
     let inferred = infer_property_types(features, filter);
@@ -678,22 +679,23 @@ impl PropertyAccumulator {
     }
 
     /// First pass: record type evidence for every key present on a feature.
-    fn observe(&mut self, props: Option<&serde_json::Map<String, serde_json::Value>>) {
+    ///
+    /// `iter()` yields only non-null values, which is why the old
+    /// `value.is_null()` guard is gone rather than lost — a null cell is absent
+    /// in both the columnar and the owned representation.
+    fn observe(&mut self, props: Option<&FeatureProperties>) {
         if self.sealed {
             return;
         }
         let Some(props) = props else { return };
-        for (key, value) in props {
-            if value.is_null() {
-                continue;
-            }
+        for (key, value) in props.iter() {
             // Opt-in attribute control: a rejected key never enters `seen`, so
             // it yields no column. System columns aren't user properties and
             // never pass through here, so they always survive.
             if !self.filter.keeps(key) {
                 continue;
             }
-            let kind = self.seen.entry(key.clone()).or_default();
+            let kind = self.seen.entry(key.to_string()).or_default();
             if value.is_number() {
                 kind.has_number = true;
             } else if let Some(s) = value.as_str() {
@@ -754,21 +756,29 @@ impl PropertyAccumulator {
     }
 
     /// Second pass: append this feature's value for every discovered column.
-    fn push_row(&mut self, props: Option<&serde_json::Map<String, serde_json::Value>>) {
+    fn push_row(&mut self, props: Option<&FeatureProperties>) {
         if !self.sealed {
             self.seal();
         }
         for (key, col) in self.numeric.iter_mut() {
-            let v = props.and_then(|p| p.get(key)).and_then(value_as_f64);
+            // Routed through the same `value_as_f64` as before, on a value
+            // rebuilt from the columnar cell — so numeric-looking strings still
+            // coerce and the number widths still round-trip. The rebuilt
+            // `Value` is transient; nothing retains it.
+            let v = props
+                .and_then(|p| p.get(key))
+                .and_then(|v| value_as_f64(&v.to_json()));
             col.push(v);
         }
         for (key, col) in self.categorical.iter_mut() {
-            let v = props.and_then(|p| p.get(key)).and_then(|v| match v {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Bool(b) => Some(b.to_string()),
-                serde_json::Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            });
+            let v = props
+                .and_then(|p| p.get(key))
+                .and_then(|v| match v.to_json() {
+                    serde_json::Value::String(s) => Some(s),
+                    serde_json::Value::Bool(b) => Some(b.to_string()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                });
             col.push(v);
         }
     }
@@ -1195,7 +1205,7 @@ mod tests {
             .collect();
         let (merged, filled) = fill_property_type_gaps(
             &declared,
-            feats.iter().map(|f| f.shared_properties.as_deref()),
+            feats.iter().map(|f| f.shared_properties.as_ref()),
             &AttributeFilter::KeepAll,
         );
         assert_eq!(
@@ -1221,7 +1231,7 @@ mod tests {
             .collect();
         let (merged, filled) = fill_property_type_gaps(
             &declared,
-            feats.iter().map(|f| f.shared_properties.as_deref()),
+            feats.iter().map(|f| f.shared_properties.as_ref()),
             &AttributeFilter::KeepAll,
         );
         assert_eq!(merged.get("only_in_schema"), Some(&PropertyKind::Numeric));
@@ -1275,7 +1285,7 @@ mod tests {
         // Inferred over BOTH tiles, the column is categorical everywhere.
         let all: Vec<ParsedFeature> = tile_a.iter().chain(tile_b.iter()).cloned().collect();
         let declared = Arc::new(infer_property_types(
-            all.iter().map(|f| f.shared_properties.as_deref()),
+            all.iter().map(|f| f.shared_properties.as_ref()),
             &AttributeFilter::KeepAll,
         ));
         assert_eq!(declared.get("code"), Some(&PropertyKind::Categorical));
@@ -1292,7 +1302,7 @@ mod tests {
         let all_null = vec![point_feature(9.0, 9.0, json!({ "other": 1 }))];
         let all: Vec<ParsedFeature> = with_value.iter().chain(all_null.iter()).cloned().collect();
         let declared = Arc::new(infer_property_types(
-            all.iter().map(|f| f.shared_properties.as_deref()),
+            all.iter().map(|f| f.shared_properties.as_ref()),
             &AttributeFilter::KeepAll,
         ));
 
@@ -1329,8 +1339,8 @@ mod tests {
             // Properties live in shared_properties (see input.rs).
             shared_properties: props
                 .as_object()
-                .filter(|m| !m.is_empty())
-                .map(|m| std::sync::Arc::new(m.clone())),
+                .cloned()
+                .and_then(crate::props::FeatureProperties::from_map),
             timestamp: 1000,
             end_timestamp: None,
             vertex_timestamps: None,
@@ -1663,7 +1673,7 @@ mod tests {
         let props = json!({ "road": "main", "lanes": 4 })
             .as_object()
             .cloned()
-            .map(std::sync::Arc::new);
+            .and_then(crate::props::FeatureProperties::from_map);
         let seg = ClippedSegment {
             tile_x: 0,
             tile_y: 0,
@@ -2094,11 +2104,13 @@ mod tests {
         ]])));
         broken.shared_properties = json!({ "name": "broken" })
             .as_object()
-            .map(|m| std::sync::Arc::new(m.clone()));
+            .cloned()
+            .and_then(crate::props::FeatureProperties::from_map);
         let mut good = polygon_feature([10.0, 10.0], 1.0);
         good.shared_properties = json!({ "name": "good" })
             .as_object()
-            .map(|m| std::sync::Arc::new(m.clone()));
+            .cloned()
+            .and_then(crate::props::FeatureProperties::from_map);
 
         let layers = build_layers_from_features(&[&broken, &good], "default").unwrap();
         assert_eq!(layers.len(), 1);

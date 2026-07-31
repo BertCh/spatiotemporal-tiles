@@ -19,7 +19,6 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use geojson::Feature;
 use postgres::types::Type;
 use postgres::{Client, NoTls, Row};
-use std::sync::Arc;
 
 use crate::db_input_common::{
     apply_int_time_format, decimal_string_to_json, json_number_or_null, warn_dropped_columns,
@@ -311,8 +310,8 @@ where
         if seen_props.len() < sch.props.len() {
             for f in &batch {
                 if let Some(props) = &f.shared_properties {
-                    for k in props.keys() {
-                        seen_props.insert(k.clone());
+                    for (k, _) in props.iter() {
+                        seen_props.insert(k.to_string());
                     }
                 }
             }
@@ -599,11 +598,9 @@ impl RowSchema {
                 properties.insert(p.name.clone(), value);
             }
         }
-        let shared_properties = if properties.is_empty() {
-            None
-        } else {
-            Some(Arc::new(properties))
-        };
+        // DB rows have no batch to build a column over, so they keep the
+        // owned-map representation.
+        let shared_properties = crate::props::FeatureProperties::from_map(properties);
 
         let feature = Feature {
             bbox: None,

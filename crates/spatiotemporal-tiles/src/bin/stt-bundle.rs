@@ -218,9 +218,7 @@ mod tests {
         use stt_core::arrow_tile::{encode_tile, ColumnarLayer, GeometryColumn};
         use stt_core::metadata::Metadata;
         use stt_core::{BlobOrdering, PackWriter, TileId};
-        let mut w = PackWriter::create(out, BlobOrdering::Auto, 8 * 1024)
-            .unwrap()
-            .with_format_version(stt_core::pack::PACKED_FORMAT_VERSION);
+        let mut w = PackWriter::create(out, BlobOrdering::Auto, 8 * 1024).unwrap();
         for k in 0..6u64 {
             let ids: Vec<u64> = (0..4).map(|i| k * 10 + i).collect();
             let n = ids.len();

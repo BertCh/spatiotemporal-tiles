@@ -295,6 +295,7 @@ pub(crate) fn run_product(args: Args, product: &Product) -> Result<()> {
             no_clip: false,
             quantize_coords: None,
             quantize_attrs: Vec::new(),
+            blob_ordering: None,
         })?;
         let _ = fs::remove_file(&intermediate);
     }

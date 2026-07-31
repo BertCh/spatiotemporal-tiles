@@ -4,9 +4,11 @@
 # (AnimatedPointLayer with `splat:true`, `<id>-splat`). Public AWS open-data, no
 # auth. Mirrors argoverse_surfel_batch.sh exactly (same logs, all 7 RING cameras
 # for the colorizer, calibration), but passes `--colorize` instead of `--surfel`
-# and writes to <id>-splat. The current pipeline bakes 3D point geometry
-# (`--point-elevation-column z`) + an interleaved `point_rgba` so the client binds
-# positions AND colour zero-copy (no per-point pad/re-pack on the render thread).
+# and writes to <id>-splat. Colour rides an interleaved `point_rgba` vector
+# column so the client binds it zero-copy (no per-point re-pack on the render
+# thread); elevation rides the quantized `z` COLUMN, which the layer lifts via
+# `elevationProperty` — never folded into the geometry, see the note in
+# av_common.run_stt_build.
 #
 #   bash argoverse_splat_batch.sh           # build any not-yet-built -splat scenes
 #   FORCE=1 bash argoverse_splat_batch.sh   # rebuild all

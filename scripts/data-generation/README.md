@@ -147,6 +147,17 @@ login`. Needs the `venv-waymo` python (`pyarrow numpy shapely pandas`) + a
   the split generated-video tar and keeps only the MP4s it wants, so the 40 GB
   part is never stored. Uses the shared `venv` (plus `huggingface_hub` +
   `requests`); `ffmpeg` optional for the `--reencode-crf` web-shrink pass.
+- `neural_atlas.py` - the Neural-State Atlas (`/atlas`): GPT-2 small's 294,912
+  sparse-autoencoder latents as a frozen semantic geography (X/Y = layout,
+  Z = transformer layer) plus a ~3.1 M-event trace of it reading held-out text on
+  the token clock. Four archives + a `neural-atlas.json` sidecar; see
+  [docs/roadmap/neural-atlas-2026-07.md](../../docs/roadmap/neural-atlas-2026-07.md)
+  §14. All-ungated inputs (gpt2 MIT / res-jb SAEs MIT / Neuronpedia labels /
+  wikitext-103 CC-BY-SA), no login, no CUDA — ~35 min end to end on an M3 Pro via
+  MPS. Nine cached stages: `--stages corpus,stats,graph,cluster,layout,labels,trace,validate,pack`
+  (or `all`), each recording its config hash and git commit, so re-cutting only
+  the archives is `--stages pack --force`. Needs `.venv-atlas` on **Python 3.12**
+  (torch has no 3.14 wheels).
 
 ### Python virtualenvs
 
@@ -163,6 +174,7 @@ its `pip freeze` snapshot:
 | `venv-nuscenes` | `requirements-nuscenes.txt` | `nuscenes_extract.py`, `av_synthetic.py` (nuscenes-devkit)                                                        |
 | `venv-comma`    | `requirements-comma.txt`    | `comma_extract.py` (comma2k19)                                                                                    |
 | `venv-test`     | `requirements-test.txt`     | the test files below (numpy/pyarrow/scipy/shapely only)                                                           |
+| `.venv-atlas`   | `requirements-atlas.txt`    | `neural_atlas.py` (torch/transformers/leidenalg/umap — **python3.12**, torch has no 3.14 wheels)                  |
 
 Recreate one with `python3 -m venv <name> && <name>/bin/pip install -r
 requirements-<suffix>.txt`. After changing a venv, re-freeze it

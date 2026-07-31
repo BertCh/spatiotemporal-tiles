@@ -28,6 +28,7 @@ pub mod input;
 /// default builds don't pull the database driver.
 #[cfg(feature = "postgres")]
 pub mod postgres_input;
+pub mod props;
 pub mod quadbin;
 pub mod simplify;
 /// STAC Item emission (`stt-build --stac`): the discovery-layer sidecar,

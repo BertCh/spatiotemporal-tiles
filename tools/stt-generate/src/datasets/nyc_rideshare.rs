@@ -528,6 +528,7 @@ fn build_stt_from_intermediate(args: &Args, intermediate_path: &PathBuf) -> Resu
             no_clip: false,
             quantize_coords: None,
             quantize_attrs: Vec::new(),
+            blob_ordering: None,
         })?;
     } else {
         common::run_stt_build_with_options(

@@ -275,6 +275,7 @@ pub fn run(args: Args) -> Result<()> {
             no_clip: false,
             quantize_coords: None,
             quantize_attrs: Vec::new(),
+            blob_ordering: None,
         })?;
         let _ = fs::remove_file(&intermediate);
     }

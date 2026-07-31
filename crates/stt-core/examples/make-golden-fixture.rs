@@ -168,7 +168,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SpatialMajor keeps the order deterministic + independent of the Auto
     // heuristic, so the content hashes are stable across builds.
     let mut w = PackWriter::create(&out_dir, BlobOrdering::SpatialMajor, 4 * 1024)?
-        .with_format_version(format_version)
         // Declared from `cfg`, the very config the payloads below are encoded
         // with — a fixture that used a re-typing without declaring it would
         // pin a spec violation as the reference bytes.
@@ -255,7 +254,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // shared payload bytes → the two builds' packs are byte-identical and
         // only the directory container differs.
         let mut gw = PackWriter::create(&dir, BlobOrdering::SpatialMajor, 8 * 1024)?
-            .with_format_version(format_version)
             .with_capabilities(required_capabilities(&cfg))
             .with_paging(paging);
         for (id, ts, te, payload) in &grid {

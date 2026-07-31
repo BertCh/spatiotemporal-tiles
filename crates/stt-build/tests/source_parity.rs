@@ -276,20 +276,20 @@ fn postgres_decodes_numeric_date_and_int2_properties() {
 
     // NUMERIC 12.34 → nearest f64 (shared decimal→JSON conversion).
     assert_eq!(
-        props.get("price"),
-        Some(&serde_json::json!(12.34)),
+        props.get("price").map(|v| v.to_json()),
+        Some(serde_json::json!(12.34)),
         "NUMERIC property decodes to a JSON number"
     );
     // INT2 7 → JSON integer.
     assert_eq!(
-        props.get("small"),
-        Some(&serde_json::json!(7)),
+        props.get("small").map(|v| v.to_json()),
+        Some(serde_json::json!(7)),
         "INT2 property decodes to a JSON integer"
     );
     // DATE 2021-06-15 → UTC-midnight epoch-ms (1_623_715_200_000).
     assert_eq!(
-        props.get("day"),
-        Some(&serde_json::json!(1_623_715_200_000_i64)),
+        props.get("day").map(|v| v.to_json()),
+        Some(serde_json::json!(1_623_715_200_000_i64)),
         "DATE property decodes to UTC-midnight epoch-ms"
     );
 }

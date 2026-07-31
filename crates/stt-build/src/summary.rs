@@ -292,7 +292,7 @@ pub fn build_summary_tier<W: TileWriter>(
 
             // Observe each source column once. Repeated `agg` entries for
             // the same source share the accumulator.
-            if let Some(props) = feature.shared_properties.as_deref() {
+            if let Some(props) = feature.shared_properties.as_ref() {
                 for col in &config.columns {
                     if matches!(col.agg, SummaryAggregation::Count) {
                         continue;
@@ -555,7 +555,7 @@ mod tests {
         let props = serde_json::json!({ "magnitude": mag })
             .as_object()
             .cloned()
-            .map(std::sync::Arc::new);
+            .and_then(crate::props::FeatureProperties::from_map);
         ParsedFeature {
             geojson: Feature {
                 bbox: None,

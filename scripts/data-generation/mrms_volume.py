@@ -218,11 +218,30 @@ def read_grid(path: Path, bounds, stride: int):
 
 
 # ── stratified LOD min-zoom (from nexrad_volume.lod_min_zoom) ─────────────────
-def lod_min_zoom(lon, lat, alt, dbz, min_zoom, max_zoom, cell_deg_top, cell_alt_top):
+# Keep in step with that function — including its 4D cell. The grid's time axis
+# is `bucket_ms` (= `--temporal-bucket` below); without it one gate claims a
+# cell for the whole window and the coarse tiers hold a temporally incoherent
+# scatter instead of a thinned copy of each scan. See the note over
+# nexrad_volume.lod_min_zoom for the measurement.
+LOD_BUCKET_MS = 300_000
+
+
+def lod_min_zoom(lon, lat, alt, dbz, t, bucket_ms,
+                 min_zoom, max_zoom, cell_deg_top, cell_alt_top, origins=None):
+    """Coarsest zoom at which each point wins its 4D (lon, lat, alt, bucket) cell.
+
+    `origins` pins the grid's (lon0, lat0, alt0) corner. The default — the
+    minima of the points passed in — is only correct when the WHOLE dataset is
+    passed at once. Callers that stream one bucket at a time (see the frame loop
+    in `main`) MUST pin it to a window-independent corner, or each frame lays
+    down a differently-offset grid and the tiers stop nesting.
+    """
     n = len(lon)
     alt = np.nan_to_num(alt.astype(np.float64), nan=0.0)
     dbz = np.nan_to_num(dbz.astype(np.float64), nan=-99.0)
-    lon0, lat0, alt0 = lon.min(), lat.min(), alt.min()
+    lon0, lat0, alt0 = origins if origins is not None else (lon.min(), lat.min(), alt.min())
+    _, ct = np.unique((t.astype(np.int64) // max(bucket_ms, 1)), return_inverse=True)
+    ct = ct.astype(np.int64)
     order = np.argsort(-dbz, kind="stable")
     min_z = np.full(n, max_zoom, dtype=np.int16)
     for z in range(min_zoom, max_zoom):
@@ -231,7 +250,7 @@ def lod_min_zoom(lon, lat, alt, dbz, min_zoom, max_zoom, cell_deg_top, cell_alt_
         cx = ((lon - lon0) / cd).astype(np.int64)
         cy = ((lat - lat0) / cd).astype(np.int64)
         cz = ((alt - alt0) / ca).astype(np.int64)
-        code = (cx << 40) ^ (cy << 20) ^ cz
+        code = ((cx << 40) ^ (cy << 20) ^ cz) * np.int64(1000003) + ct
         _, first = np.unique(code[order], return_index=True)
         np.minimum.at(min_z, order[first], z)
     return min_z
@@ -269,6 +288,14 @@ def main() -> int:
                     help="keep cells ≥ this dBZ (10 = every detectable echo)")
     ap.add_argument("--hmax-km", type=float, default=19.0, help="drop levels above this")
     ap.add_argument("--no-lod", action="store_true")
+    # Cells at the z7 tier, doubling per zoom out. 0.02° ≈ the 2 km native grid
+    # (`--grid-km`), so z7 is effectively lossless and the thinning bites at
+    # z6 and coarser — which is where a continental framing actually sits.
+    # NOTE on the next rebuild: these were chosen while the thinning key was
+    # space-only, where they had to be tight to stop the coarse tiers thinning
+    # to nothing. With the bucket in the key each scan thins against itself, so
+    # the tiers come out denser (and the archive bigger) at the same numbers;
+    # check the per-bucket column the build prints and coarsen if it overshoots.
     ap.add_argument("--lod-cell-deg", type=float, default=0.02)
     ap.add_argument("--lod-cell-alt", type=float, default=1000.0)
     ap.add_argument("--min-zoom", type=int, default=2)
@@ -322,51 +349,91 @@ def main() -> int:
             z[yy, xx].astype(np.float32),
         )
 
-    jobs = [(h, f) for f in frames for h in heights]
-    chunks = {"lon": [], "lat": [], "alt": [], "t": [], "dbz": []}
-    done = 0
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        for res in ex.map(decode_one, jobs):
-            done += 1
-            if done % 66 == 0 or done == len(jobs):
-                pts = sum(len(c) for c in chunks["lon"])
-                print(f"    {done}/{len(jobs)} height-frames  {pts:,} pts  "
-                      f"{time_mod.time()-t0:.0f}s", flush=True)
-            if res is None:
-                continue
-            for k, v in zip(("lon", "lat", "alt", "t", "dbz"), res):
-                chunks[k].append(v)
+    # ── stream FRAME BY FRAME, one parquet row group each ────────────────────
+    # This used to decode every (height, frame) job into one flat list, then
+    # concatenate, sort and LOD the whole window at once — so peak RSS scaled
+    # with the WINDOW, and a national 9.5 h window at 2 km (~10× what the old
+    # 35-minute build held) simply could not be assembled on a 36 GB box.
+    #
+    # Frame-local is not an approximation. `lod_min_zoom`'s cell has carried the
+    # temporal bucket since 2026-07-28, and `--temporal-bucket` (5 m) equals the
+    # frame cadence, so every bucket already thins against itself: given a PINNED
+    # grid corner (`LOD_ORIGINS` below), running it per frame produces the same
+    # `min_zoom` the whole-window pass would. Frames are emitted in time order,
+    # so the output stays sorted by timestamp without a global sort.
+    schema = pa.schema([
+        ("lon", pa.float64()), ("lat", pa.float64()), ("timestamp", pa.int64()),
+        ("alt_m", pa.float32()), ("dbz", pa.float32()), ("dbz_band", pa.string()),
+    ] + ([] if args.no_lod else [("min_zoom", pa.int16())]))
 
-    if not chunks["lon"]:
-        sys.exit("No gates above floor in window — check bounds/time/floor.")
-    g = {k: np.concatenate(v) for k, v in chunks.items()}
-    order = np.argsort(g["t"], kind="stable")
-    g = {k: v[order] for k, v in g.items()}
-    n = len(g["lon"])
-    print(f"\n  {n:,} 3D points total ({n/max(len(frames),1):,.0f}/frame avg)")
-
-    cols = {
-        "lon": pa.array(g["lon"], type=pa.float64()),
-        "lat": pa.array(g["lat"], type=pa.float64()),
-        "timestamp": pa.array(g["t"], type=pa.int64()),
-        "alt_m": pa.array(g["alt"], type=pa.float32()),
-        "dbz": pa.array(g["dbz"], type=pa.float32()),
-        "dbz_band": dbz_band_column(g["dbz"]),
-    }
-    if not args.no_lod:
-        mz = lod_min_zoom(g["lon"], g["lat"], g["alt"], g["dbz"],
-                          args.min_zoom, args.max_zoom, args.lod_cell_deg, args.lod_cell_alt)
-        cols["min_zoom"] = pa.array(mz, type=pa.int16())
-        cum = np.cumsum(np.bincount(mz - args.min_zoom,
-                                    minlength=args.max_zoom - args.min_zoom + 1))
-        print("  LOD min-zoom pyramid (loaded at each zoom / % full):")
-        for i, z in enumerate(range(args.min_zoom, args.max_zoom + 1)):
-            print(f"    z{z}: {cum[i]:>11,}  ({100.0*cum[i]/max(n,1):5.1f}%)")
+    # Pin the LOD grid corner to the REQUESTED bounds, not to the data: which
+    # cells exist must not depend on where that frame's echo happened to fall.
+    lod_origins = (bounds[1], bounds[0], 0.0)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     vol_pq = args.out_dir / "mrms-storm3d-volume.parquet"
-    pq.write_table(pa.table(cols), vol_pq, compression="snappy")
-    print(f"  wrote {vol_pq} ({time_mod.time()-t0:.0f}s total)")
+    n_zooms = args.max_zoom - args.min_zoom + 1
+    lod_totals = np.zeros(n_zooms, dtype=np.int64)
+    frame_shares: list[np.ndarray] = []
+    n = 0
+    empty_frames = 0
+
+    with pq.ParquetWriter(vol_pq, schema, compression="snappy") as writer, \
+            ThreadPoolExecutor(max_workers=args.workers) as ex:
+        for fi, when in enumerate(frames):
+            parts = [r for r in ex.map(decode_one, [(h, when) for h in heights])
+                     if r is not None]
+            if not parts:
+                empty_frames += 1
+                continue
+            g = {k: np.concatenate([p[i] for p in parts])
+                 for i, k in enumerate(("lon", "lat", "alt", "t", "dbz"))}
+            nf = len(g["lon"])
+            cols = {
+                "lon": pa.array(g["lon"], type=pa.float64()),
+                "lat": pa.array(g["lat"], type=pa.float64()),
+                "timestamp": pa.array(g["t"], type=pa.int64()),
+                "alt_m": pa.array(g["alt"], type=pa.float32()),
+                "dbz": pa.array(g["dbz"], type=pa.float32()),
+                "dbz_band": dbz_band_column(g["dbz"]),
+            }
+            if not args.no_lod:
+                mz = lod_min_zoom(g["lon"], g["lat"], g["alt"], g["dbz"], g["t"],
+                                  LOD_BUCKET_MS, args.min_zoom, args.max_zoom,
+                                  args.lod_cell_deg, args.lod_cell_alt,
+                                  origins=lod_origins)
+                cols["min_zoom"] = pa.array(mz, type=pa.int16())
+                lod_totals += np.bincount(mz - args.min_zoom, minlength=n_zooms)
+                frame_shares.append(np.array(
+                    [100.0 * int(np.count_nonzero(mz <= z)) / nf
+                     for z in range(args.min_zoom, args.max_zoom + 1)]))
+            writer.write_table(pa.table(cols, schema=schema))
+            n += nf
+            del g, cols
+            if fi % 10 == 0 or fi == len(frames) - 1:
+                print(f"    frame {fi+1}/{len(frames)} {when:%H:%M}Z  "
+                      f"{nf:,} pts  ({n:,} total)  {time_mod.time()-t0:.0f}s",
+                      flush=True)
+
+    if n == 0:
+        sys.exit("No gates above floor in window — check bounds/time/floor.")
+    if empty_frames:
+        print(f"  WARNING: {empty_frames}/{len(frames)} frames had no granules "
+              f"or no echo above floor")
+    print(f"\n  {n:,} 3D points total ({n/max(len(frames)-empty_frames,1):,.0f}/frame avg)")
+
+    if not args.no_lod:
+        cum = np.cumsum(lod_totals)
+        shares = np.vstack(frame_shares)
+        # Per-BUCKET share alongside the dataset-wide count: the renderer draws
+        # one bucket at a time, so that column is what predicts the look.
+        print("  LOD min-zoom pyramid (dataset-wide / median share of ONE bucket):")
+        for i, z in enumerate(range(args.min_zoom, args.max_zoom + 1)):
+            print(f"    z{z}: {cum[i]:>12,}  ({100.0*cum[i]/max(n,1):5.1f}% of all)"
+                  f"   bucket median {np.median(shares[:, i]):5.1f}%"
+                  f"  worst {shares[:, i].min():5.1f}%")
+    print(f"  wrote {vol_pq} "
+          f"({vol_pq.stat().st_size/1e9:.2f} GB, {time_mod.time()-t0:.0f}s total)")
 
     if args.skip_build:
         print("  --skip-build: parquet only.")

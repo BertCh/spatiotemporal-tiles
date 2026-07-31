@@ -11,6 +11,5 @@ built and analysed as packed directories.
 | `packed-stats`        | Size / layout statistics for a packed dataset.                                                      |
 | `point_column_stats`  | Per-column byte breakdown for a point dataset.                                                      |
 | `pack-cover`          | Backfill the tight `cover_t_min` covering bound on a packed dataset (tile payload bytes untouched). |
-| `reoptimize`          | Re-encode a packed dataset in place (decode → re-encode via `PackWriter`).                          |
 | `encoding-experiment` | Measure candidate per-column encodings against the packed baseline.                                 |
 | `make-golden-fixture` | Regenerate the cross-impl golden packed fixture.                                                    |

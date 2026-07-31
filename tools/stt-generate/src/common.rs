@@ -1093,13 +1093,77 @@ pub fn run_stt_build(
     )
 }
 
-/// Find the stt-build binary - uses local binary if available, otherwise falls back to PATH
+/// Find the stt-build binary: `STT_BUILD_BIN`, then a sibling of this exe, then
+/// the repo's own `target/` (this crate is its OWN workspace under `tools/`, so
+/// its `target/release` never contains `stt-build`), then PATH.
+///
+/// Why the extra steps: the sibling probe can never hit in a normal checkout,
+/// so every invocation fell through to the bare `"stt-build"` PATH lookup. On a
+/// machine with a released `~/.cargo/bin/stt-build` that silently resolved to
+/// the INSTALLED binary, not the tree's. Observed 2026-07-29: `stt-generate`
+/// drove **stt-build 0.1.0** while the workspace was at 0.5.0, producing
+/// archives with no `schemas`, no `capabilities`, and `tile_count: 0` — which
+/// looks like a plausible archive and fails only later, at read time. Silence
+/// was the whole defect, so the resolved path is now printed and a version
+/// mismatch against this crate warns loudly.
 pub fn find_stt_build_binary() -> std::path::PathBuf {
-    std::env::current_exe()
+    if let Some(explicit) = std::env::var_os("STT_BUILD_BIN") {
+        return std::path::PathBuf::from(explicit);
+    }
+
+    let sibling = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("stt-build")))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("stt-build"))
+        .filter(|p| p.exists());
+    if let Some(p) = sibling {
+        return p;
+    }
+
+    // tools/stt-generate/target/<profile>/stt-generate → repo root is five up
+    // (exe, release, target, stt-generate, tools, root — `ancestors` yields the
+    // path itself first, so the root is nth(5), not nth(4)).
+    let workspace = std::env::current_exe().ok().and_then(|p| {
+        let root = p.ancestors().nth(5)?.to_path_buf();
+        let candidate = root.join("target/release/stt-build");
+        candidate.exists().then_some(candidate)
+    });
+    if let Some(p) = workspace {
+        return p;
+    }
+
+    std::path::PathBuf::from("stt-build")
+}
+
+/// Print which `stt-build` is about to run, and warn when its version does not
+/// match this crate's. A mismatch is not always wrong (a deliberate pin), so it
+/// warns rather than aborts — but it is never something the operator should
+/// have to discover by inspecting the output archive.
+fn report_stt_build_binary(path: &Path) {
+    let version = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    match version {
+        Some(v) => {
+            println!("   using {} ({v})", path.display());
+            let ours = env!("CARGO_PKG_VERSION");
+            if !v.split_whitespace().any(|tok| tok == ours) {
+                eprintln!(
+                    "⚠️  stt-build reports {v} but stt-generate is {ours}. A stale \
+                     binary silently emits archives with no schemas/capabilities. \
+                     Set STT_BUILD_BIN, or build the workspace: cargo build --release"
+                );
+            }
+        }
+        None => eprintln!(
+            "⚠️  could not run {} --version — the archive may be built by an \
+             unexpected binary. Set STT_BUILD_BIN to pin it.",
+            path.display()
+        ),
+    }
 }
 
 /// Run stt-build to create an STT archive with optional end time field
@@ -1153,6 +1217,7 @@ pub fn run_stt_build_with_options(
         no_clip: false,
         quantize_coords: None,
         quantize_attrs: Vec::new(),
+        blob_ordering: None,
     })
 }
 
@@ -1229,6 +1294,9 @@ pub struct SttBuildOptions {
     /// quantization for the named columns (use when a column needs a specific
     /// precision, e.g. integer-exact). Empty = rely on the automatic pass.
     pub quantize_attrs: Vec<String>,
+    /// Pack ordering, forwarded as `--blob-ordering`. `None` → `time-major`,
+    /// NOT stt-build's `auto` — see [`DEFAULT_BLOB_ORDERING`].
+    pub blob_ordering: Option<String>,
 }
 
 /// Born-optimized coordinate-quantization default (meters) applied to every
@@ -1239,6 +1307,23 @@ pub struct SttBuildOptions {
 /// disable all generation-time quantization.
 pub const DEFAULT_QUANTIZE_COORDS_M: f64 = 0.1;
 
+/// Pack ordering applied to every generated dataset unless the caller overrides
+/// it — deliberately NOT stt-build's `auto`.
+///
+/// Everything `stt-generate` produces is an ANIMATED demo whose loader walks the
+/// playhead forward, and a time-ordered range read over a spatially-ordered
+/// archive becomes a scatter-gather: buffered ranges come back empty and the
+/// playhead stalls with no error. `auto` picks from the occupied space-vs-time
+/// extent and cannot see that intent — on 2026-07-29 it chose `spatial` for
+/// `drifters` and `hilbert3` for `ais-all-us` / `animals` /
+/// `osm-nyc-changesets`, every one of which shipped as `time-major`. The
+/// showcase's own reconcile test fails the demo that regresses this way, which
+/// is how it was caught.
+///
+/// Pass `blob_ordering: Some("auto")` explicitly for a dataset that is genuinely
+/// pan-first rather than play-first.
+pub const DEFAULT_BLOB_ORDERING: &str = "time-major";
+
 /// Single entry point that drives the stt-build CLI with every option,
 /// including the optional summary tier.
 pub fn run_stt_build_with_full_options(opts: SttBuildOptions) -> Result<()> {
@@ -1247,6 +1332,7 @@ pub fn run_stt_build_with_full_options(opts: SttBuildOptions) -> Result<()> {
     println!("\n📦 Building STT archive...");
 
     let stt_build_path = find_stt_build_binary();
+    report_stt_build_binary(&stt_build_path);
 
     let mut cmd = Command::new(&stt_build_path);
     cmd.arg("--input")
@@ -1319,6 +1405,12 @@ pub fn run_stt_build_with_full_options(opts: SttBuildOptions) -> Result<()> {
     } else if let Some(m) = opts.quantize_coords {
         cmd.arg("--quantize-coords").arg(m.to_string());
     }
+
+    cmd.arg("--blob-ordering").arg(
+        opts.blob_ordering
+            .as_deref()
+            .unwrap_or(DEFAULT_BLOB_ORDERING),
+    );
 
     if let Some(sm) = &opts.summary {
         cmd.arg("--summary-tier").arg(&sm.scheme);

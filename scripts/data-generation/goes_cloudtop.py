@@ -295,12 +295,46 @@ def compute_slices(
 
 
 # ── isoband extraction ────────────────────────────────────────────────────────
+def _closed_ring(ring: np.ndarray) -> np.ndarray | None:
+    """Drop a degenerate ring; close an open one.
+
+    contourpy returns closed rings for filled contours, but a band that runs
+    into the grid's own edge can come back OPEN, and shapely then rejects the
+    entire polygon with "Points of LinearRing do not form a closed linestring"
+    — killing the whole scan, not just that ring. Repeating the first point is
+    the right repair (a contour ring's interior is unambiguous); a ring with
+    fewer than three distinct points encloses nothing and is dropped.
+
+    Surfaced by the CONUS bbox: a wider domain simply has more band/edge
+    intersections than the single-storm crop this script was written for.
+    """
+    if ring.shape[0] < 3:
+        return None
+    # Non-finite vertices come from the fixed-grid → geodetic transform OFF THE
+    # SATELLITE DISK. They are fatal in a subtle way: NaN != NaN, so such a ring
+    # can never satisfy shapely's closure test no matter how it is repaired, and
+    # the exception takes down the whole scan. A ring that runs off the disk has
+    # no trustworthy interior, so drop it rather than stitch across the gap.
+    # Only reachable once the bbox reaches far from the sub-satellite point —
+    # GOES-16 sits at 75.2°W, so a CONUS-wide crop hits it and the single-storm
+    # crop never did.
+    if not np.isfinite(ring).all():
+        return None
+    if not np.array_equal(ring[0], ring[-1]):
+        ring = np.vstack([ring, ring[:1]])
+    return ring if ring.shape[0] >= 4 else None
+
+
 def _rings_to_polygons(points: np.ndarray, offsets: np.ndarray) -> list[Polygon]:
     """One contourpy OuterOffset entry (already lon/lat) → shapely Polygons."""
     rings = [points[offsets[r] : offsets[r + 1]] for r in range(len(offsets) - 1)]
-    if not rings or len(rings[0]) < 4:
+    shell = _closed_ring(rings[0]) if rings else None
+    if shell is None:
         return []
-    poly = Polygon(rings[0], rings[1:])
+    # Holes were previously passed through unchecked — the same open-ring throw
+    # applies to them.
+    holes = [h for h in (_closed_ring(r) for r in rings[1:]) if h is not None]
+    poly = Polygon(shell, holes)
     if not poly.is_valid:
         poly = poly.buffer(0)  # fix self-touching rings
     if poly.is_empty:

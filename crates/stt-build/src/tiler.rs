@@ -1828,7 +1828,7 @@ mod tests {
         let props = serde_json::json!({ "v": ts as f64 })
             .as_object()
             .cloned()
-            .map(std::sync::Arc::new);
+            .and_then(crate::props::FeatureProperties::from_map);
         ParsedFeature {
             geojson: Feature {
                 bbox: None,
@@ -2022,9 +2022,9 @@ mod tests {
     fn max_zoom_field_confines_feature_to_band() {
         let mut p = point(-73.98, 40.75, 1_600_000_000_000);
         {
-            let props = std::sync::Arc::make_mut(p.shared_properties.as_mut().unwrap());
-            props.insert("min_zoom".to_string(), serde_json::json!(11));
-            props.insert("max_zoom".to_string(), serde_json::json!(11));
+            let props = p.shared_properties.as_mut().unwrap();
+            props.insert("min_zoom", serde_json::json!(11));
+            props.insert("max_zoom", serde_json::json!(11));
         }
         let config = TileConfig {
             min_zoom: 10,

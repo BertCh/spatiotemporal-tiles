@@ -442,6 +442,7 @@ fn build_field(input: &Path, output: &Path, min_zoom: u8, max_zoom: u8) -> Resul
         no_clip: false,
         quantize_coords: None,
         quantize_attrs: Vec::new(),
+            blob_ordering: None,
     })
 }
 
@@ -464,6 +465,7 @@ fn build_cells(input: &Path, output: &Path, min_zoom: u8, max_zoom: u8) -> Resul
         no_clip: false,
         quantize_coords: None,
         quantize_attrs: Vec::new(),
+            blob_ordering: None,
     })
 }
 
@@ -488,5 +490,6 @@ fn build_tracks(input: &Path, output: &Path, min_zoom: u8, max_zoom: u8) -> Resu
         no_clip: false,
         quantize_coords: None,
         quantize_attrs: Vec::new(),
+            blob_ordering: None,
     })
 }

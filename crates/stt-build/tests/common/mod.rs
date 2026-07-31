@@ -392,8 +392,8 @@ pub fn assert_features_equal(file: &[ParsedFeature], other: &[ParsedFeature], la
             "{label} row {i}: vertex_value_matrix"
         );
         assert_eq!(
-            fa.shared_properties.as_deref(),
-            fb.shared_properties.as_deref(),
+            fa.shared_properties.as_ref().map(|p| p.to_map()),
+            fb.shared_properties.as_ref().map(|p| p.to_map()),
             "{label} row {i}: properties"
         );
     }

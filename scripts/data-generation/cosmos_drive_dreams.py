@@ -1099,7 +1099,6 @@ def build_archives(
                 stt_build=stt_build, min_zoom=14, max_zoom=18,
                 temporal_bucket="100ms", quantize_coords=0.05,
                 quantize_attrs=avc.lidar_quantize_attrs(0.05),
-                point_elevation_column="z",
                 blob_ordering="time-major",
             )
 
