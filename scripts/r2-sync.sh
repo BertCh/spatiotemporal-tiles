@@ -307,6 +307,25 @@ sync_tree() {
     --filter "- **" \
     "${src}" "${dst}"
 
+  # Root-level dataset sidecars: `<stem>.meta.json` and the `<stem>-*.bin`
+  # typed-array blobs. The Neural-State Atlas is the first surface to use them
+  # — its node index and per-node series are plain binary buffers fetched
+  # directly, not packed archives — and NO pass above matches them: they sit at
+  # the data root rather than under `packs/`, `index/` or a bundle directory,
+  # so every filter list ends up rejecting them at its trailing `- **`.
+  # Discovered 2026-07-31, when the three atlas ARCHIVES synced and the two
+  # `.bin` sidecars did not, which is precisely the partial-sync state
+  # ATLAS_ARCHIVES_SYNCED exists to keep off the public deploy.
+  # Mutable regime (stable names, bytes change on regenerate), so they take the
+  # short-TTL header like manifest.json — never the immutable one.
+  echo ">> [sidecar]   ${src} (*.meta.json + *.bin) -> ${dst}"
+  rclone copy "${COMMON_FLAGS[@]}" ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
+    "${LICENSE_EXCLUDE_FLAGS[@]}" \
+    --header-upload "${MANIFEST_HEADER}" \
+    --filter "+ *.meta.json" --filter "+ *.bin" \
+    --filter "- **" \
+    "${src}" "${dst}"
+
   if [[ "${PRUNE}" -eq 1 ]]; then
     prune_tree "${src}" "${dst}" "${grace_refs}"
   else
