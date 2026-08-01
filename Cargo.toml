@@ -59,7 +59,7 @@ parquet = { version = "59", default-features = false, features = [
 ] }
 
 # WKB / geometry decoding for input parsing
-geozero = { version = "0.14", default-features = false, features = [
+geozero = { version = "0.15", default-features = false, features = [
   "with-wkb",
   "with-geo",
 ] }
