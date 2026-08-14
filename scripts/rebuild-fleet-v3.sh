@@ -105,13 +105,27 @@ def n(p):
     return (json.load(open(p)).get('metadata') or {}).get('feature_count') or 0
 o,w = n(sys.argv[1]), n(sys.argv[2])
 ratio = (w/o) if o else 1.0
-print(f"{o} {w} {ratio:.3f} {'SHORTFALL' if ratio < 0.95 else 'ok'}")
+# Three bands, not two. A big OVERSHOOT is not loss and must not fail the
+# dataset, but it is still recipe drift and must not read as a clean pass
+# either: `ais-all-us` came back at 6.45x / 2.2 GB against a live 0.51 GB,
+# because today's default is `--sample-minutes 0` ("preserve every usable
+# row", the no-thinning rule) while the shipped archive was built thinned.
+# More data, four times the bytes, and a decision someone has to actually make.
+verdict = 'SHORTFALL' if ratio < 0.95 else ('REVIEW' if ratio > 1.5 else 'ok')
+print(f"{o} {w} {ratio:.3f} {verdict}")
 PY
 )
     set -- $cmp
     if [ "$4" = "SHORTFALL" ]; then
       say "FAIL  $stem  ${elapsed}s  features $2 vs live $1 (${3}x) — REBUILD IS NOT A REPLACEMENT"
       return 1
+    fi
+    if [ "$4" = "REVIEW" ]; then
+      local newmb livemb
+      newmb=$(du -sm "$OUT/$stem" 2>/dev/null | cut -f1)
+      livemb=$(du -sm "$REPO/examples/showcase/public/data/$stem" 2>/dev/null | cut -f1)
+      say "REVIEW $stem  ${elapsed}s  validate=$vexit  features $2 vs live $1 (${3}x)  size ${newmb}MB vs ${livemb}MB — more data than shipped; confirm the recipe before publishing"
+      return 0
     fi
     say "OK    $stem  ${elapsed}s  validate=$vexit  features $2 vs live $1 (${3}x)"
     return 0
