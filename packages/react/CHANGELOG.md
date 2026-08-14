@@ -1,5 +1,13 @@
 # @poopdeck.gl/react
 
+## 0.6.0
+
+### Patch Changes
+
+- Updated dependencies [[`d5163aa`](https://github.com/BertCh/spatiotemporal-tiles/commit/d5163aab712f83c0a45b428089b11f9b83bc8b94), [`2c020da`](https://github.com/BertCh/spatiotemporal-tiles/commit/2c020dac959f4acdd99b3171a645fcc63077ccd0), [`d5163aa`](https://github.com/BertCh/spatiotemporal-tiles/commit/d5163aab712f83c0a45b428089b11f9b83bc8b94), [`a7b57dc`](https://github.com/BertCh/spatiotemporal-tiles/commit/a7b57dc13db321c72fee68fb0110e9cd8347c1ce), [`d5163aa`](https://github.com/BertCh/spatiotemporal-tiles/commit/d5163aab712f83c0a45b428089b11f9b83bc8b94), [`2a58eb4`](https://github.com/BertCh/spatiotemporal-tiles/commit/2a58eb4ce26d7921c4b9832149f5dd11987fe148)]:
+  - @poopdeck.gl/core@0.6.0
+  - @poopdeck.gl/playback@0.6.0
+
 ## 0.4.0
 
 ### Minor Changes
