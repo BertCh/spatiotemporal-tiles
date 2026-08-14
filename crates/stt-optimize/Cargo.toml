@@ -21,7 +21,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Workspace crate
-stt-core = { path = "../stt-core", version = "0.5.0" }
+stt-core = { path = "../stt-core", version = "0.6.0" }
 
 # Core dependencies
 anyhow.workspace = true
