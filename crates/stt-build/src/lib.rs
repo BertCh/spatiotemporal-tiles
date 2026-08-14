@@ -11,6 +11,13 @@
 pub mod build_options;
 pub mod clip;
 pub mod columnar;
+/// Pass 1 — the dataset-global statistics scan every dataset-global encoding
+/// pin is derived from. Sits between `source.load(...)` and `generate_tiles*`:
+/// no new I/O, one extra iteration over the already-resident features, memory
+/// O(columns + capped category sets). It exists because a per-tile encoder
+/// cannot see the dataset, so every verdict it makes locally is a function of
+/// which rows landed in the tile rather than of the column's domain.
+pub mod dataset_stats;
 /// Decode logic shared by the PostGIS and DuckDB input adaptors (row outcome,
 /// per-vertex coercion tally, dropped-column warning, integer `--time-format`
 /// scaling, NaN→JSON-null) — one definition so the readers can't drift.
@@ -22,7 +29,14 @@ pub(crate) mod db_input_common;
 /// (statically bundled) database engine.
 #[cfg(feature = "duckdb")]
 pub mod duckdb_input;
+pub mod home_zoom;
 pub mod input;
+/// The LOD-grid ↔ `--temporal-bucket` precondition: read a baked LOD-floor
+/// column's declared thinning-grid bucket out of the Parquet footer and assert
+/// it equals the bucket this build resolves to. Byte-neutral (a passing build is
+/// bit-identical); it exists because a mismatch is otherwise silent and ships a
+/// wrong-density pyramid.
+pub mod lod_bucket;
 /// PostGIS input source — read features from a live PostgreSQL/PostGIS query
 /// instead of a GeoParquet file. Gated behind the `postgres` cargo feature so
 /// default builds don't pull the database driver.

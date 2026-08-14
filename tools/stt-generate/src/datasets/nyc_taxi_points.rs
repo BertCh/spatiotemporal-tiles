@@ -6,9 +6,7 @@
 //! re-running the OSRM pipeline — the route geometries already baked into the
 //! packed tiles are reused as-is.
 
-use crate::common::{
-    self, PointRecord, PropertyColumn, PropertyKind, StreamingParquetWriter,
-};
+use crate::common::{self, PointRecord, PropertyColumn, PropertyKind, StreamingParquetWriter};
 use anyhow::{anyhow, Context, Result};
 use arrow::array::{
     Array, FixedSizeListArray, Float64Array, Int32Array, Int64Array, ListArray, UInt16Array,
@@ -120,11 +118,21 @@ pub fn run(args: Args) -> Result<()> {
     let target_tiles: Vec<_> = entries.iter().filter(|e| e.zoom == target_zoom).collect();
 
     println!("   Total tiles:         {}", entries.len());
-    println!("   Processing zoom:     {} ({} tiles)", target_zoom, target_tiles.len());
+    println!(
+        "   Processing zoom:     {} ({} tiles)",
+        target_zoom,
+        target_tiles.len()
+    );
 
     let property_columns = vec![
-        PropertyColumn { name: "trip_id".into(), kind: PropertyKind::Numeric },
-        PropertyColumn { name: "status".into(), kind: PropertyKind::String },
+        PropertyColumn {
+            name: "trip_id".into(),
+            kind: PropertyKind::Numeric,
+        },
+        PropertyColumn {
+            name: "status".into(),
+            kind: PropertyKind::String,
+        },
     ];
     let mut writer = StreamingParquetWriter::with_columns(&intermediate_path, property_columns)?;
 
@@ -298,7 +306,10 @@ pub fn run(args: Args) -> Result<()> {
         if !args.keep_intermediate {
             let _ = std::fs::remove_file(&intermediate_path);
         } else {
-            println!("   📁 Keeping intermediate: {}", intermediate_path.display());
+            println!(
+                "   📁 Keeping intermediate: {}",
+                intermediate_path.display()
+            );
         }
     }
 
@@ -432,7 +443,11 @@ fn interpolate_along_path_with_times(
         let span = (t1 - t0) as f64;
         // Zero-duration segments (rare; saturated OSRM legs or duplicate
         // vertices) snap to the segment start to avoid div-by-zero.
-        let local = if span > 0.0 { (ts - t0) as f64 / span } else { 0.0 };
+        let local = if span > 0.0 {
+            (ts - t0) as f64 / span
+        } else {
+            0.0
+        };
         let a = coords[seg];
         let b = coords[seg + 1];
         let lon = a[0] + (b[0] - a[0]) * local;
@@ -483,11 +498,18 @@ fn interpolate_along_path(
         let target_d = frac * total;
 
         // Find first vertex with cumulative distance >= target_d.
-        let upper = cum.iter().position(|&d| d >= target_d).unwrap_or(coords.len() - 1);
+        let upper = cum
+            .iter()
+            .position(|&d| d >= target_d)
+            .unwrap_or(coords.len() - 1);
         let seg = upper.saturating_sub(1);
         let d0 = cum[seg];
         let d1 = *cum.get(seg + 1).unwrap_or(&total);
-        let local = if d1 > d0 { (target_d - d0) / (d1 - d0) } else { 0.0 };
+        let local = if d1 > d0 {
+            (target_d - d0) / (d1 - d0)
+        } else {
+            0.0
+        };
 
         let a = coords[seg];
         let b = *coords.get(seg + 1).unwrap_or(&a);

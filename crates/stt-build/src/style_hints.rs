@@ -13,7 +13,11 @@ use crate::input::ParsedFeature;
 use std::collections::{BTreeMap, HashSet};
 use stt_core::metadata::StyleHints;
 use stt_core::types::TimeRange;
-use stt_optimize::analysis::properties::{profile_properties, PropertyValues};
+use stt_optimize::analysis::properties::{
+    profile_properties_with, PlaybackDerivation, PropertyValues,
+};
+
+pub use stt_optimize::analysis::properties::PlaybackDerivation as DerivedPlaybackParams;
 
 /// Memory guard: at most this many sampled values per property. Sampling is a
 /// DETERMINISTIC stride over the feature slice (every `ceil(n / cap)`-th
@@ -62,6 +66,29 @@ pub fn compute_style_hints(
     temporal_bucket_ms: u64,
     full: bool,
 ) -> Option<StyleHints> {
+    compute_style_hints_with(
+        features,
+        time_range,
+        temporal_bucket_ms,
+        full,
+        PlaybackDerivation::default(),
+    )
+}
+
+/// [`compute_style_hints`] with the derived playback parameters (BH-10).
+///
+/// `derivation` carries the build's total tile-payload bytes (only known after
+/// tiling — the caller reads it off the pack writer) and the refit gate for
+/// `suggested_playback_seconds`. [`PlaybackDerivation::default()`] reproduces
+/// [`compute_style_hints`] exactly, which is what keeps the emission opt-in:
+/// nothing in a manifest moves until a build asks for it.
+pub fn compute_style_hints_with(
+    features: &[ParsedFeature],
+    time_range: &TimeRange,
+    temporal_bucket_ms: u64,
+    full: bool,
+    derivation: PlaybackDerivation,
+) -> Option<StyleHints> {
     if features.is_empty() {
         return None;
     }
@@ -71,11 +98,12 @@ pub fn compute_style_hints(
         Vec::new()
     };
 
-    Some(profile_properties(
+    Some(profile_properties_with(
         &props,
         time_range.end.saturating_sub(time_range.start),
         temporal_bucket_ms,
         layer_hint(features),
+        derivation,
     ))
 }
 
@@ -179,6 +207,7 @@ mod tests {
         vertex_timestamps: Option<Vec<u64>>,
     ) -> ParsedFeature {
         ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(geometry)),
@@ -324,6 +353,80 @@ mod tests {
         let a = compute_style_hints(&features, &tr, 3_600_000, true).unwrap();
         let b = compute_style_hints(&features, &tr, 3_600_000, true).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// BH-10 at the build seam. The gate is OFF by default, so the emitted
+    /// block must be byte-for-byte what it was before the field existed; ON, the
+    /// duration is refit and the window appears.
+    #[test]
+    fn derived_playback_params_are_opt_in_at_this_seam() {
+        let hour = 3_600_000u64;
+        let features: Vec<ParsedFeature> = (0..40)
+            .map(|i| point(serde_json::json!({ "v": i })))
+            .collect();
+        let tr = TimeRange::new(0, 4_000 * hour);
+
+        // Default: legacy duration (sqrt(4000) ≈ 63), no window.
+        let legacy = compute_style_hints(&features, &tr, hour, false).unwrap();
+        assert_eq!(legacy.suggested_playback_seconds, Some(63));
+        assert_eq!(legacy.suggested_time_window_ms, None);
+        assert_eq!(
+            compute_style_hints_with(
+                &features,
+                &tr,
+                hour,
+                false,
+                DerivedPlaybackParams::default()
+            )
+            .unwrap(),
+            legacy,
+            "the default derivation must be indistinguishable from the legacy call"
+        );
+
+        // Gated on: 4000/20 = 200 s, and a window derived from the byte total.
+        let derived = compute_style_hints_with(
+            &features,
+            &tr,
+            hour,
+            false,
+            DerivedPlaybackParams {
+                total_payload_bytes: Some(64 * 1024 * 1024),
+                refit: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(derived.suggested_playback_seconds, Some(200));
+        let window = derived.suggested_time_window_ms.expect("window derived");
+        assert!(window >= hour, "never narrower than one bucket");
+        assert!(window <= 24 * hour, "never wider than the 24-bucket cap");
+        // Everything else about the block is untouched by the gate.
+        assert_eq!(derived.layer_hint, legacy.layer_hint);
+        assert_eq!(derived.properties, legacy.properties);
+        assert_eq!(derived.version, legacy.version);
+    }
+
+    /// Determinism with the gate ON: the mandatory byte-identical re-run.
+    #[test]
+    fn derived_hints_are_identical_across_reruns() {
+        let hour = 3_600_000u64;
+        let features: Vec<ParsedFeature> = (0..50)
+            .map(|i| point(serde_json::json!({ "v": i, "c": format!("k{}", i % 5) })))
+            .collect();
+        let tr = TimeRange::new(0, 777 * hour);
+        let d = DerivedPlaybackParams {
+            total_payload_bytes: Some(123_456_789),
+            refit: true,
+        };
+        let a = compute_style_hints_with(&features, &tr, hour, true, d).unwrap();
+        for _ in 0..8 {
+            let b = compute_style_hints_with(&features, &tr, hour, true, d).unwrap();
+            assert_eq!(a, b);
+            // The serialized bytes, not just the struct — the manifest is what ships.
+            assert_eq!(
+                serde_json::to_vec(&a).unwrap(),
+                serde_json::to_vec(&b).unwrap()
+            );
+        }
     }
 
     #[test]

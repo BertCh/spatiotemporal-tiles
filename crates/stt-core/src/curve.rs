@@ -34,12 +34,17 @@ pub enum BlobOrdering {
     /// 3D Hilbert curve over `(x, y, time_bucket)` at native per-axis
     /// resolution. The best generalist — no catastrophic query — and the
     /// measured winner on the widest range of datasets. This is the enum
-    /// `Default`. The `stt-build` CLI defaults to `--blob-ordering auto`
-    /// (resolved to a concrete order by [`choose`](BlobOrdering::choose)); there
-    /// is no no-reorder mode — the packed writer always reorders before cutting
-    /// packs. An opt-in
-    /// `--blob-ordering measured` instead picks the concrete order by simulating
-    /// per-ordering range-read cost (see [`crate::ordering_sim`]).
+    /// `Default`.
+    ///
+    /// The `stt-build` CLI defaults to `--blob-ordering measured`: the concrete
+    /// order is picked by simulating per-ordering range-read cost over the
+    /// dataset's own tiles ([`crate::ordering_sim`]), under per-dataset query
+    /// weights. `--blob-ordering auto` selects the cheap cardinality heuristic
+    /// ([`choose`](BlobOrdering::choose)) instead, and is also what `measured`
+    /// degrades to on inputs below
+    /// [`MIN_TILES_TO_SIMULATE`](crate::ordering_sim::MIN_TILES_TO_SIMULATE).
+    /// There is no no-reorder mode — the packed writer always reorders before
+    /// cutting packs.
     #[default]
     Hilbert3,
     /// 3D Morton / Z-order over `(x, y, time_bucket)`. Cheaper to compute than
@@ -74,9 +79,12 @@ impl BlobOrdering {
     /// - **balanced or space-dominant** (e.g. flights: 2¹⁰ × 24 buckets) →
     ///   [`Hilbert3`], the robust generalist with no catastrophic query.
     ///
-    /// This is the `--blob-ordering auto` path. For a per-dataset pick that
-    /// actually measures range-read cost across orderings, see the opt-in
-    /// `--blob-ordering measured` mode ([`crate::ordering_sim`]).
+    /// This is the `--blob-ordering auto` path. It is no longer the CLI default
+    /// — `measured` ([`crate::ordering_sim`]) is, since the workload model gave
+    /// the simulator a playback query to rank with — but this rule is unchanged
+    /// and still load-bearing in two places: it is what `auto` means, what
+    /// `order-audit` reports as `auto_choice`, and the fallback `measured`
+    /// resolves to when the input is too small to simulate.
     ///
     /// [`SpatialMajor`]: BlobOrdering::SpatialMajor
     /// [`Hilbert3`]: BlobOrdering::Hilbert3

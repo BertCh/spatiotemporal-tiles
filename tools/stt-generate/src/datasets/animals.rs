@@ -15,7 +15,9 @@
 //! coloured by taxonomic class (bird / mammal / fish / reptile / insect),
 //! resolved via the GBIF species-match API.
 
-use crate::common::{self, LineStringRecord, PropertyColumn, SttBuildOptions, StreamingLineStringParquetWriter};
+use crate::common::{
+    self, LineStringRecord, PropertyColumn, StreamingLineStringParquetWriter, SttBuildOptions,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use clap::Parser;
@@ -119,7 +121,10 @@ pub fn run(args: Args) -> Result<()> {
         .timestamp_millis();
 
     // 1) Enumerate the open tracking datasets.
-    println!("🔎 Enumerating GBIF tracking datasets ({})...", licenses.join(", "));
+    println!(
+        "🔎 Enumerating GBIF tracking datasets ({})...",
+        licenses.join(", ")
+    );
     let mut datasets = enumerate_datasets(&client, &licenses)?;
     datasets.sort_by(|a, b| a.key.cmp(&b.key)); // deterministic order
     if args.max_records > 0 {
@@ -190,7 +195,10 @@ pub fn run(args: Args) -> Result<()> {
 
     writer.finish()?;
     println!("\n📊 Summary:");
-    println!("   {} track segments from {} fixes", total_segments, total_fixes);
+    println!(
+        "   {} track segments from {} fixes",
+        total_segments, total_fixes
+    );
     let mut groups: Vec<_> = group_counts.iter().collect();
     groups.sort_by(|a, b| b.1.cmp(a.1));
     for (g, n) in groups {
@@ -245,7 +253,11 @@ fn enumerate_datasets(
             url.push_str(&format!("&license={}", l));
         }
         let v: Value = client.get(&url).send()?.error_for_status()?.json()?;
-        let results = v.get("results").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+        let results = v
+            .get("results")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
         if results.is_empty() {
             break;
         }
@@ -253,14 +265,25 @@ fn enumerate_datasets(
             if let Some(key) = r.get("key").and_then(|k| k.as_str()) {
                 out.push(DatasetInfo {
                     key: key.to_string(),
-                    title: r.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-                    license: r.get("license").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                    title: r
+                        .get("title")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    license: r
+                        .get("license")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     record_count: r.get("recordCount").and_then(|c| c.as_u64()).unwrap_or(0),
                 });
             }
         }
         offset += limit;
-        if v.get("endOfRecords").and_then(|e| e.as_bool()).unwrap_or(true) {
+        if v.get("endOfRecords")
+            .and_then(|e| e.as_bool())
+            .unwrap_or(true)
+        {
             break;
         }
     }
@@ -336,8 +359,13 @@ fn process_dataset(
             Some(ms) => ms,
             None => continue,
         };
-        let (lon, lat) = match (rec.get(ci_lon).and_then(parse_f64), rec.get(ci_lat).and_then(parse_f64)) {
-            (Some(lon), Some(lat)) if lon.abs() <= 180.0 && lat.abs() <= 90.0 && (lon != 0.0 || lat != 0.0) => {
+        let (lon, lat) = match (
+            rec.get(ci_lon).and_then(parse_f64),
+            rec.get(ci_lat).and_then(parse_f64),
+        ) {
+            (Some(lon), Some(lat))
+                if lon.abs() <= 180.0 && lat.abs() <= 90.0 && (lon != 0.0 || lat != 0.0) =>
+            {
                 (lon, lat)
             }
             _ => continue,
@@ -352,7 +380,10 @@ fn process_dataset(
                 record_class = c;
             }
         }
-        by_individual.entry(key).or_default().push(Fix { ms, lon, lat });
+        by_individual
+            .entry(key)
+            .or_default()
+            .push(Fix { ms, lon, lat });
     }
 
     if by_individual.is_empty() {
@@ -362,7 +393,10 @@ fn process_dataset(
     // Resolve a coarse taxon group (prefer the archive's own class column,
     // else the GBIF species-match API).
     let (group, class_label) = if !record_class.is_empty() {
-        (classify(Some(&record_class), None).to_string(), record_class)
+        (
+            classify(Some(&record_class), None).to_string(),
+            record_class,
+        )
     } else {
         resolve_taxon(client, &sci_name, class_cache)
     };
@@ -449,7 +483,11 @@ fn resolve_taxon(
     if let Some(c) = cache.get(sci_name) {
         return c.clone();
     }
-    let url = format!("{}/species/match?name={}", GBIF_API, urlencoding::encode(sci_name));
+    let url = format!(
+        "{}/species/match?name={}",
+        GBIF_API,
+        urlencoding::encode(sci_name)
+    );
     let v: Option<Value> = client.get(&url).send().ok().and_then(|r| r.json().ok());
     let class = v
         .as_ref()
@@ -481,8 +519,8 @@ fn classify(class: Option<&str>, phylum: Option<&str>) -> &'static str {
     match class.unwrap_or("") {
         "Aves" => "bird",
         "Mammalia" => "mammal",
-        "Reptilia" | "Testudines" | "Squamata" | "Crocodylia" | "Lepidosauria"
-        | "Archosauria" | "Sauropsida" => "reptile",
+        "Reptilia" | "Testudines" | "Squamata" | "Crocodylia" | "Lepidosauria" | "Archosauria"
+        | "Sauropsida" => "reptile",
         "Actinopterygii" | "Actinopteri" | "Teleostei" | "Elasmobranchii" | "Chondrichthyes"
         | "Holocephali" | "Myxini" | "Petromyzonti" | "Cephalaspidomorphi" | "Coelacanthi"
         | "Dipneusti" | "Sarcopterygii" => "fish",
@@ -555,7 +593,14 @@ fn split_track(fixes: &[Fix], max_gap_ms: i64, min_points: usize) -> Vec<Vec<Fix
 fn download(url: &str, out: &PathBuf) -> Result<()> {
     let status = Command::new("curl")
         .args([
-            "-sS", "-f", "-L", "--connect-timeout", "30", "--max-time", "900", "-o",
+            "-sS",
+            "-f",
+            "-L",
+            "--connect-timeout",
+            "30",
+            "--max-time",
+            "900",
+            "-o",
             out.to_str().unwrap(),
             url,
         ])
@@ -606,7 +651,9 @@ fn parse_event_ms(s: &str) -> Option<i64> {
 }
 
 fn ms_to_dt(ms: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(ms).single().unwrap_or_else(Utc::now)
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(Utc::now)
 }
 
 fn truncate(s: &str, n: usize) -> String {

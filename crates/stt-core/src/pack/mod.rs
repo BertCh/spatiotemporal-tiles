@@ -22,7 +22,7 @@
 //!
 //! Packs and the directory are content-addressed (blake3, 128-bit → 32 hex
 //! chars) so their bytes never change without their name changing. The directory
-//! is the v5 codec ([`crate::directory`]): per-run `pack_id` column +
+//! is the v6 codec ([`crate::directory`]): per-run `pack_id` column +
 //! pack-relative offsets. See `docs/spec/stt-packed-format.md` for the full
 //! contract.
 //!
@@ -42,7 +42,7 @@ use crate::types::Compression;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -58,30 +58,49 @@ pub const PACKED_FORMAT: &str = "stt-packed";
 /// (`manifest.schemas`). See
 /// `docs/roadmap/stt-packed-format-decisions.md`.
 ///
-/// A manifest declaring formatVersion 1 (the transitional 0.3.x shape) is a
-/// hard open error: this toolchain cannot read it, and refusing loudly is what
-/// keeps it from being misdecoded as a formatVersion-2 dataset.
-pub const PACKED_FORMAT_VERSION: u32 = 2;
+/// Any manifest version other than v3 is a hard open error. Refusing loudly
+/// prevents legacy or future bytes from being misdecoded as a v3 dataset.
+pub const PACKED_FORMAT_VERSION: u32 = 3;
+/// Oldest manifest `formatVersion` the READER accepts.
+///
+/// v2 differs from v3 in the CONTAINER only: it has no `variants` registry (the
+/// variant axis did not exist, so every payload is raw) and its directory codec
+/// is v5 (no per-entry `variant_id`). The tile payloads are byte-identical in
+/// shape — [`crate::arrow_tile::LAYER_FRAME_VERSION`] is 2 for both — so no
+/// decode path forks below the container.
+///
+/// Read-only: [`PACKED_FORMAT_VERSION`] is what every writer emits, so this
+/// cannot put a v2 manifest into the world. It exists because a published
+/// archive is a durable artifact and some have no reproducible source.
+pub const MIN_PACKED_FORMAT_VERSION: u32 = 2;
 
 // ----------------------------------------------------------------------------
 // Object magic (`.sttp` / `.sttd` self-identification, spec §9.2)
 // ----------------------------------------------------------------------------
 
-/// First 4 bytes of a formatVersion-2 pack object.
+/// First 4 bytes of a formatVersion-3 pack object.
 pub const PACK_MAGIC: [u8; 4] = *b"STTP";
-/// First 4 bytes of a formatVersion-2 directory object.
+/// First 4 bytes of a formatVersion-3 directory object.
 pub const DIRECTORY_MAGIC: [u8; 4] = *b"STTD";
 /// Length of the object magic prelude: 4-byte tag + u8 object version + 3 zero
-/// bytes. Blob offsets in a formatVersion-2 directory are object-absolute, so a
+/// bytes. Blob offsets in a formatVersion-3 directory are object-absolute, so a
 /// pack's first blob sits at offset 8; the manifest `length` fields and every
 /// blake3 content address cover the ENTIRE object, prelude included, so a reader
 /// that hashed only the post-prelude bytes would reject every object it opens.
-/// formatVersion-1 objects carry no magic at all.
+/// Historical pre-v3 objects are not accepted by the current reader.
 pub const OBJECT_MAGIC_LEN: usize = 8;
 /// Version of the OBJECT-PRELUDE axis: the byte at offset 4 of every `.sttp` /
 /// `.sttd`. Counted independently of [`PACKED_FORMAT_VERSION`] (manifest schema)
 /// and of the layer-frame version, so a prelude revision need not disturb either.
-const OBJECT_MAGIC_VERSION: u8 = 2;
+const OBJECT_MAGIC_VERSION: u8 = 3;
+/// Oldest object prelude the READER accepts. The prelude is a pure envelope —
+/// a 4-byte kind tag, this version byte, three reserved zeros — so an older
+/// value changes nothing about how the bytes AFTER it are parsed. Accepting it
+/// costs one comparison and is what keeps published archives (several of which
+/// have no reproducible source) openable.
+///
+/// The writer always emits [`OBJECT_MAGIC_VERSION`]; this bound is read-only.
+const MIN_OBJECT_MAGIC_VERSION: u8 = 2;
 
 /// The full 8-byte magic prelude for an object kind.
 fn object_magic(kind: [u8; 4]) -> [u8; OBJECT_MAGIC_LEN] {
@@ -102,14 +121,14 @@ fn strip_object_magic<'a>(bytes: &'a [u8], kind: [u8; 4], what: &str) -> Result<
     let tag = std::str::from_utf8(&kind).expect("magic tags are ASCII");
     if bytes.len() < OBJECT_MAGIC_LEN || bytes[0..4] != kind {
         return Err(Error::InvalidArchive(format!(
-            "{what}: missing {tag:?} magic (formatVersion-2 objects start with an \
+            "{what}: missing {tag:?} magic (formatVersion-3 objects start with an \
              8-byte magic prelude)"
         )));
     }
-    if bytes[4] != OBJECT_MAGIC_VERSION {
+    if !(MIN_OBJECT_MAGIC_VERSION..=OBJECT_MAGIC_VERSION).contains(&bytes[4]) {
         return Err(Error::InvalidArchive(format!(
             "{what}: unsupported {tag} object version {} (this reader supports \
-             {OBJECT_MAGIC_VERSION})",
+             {MIN_OBJECT_MAGIC_VERSION}..={OBJECT_MAGIC_VERSION})",
             bytes[4]
         )));
     }
@@ -121,18 +140,17 @@ fn strip_object_magic<'a>(bytes: &'a [u8], kind: [u8; 4], what: &str) -> Result<
     Ok(&bytes[OBJECT_MAGIC_LEN..])
 }
 
-/// A directory object's codec bytes: the whole object under formatVersion 1,
-/// the post-magic slice under formatVersion 2. (`rootLength` keeps meaning the
-/// root frame's
+/// A v3 directory object's codec bytes: the post-magic slice. (`rootLength`
+/// keeps meaning the root frame's
 /// at-rest length — a paged root fetch is `bytes=0..(8+rootLength-1)` — so
 /// all downstream paged math is unchanged once the magic is stripped.)
 /// Public so out-of-band directory consumers (e.g. `stt-validate`'s direct
 /// paged-structure re-check) apply the same version-aware unwrap.
 pub fn directory_codec_bytes(bytes: &[u8], format_version: u32) -> Result<&[u8]> {
-    if format_version != PACKED_FORMAT_VERSION {
+    if !(MIN_PACKED_FORMAT_VERSION..=PACKED_FORMAT_VERSION).contains(&format_version) {
         return Err(Error::InvalidArchive(format!(
             "unsupported packed formatVersion {format_version} \
-             (this reader supports {PACKED_FORMAT_VERSION})"
+             (this reader supports {MIN_PACKED_FORMAT_VERSION}..={PACKED_FORMAT_VERSION})"
         )));
     }
     strip_object_magic(bytes, DIRECTORY_MAGIC, "directory object")
@@ -159,6 +177,30 @@ pub const CAPABILITY_TIME_DELTA: &str = "time-delta";
 /// would render raw 0..65534 indices as physical values — e.g. a −2..32 °C
 /// sea-surface temperature ramp saturated everywhere.
 pub const CAPABILITY_VERTEX_VALUE_QUANT: &str = "vertex-value-quant";
+/// `manifest.capabilities` entry: PER-FEATURE triangle emission (TB-12). A
+/// polygon layer's `triangles` column bakes indices only for the features a
+/// renderer's own single-boundary earcut cannot reproduce (holes, multi-part)
+/// and leaves every other feature's list EMPTY, expecting the reader to earcut
+/// it at decode.
+///
+/// The pre-TB-12 readers all branch on whether the LAYER has a triangle column
+/// and then trust each feature's slice verbatim, so against them an empty list
+/// means "draw nothing": every single-ring polygon would silently VANISH. That
+/// is the silent-misdecode class this registry exists to turn into a refusal at
+/// open, which is why per-feature emission is a capability and not a quiet
+/// byte saving.
+pub const CAPABILITY_TRIANGLES_PARTIAL: &str = "triangles-partial";
+/// `manifest.capabilities` entry: FEATURE-ANCHORED per-vertex times (TB-11
+/// extension 2). `TILE_META.vtf` re-types the `vertex_time` list leaf to
+/// `UInt16` deltas measured from **each feature's own `start_time`** instead of
+/// a layer-wide origin.
+///
+/// A reader that knows only the layer-anchored `vt` form sees a `List<UInt16>`
+/// with no origin/step pair. Depending on how forgiving it is, it either treats
+/// the raw deltas as absolute Unix ms — putting every vertex in January 1970 —
+/// or anchors them against an origin it invented. Both are silent, which is why
+/// the form is gated rather than merely additive.
+pub const CAPABILITY_VERTEX_TIME_FEATURE_ANCHOR: &str = "vertex-time-feature-anchor";
 /// Every `manifest.capabilities` value this toolchain implements — the
 /// required-to-understand feature registry (`docs/spec/stt-packed-format.md`
 /// §3.1). Each capability RE-TYPES existing columns, so a reader that lacks it
@@ -171,6 +213,8 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     CAPABILITY_ELEVATION_FOLD,
     CAPABILITY_TIME_DELTA,
     CAPABILITY_VERTEX_VALUE_QUANT,
+    CAPABILITY_TRIANGLES_PARTIAL,
+    CAPABILITY_VERTEX_TIME_FEATURE_ANCHOR,
 ];
 
 /// Default pack target size — 64 MiB. Well under the 512 MB CDN per-object cap,
@@ -200,7 +244,7 @@ fn blake3_128_hex(bytes: &[u8]) -> String {
 pub const DIRECTORY_ENCODING_ZSTD: &str = "zstd";
 
 /// `directory.layout` value for the paged container (root page + leaf pages,
-/// each independently framed). Absent or `"single"` = the whole-load v5 object.
+/// each independently framed). Absent or `"single"` = the whole-load v6 object.
 pub const DIRECTORY_LAYOUT_PAGED: &str = "paged";
 /// `directory.layout` value for the single whole-load object (the default).
 pub const DIRECTORY_LAYOUT_SINGLE: &str = "single";
@@ -213,14 +257,14 @@ pub struct DirectoryRef {
     /// Directory object length in bytes (the at-rest object, i.e. the
     /// compressed length when `encoding` is set).
     pub length: u64,
-    /// Directory codec version (`5` for the packed format). The leaf pages of a
-    /// paged directory are this same v5 codec — `layout` (below), not this
+    /// Directory codec version (`6` for the packed format). The leaf pages of a
+    /// paged directory are this same v6 codec — `layout` (below), not this
     /// version, discriminates the container shape.
     #[serde(rename = "directoryVersion")]
     pub directory_version: u8,
     /// At-rest encoding of the directory object. `Some("zstd")` means the
-    /// object bytes are a zstd frame wrapping the codec bytes; absent (the
-    /// shape every pre-encoding manifest has) means raw codec bytes. For a
+    /// object bytes are a zstd frame wrapping the codec bytes; absent means
+    /// raw codec bytes. For a
     /// paged directory it describes the framing of **each page** (root + every
     /// leaf), not one frame over the whole object. The content address and
     /// `length` always describe the at-rest bytes.
@@ -228,7 +272,7 @@ pub struct DirectoryRef {
     pub encoding: Option<String>,
     /// Container layout. `Some("paged")` = a root page + leaf pages;
     /// absent or `Some("single")` = the single whole-load object. Readers that
-    /// don't know `"paged"` fail loudly (the root's first byte isn't a valid v5
+    /// don't know `"paged"` fail loudly (the root's first byte isn't a valid v6
     /// directory version), which is why readers ship before any paged dataset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<String>,
@@ -252,6 +296,18 @@ pub struct DirectoryRef {
         skip_serializing_if = "Option::is_none"
     )]
     pub page_entries: Option<u64>,
+    /// Required-on-paged blake3-128 of the exact at-rest root frame (excluding
+    /// the 8-byte `.sttd` object magic).
+    #[serde(default, rename = "rootHash", skip_serializing_if = "Option::is_none")]
+    pub root_hash: Option<String>,
+    /// Required-on-paged blake3-128 hashes of the exact at-rest leaf frames, in
+    /// page descriptor order.
+    #[serde(
+        default,
+        rename = "pageHashes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub page_hashes: Option<Vec<String>>,
 }
 
 impl DirectoryRef {
@@ -271,7 +327,7 @@ pub struct PackRef {
     pub length: u64,
 }
 
-/// One schema-template entry of a formatVersion-2 manifest's `schemas` table:
+/// One schema-template entry of a formatVersion-3 manifest's `schemas` table:
 /// the blake3-128 content hash of the raw template bytes (32 lowercase hex
 /// chars — the hex form of the 16-byte reference v2 layer frames embed) and
 /// the raw template bytes, base64-encoded (standard alphabet, padded).
@@ -281,6 +337,40 @@ pub struct SchemaTemplateRef {
     pub hash: String,
     /// The raw template bytes, base64.
     pub data: String,
+}
+
+/// Stable logical role of an independently addressable tile representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VariantKind {
+    Raw,
+    Summary,
+    /// A REDUCED representation: fewer features than the base tier, derived by
+    /// a declared `method` (DT-1). Explicitly not lossless.
+    ///
+    /// Needs no must-understand capability: variant 0 stays complete and a
+    /// reader never fetches a variant it did not ask for (the summary-tier
+    /// precedent).
+    Reduced,
+}
+
+/// One entry in the manifest's required variant registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestVariant {
+    /// Numeric id stored in every directory entry and carried by every TileId.
+    pub id: u32,
+    /// Semantic representation role.
+    pub kind: VariantKind,
+    /// Layer name used by this variant when it has one canonical layer.
+    #[serde(default, rename = "layerName", skip_serializing_if = "Option::is_none")]
+    pub layer_name: Option<String>,
+    /// Reduction method — REQUIRED when `kind` is [`VariantKind::Reduced`],
+    /// and absent otherwise (DT-1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<crate::metadata::ReductionMethod>,
+    /// Method-specific parameters, required alongside `method`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
 }
 
 /// Decode + hash-validate a manifest's `schemas` table into the decode-side
@@ -341,6 +431,19 @@ pub struct Manifest {
     /// every frame carries its schema inline (the key is then omitted).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schemas: Vec<SchemaTemplateRef>,
+    /// Required registry of independently addressable tile representations.
+    /// Every directory `variant_id` MUST resolve here.
+    ///
+    /// `#[serde(default)]` is deliberate and does NOT relax that requirement:
+    /// the field is required by `formatVersion` 3, and the version gate rejects
+    /// anything older. Without the default, a pre-v3 manifest died inside serde
+    /// with `missing field 'variants'` — a decode error that says nothing about
+    /// the real problem — *before* the version check could produce the message
+    /// that actually helps ("unsupported formatVersion N"). Defaulting to empty
+    /// lets the version gate speak first; a v3 manifest that genuinely omits
+    /// `variants` still fails validation on the `variant_id` resolution below.
+    #[serde(default)]
+    pub variants: Vec<ManifestVariant>,
     /// Blob compression codec (always `"zstd"`, per-blob, no shared dict).
     pub compression: String,
     /// The concrete blob byte-ordering the writer resolved and laid down
@@ -355,6 +458,64 @@ pub struct Manifest {
         skip_serializing_if = "Option::is_none"
     )]
     pub blob_ordering: Option<String>,
+    /// **TB-10 shared adaptive boundaries.** The dataset-wide candidate instants
+    /// that `--adaptive-temporal` window keys were snapped down onto, ascending
+    /// and deduplicated.
+    ///
+    /// Adaptive mode derives each tile's time key from its own cell's feature
+    /// distribution, so before snapping a client had no way to ENUMERATE the
+    /// keys a viewport would need — it could only discover them from the
+    /// directory, which is what broke multi-cell prefetch. Publishing the
+    /// candidate set restores enumeration: every window key is drawn from this
+    /// list (bar the rare collision fallback, which keeps its exact timestamp).
+    ///
+    /// ADDITIVE, never a capability: a reader that ignores the key decodes every
+    /// tile correctly and merely prefetches less well. Omitted from the JSON
+    /// when empty, so non-adaptive builds stay byte-identical.
+    #[serde(
+        default,
+        rename = "adaptiveBoundaries",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub adaptive_boundaries: Vec<i64>,
+    /// **Co-versioning for [`Self::blob_ordering`]** (SH-3 / WM-2): the workload
+    /// model the layout was chosen under, including the reader-mirroring
+    /// coalescing gap the simulation priced at. See
+    /// [`crate::metadata::OrderingWorkload`].
+    ///
+    /// `blob_ordering` alone says WHAT the layout is; it cannot say whether the
+    /// layout is still optimal. Two things invalidate a simulated layout without
+    /// moving a single archive byte — a re-fit of the query weights, and a change
+    /// to the reader's coalescing gap — and both are recorded here so
+    /// `stt-optimize order-audit` can flag drift instead of silently comparing
+    /// against today's constants.
+    ///
+    /// Present on exactly the archives whose ordering was resolved by SIMULATION
+    /// (`--blob-ordering measured` with enough tiles to simulate) and absent
+    /// everywhere else; that presence/absence is itself the signal, because the
+    /// ordering STRING only ever names the concrete winner
+    /// (`"spatial" | "time-major" | …`) and so cannot distinguish a fitted layout
+    /// from a declared one. Omitted from the JSON when `None`, so every
+    /// non-measured build stays byte-identical to a pre-field build.
+    ///
+    /// ⚠️ **Mirrored, deliberately.** The identical object is also written to
+    /// `metadata.ordering_workload` (see
+    /// [`crate::metadata::Metadata::ordering_workload`]). This top-level key is
+    /// canonical — it belongs beside the layout fact it co-versions, not inside
+    /// the content-description block — but the shipped TS reader
+    /// (`packages/core/src/archive.ts`, `manifestBuildAssumedGapBytes`) reads the
+    /// `metadata` copy, so removing the mirror would silently disable the
+    /// adaptive-coalesce co-versioning guard. Both copies are written from one
+    /// value at one site in [`PackWriter::finalize`] and are asserted equal by
+    /// `manifest_records_the_ordering_workload_at_both_pinned_keys`.
+    /// **Removal trigger:** when the TS reader reads `orderingWorkload`, drop the
+    /// `metadata` mirror.
+    #[serde(
+        default,
+        rename = "orderingWorkload",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ordering_workload: Option<crate::metadata::OrderingWorkload>,
     /// Pointer to the encoded directory object.
     pub directory: DirectoryRef,
     /// Pack table. Index == `pack_id`.
@@ -389,6 +550,7 @@ struct PendingTile {
     hilbert: u64,
     time_start: i64,
     time_end: i64,
+    variant_id: u32,
     cover_t_min: Option<i64>,
     feature_count: u32,
     temporal_bucket_ms: Option<u64>,
@@ -515,8 +677,11 @@ pub struct PackWriter {
     pending: Vec<PendingTile>,
     /// `Some(k)` → emit a **paged** directory (root + leaf pages of ≤ `k`
     /// entries; see [`crate::directory_page`]); `None` → the single whole-load
-    /// v5 directory (the default). Set via [`with_paging`](Self::with_paging).
+    /// v6 directory (the default). Set via [`with_paging`](Self::with_paging).
     page_entries: Option<usize>,
+    /// Minimum directory entry count before paging activates. `0` means every
+    /// non-empty directory is paged (the explicit `with_paging` behaviour).
+    paging_min_entries: usize,
     /// zstd level for per-blob + directory compression. Defaults to
     /// [`compression::ZSTD_LEVEL`]; a publish build raises it via
     /// [`with_zstd_level`](Self::with_zstd_level). Decode is level-independent,
@@ -526,12 +691,21 @@ pub struct PackWriter {
     /// Set via [`with_capabilities`](Self::with_capabilities); empty (the
     /// default) omits the key from the manifest.
     capabilities: Vec<String>,
+    /// `manifest.adaptiveBoundaries` — TB-10's shared candidate instants. Set
+    /// via [`with_adaptive_boundaries`](Self::with_adaptive_boundaries); empty
+    /// (the default) omits the key.
+    adaptive_boundaries: Vec<i64>,
     /// Opt into the **measured** ordering picker: resolve the concrete on-disk
     /// order by simulating per-ordering range-read cost ([`crate::ordering_sim`])
     /// rather than the `auto` cardinality heuristic. Set via
     /// [`with_measured_ordering`](Self::with_measured_ordering); `false` (the
     /// default) keeps the `ordering` argument's behaviour.
     measured_ordering: bool,
+    /// Which query weighting the measured picker runs under. `Derived` (the
+    /// default) reads the dataset's `layer_hint` + bucket count; `Legacy`
+    /// forces the pre-M4 two-query weights. Inert unless
+    /// [`measured_ordering`](Self::with_measured_ordering) is on.
+    ordering_workload: crate::ordering_sim::OrderingWorkloadMode,
     /// Schema-template sink: the encoder records each layer's stripped
     /// schema prefix here (wired automatically by
     /// [`encoder_config`](Self::encoder_config) → [`crate::arrow_tile::
@@ -557,11 +731,25 @@ pub struct PackWriter {
     memory_budget: u64,
     /// Total bytes of payloads currently held in RAM (`PendingPayload::Mem`).
     pending_payload_bytes: u64,
+    /// Total UNCOMPRESSED payload bytes ever handed to
+    /// [`add_tile_full`](Self::add_tile_full), regardless of where they were
+    /// stored. Unlike [`pending_payload_bytes`](Self::pending_payload_bytes)
+    /// this is a monotonic total, not a residency gauge, so it is a stable
+    /// answer to "how big is this dataset" at any point before finalize.
+    /// Read-only, via [`payload_bytes`](Self::payload_bytes); it influences no
+    /// output byte.
+    total_payload_bytes: u64,
     /// Lazily created once the budget is exceeded; `None` = nothing spilled.
     spill: Option<SpillFile>,
 }
 
 impl PackWriter {
+    fn merge_capabilities(&mut self, capabilities: impl IntoIterator<Item = String>) {
+        self.capabilities.extend(capabilities);
+        self.capabilities.sort_unstable();
+        self.capabilities.dedup();
+    }
+
     /// Create a packed-format writer targeting `out_dir`.
     ///
     /// `out_dir` (and its `index/` + `packs/` subdirs) are created on
@@ -580,13 +768,17 @@ impl PackWriter {
             pack_target_bytes: pack_target_bytes.max(1),
             pending: Vec::new(),
             page_entries: None,
+            paging_min_entries: 0,
             zstd_level: compression::ZSTD_LEVEL,
             capabilities: Vec::new(),
+            adaptive_boundaries: Vec::new(),
             measured_ordering: false,
+            ordering_workload: crate::ordering_sim::OrderingWorkloadMode::default(),
             templates: Arc::new(TemplateCollector::new()),
             encoder: crate::arrow_tile::EncoderConfig::default(),
             memory_budget: 0,
             pending_payload_bytes: 0,
+            total_payload_bytes: 0,
             spill: None,
         })
     }
@@ -630,9 +822,8 @@ impl PackWriter {
     }
 
     /// The manifest `formatVersion` this writer emits — always
-    /// [`PACKED_FORMAT_VERSION`]. Encode callers derive their LAYER-FRAME
-    /// version from this, so a dataset can never mix frame and manifest
-    /// versions — which readers reject outright.
+    /// [`PACKED_FORMAT_VERSION`]. The layer-frame axis is intentionally
+    /// independent and is pinned by [`encoder_config`](Self::encoder_config).
     ///
     /// There is no setter. The transitional format was withdrawn in
     /// `e084ccd`, and the writer emitting a version the reader refuses is not
@@ -664,6 +855,23 @@ impl PackWriter {
     /// stride. Prefer shipping elevation as a numeric COLUMN and lifting it
     /// client-side via the layer's `elevationProperty`.
     pub fn with_encoder_config(mut self, cfg: crate::arrow_tile::EncoderConfig) -> Self {
+        let mut required = Vec::new();
+        if cfg.quantize_coords_m.is_some() {
+            required.push(CAPABILITY_COORD_QUANT.to_string());
+        }
+        if !cfg.quantize_attrs.is_empty() || cfg.quantize_attrs_auto {
+            required.push(CAPABILITY_ATTR_QUANT.to_string());
+        }
+        if !cfg.point_elevation_column.is_empty() {
+            required.push(CAPABILITY_ELEVATION_FOLD.to_string());
+        }
+        if cfg.compact_times {
+            required.push(CAPABILITY_TIME_DELTA.to_string());
+        }
+        if cfg.quantize_vertex_values {
+            required.push(CAPABILITY_VERTEX_VALUE_QUANT.to_string());
+        }
+        self.merge_capabilities(required);
         self.encoder = cfg;
         self
     }
@@ -672,13 +880,12 @@ impl PackWriter {
     /// from [`with_encoder_config`](Self::with_encoder_config), with the frame
     /// version and template sink forced to the writer's own.
     ///
-    /// That override is the single coupling point keeping a dataset's frames
-    /// and its manifest declaration in lockstep — mixed versions are a reader
-    /// hard error, and a template-referencing frame whose templates were never
-    /// recorded fails template resolution at read time.
+    /// That override pins the independent layer-frame version and template
+    /// registry in one place. A template-referencing frame whose templates
+    /// were never recorded fails template resolution at read time.
     pub fn encoder_config(&self) -> crate::arrow_tile::EncoderConfig {
         crate::arrow_tile::EncoderConfig {
-            format_version: PACKED_FORMAT_VERSION,
+            format_version: crate::arrow_tile::LAYER_FRAME_VERSION,
             template_collector: Some(self.template_collector()),
             ..self.encoder.clone()
         }
@@ -687,10 +894,20 @@ impl PackWriter {
     /// Opt into a **paged** directory: the `.sttd` becomes a root page + leaf
     /// pages of ≤ `page_entries` entries each, so a cold reader fetches only the
     /// leaves its viewport/time-window touches. `None` (the default) emits the
-    /// single whole-load v5 directory — byte-identical output to a build that
+    /// single whole-load v6 directory — byte-identical output to a build that
     /// never enables paging. `Some(0)` is clamped to 1.
     pub fn with_paging(mut self, page_entries: Option<usize>) -> Self {
         self.page_entries = page_entries.map(|k| k.max(1));
+        self.paging_min_entries = 0;
+        self
+    }
+
+    /// Enable paging only when the directory is large enough to benefit.
+    /// Sparse archives stay a smaller single-frame index; large archives keep
+    /// viewport-proportional leaf loading.
+    pub fn with_adaptive_paging(mut self, page_entries: usize, min_entries: usize) -> Self {
+        self.page_entries = Some(page_entries.max(1));
+        self.paging_min_entries = min_entries.max(1);
         self
     }
 
@@ -716,8 +933,36 @@ impl PackWriter {
     pub fn with_capabilities(mut self, mut capabilities: Vec<String>) -> Self {
         capabilities.sort_unstable();
         capabilities.dedup();
-        self.capabilities = capabilities;
+        self.merge_capabilities(capabilities);
         self
+    }
+
+    /// Publish TB-10's shared adaptive boundary set in the manifest.
+    ///
+    /// ADDITIVE: a reader that ignores `adaptiveBoundaries` still decodes every
+    /// tile — it just cannot enumerate the adaptive key set ahead of a fetch,
+    /// which is the prefetch problem the field exists to solve. Sorted and
+    /// deduped here so the manifest bytes never depend on caller order.
+    pub fn with_adaptive_boundaries(mut self, mut boundaries: Vec<i64>) -> Self {
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        self.adaptive_boundaries = boundaries;
+        self
+    }
+
+    /// Declare one required-to-understand capability AFTER construction.
+    ///
+    /// The builder-style [`with_capabilities`](Self::with_capabilities) covers
+    /// everything derivable from settings before any tile is encoded. Some
+    /// capabilities are instead OBSERVED while encoding — TB-12's
+    /// [`CAPABILITY_TRIANGLES_PARTIAL`] is only owed when a layer actually mixes
+    /// empty and baked triangle lists — and those arrive after the writer
+    /// already exists. Declaring one is idempotent and order-independent (the
+    /// set is sorted and deduped), so it stays deterministic no matter which
+    /// worker observed it first. Must be called before
+    /// [`finalize`](Self::finalize), which is when the manifest is written.
+    pub fn declare_capability(&mut self, capability: &str) {
+        self.merge_capabilities([capability.to_string()]);
     }
 
     /// Opt into the **measured** ordering picker (`--blob-ordering measured`):
@@ -728,6 +973,26 @@ impl PackWriter {
     /// `false` (the default) emits the bytes a build that never calls this does.
     pub fn with_measured_ordering(mut self, on: bool) -> Self {
         self.measured_ordering = on;
+        self
+    }
+
+    /// Choose the query weighting the **measured** picker ranks under
+    /// (`stt-build --ordering-workload`).
+    ///
+    /// [`Derived`](crate::ordering_sim::OrderingWorkloadMode::Derived) — the
+    /// default — derives per-dataset weights from the metadata's `layer_hint`
+    /// and the native tier's distinct bucket count
+    /// ([`crate::ordering_sim::workload_weights`]), so a playback-class dataset
+    /// is not laid out for an access pattern it never issues.
+    /// [`Legacy`](crate::ordering_sim::OrderingWorkloadMode::Legacy) is the
+    /// documented escape hatch: it forces the pre-M4 scrub+pan weighting, which
+    /// is what every archive built before the workload model used. Inert unless
+    /// [`with_measured_ordering`](Self::with_measured_ordering) is on.
+    pub fn with_ordering_workload(
+        mut self,
+        mode: crate::ordering_sim::OrderingWorkloadMode,
+    ) -> Self {
+        self.ordering_workload = mode;
         self
     }
 
@@ -748,6 +1013,13 @@ impl PackWriter {
         payload: &[u8],
     ) -> Result<()> {
         check_payload_len(id, payload.len() as u64)?;
+        // Monotonic dataset-size total (see `total_payload_bytes`). Counted
+        // before the storage-medium branch so a spilled payload counts the same
+        // as an in-RAM one, and counted pre-dedup/pre-compression because the
+        // quantity it answers for is DECODED resident bytes.
+        self.total_payload_bytes = self
+            .total_payload_bytes
+            .saturating_add(payload.len() as u64);
         // Frame/manifest version coherence: readers hard-reject mixed-version
         // datasets, so a layer frame of the OTHER version would brick the
         // output on first read. Refuse it at add time, naming the tile —
@@ -785,6 +1057,7 @@ impl PackWriter {
             hilbert: id.hilbert_index(),
             time_start,
             time_end,
+            variant_id: id.variant_id,
             cover_t_min,
             feature_count,
             temporal_bucket_ms,
@@ -796,6 +1069,19 @@ impl PackWriter {
     /// Number of tiles buffered so far.
     pub fn tile_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Total UNCOMPRESSED tile-payload bytes added so far — the sum of every
+    /// `payload.len()` handed to [`add_tile_full`](Self::add_tile_full),
+    /// counted before dedup and before per-blob zstd.
+    ///
+    /// This is the "how many bytes does a client hold if it decodes everything"
+    /// total, which is what the derived playback-window hint (BH-10) prices a
+    /// memory budget against — not the on-the-wire compressed size. Purely
+    /// observational: reading it cannot change an output byte, and a build that
+    /// never reads it is byte-identical.
+    pub fn payload_bytes(&self) -> u64 {
+        self.total_payload_bytes
     }
 
     /// Finalise: order + dedup + per-blob zstd, cut packs, write
@@ -813,17 +1099,27 @@ impl PackWriter {
             pack_target_bytes,
             mut pending,
             page_entries,
+            paging_min_entries,
             zstd_level,
             capabilities,
+            adaptive_boundaries,
             measured_ordering,
+            ordering_workload,
             templates,
             // Encode-time only — finalize just stores what was handed to it.
             encoder: _,
             memory_budget,
             pending_payload_bytes: _,
+            total_payload_bytes: _,
             spill,
         } = self;
-        // (formatVersion-2 objects carry an 8-byte magic prelude and blob
+        if pending.is_empty() {
+            return Err(Error::Other(
+                "cannot finalize a packed dataset with no tiles (the manifest requires at least one pack)"
+                    .into(),
+            ));
+        }
+        // (formatVersion-3 objects carry an 8-byte magic prelude and blob
         // offsets are object-absolute — the first blob of a pack sits at
         // offset 8, and content addresses cover the prelude too;
         // `PackStreamWriter` below owns that math.)
@@ -866,6 +1162,16 @@ impl PackWriter {
         // range-read cost across the native tiles; otherwise `auto` uses the
         // (occupied-extent) cardinality heuristic and an explicit order passes
         // through.
+        // `auto`'s cardinality heuristic, also the documented fallback the
+        // measured picker degrades to when there is nothing worth simulating.
+        let auto_choice = || {
+            let space_bits = crate::curve::bits_for(x_span.max(y_span) + 1);
+            let time_bits = crate::curve::bits_for((tb_span.max(0) + 1) as u64);
+            BlobOrdering::choose(space_bits, time_bits)
+        };
+        // Set only when the ordering was actually resolved by simulation, so it
+        // is exactly the archives whose layout the workload model explains.
+        let mut resolved_workload: Option<crate::metadata::OrderingWorkload> = None;
         let ordering = if measured_ordering {
             let samples: Vec<crate::ordering_sim::TileSample> = pending
                 .iter()
@@ -880,25 +1186,60 @@ impl PackWriter {
                     len: p.payload.len() as u64,
                 })
                 .collect();
-            // Pass the archive's real pack target so the simulated per-pack
-            // coalescing matches the packs this build will actually cut. (Blob
-            // weights here are uncompressed payload lengths vs the writer's
-            // compressed cut, so boundaries land a little early — but uniformly
-            // across all orderings, so the RELATIVE ranking is preserved.)
-            crate::ordering_sim::measured_ordering(
-                &samples,
-                crate::ordering_sim::SimOptions {
+            if samples.len() < crate::ordering_sim::MIN_TILES_TO_SIMULATE {
+                // Below the floor the canonical band degenerates to one or two
+                // cells and the ranking is decided by rounding, so `measured`
+                // falls back to `auto` and records nothing. Same floor the
+                // pre-build layout advisor gives up at.
+                auto_choice()
+            } else {
+                // Per-dataset weights from build inputs the pipeline already
+                // computed: the dominant layer kind and the native tier's
+                // distinct bucket count. `Legacy` mode pins the pre-M4
+                // two-query weighting instead.
+                let distinct_buckets = {
+                    let mut tbs: Vec<i64> = samples.iter().map(|s| s.tb).collect();
+                    tbs.sort_unstable();
+                    tbs.dedup();
+                    tbs.len()
+                };
+                let weights = match ordering_workload {
+                    crate::ordering_sim::OrderingWorkloadMode::Derived => {
+                        crate::ordering_sim::workload_weights(
+                            metadata
+                                .style_hints
+                                .as_ref()
+                                .and_then(|h| h.layer_hint.as_deref()),
+                            distinct_buckets,
+                        )
+                    }
+                    crate::ordering_sim::OrderingWorkloadMode::Legacy => {
+                        crate::ordering_sim::LEGACY_WEIGHTS
+                    }
+                };
+                // Pass the archive's real pack target so the simulated per-pack
+                // coalescing matches the packs this build will actually cut. (Blob
+                // weights here are uncompressed payload lengths vs the writer's
+                // compressed cut, so boundaries land a little early — but uniformly
+                // across all orderings, so the RELATIVE ranking is preserved.)
+                let opts = crate::ordering_sim::SimOptions {
                     pack_bytes: pack_target_bytes,
+                    weights,
                     ..crate::ordering_sim::SimOptions::default()
-                },
-            )
+                };
+                resolved_workload = Some(crate::metadata::OrderingWorkload {
+                    scrub: weights.scrub,
+                    pan: weights.pan,
+                    playback: weights.playback,
+                    playback_window_buckets: opts.playback_window_buckets,
+                    runway_multiplier: opts.runway_multiplier,
+                    coalesce_gap_bytes: opts.coalesce_gap_bytes,
+                });
+                crate::ordering_sim::measured_ordering(&samples, opts)
+            }
         } else {
             match ordering {
-                BlobOrdering::Auto => {
-                    let space_bits = crate::curve::bits_for(x_span.max(y_span) + 1);
-                    let time_bits = crate::curve::bits_for((tb_span.max(0) + 1) as u64);
-                    BlobOrdering::choose(space_bits, time_bits)
-                }
+                BlobOrdering::Auto => auto_choice(),
                 other => other,
             }
         };
@@ -1047,9 +1388,22 @@ impl PackWriter {
                     // occupies [0, 8), so blobs start at 8 and readers slice
                     // `[offset..offset+length]` off the whole object unchanged.
                     let (pack_id, offset) = stream.append(&compressed)?;
+                    let compressed_len = u32::try_from(compressed.len()).map_err(|_| {
+                        Error::Other(format!(
+                            "compressed tile blob is {} bytes, exceeding the directory's u32 length field",
+                            compressed.len()
+                        ))
+                    })?;
+                    let uncompressed_size =
+                        u32::try_from(p.payload.len()).map_err(|_| {
+                            Error::Other(format!(
+                                "tile payload is {} bytes, exceeding the directory's u32 uncompressed_size field",
+                                p.payload.len()
+                            ))
+                        })?;
                     blobs.push(Blob {
-                        length: compressed.len() as u32,
-                        uncompressed_size: p.payload.len() as u32,
+                        length: compressed_len,
+                        uncompressed_size,
                         crc,
                     });
                     placements.push(Placement { pack_id, offset });
@@ -1078,6 +1432,7 @@ impl PackWriter {
                 y: p.y,
                 time_start: p.time_start,
                 time_end: p.time_end,
+                variant_id: p.variant_id,
                 pack_id: pl.pack_id,
                 offset: pl.offset,
                 length: blob.length,
@@ -1092,7 +1447,15 @@ impl PackWriter {
         // Directory codec order is (zoom, hilbert, time_start); the extra
         // bucket key totalizes ties between a cell's base and temporal-LOD
         // entries so the encoded directory is byte-reproducible too.
-        entries.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start, e.temporal_bucket_ms));
+        entries.sort_by_key(|e| {
+            (
+                e.zoom,
+                e.hilbert,
+                e.time_start,
+                e.variant_id,
+                e.temporal_bucket_ms,
+            )
+        });
 
         // The manifest's totals are derived from the directory itself, not
         // taken from the caller: `tile_count` = directory entries,
@@ -1101,6 +1464,18 @@ impl PackWriter {
         // manifest and directory consistent by construction for every writer
         // path; a caller that forgot to set them would otherwise ship 0s.
         let mut metadata = metadata.clone();
+        // Co-version the layout with the workload it was optimised for. Only a
+        // simulated (`measured`) ordering sets this, so every other build emits
+        // byte-identical metadata to a build that predates the field.
+        //
+        // This is the READER-COMPAT MIRROR of `Manifest::ordering_workload`
+        // (the canonical key, beside `blobOrdering`). Written from the same
+        // `resolved_workload` in the same function so the two copies cannot
+        // diverge; see the rustdoc on `Manifest::ordering_workload` for the
+        // removal trigger.
+        if let Some(workload) = resolved_workload {
+            metadata.ordering_workload = Some(workload);
+        }
         metadata.tile_count = entries.len() as u64;
         metadata.feature_count = entries.iter().map(|e| u64::from(e.feature_count)).sum();
 
@@ -1111,12 +1486,13 @@ impl PackWriter {
         // Encode the directory. Both shapes are zstd-at-rest (declared via
         // `directory.encoding`) — directories compress ~2x and sit on the
         // cold-start critical path with no CDN content-encoding rescue:
-        //   - single (default): one zstd frame over the whole v5 codec buffer.
+        //   - single (default): one zstd frame over the whole v6 codec buffer.
         //   - paged (opt-in):   a root page + leaf pages, each its own zstd
         //     frame, so a cold reader fetches only the leaves it touches. The
-        //     leaf codec is the same v5 directory.
+        //     leaf codec is the same v6 directory.
         // The object is content-addressed over its at-rest bytes either way.
-        let (index_bytes, directory_ref_fields): (Vec<u8>, _) = if let Some(k) = page_entries {
+        let use_paging = page_entries.filter(|_| entries.len() >= paging_min_entries);
+        let (index_bytes, directory_ref_fields): (Vec<u8>, _) = if let Some(k) = use_paging {
             let paged =
                 crate::directory_page::encode_paged_directory_level(&entries, k, true, zstd_level)?;
             (
@@ -1126,14 +1502,16 @@ impl PackWriter {
                     Some(paged.root_length),
                     Some(paged.page_count as u64),
                     Some(paged.page_entries as u64),
+                    Some(paged.root_hash),
+                    Some(paged.page_hashes),
                 ),
             )
         } else {
             let index_plain = crate::directory::encode_directory(&entries);
             let bytes = compression::compress_zstd_with_dict_level(&index_plain, None, zstd_level)?;
-            (bytes, (None, None, None, None))
+            (bytes, (None, None, None, None, None, None))
         };
-        // formatVersion 2: the object is magic + frames; `rootLength` keeps meaning the
+        // formatVersion 3: the object is magic + frames; `rootLength` keeps meaning the
         // root frame's at-rest length (a paged reader fetches
         // `bytes=0..(8+rootLength-1)`), so the DirectoryRef fields above need
         // no adjustment — only the object bytes gain the prelude.
@@ -1148,7 +1526,8 @@ impl PackWriter {
         let index_path = out_dir.join(&index_rel);
         write_atomic(&index_dir, &index_path, &index_bytes)?;
 
-        let (layout, root_length, page_count, page_entries_field) = directory_ref_fields;
+        let (layout, root_length, page_count, page_entries_field, root_hash, page_hashes) =
+            directory_ref_fields;
 
         // Publish the collected schema templates. The collector snapshot is
         // sorted by hash and deduped by construction, so the manifest bytes are
@@ -1165,15 +1544,57 @@ impl PackWriter {
                 .collect()
         };
 
+        let mut variants = vec![ManifestVariant {
+            id: crate::tile::RAW_VARIANT_ID,
+            kind: VariantKind::Raw,
+            layer_name: None,
+            method: None,
+            params: None,
+        }];
+        if let Some(summary) = &metadata.summary_tier {
+            if summary.variant_id == crate::tile::RAW_VARIANT_ID {
+                return Err(Error::Other(
+                    "summary_tier.variant_id must not reuse raw variant 0".into(),
+                ));
+            }
+            variants.push(ManifestVariant {
+                id: summary.variant_id,
+                kind: VariantKind::Summary,
+                layer_name: Some(summary.layer_name.clone()),
+                method: None,
+                params: None,
+            });
+        }
+        variants.sort_by_key(|variant| variant.id);
+        variants.dedup_by_key(|variant| variant.id);
+        for entry in &entries {
+            if !variants
+                .iter()
+                .any(|variant| variant.id == entry.variant_id)
+            {
+                return Err(Error::Other(format!(
+                    "tile variant {} is not declared by metadata/manifest",
+                    entry.variant_id
+                )));
+            }
+        }
+
         // Build + write the manifest.
         let manifest = Manifest {
             format: PACKED_FORMAT.to_string(),
             format_version: PACKED_FORMAT_VERSION,
             capabilities,
             schemas,
+            variants,
             compression: "zstd".to_string(),
-            // Record the concrete order actually laid down (never auto/measured).
+            // Record the concrete order actually laid down (never auto/measured)
+            // and, beside it, the workload model that order was chosen under.
+            // Both keys are omitted when nothing was simulated.
             blob_ordering: Some(ordering.as_str().to_string()),
+            // TB-10: empty unless an adaptive build set it, and skipped from the
+            // JSON when empty, so non-adaptive manifests are byte-unchanged.
+            adaptive_boundaries,
+            ordering_workload: resolved_workload,
             directory: DirectoryRef {
                 key: index_rel,
                 length: index_bytes.len() as u64,
@@ -1183,6 +1604,8 @@ impl PackWriter {
                 root_length,
                 page_count,
                 page_entries: page_entries_field,
+                root_hash,
+                page_hashes,
             },
             packs: pack_refs,
             metadata,
@@ -1198,12 +1621,26 @@ impl PackWriter {
 }
 
 /// Unwrap a directory object's at-rest encoding into raw codec bytes.
-/// `encoding` is the manifest's `directory.encoding`: absent = raw (every
-/// pre-encoding manifest), `"zstd"` = one zstd frame around the codec bytes.
-fn decode_directory_object(bytes: &[u8], encoding: Option<&str>) -> Result<Vec<u8>> {
+/// `encoding` is the manifest's `directory.encoding`: absent = raw,
+/// `"zstd"` = one zstd frame around the codec bytes.
+fn decode_directory_object(
+    bytes: &[u8],
+    encoding: Option<&str>,
+    max_output: usize,
+) -> Result<Vec<u8>> {
     match encoding {
-        None => Ok(bytes.to_vec()),
-        Some(DIRECTORY_ENCODING_ZSTD) => compression::decompress_zstd_with_dict(bytes, None),
+        None => {
+            if bytes.len() > max_output {
+                return Err(Error::InvalidArchive(format!(
+                    "directory is {} bytes, exceeding the {max_output}-byte limit derived from tileCount",
+                    bytes.len()
+                )));
+            }
+            Ok(bytes.to_vec())
+        }
+        Some(DIRECTORY_ENCODING_ZSTD) => {
+            compression::decompress_zstd_with_dict_bounded(bytes, None, max_output)
+        }
         Some(other) => Err(Error::InvalidArchive(format!(
             "unknown directory encoding {other:?} (this reader supports absent or \"zstd\")"
         ))),
@@ -1212,21 +1649,126 @@ fn decode_directory_object(bytes: &[u8], encoding: Option<&str>) -> Result<Vec<u
 
 /// Decode the full tile-entry list from a directory object's at-rest bytes,
 /// branching on the container layout. The single (whole-load) shape unwraps the
-/// at-rest encoding then runs the v5 codec; the paged shape decodes the root +
+/// at-rest encoding then runs the v6 codec; the paged shape decodes the root +
 /// every leaf (the local load-all path — a mmap'd file has no cold-start cost,
 /// so the paging *query* win lives in the TS HTTP reader). Used by the local
 /// `PackedReader` and `verify_packed_objects`.
-fn decode_directory_entries(bytes: &[u8], dref: &DirectoryRef) -> Result<Vec<TileEntry>> {
+fn decode_directory_entries(
+    bytes: &[u8],
+    dref: &DirectoryRef,
+    expected_entries: u64,
+) -> Result<Vec<TileEntry>> {
     if dref.is_paged() {
         let root_length = dref.root_length.ok_or_else(|| {
             Error::InvalidArchive("paged directory: manifest missing rootLength".into())
         })?;
         let zstd = dref.encoding.as_deref() == Some(DIRECTORY_ENCODING_ZSTD);
-        crate::directory_page::decode_paged_directory(bytes, root_length, zstd)
+        validate_paged_frame_hashes(bytes, dref, zstd)?;
+        crate::directory_page::decode_paged_directory_bounded(
+            bytes,
+            root_length,
+            zstd,
+            dref.page_count,
+        )
     } else {
-        let raw = decode_directory_object(bytes, dref.encoding.as_deref())?;
+        let entry_count = usize::try_from(expected_entries).map_err(|_| {
+            Error::InvalidArchive(format!(
+                "metadata tileCount {expected_entries} does not fit this platform"
+            ))
+        })?;
+        let max_output = crate::directory_page::DIRECTORY_FRAME_OVERHEAD
+            .checked_add(
+                entry_count
+                    .checked_mul(crate::directory_page::MAX_DECODED_BYTES_PER_ENTRY)
+                    .ok_or_else(|| {
+                        Error::InvalidArchive("directory decode limit overflows".into())
+                    })?,
+            )
+            .ok_or_else(|| Error::InvalidArchive("directory decode limit overflows".into()))?
+            .min(crate::directory_page::MAX_DECODED_DIRECTORY_BYTES);
+        let raw = decode_directory_object(bytes, dref.encoding.as_deref(), max_output)?;
         crate::directory::decode_directory(&raw)
     }
+}
+
+fn validate_paged_frame_hashes(bytes: &[u8], dref: &DirectoryRef, zstd: bool) -> Result<()> {
+    // Per-frame hashes are a v6 addition. A pre-v6 container never carried them,
+    // so demanding them turns "this archive predates the feature" into "this
+    // archive is corrupt". Skip only for those, and ONLY when they are genuinely
+    // absent: a v6 directory missing its hashes really is corrupt, and a pre-v6
+    // one that DOES carry them is still checked.
+    if dref.directory_version < crate::directory::DIRECTORY_VERSION
+        && dref.root_hash.is_none()
+        && dref.page_hashes.is_none()
+    {
+        return Ok(());
+    }
+    let root_hash = dref
+        .root_hash
+        .as_deref()
+        .ok_or_else(|| Error::InvalidArchive("paged directory missing rootHash".into()))?;
+    let page_hashes = dref
+        .page_hashes
+        .as_deref()
+        .ok_or_else(|| Error::InvalidArchive("paged directory missing pageHashes".into()))?;
+    let root_length = dref
+        .root_length
+        .ok_or_else(|| Error::InvalidArchive("paged directory missing rootLength".into()))?;
+    let root_len = usize::try_from(root_length)
+        .map_err(|_| Error::InvalidArchive("paged rootLength does not fit this platform".into()))?;
+    let root_frame = bytes
+        .get(..root_len)
+        .ok_or_else(|| Error::InvalidArchive("paged rootLength exceeds directory object".into()))?;
+    let actual_root = blake3_128_hex(root_frame);
+    if actual_root != root_hash {
+        return Err(Error::InvalidArchive(format!(
+            "paged directory root hash mismatch: bytes hash to {actual_root}, manifest declares {root_hash}"
+        )));
+    }
+
+    let page_count = dref
+        .page_count
+        .ok_or_else(|| Error::InvalidArchive("paged directory missing pageCount".into()))?;
+    let page_count_usize = usize::try_from(page_count)
+        .map_err(|_| Error::InvalidArchive("paged pageCount does not fit this platform".into()))?;
+    let root_limit = crate::directory_page::ROOT_HEADER_LEN
+        .checked_add(
+            page_count_usize
+                .checked_mul(crate::directory_page::DESCRIPTOR_LEN)
+                .ok_or_else(|| Error::InvalidArchive("paged root size overflows".into()))?,
+        )
+        .ok_or_else(|| Error::InvalidArchive("paged root size overflows".into()))?
+        .min(crate::directory_page::MAX_DECODED_DIRECTORY_BYTES);
+    let root_raw = crate::directory_page::unframe_bounded(root_frame, zstd, root_limit)?;
+    let root = crate::directory_page::decode_root(&root_raw)?;
+    for (index, (descriptor, expected_hash)) in
+        root.pages.iter().zip(page_hashes.iter()).enumerate()
+    {
+        let start = root_length
+            .checked_add(descriptor.rel_offset)
+            .ok_or_else(|| Error::InvalidArchive("paged leaf offset overflows".into()))?;
+        let end = start
+            .checked_add(descriptor.length as u64)
+            .ok_or_else(|| Error::InvalidArchive("paged leaf range overflows".into()))?;
+        let start = usize::try_from(start).map_err(|_| {
+            Error::InvalidArchive(format!(
+                "paged leaf {index} start does not fit this platform"
+            ))
+        })?;
+        let end = usize::try_from(end).map_err(|_| {
+            Error::InvalidArchive(format!("paged leaf {index} end does not fit this platform"))
+        })?;
+        let frame = bytes
+            .get(start..end)
+            .ok_or_else(|| Error::InvalidArchive(format!("paged leaf {index} is out of bounds")))?;
+        let actual = blake3_128_hex(frame);
+        if actual != *expected_hash {
+            return Err(Error::InvalidArchive(format!(
+                "paged directory leaf {index} hash mismatch: bytes hash to {actual}, manifest declares {expected_hash}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Write `bytes` to a temp file inside `dir` then atomically rename to
@@ -1264,6 +1806,116 @@ fn write_atomic(dir: &Path, final_path: &Path, bytes: &[u8]) -> Result<()> {
 /// golden/reproducibility tests). The open temp file is removed on drop
 /// (error paths); sealed packs are content-addressed, so re-writes after a
 /// failed run are idempotent.
+/// One blob as the WM-5 planner sees it: its POST-DEDUP COMPRESSED length in
+/// final layout order.
+///
+/// Using the post-dedup compressed length is the point — §6.5 gap 3 records
+/// that the build-path simulation drifted by pricing pre-dedup *uncompressed*
+/// bytes, which is not what the reader fetches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedBlob {
+    pub len: u64,
+}
+
+/// Knobs for [`plan_pack_cuts`] (WM-5).
+#[derive(Debug, Clone)]
+pub struct PackCutOptions {
+    /// Soft target pack size — the incumbent's capacity.
+    pub target_bytes: u64,
+    /// HARD per-object ceiling (Cloudflare's 512 MB), never exceeded except by
+    /// the unsplittable-blob exemption.
+    pub max_bytes: u64,
+    /// Bytes-equivalent price of one pack boundary: a cut costs at most one
+    /// extra request to any query that spans it, and P3 says price requests in
+    /// bytes. Defaults to one coalesce gap.
+    pub boundary_price_bytes: u64,
+}
+
+impl Default for PackCutOptions {
+    fn default() -> Self {
+        Self {
+            target_bytes: DEFAULT_PACK_TARGET_BYTES,
+            max_bytes: 512 * 1024 * 1024,
+            boundary_price_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
+/// WM-5 — plan pack cut positions by shortest path over candidate cuts.
+///
+/// Returns the indices to cut BEFORE, ascending. An empty plan reproduces
+/// next-fit exactly.
+///
+/// ⚠️ REGISTER: the next-fit cut is pinned as EXACTLY OPTIMAL *for its own cost
+/// model* (fewest segments under capacity), and this item does not touch that.
+/// What changes is the cost MODEL: the objective gains a workload term, and the
+/// solver for that different objective is this DP. Next-fit remains reachable
+/// and semantically intact as the no-plan path.
+///
+/// Cost of a segment = `boundary_price_bytes` (one boundary) + the segment's
+/// own bytes. Minimizing that over contiguous segments under the capacity
+/// constraint is a shortest path on a DAG; with the monotone edge cost here it
+/// is solved exactly by the O(m·C/ℓ_min) forward scan below.
+///
+/// Deterministic: integer arithmetic, no RNG, ties resolved toward the EARLIER
+/// cut so the plan is a pure function of the blob lengths.
+pub fn plan_pack_cuts(blobs: &[PlannedBlob], opts: &PackCutOptions) -> Vec<usize> {
+    let n = blobs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let cap = opts.max_bytes.max(1);
+    let target = opts.target_bytes.clamp(1, cap);
+
+    // best[i] = (cost of packing blobs[i..], index of the cut that achieves it)
+    let mut best_cost = vec![u128::MAX; n + 1];
+    let mut best_next = vec![n; n + 1];
+    best_cost[n] = 0;
+
+    for i in (0..n).rev() {
+        let mut run = 0u64;
+        let mut j = i;
+        while j < n {
+            let blen = blobs[j].len;
+            // The unsplittable-blob exemption: a lone blob larger than the cap
+            // still owns a pack rather than being dropped.
+            if run > 0 && run.saturating_add(blen) > cap {
+                break;
+            }
+            run = run.saturating_add(blen);
+            j += 1;
+            // A segment past the soft target buys nothing, so stop extending —
+            // this is what bounds the scan to O(C/ℓ_min) per start.
+            let seg_cost = u128::from(opts.boundary_price_bytes) + u128::from(run);
+            if best_cost[j] != u128::MAX {
+                let total = seg_cost.saturating_add(best_cost[j]);
+                if total < best_cost[i] {
+                    best_cost[i] = total;
+                    best_next[i] = j;
+                }
+            }
+            if run >= target {
+                break;
+            }
+        }
+        // Safety net: a start that could not reach any priced suffix takes the
+        // singleton, which is always legal.
+        if best_cost[i] == u128::MAX {
+            let j = (i + 1).min(n);
+            best_cost[i] = u128::from(opts.boundary_price_bytes) + u128::from(blobs[i].len);
+            best_next[i] = j;
+        }
+    }
+
+    let mut cuts = Vec::new();
+    let mut i = best_next[0];
+    while i < n {
+        cuts.push(i);
+        i = best_next[i];
+    }
+    cuts
+}
+
 struct PackStreamWriter {
     out_dir: PathBuf,
     packs_dir: PathBuf,
@@ -1274,6 +1926,12 @@ struct PackStreamWriter {
     current: Option<OpenPack>,
     next_pack_id: u32,
     refs: Vec<PackRef>,
+    /// WM-5: planned cut positions (cut BEFORE blob `i`), ascending. Empty =
+    /// pure next-fit, which is the default and the documented rollback.
+    cut_plan: Vec<usize>,
+    /// Count of UNIQUE blobs appended so far — the index `cut_plan` refers to.
+    /// Deduped blobs never reach `append`, so this is the layout position.
+    appended_unique: usize,
 }
 
 /// The in-progress pack object: temp file + incremental hash + length so far.
@@ -1302,6 +1960,8 @@ impl PackStreamWriter {
             current: None,
             next_pack_id: 0,
             refs: Vec::new(),
+            cut_plan: Vec::new(),
+            appended_unique: 0,
         }
     }
 
@@ -1312,8 +1972,16 @@ impl PackStreamWriter {
     /// rule, unchanged).
     fn append(&mut self, compressed: &[u8]) -> Result<(u32, u64)> {
         let blen = compressed.len() as u64;
+        let idx = self.appended_unique;
+        self.appended_unique += 1;
+        // WM-5: an explicit plan cuts here; otherwise next-fit decides.
+        let planned_cut = self.cut_plan.binary_search(&idx).is_ok();
         if let Some(cur) = &self.current {
-            if cur.len > self.data_start && cur.len + blen > self.pack_target_bytes {
+            let nonempty = cur.len > self.data_start;
+            // Next-fit is retained VERBATIM as both the no-plan path and the
+            // safety net: a planned cut may never leave an overfull pack, and
+            // if a plan somehow would, next-fit still seals.
+            if nonempty && (planned_cut || cur.len + blen > self.pack_target_bytes) {
                 self.seal()?;
             }
         }
@@ -1409,6 +2077,12 @@ pub fn verify_packed_objects<P: AsRef<Path>>(manifest_path: P) -> Result<Vec<Str
     let manifest = Manifest::from_json_bytes(&fs::read(manifest_path)?)?;
 
     let mut issues = Vec::new();
+    if let Err(error) = manifest_open_checks(&manifest) {
+        issues.push(error.to_string());
+        // Object keys are untrusted until the semantic checks pass. Do not
+        // resolve even one referenced path for a malformed manifest.
+        return Ok(issues);
+    }
 
     if manifest.format != PACKED_FORMAT {
         issues.push(format!(
@@ -1416,13 +2090,16 @@ pub fn verify_packed_objects<P: AsRef<Path>>(manifest_path: P) -> Result<Vec<Str
             manifest.format
         ));
     }
-    if manifest.format_version != PACKED_FORMAT_VERSION {
+    if !(MIN_PACKED_FORMAT_VERSION..=PACKED_FORMAT_VERSION).contains(&manifest.format_version) {
         issues.push(format!(
-            "manifest formatVersion is {}, expected {PACKED_FORMAT_VERSION}",
+            "manifest formatVersion is {}, expected \
+             {MIN_PACKED_FORMAT_VERSION}..={PACKED_FORMAT_VERSION}",
             manifest.format_version
         ));
     }
-    if manifest.directory.directory_version != crate::directory::DIRECTORY_VERSION {
+    if !(crate::directory::MIN_DIRECTORY_VERSION..=crate::directory::DIRECTORY_VERSION)
+        .contains(&manifest.directory.directory_version)
+    {
         issues.push(format!(
             "directoryVersion is {}, expected {}",
             manifest.directory.directory_version,
@@ -1433,7 +2110,7 @@ pub fn verify_packed_objects<P: AsRef<Path>>(manifest_path: P) -> Result<Vec<Str
 
     // Each content-addressed object: name must equal blake3-128 of its bytes,
     // and on-disk length must equal the declared length. Content addresses
-    // cover the ENTIRE object — magic prelude included on formatVersion 2 — so this check
+    // cover the ENTIRE object — magic prelude included on formatVersion 3 — so this check
     // is version-independent; the magic itself is validated separately below.
     fn check_object(
         root: &Path,
@@ -1489,15 +2166,15 @@ pub fn verify_packed_objects<P: AsRef<Path>>(manifest_path: P) -> Result<Vec<Str
 
     // Directory must decode (through its magic prelude, at-rest encoding +
     // container layout) and reference only packs that exist. Under
-    // formatVersion 2, the
+    // formatVersion 3, the
     // decoded entries additionally drive the frame → manifest.schemas
     // reference check (a dataset whose frames reference a missing template
     // is undecodable and must not verify clean).
     match fs::read(root.join(&manifest.directory.key)) {
         Ok(dir_bytes) => {
-            match directory_codec_bytes(&dir_bytes, manifest.format_version)
-                .and_then(|codec| decode_directory_entries(codec, &manifest.directory))
-            {
+            match directory_codec_bytes(&dir_bytes, manifest.format_version).and_then(|codec| {
+                decode_directory_entries(codec, &manifest.directory, manifest.metadata.tile_count)
+            }) {
                 Ok(entries) => {
                     if let Some(max_pid) = entries.iter().map(|e| e.pack_id).max() {
                         if max_pid as usize >= manifest.packs.len() {
@@ -1592,7 +2269,7 @@ fn verify_v2_frame_template_refs<F>(
 ) where
     F: FnMut(usize) -> Option<Vec<u8>>,
 {
-    if manifest.format_version != PACKED_FORMAT_VERSION {
+    if !(MIN_PACKED_FORMAT_VERSION..=PACKED_FORMAT_VERSION).contains(&manifest.format_version) {
         return;
     }
     // Unparseable hex entries simply can't match any frame reference; their
@@ -1652,7 +2329,7 @@ fn verify_v2_frame_template_refs<F>(
         };
         if !crate::arrow_tile::is_frame_v2(&payload) {
             issues.push(format!(
-                "tile {:?}: v1 layer frame inside a formatVersion-2 dataset",
+                "tile {:?}: v1 layer frame inside a formatVersion-3 dataset",
                 e.tile_id()
             ));
             continue;
@@ -1700,7 +2377,7 @@ struct LoadedPack {
 /// job; this opens objects from the filesystem.
 ///
 /// Mirrors `ArchiveReader`: [`entries`](Self::entries) returns
-/// the decoded v5 directory, [`metadata`](Self::metadata) the folded metadata,
+/// the decoded v6 directory, [`metadata`](Self::metadata) the folded metadata,
 /// and [`read_payload`](Self::read_payload) selects the entry's pack, slices
 /// `[offset..offset+length]`, verifies CRC32C and decompresses the per-blob
 /// zstd. Packs are mmap'd lazily by `pack_id`.
@@ -1710,14 +2387,10 @@ pub struct PackedReader {
     compression: Compression,
     packs: Vec<std::cell::RefCell<LoadedPack>>,
     capabilities: Vec<String>,
-    /// The manifest's authoritative `formatVersion` (1 | 2). Decides object
-    /// magic expectations and which layer-frame shape
-    /// [`read_layers`](Self::read_layers) accepts — mixed-version datasets
-    /// are hard errors both ways.
+    /// The manifest's authoritative packed `formatVersion` (3).
     format_version: u32,
-    /// formatVersion-2 only: the hash-validated schema-template registry
-    /// decoded from `manifest.schemas` at open. `None` on formatVersion-1
-    /// datasets.
+    /// The hash-validated schema-template registry decoded from
+    /// `manifest.schemas` at open.
     templates: Option<TemplateRegistry>,
     /// `Some` iff this reader was opened via
     /// [`open_bundle`](Self::open_bundle): the whole `.sttb` is one mapping
@@ -1740,6 +2413,266 @@ struct BundleBacking {
 /// [`PackedReader::open_bundle`]: format tag, `formatVersion`, the
 /// required-to-understand capability registry, and the compression codec.
 /// Returns the decoded compression so both open paths stay in lockstep.
+fn is_lower_blake3_128(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn validate_object_key(key: &str, directory: &str, extension: &str) -> Result<()> {
+    let mut parts = key.split('/');
+    let prefix = parts.next();
+    let file = parts.next();
+    if prefix != Some(directory) || parts.next().is_some() {
+        return Err(Error::InvalidArchive(format!(
+            "unsafe object key {key:?}: expected {directory}/<32-lowercase-hex>.{extension}"
+        )));
+    }
+    let Some(file) = file else {
+        return Err(Error::InvalidArchive(format!("unsafe object key {key:?}")));
+    };
+    let suffix = format!(".{extension}");
+    let Some(hash) = file.strip_suffix(&suffix) else {
+        return Err(Error::InvalidArchive(format!(
+            "unsafe object key {key:?}: expected .{extension} suffix"
+        )));
+    };
+    if !is_lower_blake3_128(hash) {
+        return Err(Error::InvalidArchive(format!(
+            "unsafe object key {key:?}: content address must be 32 lowercase hex characters"
+        )));
+    }
+    Ok(())
+}
+
+/// The variant registry to validate a manifest's tiles against.
+///
+/// A pre-v3 manifest carries no `variants` key at all, because the variant axis
+/// did not exist when it was written — which means every payload in such an
+/// archive is raw, and its directory decodes every entry to
+/// [`crate::tile::RAW_VARIANT_ID`]. So the absent registry is not missing
+/// information; it is the IMPLICIT raw-only registry, and this returns it
+/// rather than mutating the parsed manifest (parse stays a faithful record of
+/// the bytes on disk).
+///
+/// A v3 manifest is returned borrowed and unchanged — `variants` is required
+/// there, and an empty one stays the hard error it should be.
+fn effective_variants(manifest: &Manifest) -> std::borrow::Cow<'_, [ManifestVariant]> {
+    if manifest.format_version >= PACKED_FORMAT_VERSION || !manifest.variants.is_empty() {
+        return std::borrow::Cow::Borrowed(&manifest.variants);
+    }
+    let mut implied = vec![ManifestVariant {
+        id: crate::tile::RAW_VARIANT_ID,
+        kind: VariantKind::Raw,
+        layer_name: None,
+        method: None,
+        params: None,
+    }];
+    // A legacy summary tier named its variant in `metadata.summary_tier` — the
+    // only place it could — so honour that too, or every summary tile in the
+    // archive would read as an undeclared variant.
+    if let Some(summary) = &manifest.metadata.summary_tier {
+        if summary.variant_id != crate::tile::RAW_VARIANT_ID {
+            implied.push(ManifestVariant {
+                id: summary.variant_id,
+                kind: VariantKind::Summary,
+                layer_name: None,
+                method: None,
+                params: None,
+            });
+        }
+    }
+    std::borrow::Cow::Owned(implied)
+}
+
+/// Semantic checks that JSON Schema alone cannot express and that every open
+/// path must run before resolving any referenced object.
+fn validate_manifest_semantics(manifest: &Manifest) -> Result<()> {
+    let variants = effective_variants(manifest);
+    if variants.is_empty() {
+        return Err(Error::InvalidArchive(
+            "manifest variants must contain at least the raw variant".into(),
+        ));
+    }
+    let mut variant_ids = HashSet::with_capacity(variants.len());
+    for variant in variants.iter() {
+        if !variant_ids.insert(variant.id) {
+            return Err(Error::InvalidArchive(format!(
+                "manifest variant id {} is duplicated",
+                variant.id
+            )));
+        }
+    }
+    if !variants.iter().any(|variant| {
+        variant.id == crate::tile::RAW_VARIANT_ID && variant.kind == VariantKind::Raw
+    }) {
+        return Err(Error::InvalidArchive(
+            "manifest variant 0 must be declared with kind raw".into(),
+        ));
+    }
+    if let Some(summary) = &manifest.metadata.summary_tier {
+        if !variants
+            .iter()
+            .any(|variant| variant.id == summary.variant_id && variant.kind == VariantKind::Summary)
+        {
+            return Err(Error::InvalidArchive(format!(
+                "metadata summary_tier variant {} is not declared as kind summary",
+                summary.variant_id
+            )));
+        }
+    }
+    // The directory codec is COUPLED to the manifest version, not independently
+    // ranged. A current archive must carry the current codec — a v3 manifest
+    // claiming directory v4 is drift, not history, and stays a hard error. Only
+    // a genuinely legacy manifest may carry a legacy codec.
+    let expected_directory = if manifest.format_version >= PACKED_FORMAT_VERSION {
+        crate::directory::DIRECTORY_VERSION..=crate::directory::DIRECTORY_VERSION
+    } else {
+        crate::directory::MIN_DIRECTORY_VERSION..=crate::directory::DIRECTORY_VERSION
+    };
+    if !expected_directory.contains(&manifest.directory.directory_version) {
+        return Err(Error::InvalidArchive(format!(
+            "directoryVersion is {}, expected {}..={} for formatVersion {}",
+            manifest.directory.directory_version,
+            expected_directory.start(),
+            expected_directory.end(),
+            manifest.format_version
+        )));
+    }
+    validate_object_key(&manifest.directory.key, "index", "sttd")?;
+    if manifest.directory.length <= OBJECT_MAGIC_LEN as u64 {
+        return Err(Error::InvalidArchive(format!(
+            "directory {:?} length {} cannot contain magic plus a codec frame",
+            manifest.directory.key, manifest.directory.length
+        )));
+    }
+    match manifest.directory.encoding.as_deref() {
+        None | Some(DIRECTORY_ENCODING_ZSTD) => {}
+        Some(other) => {
+            return Err(Error::InvalidArchive(format!(
+                "unknown directory encoding {other:?}"
+            )))
+        }
+    }
+
+    match manifest.directory.layout.as_deref() {
+        None | Some(DIRECTORY_LAYOUT_SINGLE) => {
+            if manifest.directory.root_length.is_some()
+                || manifest.directory.page_count.is_some()
+                || manifest.directory.page_entries.is_some()
+                || manifest.directory.root_hash.is_some()
+                || manifest.directory.page_hashes.is_some()
+            {
+                return Err(Error::InvalidArchive(
+                    "single directory must not declare paged-only fields".into(),
+                ));
+            }
+        }
+        Some(DIRECTORY_LAYOUT_PAGED) => {
+            let root_length = manifest.directory.root_length.ok_or_else(|| {
+                Error::InvalidArchive("paged directory is missing rootLength".into())
+            })?;
+            let page_count = manifest.directory.page_count.ok_or_else(|| {
+                Error::InvalidArchive("paged directory is missing pageCount".into())
+            })?;
+            let page_entries = manifest.directory.page_entries.ok_or_else(|| {
+                Error::InvalidArchive("paged directory is missing pageEntries".into())
+            })?;
+            if root_length == 0
+                || root_length
+                    > manifest
+                        .directory
+                        .length
+                        .saturating_sub(OBJECT_MAGIC_LEN as u64)
+            {
+                return Err(Error::InvalidArchive(format!(
+                    "paged rootLength {root_length} is outside the directory payload"
+                )));
+            }
+            if page_count == 0 || page_entries == 0 {
+                return Err(Error::InvalidArchive(
+                    "paged pageCount and pageEntries must both be greater than zero".into(),
+                ));
+            }
+            // Per-frame hashes arrived with directory v6. A pre-v6 container never
+            // wrote them, so requiring them would report "corrupt" for an archive
+            // that is merely older. Everything else about the paged shape above —
+            // rootLength, pageCount, pageEntries and their bounds — is still
+            // enforced, and a v6 directory missing its hashes remains an error.
+            let legacy_unhashed = manifest.directory.directory_version
+                < crate::directory::DIRECTORY_VERSION
+                && manifest.directory.root_hash.is_none()
+                && manifest.directory.page_hashes.is_none();
+            if legacy_unhashed {
+                return Ok(());
+            }
+            let root_hash = manifest.directory.root_hash.as_deref().ok_or_else(|| {
+                Error::InvalidArchive("paged directory is missing rootHash".into())
+            })?;
+            let page_hashes = manifest.directory.page_hashes.as_deref().ok_or_else(|| {
+                Error::InvalidArchive("paged directory is missing pageHashes".into())
+            })?;
+            if !is_lower_blake3_128(root_hash) {
+                return Err(Error::InvalidArchive(
+                    "directory rootHash must be 32 lowercase hex characters".into(),
+                ));
+            }
+            if page_hashes.len() as u64 != page_count {
+                return Err(Error::InvalidArchive(format!(
+                    "directory pageHashes has {} values, pageCount is {page_count}",
+                    page_hashes.len()
+                )));
+            }
+            if page_hashes.iter().any(|h| !is_lower_blake3_128(h)) {
+                return Err(Error::InvalidArchive(
+                    "every directory pageHashes value must be 32 lowercase hex characters".into(),
+                ));
+            }
+        }
+        Some(other) => {
+            return Err(Error::InvalidArchive(format!(
+                "unknown directory layout {other:?}"
+            )))
+        }
+    }
+
+    if manifest.packs.is_empty() {
+        return Err(Error::InvalidArchive(
+            "packed manifest must contain at least one pack".into(),
+        ));
+    }
+    let mut keys = HashSet::with_capacity(manifest.packs.len() + 1);
+    keys.insert(manifest.directory.key.as_str());
+    for pack in &manifest.packs {
+        validate_object_key(&pack.key, "packs", "sttp")?;
+        if pack.length < OBJECT_MAGIC_LEN as u64 {
+            return Err(Error::InvalidArchive(format!(
+                "pack {:?} length {} is smaller than its object magic",
+                pack.key, pack.length
+            )));
+        }
+        if !keys.insert(pack.key.as_str()) {
+            return Err(Error::InvalidArchive(format!(
+                "manifest object key {:?} is duplicated",
+                pack.key
+            )));
+        }
+    }
+
+    let mut capabilities = HashSet::with_capacity(manifest.capabilities.len());
+    if let Some(duplicate) = manifest
+        .capabilities
+        .iter()
+        .find(|capability| !capabilities.insert(capability.as_str()))
+    {
+        return Err(Error::InvalidArchive(format!(
+            "manifest capability {duplicate:?} is duplicated"
+        )));
+    }
+    Ok(())
+}
+
 fn manifest_open_checks(manifest: &Manifest) -> Result<Compression> {
     if manifest.format != PACKED_FORMAT {
         return Err(Error::InvalidArchive(format!(
@@ -1751,15 +2684,20 @@ fn manifest_open_checks(manifest: &Manifest) -> Result<Compression> {
     // misdecode downstream (the directory codec has its own version byte;
     // this guards the manifest schema itself). `formatVersion` is the
     // AUTHORITATIVE discriminator — the layer-frame escape is only
-    // defense-in-depth. A formatVersion-1 (0.3.x) archive lands here too: this
-    // toolchain cannot read it, so it is a hard error rather than a silent
-    // misdecode.
-    if manifest.format_version != PACKED_FORMAT_VERSION {
+    // defense-in-depth.
+    //
+    // The accepted range bottoms out at [`MIN_PACKED_FORMAT_VERSION`]: v2 is a
+    // CONTAINER-only difference (no `variants` registry, directory codec v5) and
+    // its payloads share this toolchain's layer-frame version, so reading it
+    // forks nothing below the container. Writers remain v3-only.
+    if !(MIN_PACKED_FORMAT_VERSION..=PACKED_FORMAT_VERSION).contains(&manifest.format_version) {
         return Err(Error::InvalidArchive(format!(
-            "unsupported packed formatVersion {} (this reader supports {PACKED_FORMAT_VERSION})",
+            "unsupported packed formatVersion {} (this reader supports \
+             {MIN_PACKED_FORMAT_VERSION}..={PACKED_FORMAT_VERSION})",
             manifest.format_version
         )));
     }
+    validate_manifest_semantics(manifest)?;
     // Required-to-understand capabilities (spec §3.1): each one re-types
     // EXISTING columns, so a reader that lacks it wouldn't fail later — it
     // would silently misdecode, per tile. Refuse loudly at open instead.
@@ -1786,6 +2724,56 @@ fn manifest_open_checks(manifest: &Manifest) -> Result<Compression> {
     }
 }
 
+fn validate_decoded_entries(manifest: &Manifest, entries: &[TileEntry]) -> Result<()> {
+    if entries.len() as u64 != manifest.metadata.tile_count {
+        return Err(Error::InvalidArchive(format!(
+            "directory decoded {} entries, metadata.tileCount declares {}",
+            entries.len(),
+            manifest.metadata.tile_count
+        )));
+    }
+    let variants = effective_variants(manifest);
+    for entry in entries {
+        if !variants
+            .iter()
+            .any(|variant| variant.id == entry.variant_id)
+        {
+            return Err(Error::InvalidArchive(format!(
+                "tile {:?} references undeclared variant {}",
+                entry.tile_id(),
+                entry.variant_id
+            )));
+        }
+        let pack = manifest.packs.get(entry.pack_id as usize).ok_or_else(|| {
+            Error::InvalidArchive(format!(
+                "tile {:?} references pack {} but the manifest contains {} pack(s)",
+                entry.tile_id(),
+                entry.pack_id,
+                manifest.packs.len()
+            ))
+        })?;
+        let end = entry
+            .offset
+            .checked_add(entry.length as u64)
+            .ok_or_else(|| {
+                Error::InvalidArchive(format!(
+                    "tile {:?}: blob offset+length overflows",
+                    entry.tile_id()
+                ))
+            })?;
+        if entry.offset < OBJECT_MAGIC_LEN as u64 || end > pack.length {
+            return Err(Error::InvalidArchive(format!(
+                "tile {:?} blob range {}..{end} is outside declared pack {:?} length {}",
+                entry.tile_id(),
+                entry.offset,
+                pack.key,
+                pack.length
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl PackedReader {
     /// Open a packed dataset by its `manifest.json` path. The directory and pack
     /// objects are resolved relative to the manifest's parent directory.
@@ -1799,7 +2787,7 @@ impl PackedReader {
         let manifest_bytes = fs::read(manifest_path)?;
         let manifest = Manifest::from_json_bytes(&manifest_bytes)?;
         let compression = manifest_open_checks(&manifest)?;
-        // formatVersion 2: decode + hash-validate the manifest-embedded schema templates
+        // formatVersion 3: decode + hash-validate the manifest-embedded schema templates
         // into the registry every tile decode resolves against. Fails the
         // whole open (dataset-level) on any corrupt entry.
         // `manifest_open_checks` above already refused anything that is not
@@ -1808,13 +2796,26 @@ impl PackedReader {
 
         // Load + decode the directory object (validating + stripping its
         // object magic prelude first). The single (whole-load) shape unwraps the
-        // at-rest encoding then runs the v5 codec; the paged shape decodes the
+        // at-rest encoding then runs the v6 codec; the paged shape decodes the
         // root + every leaf (local load-all — a mmap'd file has no cold-start
         // cost). Both branches return the same full entry list.
         let dir_path = root.join(&manifest.directory.key);
         let dir_bytes = fs::read(&dir_path)?;
+        if dir_bytes.len() as u64 != manifest.directory.length {
+            return Err(Error::InvalidArchive(format!(
+                "directory {} is {} bytes, manifest declared {}",
+                dir_path.display(),
+                dir_bytes.len(),
+                manifest.directory.length
+            )));
+        }
         let codec_bytes = directory_codec_bytes(&dir_bytes, manifest.format_version)?;
-        let entries = decode_directory_entries(codec_bytes, &manifest.directory)?;
+        let entries = decode_directory_entries(
+            codec_bytes,
+            &manifest.directory,
+            manifest.metadata.tile_count,
+        )?;
+        validate_decoded_entries(&manifest, &entries)?;
 
         // Prepare (lazy) pack handles in pack_id order.
         let packs = manifest
@@ -1897,7 +2898,7 @@ impl PackedReader {
             Ok((offset, length))
         };
 
-        // formatVersion 2: registry from the embedded manifest, then per-object magic
+        // formatVersion 3: registry from the embedded manifest, then per-object magic
         // validation on every window before anything decodes through it.
         // `manifest_open_checks` above already refused anything that is not
         // PACKED_FORMAT_VERSION, so the registry is unconditional here.
@@ -1910,7 +2911,12 @@ impl PackedReader {
         )?;
         let dir_object = &mmap[dir_off as usize..(dir_off + dir_len) as usize];
         let codec_bytes = directory_codec_bytes(dir_object, manifest.format_version)?;
-        let entries = decode_directory_entries(codec_bytes, &manifest.directory)?;
+        let entries = decode_directory_entries(
+            codec_bytes,
+            &manifest.directory,
+            manifest.metadata.tile_count,
+        )?;
+        validate_decoded_entries(&manifest, &entries)?;
         let windows = manifest
             .packs
             .iter()
@@ -2062,8 +3068,20 @@ impl PackedReader {
         }
 
         let payload = if self.compression == Compression::Zstd {
-            compression::decompress_zstd_with_dict(compressed, None)?
+            compression::decompress_zstd_with_dict_bounded(
+                compressed,
+                None,
+                entry.uncompressed_size as usize,
+            )?
         } else {
+            if compressed.len() != entry.uncompressed_size as usize {
+                return Err(Error::InvalidArchive(format!(
+                    "tile {:?} uncompressed blob is {} bytes, expected {}",
+                    entry.tile_id(),
+                    compressed.len(),
+                    entry.uncompressed_size
+                )));
+            }
             compression::decompress(compressed, self.compression)?
         };
 
@@ -2092,7 +3110,7 @@ impl PackedReader {
     pub fn decode_payload(&self, payload: &[u8]) -> Result<Vec<crate::arrow_tile::DecodedLayer>> {
         if !crate::arrow_tile::is_frame_v2(payload) {
             return Err(Error::InvalidArchive(
-                "pre-v2 layer frame inside a formatVersion-2 dataset (the manifest is \
+                "pre-v2 layer frame inside a formatVersion-3 dataset (the manifest is \
                  authoritative; mixed-version datasets are invalid)"
                     .into(),
             ));
@@ -2110,8 +3128,8 @@ impl PackedReader {
         self.format_version
     }
 
-    /// The schema-template registry decoded from `manifest.schemas` (`None` on
-    /// formatVersion-1 datasets). Exposed so tools that fetch payloads through
+    /// The schema-template registry decoded from `manifest.schemas`. Exposed
+    /// so tools that fetch payloads through
     /// [`read_payload`](Self::read_payload) can decode them out-of-band via
     /// [`crate::arrow_tile::decode_tile_with_templates`].
     pub fn templates(&self) -> Option<&TemplateRegistry> {
@@ -2158,14 +3176,18 @@ mod tests {
 
     /// Distinct-payload tile so each blob is unique (forces many packs at a tiny
     /// target). `seed` perturbs the feature ids so compressed bytes differ.
-    fn distinct_tile(seed: u64) -> Vec<u8> {
+    pub(super) fn distinct_tile(seed: u64) -> Vec<u8> {
         let ids: Vec<u64> = (0..6).map(|i| seed * 100 + i).collect();
         encode_tile(&[point_layer("default", ids, (seed as i64) * 7)]).unwrap()
     }
 
     /// Plain writer for the tests whose payloads are bare `encode_tile` frames
     /// (or opaque bytes) rather than a full template-collecting build.
-    fn test_writer(out: &Path, ordering: BlobOrdering, pack_target_bytes: u64) -> PackWriter {
+    pub(super) fn test_writer(
+        out: &Path,
+        ordering: BlobOrdering,
+        pack_target_bytes: u64,
+    ) -> PackWriter {
         PackWriter::create(out, ordering, pack_target_bytes).unwrap()
     }
 
@@ -2183,17 +3205,28 @@ mod tests {
             format_version: PACKED_FORMAT_VERSION,
             capabilities: Vec::new(),
             schemas: Vec::new(),
+            variants: vec![ManifestVariant {
+                id: crate::tile::RAW_VARIANT_ID,
+                kind: VariantKind::Raw,
+                layer_name: None,
+                method: None,
+                params: None,
+            }],
             compression: "zstd".to_string(),
             blob_ordering: None,
+            adaptive_boundaries: Vec::new(),
+            ordering_workload: None,
             directory: DirectoryRef {
                 key: "index/abc.sttd".to_string(),
                 length: 42,
-                directory_version: 5,
+                directory_version: crate::directory::DIRECTORY_VERSION,
                 encoding: Some(DIRECTORY_ENCODING_ZSTD.to_string()),
                 layout: None,
                 root_length: None,
                 page_count: None,
                 page_entries: None,
+                root_hash: None,
+                page_hashes: None,
             },
             packs: vec![
                 PackRef {
@@ -2222,13 +3255,14 @@ mod tests {
         assert_eq!(back.format, m.format);
         assert_eq!(back.format_version, m.format_version);
         assert_eq!(back.packs.len(), 2);
-        assert_eq!(back.directory.directory_version, 5);
+        assert_eq!(
+            back.directory.directory_version,
+            crate::directory::DIRECTORY_VERSION
+        );
         assert_eq!(back.directory.encoding.as_deref(), Some("zstd"));
         assert_eq!(back.metadata.name, "manifest-test");
 
-        // Backward compat: a pre-encoding manifest (no `encoding` key — the
-        // shape of every deployed dataset) must parse with `encoding: None`,
-        // and a None encoding must serialize without the key.
+        // A raw directory omits the encoding key.
         let mut legacy_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         legacy_json["directory"]
             .as_object_mut()
@@ -2237,8 +3271,7 @@ mod tests {
         let legacy_back =
             Manifest::from_json_bytes(&serde_json::to_vec(&legacy_json).unwrap()).unwrap();
         assert_eq!(legacy_back.directory.encoding, None);
-        // A pre-capabilities manifest (no `capabilities` key — the shape of
-        // every deployed dataset) parses to an empty list.
+        // An omitted capabilities key remains the canonical empty list.
         assert!(legacy_back.capabilities.is_empty());
         let legacy_out = String::from_utf8(legacy_back.to_json_bytes().unwrap()).unwrap();
         assert!(!legacy_out.contains("\"encoding\""), "{legacy_out}");
@@ -2420,6 +3453,164 @@ mod tests {
         ));
     }
 
+    /// Below the simulation floor there is nothing to measure — the canonical
+    /// band collapses to one or two cells and the ranking is decided by
+    /// rounding — so `measured` degrades to `auto`'s cardinality heuristic and
+    /// records NO workload (there was no simulation to co-version).
+    #[test]
+    fn measured_below_the_simulation_floor_falls_back_to_auto() {
+        let bucket = 3_600_000i64;
+        // Same input built twice: once via `measured` (which must give up), once
+        // via `auto` outright. Six tiles — under MIN_TILES_TO_SIMULATE = 8.
+        let build = |out: &Path, measured: bool| {
+            let mut w =
+                test_writer(out, BlobOrdering::Auto, 1 << 20).with_measured_ordering(measured);
+            for b in 0..6i64 {
+                let t = b * bucket;
+                let id = TileId::new(9, 100, 200 + b as u32, t as u64);
+                let payload = distinct_tile(b as u64);
+                w.add_tile_full(&id, t, t + bucket - 1, Some(t), 1, None, &payload)
+                    .unwrap();
+            }
+            let meta = Metadata::new("floor")
+                .with_temporal_bucket_ms(bucket as u64)
+                .with_zoom_levels(0, 9);
+            w.finalize(&meta).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let measured = build(&dir.path().join("m"), true);
+        let auto = build(&dir.path().join("a"), false);
+        assert!(crate::ordering_sim::MIN_TILES_TO_SIMULATE > 6);
+        assert_eq!(
+            measured.blob_ordering, auto.blob_ordering,
+            "below the floor, measured must resolve to auto's choice"
+        );
+        assert_eq!(
+            measured.metadata.ordering_workload, None,
+            "a fallback pick has no workload to record"
+        );
+        // The whole manifest is byte-identical, so the fallback really is the
+        // incumbent path and not a look-alike.
+        assert_eq!(
+            measured.to_json_bytes().unwrap(),
+            auto.to_json_bytes().unwrap()
+        );
+    }
+
+    /// The workload block is written ONLY by a simulated ordering, so every
+    /// `auto`/explicit build — which is every golden fixture and every archive
+    /// in the published fleet — emits byte-identical manifest JSON to a build
+    /// that predates the field.
+    #[test]
+    fn ordering_workload_is_omitted_unless_the_ordering_was_simulated() {
+        let bucket = 3_600_000i64;
+        let build = |out: &Path, ordering: BlobOrdering, measured: bool| {
+            let mut w = test_writer(out, ordering, 1 << 20).with_measured_ordering(measured);
+            for x in 0..3u32 {
+                for b in 0..8i64 {
+                    let t = b * bucket;
+                    let id = TileId::new(10, 700 + x, 800, t as u64);
+                    let payload = distinct_tile(u64::from(x) * 100 + b as u64);
+                    w.add_tile_full(&id, t, t + bucket - 1, Some(t), 1, None, &payload)
+                        .unwrap();
+                }
+            }
+            let meta = Metadata::new("omit")
+                .with_temporal_bucket_ms(bucket as u64)
+                .with_zoom_levels(0, 10);
+            w.finalize(&meta).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        for (name, ordering) in [
+            ("auto", BlobOrdering::Auto),
+            ("spatial", BlobOrdering::SpatialMajor),
+            ("time-major", BlobOrdering::TimeMajor),
+            ("hilbert3", BlobOrdering::Hilbert3),
+        ] {
+            let m = build(&dir.path().join(name), ordering, false);
+            assert_eq!(m.metadata.ordering_workload, None, "{name}");
+            let json = String::from_utf8(m.to_json_bytes().unwrap()).unwrap();
+            assert!(
+                !json.contains("orderingWorkload"),
+                "{name} emitted the key: {json}"
+            );
+        }
+        // ...and a measured build DOES record it, at BOTH pinned keys.
+        let m = build(&dir.path().join("measured"), BlobOrdering::Auto, true);
+        let w = m
+            .ordering_workload
+            .expect("measured records a workload top-level");
+        assert_eq!(
+            m.metadata.ordering_workload,
+            Some(w),
+            "the metadata mirror must carry the identical object"
+        );
+        assert_eq!(
+            w.coalesce_gap_bytes,
+            crate::ordering_sim::DEFAULT_COALESCE_GAP_BYTES
+        );
+        assert_eq!(
+            w.runway_multiplier,
+            crate::ordering_sim::DEFAULT_RUNWAY_MULTIPLIER
+        );
+        // Top-level key is camelCase (`orderingWorkload`, beside `blobOrdering`);
+        // the mirror inside the folded `metadata` block is snake_case like every
+        // other key there. The OBJECT's own keys are snake_case in both places,
+        // so the two copies are byte-identical JSON.
+        let json = String::from_utf8(m.to_json_bytes().unwrap()).unwrap();
+        assert!(json.contains("\"orderingWorkload\""), "{json}");
+        assert!(json.contains("\"ordering_workload\""), "{json}");
+        assert!(json.contains("\"coalesce_gap_bytes\""), "{json}");
+        assert!(json.contains("\"playback_window_buckets\""), "{json}");
+        assert!(json.contains("\"runway_multiplier\""), "{json}");
+    }
+
+    /// SH-3 / WM-2: the workload is co-versioned at **two** manifest keys and
+    /// the two must never disagree.
+    ///
+    /// `Manifest::ordering_workload` (top-level `orderingWorkload`, beside the
+    /// `blobOrdering` it co-versions) is canonical. `metadata.ordering_workload`
+    /// is the reader-compat mirror the shipped TS reader resolves the
+    /// build-assumed coalescing gap through
+    /// (`archive.ts::manifestBuildAssumedGapBytes`) — deleting it would silently
+    /// disable the adaptive-coalesce co-versioning guard instead of failing
+    /// loudly, so this test is what keeps the mirror honest until the reader
+    /// moves. Both survive a JSON round-trip: an audit reads them BACK off disk.
+    #[test]
+    fn manifest_records_the_ordering_workload_at_both_pinned_keys() {
+        let bucket = 3_600_000i64;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("both");
+        let mut w = test_writer(&out, BlobOrdering::Auto, 1 << 20).with_measured_ordering(true);
+        for x in 0..3u32 {
+            for b in 0..8i64 {
+                let t = b * bucket;
+                let id = TileId::new(10, 700 + x, 800, t as u64);
+                let payload = distinct_tile(u64::from(x) * 100 + b as u64);
+                w.add_tile_full(&id, t, t + bucket - 1, Some(t), 1, None, &payload)
+                    .unwrap();
+            }
+        }
+        let meta = Metadata::new("both")
+            .with_temporal_bucket_ms(bucket as u64)
+            .with_zoom_levels(0, 10);
+        let manifest = w.finalize(&meta).unwrap();
+
+        let top = manifest.ordering_workload.expect("top-level key");
+        assert_eq!(manifest.metadata.ordering_workload, Some(top));
+
+        // Round-trip through the on-disk bytes — the audit path.
+        let bytes = std::fs::read(out.join("manifest.json")).unwrap();
+        let reparsed = Manifest::from_json_bytes(&bytes).unwrap();
+        assert_eq!(reparsed.ordering_workload, Some(top));
+        assert_eq!(reparsed.metadata.ordering_workload, Some(top));
+
+        // The two serialized objects are literally the same JSON value.
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["orderingWorkload"], v["metadata"]["ordering_workload"]);
+        assert!(v["orderingWorkload"]["coalesce_gap_bytes"].is_u64());
+    }
+
     /// A **paged** directory build round-trips end-to-end through
     /// `PackedReader`: every input tile's payload decodes byte-identically, the
     /// manifest carries the container fields, and content-address verification
@@ -2471,6 +3662,11 @@ mod tests {
             "expected multiple leaf pages"
         );
         assert_eq!(paged.directory.page_entries, Some(16));
+        assert!(paged.directory.root_hash.is_some());
+        assert_eq!(
+            paged.directory.page_hashes.as_ref().unwrap().len() as u64,
+            paged.directory.page_count.unwrap()
+        );
         assert_eq!(
             paged.directory.directory_version,
             crate::directory::DIRECTORY_VERSION
@@ -2521,6 +3717,155 @@ mod tests {
         // Content-address integrity verifies clean on the paged dataset.
         let issues = verify_packed_objects(paged_out.join("manifest.json")).unwrap();
         assert!(issues.is_empty(), "paged verify issues: {issues:?}");
+
+        // The v3 cutover requires independent page authentication; there is
+        // no unhashed paged-directory compatibility shape.
+        let mut unhashed = paged.clone();
+        unhashed.directory.root_hash = None;
+        unhashed.directory.page_hashes = None;
+        fs::write(
+            paged_out.join("manifest.json"),
+            unhashed.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+        let error = PackedReader::open(paged_out.join("manifest.json"))
+            .err()
+            .expect("unhashed paged v3 manifest must be rejected");
+        assert!(error.to_string().contains("rootHash"));
+    }
+
+    #[test]
+    fn adaptive_paging_uses_single_below_threshold_and_paged_at_threshold() {
+        let build = |out: &Path, min_entries: usize| {
+            let mut writer = test_writer(out, BlobOrdering::SpatialMajor, 1 << 20)
+                .with_adaptive_paging(2, min_entries);
+            for x in 0..4u32 {
+                let id = TileId::new(2, x, 0, 0);
+                writer
+                    .add_tile_full(&id, 0, 999, Some(0), 1, None, &distinct_tile(x as u64))
+                    .unwrap();
+            }
+            writer
+                .finalize(&Metadata::new("adaptive").with_temporal_bucket_ms(1_000))
+                .unwrap()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let single = build(&dir.path().join("single"), 5);
+        let paged = build(&dir.path().join("paged"), 4);
+        assert!(single.directory.layout.is_none());
+        assert_eq!(
+            paged.directory.layout.as_deref(),
+            Some(DIRECTORY_LAYOUT_PAGED)
+        );
+        assert_eq!(paged.directory.page_count, Some(2));
+    }
+
+    #[test]
+    fn paged_frame_hash_rejects_tampered_leaf_before_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        let mut writer = test_writer(&out, BlobOrdering::Auto, 64 * 1024).with_paging(Some(2));
+        for k in 0..4u64 {
+            writer
+                .add_tile_full(
+                    &TileId::new(8, k as u32, 0, 0),
+                    0,
+                    100,
+                    None,
+                    6,
+                    None,
+                    &distinct_tile(k),
+                )
+                .unwrap();
+        }
+        let manifest = writer.finalize(&Metadata::new("page-hash")).unwrap();
+        let path = out.join(&manifest.directory.key);
+        let mut object = fs::read(&path).unwrap();
+        let first_leaf = OBJECT_MAGIC_LEN + manifest.directory.root_length.unwrap() as usize;
+        object[first_leaf] ^= 0x01;
+        fs::write(path, object).unwrap();
+
+        let error = PackedReader::open(out.join("manifest.json"))
+            .err()
+            .expect("tampered page must fail");
+        assert!(
+            error.to_string().contains("leaf 0 hash mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn open_rejects_unsafe_manifest_key_before_resolving_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        let mut writer = test_writer(&out, BlobOrdering::Auto, 64 * 1024);
+        writer
+            .add_tile_full(
+                &TileId::new(8, 0, 0, 0),
+                0,
+                100,
+                None,
+                6,
+                None,
+                &distinct_tile(0),
+            )
+            .unwrap();
+        let mut manifest = writer.finalize(&Metadata::new("unsafe-key")).unwrap();
+        manifest.directory.key = "../outside.sttd".into();
+        fs::write(out.join("manifest.json"), manifest.to_json_bytes().unwrap()).unwrap();
+
+        let error = PackedReader::open(out.join("manifest.json"))
+            .err()
+            .expect("unsafe key must fail");
+        assert!(
+            error.to_string().contains("unsafe object key"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn open_rejects_manifest_layout_and_version_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        let mut writer = test_writer(&out, BlobOrdering::Auto, 64 * 1024);
+        writer
+            .add_tile_full(
+                &TileId::new(8, 0, 0, 0),
+                0,
+                100,
+                None,
+                6,
+                None,
+                &distinct_tile(0),
+            )
+            .unwrap();
+        let manifest = writer.finalize(&Metadata::new("semantics")).unwrap();
+        let manifest_path = out.join("manifest.json");
+
+        let mut wrong_version = manifest.clone();
+        wrong_version.directory.directory_version = 4;
+        fs::write(&manifest_path, wrong_version.to_json_bytes().unwrap()).unwrap();
+        let error = PackedReader::open(&manifest_path)
+            .err()
+            .expect("directoryVersion 4 must fail");
+        assert!(error.to_string().contains("directoryVersion"));
+
+        let mut unknown_layout = manifest.clone();
+        unknown_layout.directory.layout = Some("future-layout".into());
+        fs::write(&manifest_path, unknown_layout.to_json_bytes().unwrap()).unwrap();
+        let error = PackedReader::open(&manifest_path)
+            .err()
+            .expect("unknown layout must fail");
+        assert!(error.to_string().contains("unknown directory layout"));
+
+        let mut no_packs = manifest;
+        no_packs.packs.clear();
+        fs::write(&manifest_path, no_packs.to_json_bytes().unwrap()).unwrap();
+        let error = PackedReader::open(&manifest_path)
+            .err()
+            .expect("empty pack table must fail");
+        assert!(error.to_string().contains("at least one pack"));
     }
 
     /// A single blob larger than the pack target gets its own pack (never split).
@@ -2826,10 +4171,8 @@ mod tests {
         assert!(check_payload_len(&id, u64::MAX).is_err());
     }
 
-    /// The directory ships zstd-compressed at rest (declared via
-    /// `directory.encoding`), and a manifest with a RAW directory and no
-    /// `encoding` key must still open and verify — the key is optional and
-    /// absent means raw.
+    /// The writer chooses zstd at rest; the v3 contract also permits an
+    /// explicitly raw directory by omitting `directory.encoding`.
     #[test]
     fn directory_encoding_compressed_and_raw_both_read() {
         let dir = tempfile::tempdir().unwrap();
@@ -2877,6 +4220,8 @@ mod tests {
             root_length: None,
             page_count: None,
             page_entries: None,
+            root_hash: None,
+            page_hashes: None,
         };
         fs::write(&manifest_path, legacy.to_json_bytes().unwrap()).unwrap();
 
@@ -2919,11 +4264,14 @@ mod tests {
         // Doctor the manifest to claim a future formatVersion.
         let mut v: serde_json::Value =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-        v["formatVersion"] = serde_json::json!(3);
+        v["formatVersion"] = serde_json::json!(PACKED_FORMAT_VERSION + 1);
         fs::write(&manifest_path, serde_json::to_vec(&v).unwrap()).unwrap();
 
         let err = match PackedReader::open(&manifest_path) {
-            Ok(_) => panic!("formatVersion 3 must be rejected at open"),
+            Ok(_) => panic!(
+                "formatVersion {} must be rejected at open",
+                PACKED_FORMAT_VERSION + 1
+            ),
             Err(e) => e,
         };
         assert!(
@@ -2972,6 +4320,36 @@ mod tests {
         assert!(s.contains("\"capabilities\""), "{s}");
         // This reader implements the whole registry, so open succeeds.
         assert!(PackedReader::open(&manifest_path).is_ok());
+    }
+
+    #[test]
+    fn writer_derives_capabilities_from_its_encoder_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        let cfg = EncoderConfig {
+            quantize_coords_m: Some(1.0),
+            compact_times: true,
+            ..EncoderConfig::default()
+        };
+        let mut writer = test_writer(&out, BlobOrdering::Auto, 8 * 1024).with_encoder_config(cfg);
+        let payload = encode_tile_with(
+            &[point_layer("default", vec![1, 2], 0)],
+            &writer.encoder_config(),
+        )
+        .unwrap();
+        writer
+            .add_tile_full(&TileId::new(10, 0, 0, 0), 0, 100, None, 2, None, &payload)
+            .unwrap();
+        let manifest = writer
+            .finalize(&Metadata::new("derived-capabilities"))
+            .unwrap();
+        assert_eq!(
+            manifest.capabilities,
+            vec![
+                CAPABILITY_COORD_QUANT.to_string(),
+                CAPABILITY_TIME_DELTA.to_string()
+            ]
+        );
     }
 
     /// `PackedReader::open` must reject a dataset declaring a capability this
@@ -3323,7 +4701,7 @@ mod tests {
         );
     }
 
-    // ---- formatVersion 2 (template-referencing frames + object magic) ------
+    // ---- formatVersion 3 (template-referencing frames + object magic) ------
 
     /// A quantized point layer with numeric + categorical properties — the
     /// shape whose per-tile `stt:qa`/`stt:time_offset_ms` variance the layer
@@ -3365,7 +4743,7 @@ mod tests {
         }
     }
 
-    /// The layer set the formatVersion-2 fixture builds: quantized point tiles with
+    /// The layer set the formatVersion-3 fixture builds: quantized point tiles with
     /// per-tile-varying affines plus an EMPTY tile (0 rows, dictionary
     /// column intact).
     fn v2_fixture_layers() -> Vec<ColumnarLayer> {
@@ -3384,7 +4762,7 @@ mod tests {
         }
     }
 
-    /// Build a small formatVersion-2 dataset (encoder wired to the writer's template
+    /// Build a small formatVersion-3 dataset (encoder wired to the writer's template
     /// collector) into `out`, returning the manifest and the input layers in
     /// tile order.
     fn build_v2_dataset(out: &Path, paging: Option<usize>) -> (Manifest, Vec<ColumnarLayer>) {
@@ -3414,7 +4792,7 @@ mod tests {
         (manifest, layers)
     }
 
-    /// End-to-end formatVersion 2: magic on every object, schemas embedded
+    /// End-to-end formatVersion 3: magic on every object, schemas embedded
     /// (sorted, hash-valid), verify clean, and every tile decodes through the
     /// registry to EXACTLY what the same layer's SELF-CONTAINED (inline-schema)
     /// frame decodes to — the metadata re-injection contract.
@@ -3572,7 +4950,7 @@ mod tests {
         assert!(err.to_string().contains("STTD"), "got: {err}");
     }
 
-    /// The paged directory container works identically under formatVersion 2 (magic
+    /// The paged directory container works identically under formatVersion 3 (magic
     /// stripped before the root/leaf math; `rootLength` still means the root
     /// frame's at-rest length).
     #[test]
@@ -3631,7 +5009,7 @@ mod tests {
     }
 
     /// The verbatim-repack path (pack-cover / repair tools): payloads copied
-    /// from a formatVersion-2 source MUST carry the source's formatVersion forward and
+    /// from a formatVersion-3 source MUST carry the source's formatVersion forward and
     /// seed the new writer's template collector from the source registry —
     /// the repacked dataset round-trips readable, tile for tile.
     #[test]
@@ -3648,7 +5026,7 @@ mod tests {
             .with_seeded_templates(
                 reader
                     .templates()
-                    .expect("formatVersion-2 source has a registry"),
+                    .expect("formatVersion-3 source has a registry"),
             );
         for e in reader.entries() {
             let payload = reader.read_payload(e).unwrap();
@@ -3687,7 +5065,7 @@ mod tests {
         }
     }
 
-    /// A formatVersion-2 dataset whose frames reference a template MISSING from
+    /// A formatVersion-3 dataset whose frames reference a template MISSING from
     /// `manifest.schemas` is undecodable — both validators must flag the
     /// absent hash instead of verifying clean (every object still hashes to
     /// its content address and the remaining schemas table is valid).
@@ -3728,5 +5106,251 @@ mod tests {
             issues.iter().any(|i| i.contains(&removed_hash)),
             "bundle verify must report the missing template: {issues:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // WM-5 — pack-boundary planning (§6.5)
+    // ------------------------------------------------------------------
+
+    fn blobs(lens: &[u64]) -> Vec<PlannedBlob> {
+        lens.iter().map(|&len| PlannedBlob { len }).collect()
+    }
+
+    /// Cuts partition the blob sequence: ascending, in range, and never empty
+    /// segments. Anything else would produce a pack that is not a contiguous
+    /// slice of layout order, which content addressing depends on.
+    #[test]
+    fn planned_cuts_are_ascending_and_in_range() {
+        let b = blobs(&[10, 20, 30, 40, 50, 60, 70]);
+        let opts = PackCutOptions {
+            target_bytes: 100,
+            max_bytes: 150,
+            boundary_price_bytes: 8,
+        };
+        let cuts = plan_pack_cuts(&b, &opts);
+        let mut prev = 0usize;
+        for &c in &cuts {
+            assert!(c > prev && c < b.len(), "cuts={cuts:?}");
+            prev = c;
+        }
+    }
+
+    /// ⚠️ THE HARD CONSTRAINT: no planned segment may exceed the per-object
+    /// ceiling, except the unsplittable-blob exemption (a lone blob larger than
+    /// the cap owns its pack rather than being dropped).
+    #[test]
+    fn no_planned_segment_exceeds_the_hard_cap() {
+        let opts = PackCutOptions {
+            target_bytes: 100,
+            max_bytes: 120,
+            boundary_price_bytes: 8,
+        };
+        // Includes a blob LARGER than the cap — the exemption case.
+        let b = blobs(&[30, 40, 200, 10, 50, 60, 25]);
+        let cuts = plan_pack_cuts(&b, &opts);
+
+        let mut bounds = vec![0usize];
+        bounds.extend(cuts.iter().copied());
+        bounds.push(b.len());
+        for w in bounds.windows(2) {
+            let seg = &b[w[0]..w[1]];
+            let total: u64 = seg.iter().map(|x| x.len).sum();
+            let singleton_oversized = seg.len() == 1 && seg[0].len > opts.max_bytes;
+            assert!(
+                total <= opts.max_bytes || singleton_oversized,
+                "segment {:?} totals {total}, over the {} cap and not a singleton exemption",
+                w,
+                opts.max_bytes
+            );
+        }
+    }
+
+    /// Deterministic: a pure function of the blob lengths and options.
+    #[test]
+    fn pack_cut_planning_is_deterministic() {
+        let b = blobs(&[7, 13, 29, 3, 61, 5, 41, 17, 23, 11]);
+        let opts = PackCutOptions {
+            target_bytes: 64,
+            max_bytes: 96,
+            boundary_price_bytes: 4,
+        };
+        assert_eq!(plan_pack_cuts(&b, &opts), plan_pack_cuts(&b, &opts));
+    }
+
+    /// An EMPTY plan is the documented rollback: the writer falls through to
+    /// next-fit, which the register pins as exact for its own cost model.
+    #[test]
+    fn an_empty_plan_leaves_next_fit_in_charge() {
+        assert!(plan_pack_cuts(&[], &PackCutOptions::default()).is_empty());
+        // One blob under target needs no cut at all.
+        let b = blobs(&[10]);
+        assert!(plan_pack_cuts(&b, &PackCutOptions::default()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod legacy_read_tests {
+    use super::*;
+    use crate::metadata::Metadata;
+    use crate::tile::TileId;
+    use std::fs;
+
+    /// Build a real v3 archive, then rewrite its manifest into the v2 SHAPE the
+    /// published fleet actually has: `formatVersion: 2`, no `variants` registry,
+    /// and no paged per-frame hashes. The objects on disk are untouched, which is
+    /// the point — v2 and v3 differ only in the container.
+    fn v2_shaped_manifest(manifest: &Manifest) -> serde_json::Value {
+        let mut j = serde_json::to_value(manifest).unwrap();
+        let obj = j.as_object_mut().unwrap();
+        obj.insert("formatVersion".into(), serde_json::json!(2));
+        obj.remove("variants");
+        let dir = obj.get_mut("directory").unwrap().as_object_mut().unwrap();
+        dir.insert("directoryVersion".into(), serde_json::json!(5));
+        dir.remove("rootHash");
+        dir.remove("pageHashes");
+        j
+    }
+
+    #[test]
+    fn a_v2_shaped_manifest_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        let mut writer = super::tests::test_writer(&out, BlobOrdering::Auto, 64 * 1024);
+        for i in 0..4u32 {
+            writer
+                .add_tile_full(
+                    &TileId::new(8, i, 0, 0),
+                    0,
+                    100,
+                    None,
+                    6,
+                    None,
+                    &super::tests::distinct_tile(u64::from(i)),
+                )
+                .unwrap();
+        }
+        let manifest = writer.finalize(&Metadata::new("legacy")).unwrap();
+        let path = out.join("manifest.json");
+
+        // Sanity: it opens as v3 first, so the test cannot pass vacuously.
+        let v3 = PackedReader::open(&path).expect("v3 opens");
+        let v3_entries = v3.entries().len();
+        assert_eq!(v3_entries, 4);
+
+        // Now the v2 container shape.
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&v2_shaped_manifest(&manifest)).unwrap(),
+        )
+        .unwrap();
+        let legacy = PackedReader::open(&path).expect("a v2-shaped manifest must still open");
+        assert_eq!(
+            legacy.entries().len(),
+            v3_entries,
+            "the same tiles must be visible through the legacy container"
+        );
+        // Every entry reads as the raw variant, which is what a pre-variant
+        // archive meant.
+        assert!(legacy
+            .entries()
+            .iter()
+            .all(|e| e.variant_id == crate::tile::RAW_VARIANT_ID));
+        // ...and payloads still resolve.
+        let payload = legacy.read_payload(&legacy.entries()[0]).expect("payload");
+        assert!(!payload.is_empty());
+    }
+
+    /// The relaxation is bounded on BOTH sides: it must not become a licence to
+    /// open anything.
+    #[test]
+    fn the_legacy_window_has_hard_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        let mut writer = super::tests::test_writer(&out, BlobOrdering::Auto, 64 * 1024);
+        writer
+            .add_tile_full(
+                &TileId::new(8, 0, 0, 0),
+                0,
+                100,
+                None,
+                6,
+                None,
+                &super::tests::distinct_tile(0),
+            )
+            .unwrap();
+        let manifest = writer.finalize(&Metadata::new("edges")).unwrap();
+        let path = out.join("manifest.json");
+
+        // Below the window: v1 is still refused.
+        let mut too_old = v2_shaped_manifest(&manifest);
+        too_old["formatVersion"] = serde_json::json!(1);
+        fs::write(&path, serde_json::to_vec_pretty(&too_old).unwrap()).unwrap();
+        let err = PackedReader::open(&path)
+            .err()
+            .expect("formatVersion 1 must still be refused");
+        assert!(
+            err.to_string().contains("formatVersion"),
+            "unexpected: {err}"
+        );
+
+        // Above the window: a future version is still refused.
+        let mut too_new = v2_shaped_manifest(&manifest);
+        too_new["formatVersion"] = serde_json::json!(4);
+        fs::write(&path, serde_json::to_vec_pretty(&too_new).unwrap()).unwrap();
+        assert!(PackedReader::open(&path).is_err(), "v4 must be refused");
+
+        // DRIFT, not history: a CURRENT manifest claiming a legacy directory
+        // codec is a mismatch and must stay a hard error, or the legacy window
+        // would silently excuse corruption in new archives.
+        let mut drifted = serde_json::to_value(&manifest).unwrap();
+        drifted["directory"]["directoryVersion"] = serde_json::json!(5);
+        fs::write(&path, serde_json::to_vec_pretty(&drifted).unwrap()).unwrap();
+        let err = PackedReader::open(&path)
+            .err()
+            .expect("v3 manifest + v5 directory must fail");
+        assert!(
+            err.to_string().contains("directoryVersion"),
+            "unexpected: {err}"
+        );
+
+        // A LEGACY manifest that declares hashes must still have them verified —
+        // the skip is only for genuinely absent ones.
+        let mut legacy_bad_hash = v2_shaped_manifest(&manifest);
+        legacy_bad_hash["directory"]["rootHash"] =
+            serde_json::json!("00000000000000000000000000000000");
+        fs::write(&path, serde_json::to_vec_pretty(&legacy_bad_hash).unwrap()).unwrap();
+        assert!(
+            PackedReader::open(&path).is_err(),
+            "a declared-but-wrong rootHash must still fail"
+        );
+    }
+
+    /// The WRITER never emits anything legacy, whatever the reader tolerates.
+    #[test]
+    fn the_writer_stays_current_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        let mut writer = super::tests::test_writer(&out, BlobOrdering::Auto, 64 * 1024);
+        writer
+            .add_tile_full(
+                &TileId::new(8, 0, 0, 0),
+                0,
+                100,
+                None,
+                6,
+                None,
+                &super::tests::distinct_tile(0),
+            )
+            .unwrap();
+        let manifest = writer.finalize(&Metadata::new("writer")).unwrap();
+        assert_eq!(manifest.format_version, PACKED_FORMAT_VERSION);
+        assert_eq!(
+            manifest.directory.directory_version,
+            crate::directory::DIRECTORY_VERSION
+        );
+        assert!(!manifest.variants.is_empty(), "v3 always declares variants");
+        // And the object prelude is the current one.
+        let sttd = fs::read(out.join(&manifest.directory.key)).unwrap();
+        assert_eq!(sttd[4], OBJECT_MAGIC_VERSION);
     }
 }

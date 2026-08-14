@@ -70,7 +70,11 @@ pub struct Args {
     pub scan_stride: usize,
 
     /// dBZ thresholds for the filled contour bands (ascending).
-    #[arg(long, value_delimiter = ',', default_value = "20,25,30,35,40,45,50,55,60,65")]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "20,25,30,35,40,45,50,55,60,65"
+    )]
     pub dbz_thresholds: Vec<f64>,
 
     /// Storm-cell detection floor (dBZ): connected components on dbz >= this.
@@ -128,7 +132,10 @@ pub fn run(args: Args) -> Result<()> {
         parse_bounds(&args.bounds).context("parsing --bounds")?;
     let day = NaiveDate::parse_from_str(&args.date, "%Y-%m-%d")
         .with_context(|| format!("parsing --date {}", args.date))?;
-    anyhow::ensure!(args.end_hour <= 24 && args.start_hour < args.end_hour, "invalid hour window");
+    anyhow::ensure!(
+        args.end_hour <= 24 && args.start_hour < args.end_hour,
+        "invalid hour window"
+    );
 
     let window_start = day
         .and_hms_opt(args.start_hour, 0, 0)
@@ -161,12 +168,29 @@ pub fn run(args: Args) -> Result<()> {
     let mut grids: BTreeMap<i64, MosaicGrid> = BTreeMap::new();
 
     for site in &args.sites {
-        let paths = ensure_volumes(&rt, site, &day, args.start_hour, args.end_hour, args.scan_stride, &args.cache_dir, args.no_download)
-            .with_context(|| format!("gathering volumes for {site}"))?;
+        let paths = ensure_volumes(
+            &rt,
+            site,
+            &day,
+            args.start_hour,
+            args.end_hour,
+            args.scan_stride,
+            &args.cache_dir,
+            args.no_download,
+        )
+        .with_context(|| format!("gathering volumes for {site}"))?;
         println!("  {site}: {} volume(s)", paths.len());
 
         for path in paths {
-            match rasterize_volume(&path, &mut grids, min_lat, min_lon, max_lat, max_lon, args.grid_km) {
+            match rasterize_volume(
+                &path,
+                &mut grids,
+                min_lat,
+                min_lon,
+                max_lat,
+                max_lon,
+                args.grid_km,
+            ) {
                 Ok(true) => {}
                 Ok(false) => {}
                 Err(e) => eprintln!("    ⚠️  {} skipped: {e}", path.display()),
@@ -174,7 +198,10 @@ pub fn run(args: Args) -> Result<()> {
         }
     }
 
-    anyhow::ensure!(!grids.is_empty(), "no usable radar volumes decoded — nothing to build");
+    anyhow::ensure!(
+        !grids.is_empty(),
+        "no usable radar volumes decoded — nothing to build"
+    );
     println!("  mosaicked {} scan bucket(s)", grids.len());
 
     // ---- Phase 2: contour bands + storm-cell centroids per bucket.
@@ -246,8 +273,16 @@ pub fn run(args: Args) -> Result<()> {
         let (pa, pb) = (&a.points[0], &b.points[0]);
         pa.t_ms
             .cmp(&pb.t_ms)
-            .then(pa.lon.partial_cmp(&pb.lon).unwrap_or(std::cmp::Ordering::Equal))
-            .then(pa.lat.partial_cmp(&pb.lat).unwrap_or(std::cmp::Ordering::Equal))
+            .then(
+                pa.lon
+                    .partial_cmp(&pb.lon)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(
+                pa.lat
+                    .partial_cmp(&pb.lat)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
     });
 
     let mut tracks_w = StreamingLineStringParquetWriter::with_columns(
@@ -295,11 +330,29 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     // ---- Phase 4: build the three packed STT archives.
-    build_field(&field_parquet, &args.output.join("storm-field"), args.min_zoom, args.max_zoom)?;
-    build_cells(&cells_parquet, &args.output.join("storm-cells"), args.min_zoom, args.max_zoom)?;
-    build_tracks(&tracks_parquet, &args.output.join("storm-tracks"), args.min_zoom, args.max_zoom)?;
+    build_field(
+        &field_parquet,
+        &args.output.join("storm-field"),
+        args.min_zoom,
+        args.max_zoom,
+    )?;
+    build_cells(
+        &cells_parquet,
+        &args.output.join("storm-cells"),
+        args.min_zoom,
+        args.max_zoom,
+    )?;
+    build_tracks(
+        &tracks_parquet,
+        &args.output.join("storm-tracks"),
+        args.min_zoom,
+        args.max_zoom,
+    )?;
 
-    println!("✅ storms: storm-field, storm-cells, storm-tracks written to {}", args.output.display());
+    println!(
+        "✅ storms: storm-field, storm-cells, storm-tracks written to {}",
+        args.output.display()
+    );
     Ok(())
 }
 
@@ -382,7 +435,9 @@ fn rasterize_volume(
     let file = VolumeFile::new(bytes)
         .decompress()
         .map_err(|e| anyhow::anyhow!("decompress: {e:?}"))?;
-    let scan = file.scan().map_err(|e| anyhow::anyhow!("decode scan: {e:?}"))?;
+    let scan = file
+        .scan()
+        .map_err(|e| anyhow::anyhow!("decode scan: {e:?}"))?;
 
     let site = match scan.site() {
         Some(s) => s,
@@ -442,7 +497,7 @@ fn build_field(input: &Path, output: &Path, min_zoom: u8, max_zoom: u8) -> Resul
         no_clip: false,
         quantize_coords: None,
         quantize_attrs: Vec::new(),
-            blob_ordering: None,
+        blob_ordering: None,
     })
 }
 
@@ -465,7 +520,7 @@ fn build_cells(input: &Path, output: &Path, min_zoom: u8, max_zoom: u8) -> Resul
         no_clip: false,
         quantize_coords: None,
         quantize_attrs: Vec::new(),
-            blob_ordering: None,
+        blob_ordering: None,
     })
 }
 
@@ -490,6 +545,6 @@ fn build_tracks(input: &Path, output: &Path, min_zoom: u8, max_zoom: u8) -> Resu
         no_clip: false,
         quantize_coords: None,
         quantize_attrs: Vec::new(),
-            blob_ordering: None,
+        blob_ordering: None,
     })
 }

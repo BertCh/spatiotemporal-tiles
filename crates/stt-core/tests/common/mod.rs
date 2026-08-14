@@ -113,6 +113,7 @@ pub fn arb_entry() -> impl Strategy<Value = TileEntry> {
                 y,
                 time_start,
                 time_end,
+                variant_id: stt_core::tile::RAW_VARIANT_ID,
                 pack_id,
                 offset,
                 length,

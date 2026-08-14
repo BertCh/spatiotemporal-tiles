@@ -125,7 +125,11 @@ pub fn subdivide(points: &[P2], n: usize) -> Vec<P2> {
             i += 1;
         }
         let seg = cum[i] - cum[i - 1];
-        let f = if seg < EPS { 0.0 } else { (target - cum[i - 1]) / seg };
+        let f = if seg < EPS {
+            0.0
+        } else {
+            (target - cum[i - 1]) / seg
+        };
         out.push([
             points[i - 1][0] + f * (points[i][0] - points[i - 1][0]),
             points[i - 1][1] + f * (points[i][1] - points[i - 1][1]),
@@ -176,8 +180,12 @@ pub fn bundle_edges(edges: &[Vec<P2>], params: &BundleParams) -> Vec<Vec<P2>> {
         .max(0.1);
 
     // Normalize cosLat-corrected control points into the fixed WORK box.
-    let (mut min_x, mut min_y, mut max_x, mut max_y) =
-        (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
     for edge in &resampled {
         for v in edge {
             let cx = v[0] * cos_lat0;
@@ -386,7 +394,13 @@ mod tests {
         let a: Vec<[f64; 2]> = vec![[-73.60, 45.50], [-73.40, 45.50]];
         let b: Vec<[f64; 2]> = vec![[-73.60, 45.52], [-73.40, 45.52]];
         let gap0 = (a[0][1] - b[0][1]).abs(); // 0.02 deg at every x
-        let out = bundle_edges(&[a, b], &BundleParams { iterations: 15, ..Default::default() });
+        let out = bundle_edges(
+            &[a, b],
+            &BundleParams {
+                iterations: 15,
+                ..Default::default()
+            },
+        );
         let mid = out[0].len() / 2;
         let gap_mid = (out[0][mid][1] - out[1][mid][1]).abs();
         assert!(
@@ -410,7 +424,13 @@ mod tests {
     #[test]
     fn single_edge_is_returned_resampled_not_bundled() {
         let edges = vec![vec![[-73.60, 45.50], [-73.50, 45.55]]];
-        let out = bundle_edges(&edges, &BundleParams { points: 8, ..Default::default() });
+        let out = bundle_edges(
+            &edges,
+            &BundleParams {
+                points: 8,
+                ..Default::default()
+            },
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].len(), 8);
         // Straight line: still collinear (no neighbours to bundle toward).
@@ -419,8 +439,7 @@ mod tests {
         let dy = out[0][n][1] - out[0][0][1];
         for pt in &out[0] {
             // cross product of (pt-start) with (end-start) ≈ 0 → on the line.
-            let cross =
-                (pt[0] - out[0][0][0]) * dy - (pt[1] - out[0][0][1]) * dx;
+            let cross = (pt[0] - out[0][0][0]) * dy - (pt[1] - out[0][0][1]) * dx;
             assert!(cross.abs() < 1e-6, "single edge should stay straight");
         }
     }

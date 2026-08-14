@@ -2,8 +2,9 @@
 //!
 //! Combines analysis results to generate optimal stt-build parameters.
 
-use crate::advisors::Advice;
+use crate::advisors::{Advice, ComposedMeasurement};
 use crate::analysis::AnalysisResult;
+use crate::budget_solver::{BudgetReport, ChosenLever, BUDGET_GOVERNED_FLAGS};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -38,11 +39,83 @@ pub struct Recommendations {
     /// are never auto-applied by `stt-build --auto`.
     #[serde(default)]
     pub advice: Vec<Advice>,
+    /// What the composed NON-LOSSY recipe measures on the sample, versus build
+    /// defaults, when [`crate::advisors::run_iterative`] measured it
+    /// ([`ComposedMeasurement::projected`]).
+    ///
+    /// `None` when nothing was composed: the single-pass rollback (`rounds = 0`)
+    /// or a sample below the measurement floor. This is the first number in the
+    /// pipeline that describes the RECIPE rather than one lever at a time — the
+    /// single pass never measured the combination at all.
+    #[serde(default)]
+    pub composed_projected: Option<String>,
+    /// The parallel with-lossy figure
+    /// ([`ComposedMeasurement::projected_with_lossy`]): what opting into the
+    /// lossy advisories on top of the recipe would measure.
+    ///
+    /// ⚠️ REPORT ONLY. Its presence is not a recommendation and nothing
+    /// downstream may read it as one — lossy levers stay out of [`to_command`]
+    /// and out of `stt-build --auto` regardless of what this says.
+    #[serde(default)]
+    pub composed_projected_with_lossy: Option<String>,
+    /// The answer to `--target-size B`, when a budget was requested.
+    ///
+    /// `None` — and absent from the serialized form — whenever no target size
+    /// was given, so the whole pipeline is byte-for-byte what it was before the
+    /// budget solver existed.
+    ///
+    /// When present it is authoritative over the flags it names: the solver
+    /// measured the recipe against a byte budget, so [`to_command`] takes its
+    /// zoom/bucket scalars from [`BudgetReport::chosen`] and drops the advisor's
+    /// verdict on the flags in
+    /// [`BUDGET_GOVERNED_FLAGS`](crate::budget_solver::BUDGET_GOVERNED_FLAGS) in
+    /// favour of the solver's.
+    ///
+    /// ⚠️ It cannot make the command lossy. [`ChosenLever`] has no `lossy` field
+    /// — a lossy lever is not representable as a chosen one — and
+    /// [`BudgetReport::shadow_prices`], which is where the lossy levers live, is
+    /// never consulted by [`to_command`] at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetReport>,
 }
 
 /// Generate recommendations from analysis results, attaching the advisor
 /// suggestions (pass an empty `Vec` when the advisors were not run).
+///
+/// The single-pass form: no composed measurement, so `composed_projected` stays
+/// `None`. Callers that ran [`crate::advisors::run_iterative`] should use
+/// [`generate_recommendations_composed`] instead.
 pub fn generate_recommendations(result: &AnalysisResult, advice: Vec<Advice>) -> Recommendations {
+    generate_recommendations_composed(result, advice, None)
+}
+
+/// Generate recommendations, attaching the advisor suggestions AND the composed
+/// recipe measurement.
+///
+/// The composed figures ride two places: the dedicated
+/// `composed_projected` fields, and an `explanations` line — which is what
+/// surfaces them in `stt-optimize recommend --explain` and in `stt-build
+/// --auto`'s log, where the cost of having measured them is also worth seeing.
+pub fn generate_recommendations_composed(
+    result: &AnalysisResult,
+    advice: Vec<Advice>,
+    composed: Option<&ComposedMeasurement>,
+) -> Recommendations {
+    generate_recommendations_budgeted(result, advice, composed, None)
+}
+
+/// [`generate_recommendations_composed`] with the `--target-size` solver's
+/// answer attached.
+///
+/// `budget: None` reproduces `generate_recommendations_composed` exactly — the
+/// documented rollback for the whole budget mechanism is simply not passing a
+/// target size.
+pub fn generate_recommendations_budgeted(
+    result: &AnalysisResult,
+    advice: Vec<Advice>,
+    composed: Option<&ComposedMeasurement>,
+    budget: Option<BudgetReport>,
+) -> Recommendations {
     let mut explanations = Vec::new();
 
     // Zoom levels from spatial analysis
@@ -66,6 +139,26 @@ pub fn generate_recommendations(result: &AnalysisResult, advice: Vec<Advice>) ->
     // Calculate confidence based on data quality
     let confidence = calculate_confidence(result);
 
+    // The composed recipe, when it was measured. The explanation line carries
+    // the measurement AND its cost: iteration buys the interaction between
+    // levers by spending real encode time, and a slow `recommend` should say
+    // why it was slow.
+    let composed_projected = composed.map(ComposedMeasurement::projected);
+    let composed_projected_with_lossy =
+        composed.and_then(ComposedMeasurement::projected_with_lossy);
+    if let Some(line) = &composed_projected {
+        explanations.push(format!("Composed recipe: {line}"));
+    }
+    if let Some(line) = &composed_projected_with_lossy {
+        explanations.push(format!("Lossy what-if (not applied): {line}"));
+    }
+    // The budget verdict rides the human-facing explanation list too, so a
+    // reader of `--auto`'s log or the analyze report sees whether the target was
+    // met without having to parse the report struct.
+    if let Some(report) = &budget {
+        explanations.push(format!("Budget (--target-size): {}", report.headline()));
+    }
+
     Recommendations {
         min_zoom,
         max_zoom,
@@ -75,6 +168,9 @@ pub fn generate_recommendations(result: &AnalysisResult, advice: Vec<Advice>) ->
         dominant_type: result.geometry.dominant_type.clone(),
         explanations,
         advice,
+        composed_projected,
+        composed_projected_with_lossy,
+        budget,
     }
 }
 
@@ -130,7 +226,7 @@ pub fn to_build_config(
     input: &Path,
     time_field: &str,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut config = serde_json::json!({
         "input": input.to_string_lossy(),
         "time_field": time_field,
         "min_zoom": recommendations.min_zoom,
@@ -141,8 +237,72 @@ pub fn to_build_config(
         "confidence": recommendations.confidence,
         "explanations": recommendations.explanations,
         "advice": recommendations.advice,
+        // Recipe-level measurement (null on the single-pass rollback). The
+        // with-lossy figure is a what-if for a human, never an instruction.
+        "composed_projected": recommendations.composed_projected,
+        "composed_projected_with_lossy": recommendations.composed_projected_with_lossy,
         "command": to_command(recommendations, input, time_field),
-    })
+    });
+    // The budget report is INSERTED rather than declared in the literal so a run
+    // without `--target-size` emits the exact same JSON it always did — no new
+    // null key, no shape change for existing consumers.
+    if let Some(report) = &recommendations.budget {
+        if let (Some(object), Ok(value)) = (config.as_object_mut(), serde_json::to_value(report)) {
+            object.insert("budget".to_string(), value);
+        }
+    }
+    config
+}
+
+/// The scalar recipe the command should carry: the analysis recommendation,
+/// overridden by the budget solver's own choices where it made any.
+///
+/// The solver only emits `--max-zoom` / `--temporal-bucket` when it actually
+/// MOVED them, so an unbudgeted run and a budget that needed no distortion
+/// produce the same command.
+fn command_scalars(recommendations: &Recommendations) -> (u8, u8, u64) {
+    let mut min_zoom = recommendations.min_zoom;
+    let mut max_zoom = recommendations.max_zoom;
+    let mut bucket_ms = recommendations.temporal_bucket_ms;
+    let Some(budget) = &recommendations.budget else {
+        return (min_zoom, max_zoom, bucket_ms);
+    };
+    for lever in budget.chosen.iter().filter(|l| !l.suggestion_only) {
+        let Some(value) = lever.value.as_deref() else {
+            continue;
+        };
+        match lever.flag.as_str() {
+            "--min-zoom" => min_zoom = value.parse().unwrap_or(min_zoom),
+            "--max-zoom" => max_zoom = value.parse().unwrap_or(max_zoom),
+            "--temporal-bucket" => bucket_ms = value.parse().unwrap_or(bucket_ms),
+            _ => {}
+        }
+    }
+    (min_zoom, max_zoom, bucket_ms)
+}
+
+/// The budget's non-scalar levers, in solver order, filtered by the SAME
+/// admissibility predicate the advisor list is filtered by.
+///
+/// A [`ChosenLever`] cannot be lossy (the type has no such field), so the
+/// predicate reduces to the `suggestion_only` half — which is exactly what keeps
+/// a playback-caveated `spatial` blob ordering out of the command no matter how
+/// tight the budget got.
+fn command_budget_levers(recommendations: &Recommendations) -> Vec<&ChosenLever> {
+    let Some(budget) = &recommendations.budget else {
+        return Vec::new();
+    };
+    budget
+        .chosen
+        .iter()
+        .filter(|lever| !lever.suggestion_only)
+        .filter(|lever| {
+            !matches!(
+                lever.flag.as_str(),
+                "--min-zoom" | "--max-zoom" | "--temporal-bucket"
+            )
+        })
+        .collect()
 }
 
 /// Convert recommendations to an stt-build command line.
@@ -153,6 +313,21 @@ pub fn to_build_config(
 /// data and stays a per-dataset opt-in the user must add by hand. The same
 /// goes for `suggestion_only` advice: non-lossy, but the tradeoff spelled out
 /// in its `why` needs a human decision before the flag is safe to run.
+///
+/// # With a `--target-size` budget attached
+///
+/// When [`Recommendations::budget`] is present the solver's recipe is
+/// authoritative over the flags it owns: the zoom/bucket scalars come from
+/// [`crate::budget_solver::BudgetReport::chosen`], and the advisor's opinion on
+/// the flags in [`BUDGET_GOVERNED_FLAGS`] is dropped in favour of the solver's —
+/// otherwise the command could carry `--publish` (zstd 19) while the budget was
+/// projected at level 3, and a user would be shown a number the build then
+/// silently undershoots.
+///
+/// **The lossy filter below is unchanged and unweakened.** It is the same
+/// expression it always was, and the budget path adds nothing to it that could
+/// let a lossy lever through: lossy levers are not representable as chosen ones,
+/// and the budget's shadow-price table is never read here.
 pub fn to_command(recommendations: &Recommendations, input: &Path, time_field: &str) -> String {
     // The input exactly as the caller addressed it (pasteable from the same
     // cwd); a basename would break the command from anywhere else. Suggest the
@@ -165,30 +340,46 @@ pub fn to_command(recommendations: &Recommendations, input: &Path, time_field: &
         output.to_string_lossy().to_string()
     };
     let input_str = input.to_string_lossy();
+    let (min_zoom, max_zoom, temporal_bucket_ms) = command_scalars(recommendations);
 
     let mut cmd = format!(
         "stt-build --input {} --output {} \\\n  --time-field {} --min-zoom {} --max-zoom {}",
-        input_str, output_str, time_field, recommendations.min_zoom, recommendations.max_zoom,
+        input_str, output_str, time_field, min_zoom, max_zoom,
     );
     // The recommended bucket is the recipe's core scalar — the command must
     // carry it or a paste-and-run build silently falls back to the 1h default.
     // Bare milliseconds: always valid `parse_duration` input.
-    if recommendations.temporal_bucket_ms > 0 {
-        cmd.push_str(&format!(
-            " \\\n  --temporal-bucket {}",
-            recommendations.temporal_bucket_ms
-        ));
+    if temporal_bucket_ms > 0 {
+        cmd.push_str(&format!(" \\\n  --temporal-bucket {}", temporal_bucket_ms));
     }
+    // Flags the budget solver owns once a target size is set — the advisor's
+    // verdict on these is superseded, not merged.
+    let superseded: &[&str] = if recommendations.budget.is_some() {
+        BUDGET_GOVERNED_FLAGS
+    } else {
+        &[]
+    };
     // Stable order: exactly the advisor emit order (quantize, temporal,
     // layout, budget), filtered to the auto-applicable entries.
     for advice in recommendations
         .advice
         .iter()
         .filter(|a| !a.lossy && !a.suggestion_only)
+        .filter(|a| !superseded.contains(&a.flag.as_str()))
     {
         cmd.push_str(" \\\n  ");
         cmd.push_str(&advice.flag);
         if let Some(value) = &advice.value {
+            cmd.push(' ');
+            cmd.push_str(value);
+        }
+    }
+    // …then the budget's own levers, in solver order. Empty without a budget,
+    // so an unbudgeted command is byte-for-byte what it always was.
+    for lever in command_budget_levers(recommendations) {
+        cmd.push_str(" \\\n  ");
+        cmd.push_str(&lever.flag);
+        if let Some(value) = &lever.value {
             cmd.push(' ');
             cmd.push_str(value);
         }
@@ -200,6 +391,7 @@ pub fn to_command(recommendations: &Recommendations, input: &Path, time_field: &
 mod tests {
     use super::*;
     use crate::advisors::AdviceConfidence;
+    use crate::budget_solver::{BudgetReport, ChosenLever};
 
     /// Minimal synthetic analysis result — just enough populated fields for
     /// `generate_recommendations`/`calculate_confidence` to run. The shared
@@ -230,6 +422,69 @@ mod tests {
             dominant_type: "Point".to_string(),
             explanations: vec![],
             advice,
+            composed_projected: None,
+            composed_projected_with_lossy: None,
+            budget: None,
+        }
+    }
+
+    /// A chosen lever, as the budget solver would emit one.
+    fn chosen(flag: &str, value: Option<&str>) -> ChosenLever {
+        ChosenLever {
+            flag: flag.to_string(),
+            value: value.map(str::to_string),
+            why: format!("{flag}: synthetic budget rationale"),
+            delta_bytes: Some(-1_000),
+            suggestion_only: false,
+        }
+    }
+
+    /// A budget report carrying `chosen`, feasible at an arbitrary size.
+    fn budget_with(chosen: Vec<ChosenLever>, feasible: bool) -> BudgetReport {
+        BudgetReport {
+            target_bytes: 1_000_000,
+            projected_bytes: if feasible { 900_000 } else { 1_500_000 },
+            projected_stderr: 0.0,
+            feasible,
+            within_noise: false,
+            distortion: crate::budget_solver::DistortionClass::none(),
+            chosen,
+            floor_bytes: 800_000,
+            floor_distortion: crate::budget_solver::DistortionClass::none(),
+            shadow_prices: vec![crate::budget_solver::ShadowPrice {
+                flag: "--quantize-coords".to_string(),
+                value: Some("1".to_string()),
+                marginal_bytes: 400_000,
+                delta_frac: -0.4,
+                stderr: 0.01,
+                lossy: true,
+                why: "synthetic shadow price".to_string(),
+            }],
+            zstd_sweep: vec![3, 9, 19],
+            classes_evaluated: 2,
+            basis: crate::budget_solver::EstimateBasis::Measured,
+            notes: vec!["synthetic".to_string()],
+        }
+    }
+
+    /// A composed measurement over a recipe that shrinks the sample.
+    fn composed(with_lossy: Option<usize>) -> ComposedMeasurement {
+        ComposedMeasurement {
+            rounds: 2,
+            settings: crate::measure::MeasureSettings {
+                zstd_level: 19,
+                ..crate::measure::MeasureSettings::default()
+            },
+            features: 800,
+            composed_bytes: 9_000,
+            default_bytes: 10_000,
+            with_lossy_bytes: with_lossy,
+            usage: crate::advisors::OracleUsage {
+                measurements: 3,
+                oracle_calls: 2,
+                trials_priced: 3,
+                cache_hits: 4,
+            },
         }
     }
 
@@ -347,6 +602,76 @@ mod tests {
     }
 
     #[test]
+    fn composed_measurement_rides_the_recommendations_and_the_config() {
+        let result = synthetic_result();
+        let rec = generate_recommendations_composed(
+            &result,
+            vec![advice("--publish", None, false)],
+            Some(&composed(Some(6_000))),
+        );
+
+        let projected = rec.composed_projected.as_deref().expect("composed figure");
+        // The recipe's own bytes, the reference it beats, and the cost of
+        // having measured it.
+        assert!(projected.contains("9000 B"), "{projected}");
+        assert!(projected.contains("10000 B"), "{projected}");
+        assert!(projected.contains("800-feature sample"), "{projected}");
+        assert!(projected.contains("-10.0%"), "{projected}");
+        assert!(projected.contains("2 refinement rounds"), "{projected}");
+        assert!(projected.contains("cache hits"), "{projected}");
+
+        // The lossy what-if is present, and says loudly that it is not applied.
+        let lossy = rec
+            .composed_projected_with_lossy
+            .as_deref()
+            .expect("lossy what-if");
+        assert!(lossy.contains("6000 B"), "{lossy}");
+        assert!(lossy.contains("never auto-applied"), "{lossy}");
+
+        // Both surface in the explanations (what `--explain` and `--auto` log).
+        assert!(rec
+            .explanations
+            .iter()
+            .any(|e| e.starts_with("Composed recipe: ")));
+        assert!(rec
+            .explanations
+            .iter()
+            .any(|e| e.starts_with("Lossy what-if (not applied): ")));
+
+        // …and in the build config JSON.
+        let config = to_build_config(&rec, Path::new("data.parquet"), "timestamp");
+        assert_eq!(config["composed_projected"], serde_json::json!(projected));
+        assert_eq!(
+            config["composed_projected_with_lossy"],
+            serde_json::json!(lossy)
+        );
+    }
+
+    #[test]
+    fn single_pass_recommendations_carry_no_composed_figure() {
+        // The rollback shape: `generate_recommendations` is the one-pass form,
+        // so the composed keys are present-but-null rather than fabricated.
+        let rec = generate_recommendations(&synthetic_result(), vec![]);
+        assert!(rec.composed_projected.is_none());
+        assert!(rec.composed_projected_with_lossy.is_none());
+        assert!(
+            !rec.explanations
+                .iter()
+                .any(|e| e.contains("Composed recipe")),
+            "{:?}",
+            rec.explanations
+        );
+        let config = to_build_config(&rec, Path::new("data.parquet"), "timestamp");
+        assert!(config["composed_projected"].is_null());
+
+        // A composed measurement with no lossy advice publishes no what-if.
+        let rec =
+            generate_recommendations_composed(&synthetic_result(), vec![], Some(&composed(None)));
+        assert!(rec.composed_projected.is_some());
+        assert!(rec.composed_projected_with_lossy.is_none());
+    }
+
+    #[test]
     fn recommendations_deserialize_without_dominant_type() {
         // An older serialized Recommendations (pre-dominant_type) must still
         // deserialize thanks to #[serde(default)].
@@ -362,6 +687,151 @@ mod tests {
         let rec: Recommendations = serde_json::from_value(legacy).expect("legacy deserializes");
         assert_eq!(rec.dominant_type, "");
         assert_eq!(rec.max_zoom, 12);
+    }
+
+    #[test]
+    fn without_a_budget_nothing_about_the_command_or_the_config_moves() {
+        // The rollback for the whole `--target-size` mechanism is simply not
+        // passing one, and it has to be byte-for-byte invisible.
+        let rec = rec_with_advice(vec![
+            advice("--publish", None, false),
+            advice("--blob-ordering", Some("time-major"), false),
+        ]);
+        assert!(rec.budget.is_none());
+        let cmd = to_command(&rec, Path::new("data.parquet"), "timestamp");
+        assert!(cmd.contains("--min-zoom 0 --max-zoom 10"), "{cmd}");
+        assert!(cmd.contains("--temporal-bucket 3600000"), "{cmd}");
+        assert!(cmd.contains("--publish"), "{cmd}");
+        assert!(cmd.contains("--blob-ordering time-major"), "{cmd}");
+
+        // …and the config JSON gains no key at all (not even a null one).
+        let config = to_build_config(&rec, Path::new("data.parquet"), "timestamp");
+        assert!(
+            config.get("budget").is_none(),
+            "an unbudgeted config must not grow a `budget` key: {config}"
+        );
+        let serialized = serde_json::to_string(&rec).unwrap();
+        assert!(
+            !serialized.contains("\"budget\""),
+            "Recommendations must not serialize an absent budget: {serialized}"
+        );
+    }
+
+    #[test]
+    fn a_budget_supersedes_the_scalars_and_the_flags_it_owns() {
+        // The advisor wants publish-grade zstd; the budget solved at level 3 and
+        // clamped the pyramid. The command must describe the BUDGET's recipe —
+        // otherwise the user is shown a projection the build then undershoots.
+        let mut rec = rec_with_advice(vec![
+            advice("--publish", None, false),
+            advice("--adaptive-temporal", Some("5000"), false),
+        ]);
+        rec.budget = Some(budget_with(
+            vec![
+                chosen("--max-zoom", Some("8")),
+                chosen("--temporal-bucket", Some("14400000")),
+                chosen("--temporal-lod", Some("1d@6")),
+            ],
+            true,
+        ));
+        let cmd = to_command(&rec, Path::new("data.parquet"), "timestamp");
+
+        assert!(cmd.contains("--max-zoom 8"), "{cmd}");
+        assert!(!cmd.contains("--max-zoom 10"), "{cmd}");
+        assert!(cmd.contains("--temporal-bucket 14400000"), "{cmd}");
+        assert!(!cmd.contains("--temporal-bucket 3600000"), "{cmd}");
+        assert!(cmd.contains("--temporal-lod 1d@6"), "{cmd}");
+        // The advisor's zstd verdict is superseded, not merged.
+        assert!(!cmd.contains("--publish"), "{cmd}");
+        // An advisory the budget does NOT own rides through untouched.
+        assert!(cmd.contains("--adaptive-temporal 5000"), "{cmd}");
+
+        // The report reaches the config JSON for `stt-build --auto` to fold.
+        let config = to_build_config(&rec, Path::new("data.parquet"), "timestamp");
+        assert_eq!(config["budget"]["target_bytes"], 1_000_000);
+        assert_eq!(config["budget"]["feasible"], true);
+        assert_eq!(config["budget"]["chosen"][0]["flag"], "--max-zoom");
+    }
+
+    #[test]
+    fn a_budgets_shadow_prices_never_reach_the_command() {
+        // THE no-thinning guard at this seam. A `ChosenLever` cannot be lossy
+        // (no such field), and the lossy levers that DO exist live in
+        // `shadow_prices`, which `to_command` never reads — under budget
+        // pressure exactly as much as without it.
+        let mut rec = rec_with_advice(vec![]);
+        rec.budget = Some(budget_with(vec![chosen("--max-zoom", Some("6"))], false));
+        let cmd = to_command(&rec, Path::new("data.parquet"), "timestamp");
+        assert!(cmd.contains("--max-zoom 6"), "{cmd}");
+        for lossy in [
+            "--quantize-coords",
+            "--quantize-attrs-auto",
+            "--quantize-attr",
+            "--maximum-tile-features",
+        ] {
+            assert!(!cmd.contains(lossy), "lossy flag leaked: {cmd}");
+        }
+        assert!(
+            rec.budget
+                .as_ref()
+                .unwrap()
+                .shadow_prices
+                .iter()
+                .all(|p| p.lossy),
+            "every shadow price is lossy"
+        );
+    }
+
+    #[test]
+    fn a_suggestion_only_budget_lever_stays_out_of_the_command() {
+        // A playback-caveated `spatial` ordering arrives from the layout advisor
+        // with `suggestion_only: true` and keeps it under budget pressure. It
+        // must not reach the command, and it must not override a scalar either.
+        let mut ordering = chosen("--blob-ordering", Some("spatial"));
+        ordering.suggestion_only = true;
+        let mut clamp = chosen("--max-zoom", Some("7"));
+        clamp.suggestion_only = true;
+        let mut rec = rec_with_advice(vec![]);
+        rec.budget = Some(budget_with(vec![clamp, ordering], true));
+
+        let cmd = to_command(&rec, Path::new("data.parquet"), "timestamp");
+        assert!(!cmd.contains("--blob-ordering"), "{cmd}");
+        // …and a suggestion-only scalar does not silently rewrite the recipe.
+        assert!(cmd.contains("--max-zoom 10"), "{cmd}");
+    }
+
+    #[test]
+    fn the_budget_verdict_reaches_the_explanations() {
+        let rec = generate_recommendations_budgeted(
+            &synthetic_result(),
+            vec![],
+            None,
+            Some(budget_with(vec![], false)),
+        );
+        let line = rec
+            .explanations
+            .iter()
+            .find(|e| e.starts_with("Budget (--target-size): "))
+            .unwrap_or_else(|| panic!("{:?}", rec.explanations));
+        assert!(line.contains("DOES NOT FIT"), "{line}");
+        assert!(line.contains("nothing dropped"), "{line}");
+    }
+
+    #[test]
+    fn recommendations_deserialize_without_a_budget() {
+        // Append-only schema: a report written before the budget field existed
+        // must still deserialize.
+        let legacy = serde_json::json!({
+            "min_zoom": 0,
+            "max_zoom": 10,
+            "temporal_bucket_ms": 3_600_000,
+            "temporal_bucket_human": "1 hour",
+            "confidence": 85,
+            "explanations": [],
+            "advice": [],
+        });
+        let rec: Recommendations = serde_json::from_value(legacy).expect("legacy deserializes");
+        assert!(rec.budget.is_none());
     }
 
     #[test]

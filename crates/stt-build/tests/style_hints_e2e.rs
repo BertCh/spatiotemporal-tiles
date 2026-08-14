@@ -11,7 +11,9 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use std::sync::Arc;
 use stt_build::input::{calculate_bounds, load_features, InputStrictness, TimeFormat};
-use stt_build::style_hints::compute_style_hints;
+use stt_build::style_hints::{
+    compute_style_hints, compute_style_hints_with, DerivedPlaybackParams,
+};
 use stt_build::tiler::{generate_tiles, TileConfig, TileWriter};
 
 /// Little-endian ISO WKB for a 2D point.
@@ -133,4 +135,183 @@ fn style_hints_flow_into_the_packed_manifest() {
     assert_eq!(mag["suggested_domain"][1], 9.7);
     // Numeric entries omit cardinality (absent, not null).
     assert!(mag.get("cardinality").is_none(), "{mag}");
+
+    // BH-10: the derived window key is ABSENT unless the build asks for it.
+    assert!(
+        sh.get("suggested_time_window_ms").is_none(),
+        "the derived window must not appear on a default build: {sh}"
+    );
+}
+
+/// BH-10 end to end: with the derivation gate on, the manifest gains
+/// `suggested_time_window_ms` and carries the refit duration — and with it off,
+/// the same pipeline emits byte-identical manifest JSON to today's.
+///
+/// The payload total feeding the window is the pack writer's own running sum,
+/// which is why this is asserted through a real finalize rather than in a unit
+/// test: a writer that stopped counting spilled payloads (or counted them twice)
+/// would move the hint without moving any archive byte.
+#[test]
+fn derived_playback_params_reach_the_manifest_only_when_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("quakes.parquet");
+
+    let n = 240usize;
+    let hour = 3_600_000i64;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("geometry", DataType::Binary, true),
+        Field::new("timestamp", DataType::Int64, true),
+        Field::new("magnitude", DataType::Float64, true),
+    ]));
+    let wkbs: Vec<Vec<u8>> = (0..n)
+        .map(|i| wkb_point(-120.0 + i as f64 * 0.01, 35.0 + i as f64 * 0.01))
+        .collect();
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(BinaryArray::from_iter_values(
+            wkbs.iter().map(|b| b.as_slice()),
+        )),
+        // 240 points spread over 480 hourly buckets.
+        Arc::new(Int64Array::from_iter_values(
+            (0..n).map(|i| 1_700_000_000_000i64 + i as i64 * 2 * hour),
+        )),
+        Arc::new(Float64Array::from_iter_values(
+            (0..n).map(|i| i as f64 / 10.0),
+        )),
+    ];
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+    let file = std::fs::File::create(&input).unwrap();
+    let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let features = load_features(
+        &input,
+        "timestamp",
+        None,
+        TimeFormat::UnixMs,
+        InputStrictness::Warn,
+        InputStrictness::Warn,
+    )
+    .unwrap();
+    let (bounds, time_range) = calculate_bounds(&features).unwrap();
+    let temporal_bucket_ms = hour as u64;
+    let config = TileConfig {
+        min_zoom: 4,
+        max_zoom: 5,
+        temporal_bucket_ms,
+        ..TileConfig::default()
+    };
+    let tiles = generate_tiles(&features, &config, 1).unwrap();
+
+    // One build per gate setting, everything else identical.
+    let build = |out: &std::path::Path, derived: bool| -> serde_json::Value {
+        let mut writer = stt_core::PackWriter::create(
+            out,
+            stt_core::BlobOrdering::SpatialMajor,
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        for tile in &tiles {
+            writer.write_tile(tile).unwrap();
+        }
+        let derivation = if derived {
+            DerivedPlaybackParams {
+                total_payload_bytes: Some(writer.payload_bytes()),
+                refit: true,
+            }
+        } else {
+            DerivedPlaybackParams::default()
+        };
+        assert!(
+            !derived || derivation.total_payload_bytes.unwrap() > 0,
+            "the writer must have totalled some payload bytes"
+        );
+        let hints = compute_style_hints_with(
+            &features,
+            &time_range,
+            temporal_bucket_ms,
+            false,
+            derivation,
+        )
+        .unwrap();
+        let metadata = stt_core::metadata::Metadata::new("hints-e2e")
+            .with_bounds(bounds)
+            .with_time_range(time_range)
+            .with_zoom_levels(4, 5)
+            .with_temporal_bucket_ms(temporal_bucket_ms)
+            .with_style_hints(hints);
+        writer.finalize(&metadata).unwrap();
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap()
+    };
+
+    let off = build(&dir.path().join("off"), false);
+    let on = build(&dir.path().join("on"), true);
+
+    // Gate OFF: identical to a build that predates the field, key and all.
+    let legacy_hints =
+        compute_style_hints(&features, &time_range, temporal_bucket_ms, false).unwrap();
+    assert_eq!(
+        off["metadata"]["style_hints"]["suggested_playback_seconds"],
+        serde_json::json!(legacy_hints.suggested_playback_seconds.unwrap())
+    );
+    assert!(off["metadata"]["style_hints"]
+        .get("suggested_time_window_ms")
+        .is_none());
+
+    // Gate ON: the window key appears and the duration is the refit value.
+    let sh = &on["metadata"]["style_hints"];
+    let window = sh["suggested_time_window_ms"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("derived window missing: {sh}"));
+    assert!(
+        (temporal_bucket_ms..=24 * temporal_bucket_ms).contains(&window),
+        "window {window} outside [Δ, 24Δ]"
+    );
+    let seconds = sh["suggested_playback_seconds"].as_u64().unwrap();
+    assert!((5..=300).contains(&seconds), "{seconds}s outside the band");
+    assert_ne!(
+        seconds,
+        u64::from(legacy_hints.suggested_playback_seconds.unwrap()),
+        "at 480 buckets the refit must differ from sqrt(480)≈22 — if this ever \
+         coincides, pick a different fixture rather than deleting the assertion"
+    );
+
+    // Only the hint block moved: the archive itself is byte-identical.
+    assert_eq!(off["directory"]["key"], on["directory"]["key"]);
+    assert_eq!(off["packs"], on["packs"]);
+}
+
+/// BH-10's stated assumption, asserted rather than trusted: the stt-core
+/// v2-golden fixtures are built WITHOUT stt-build's hints pipeline, so nothing
+/// in this item can move `expected-hashes.json`.
+///
+/// If this fails, the assumption broke — the golden manifests DO carry hints,
+/// the fixture pins are now coupled to the hint formulas, and BH-10's emission
+/// can no longer be described as manifest-only-on-rebuild. Say so loudly rather
+/// than re-blessing anything.
+#[test]
+fn the_v2_golden_fixtures_carry_no_style_hints_so_their_pins_cannot_move() {
+    let root = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../stt-core/tests/fixtures/v2-golden"
+    );
+    for shape in ["single", "paged"] {
+        let path = std::path::Path::new(root).join(shape).join("manifest.json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            manifest["metadata"].get("style_hints").is_none(),
+            "{} carries a style_hints block — BH-10's assumption that the golden \
+             fixture builder does not run stt-build's hints pipeline is BROKEN, and \
+             expected-hashes.json is now coupled to the hint formulas",
+            path.display()
+        );
+        assert!(
+            manifest["metadata"].get("ordering_workload").is_none()
+                && manifest.get("orderingWorkload").is_none(),
+            "{} carries an ordering workload — the fixtures are supposed to use an \
+             EXPLICIT ordering, which records none",
+            path.display()
+        );
+    }
 }

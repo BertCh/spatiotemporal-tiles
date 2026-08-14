@@ -11,8 +11,8 @@ use super::frame::{
     EndTimeForm, StartTimeForm, TemplateRegistry, TileMeta, FRAME_ALIGN, FRAME_V2_ESCAPE,
     FRAME_V2_VERSION, REF_KIND_INLINE, REF_KIND_NO_PROPS, REF_KIND_TEMPLATE_HASH,
     SECTION_CORE_BATCH, SECTION_INLINE_SCHEMA_CORE, SECTION_INLINE_SCHEMA_PROPS,
-    SECTION_PROPS_BATCH, SECTION_TILE_META, TIME_OFFSET_MS_KEY, VERTEX_TIME_ORIGIN_KEY,
-    VERTEX_TIME_STEP_KEY, VERTEX_VALUE_BUCKETS_KEY,
+    SECTION_PROPS_BATCH, SECTION_TILE_META, TIME_OFFSET_MS_KEY, VERTEX_TIME_FEATURE_STEP_KEY,
+    VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY, VERTEX_VALUE_BUCKETS_KEY,
 };
 use super::quantize::{AttrQuant, STT_QUANT_ATTR_META_KEY, VERTEX_VALUE_QUANT_SENTINEL};
 use crate::error::{Error, Result};
@@ -457,6 +457,12 @@ pub(crate) fn merge_v2_layer(
     if let Some((origin, step)) = meta.vt {
         schema_meta.insert(VERTEX_TIME_ORIGIN_KEY.to_string(), origin.to_string());
         schema_meta.insert(VERTEX_TIME_STEP_KEY.to_string(), step.to_string());
+    }
+    // TB-11 extension 2. Re-injected as its own key so the reconstructed schema
+    // says feature-anchored where the tile said feature-anchored — collapsing it
+    // onto `vt` here would hand a consumer a layer origin that never existed.
+    if let Some(step) = meta.vtf {
+        schema_meta.insert(VERTEX_TIME_FEATURE_STEP_KEY.to_string(), step.to_string());
     }
     if let Some(buckets) = meta.vb {
         schema_meta.insert(VERTEX_VALUE_BUCKETS_KEY.to_string(), buckets.to_string());

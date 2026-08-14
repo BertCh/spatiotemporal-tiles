@@ -572,6 +572,7 @@ mod tests {
             bytes_total: 500_000,
             bytes_per_feature: 100.0,
             zstd_ratio: 3.0,
+            tiles: 1,
             per_column: Vec::new(),
         });
         let advice = advise(&result, &empty_data()).unwrap();

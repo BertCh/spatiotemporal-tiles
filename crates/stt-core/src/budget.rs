@@ -26,12 +26,31 @@ pub enum ImportanceScorer {
 }
 
 /// Tile size budget configuration
+///
+/// ## Why there is no compressed-byte cap
+///
+/// A `max_compressed_size` field lived here until 2026-08. It was stored, and
+/// `build_tile_budget` passed the SAME `--maximum-tile-bytes` value twice to
+/// fill it — but nothing ever read it: [`Self::enforce_indexed`] binds only on
+/// `max_uncompressed_size` and `max_feature_count`. It was deleted rather than
+/// enforced, deliberately:
+///
+/// * Enforcing a compressed cap needs a drop → encode → zstd → check fixpoint
+///   per tile, which this module's index-based, never-materialize design exists
+///   to avoid (the caller keeps its own feature representation; the budget only
+///   ever sees `(vertex_count, property_count, bytes)`).
+/// * The correct form of a compressed cap is a **measured** post-zstd byte
+///   objective from the sample encoder, which is the measurement-oracle work
+///   feeding `--target-size` — not a stored constant.
+///
+/// So the CLI surface, the docs and the behavior now agree:
+/// `--maximum-tile-bytes` is an UNCOMPRESSED cap and says so. Re-proposing a
+/// compressed cap here means implementing the measured version; do not
+/// resurrect the dead field.
 #[derive(Debug, Clone)]
 pub struct TileBudget {
     /// Maximum uncompressed size in bytes
     pub max_uncompressed_size: usize,
-    /// Maximum compressed size in bytes (after compression)
-    pub max_compressed_size: usize,
     /// Maximum number of features
     pub max_feature_count: usize,
     /// Importance scorer to use for feature dropping
@@ -42,7 +61,6 @@ impl Default for TileBudget {
     fn default() -> Self {
         Self {
             max_uncompressed_size: 500 * 1024, // 500KB uncompressed
-            max_compressed_size: 128 * 1024,   // 128KB compressed
             max_feature_count: 10_000,
             scorer: ImportanceScorer::Combined,
         }
@@ -50,15 +68,13 @@ impl Default for TileBudget {
 }
 
 impl TileBudget {
-    /// Create a new tile budget with custom limits
-    pub fn new(
-        max_uncompressed_size: usize,
-        max_compressed_size: usize,
-        max_feature_count: usize,
-    ) -> Self {
+    /// Create a new tile budget with custom limits.
+    ///
+    /// Both caps are what [`Self::enforce_indexed`] actually binds on — there is
+    /// no third, unenforced cap (see the type docs).
+    pub fn new(max_uncompressed_size: usize, max_feature_count: usize) -> Self {
         Self {
             max_uncompressed_size,
-            max_compressed_size,
             max_feature_count,
             scorer: ImportanceScorer::Combined,
         }
@@ -221,7 +237,7 @@ mod tests {
     #[test]
     fn test_enforce_indexed_under_budget_is_noop() {
         // Well within both caps -> every index returned, in order.
-        let budget = TileBudget::new(1_000_000, 256 * 1024, 1000);
+        let budget = TileBudget::new(1_000_000, 1000);
         let sizes = [100usize, 50, 200, 75];
         let keep = budget.enforce_indexed(sizes.len(), |i| sizes[i] as f64, |i| sizes[i]);
         assert_eq!(keep, vec![0, 1, 2, 3]);
@@ -232,7 +248,7 @@ mod tests {
         // Cap at 2 features; scorer = geometry size (here, size doubles as both
         // score and bytes). The two largest (idx 2 and 3) survive, returned in
         // ascending index order.
-        let budget = TileBudget::new(1_000_000, 256 * 1024, 2);
+        let budget = TileBudget::new(1_000_000, 2);
         let sizes = [10usize, 50, 200, 100];
         let mut keep = budget.enforce_indexed(sizes.len(), |i| sizes[i] as f64, |i| sizes[i]);
         keep.sort_unstable();
@@ -242,13 +258,49 @@ mod tests {
     #[test]
     fn test_enforce_indexed_size_cap_drops_to_fit() {
         // Tiny byte cap forces a size-based drop; result must fit under cap.
-        let budget = TileBudget::new(150, 256 * 1024, 10_000);
+        let budget = TileBudget::new(150, 10_000);
         let sizes = [100usize, 100, 100, 100];
         let keep = budget.enforce_indexed(sizes.len(), |i| sizes[i] as f64, |i| sizes[i]);
         let kept_bytes: usize = keep.iter().map(|&i| sizes[i]).sum();
         assert!(keep.len() < sizes.len(), "expected some features dropped");
         // 90%-of-cap target with slight-overshoot tolerance (<=105%).
         assert!(kept_bytes <= 150 * 105 / 100);
+    }
+
+    /// SH-5 neutrality snapshot. Deleting `max_compressed_size` must not move a
+    /// single kept index: it was never read, so an over-budget fixture's keep-set
+    /// is pinned here as a literal. If a future change to the greedy moves this,
+    /// that is a real behavior change and must be argued for on its own terms —
+    /// it is NOT a side effect of the field deletion.
+    #[test]
+    fn enforce_indexed_keep_set_is_pinned_across_the_compressed_cap_deletion() {
+        // 12 items, byte cap 1000 (target 900), count cap 8. Scores are chosen
+        // so the count stage and the density stage both bind.
+        let sizes: [usize; 12] = [300, 120, 90, 400, 60, 250, 30, 180, 75, 500, 45, 210];
+        let scores: [f64; 12] = [
+            9.0, 7.0, 8.0, 12.0, 3.0, 6.0, 1.0, 11.0, 4.0, 15.0, 2.0, 10.0,
+        ];
+        let budget = TileBudget::new(1000, 8);
+        let keep = budget.enforce_indexed(sizes.len(), |i| scores[i], |i| sizes[i]);
+        assert_eq!(keep, vec![0, 1, 2, 7, 11]);
+        // Ascending order is the caller's emission-order guarantee.
+        assert!(keep.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// Determinism: the same input re-run yields the identical keep-set. No
+    /// RNG, no hash-map iteration, no wall clock in the selection path.
+    #[test]
+    fn enforce_indexed_is_deterministic_across_reruns() {
+        let sizes: [usize; 12] = [300, 120, 90, 400, 60, 250, 30, 180, 75, 500, 45, 210];
+        let scores: [f64; 12] = [
+            9.0, 7.0, 8.0, 12.0, 3.0, 6.0, 1.0, 11.0, 4.0, 15.0, 2.0, 10.0,
+        ];
+        let budget = TileBudget::new(1000, 8);
+        let a = budget.enforce_indexed(sizes.len(), |i| scores[i], |i| sizes[i]);
+        for _ in 0..8 {
+            let b = budget.enforce_indexed(sizes.len(), |i| scores[i], |i| sizes[i]);
+            assert_eq!(a, b);
+        }
     }
 
     #[test]

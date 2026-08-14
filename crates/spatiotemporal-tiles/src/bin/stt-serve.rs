@@ -230,6 +230,20 @@ struct Args {
     #[arg(long)]
     pre_tessellate: bool,
 
+    /// TB-12 per-feature triangle emission: bake indices only for the polygon
+    /// features a renderer's own single-boundary earcut cannot reproduce
+    /// (holes, multi-part) and leave the rest for the client to backfill at
+    /// decode. Saves wire bytes; requires a client that implements the
+    /// backfill.
+    ///
+    /// OPT-IN here, unlike `stt-build`, and for the same reason
+    /// `--compact-times` is: a packed archive lets an old reader refuse at open
+    /// on `manifest.capabilities`, but a served tile gives it no such chance —
+    /// it would just draw every single-ring polygon as nothing. Enabling this
+    /// adds `triangles-partial` to the `/tilejson` capability list.
+    #[arg(long)]
+    partial_triangles: bool,
+
     /// Per-feature numeric property naming the shallowest zoom a feature appears
     /// at (road-class-style LOD floor).
     #[arg(long)]
@@ -790,7 +804,7 @@ fn metadata_json(
         // Always present (an empty array when the server encodes the legacy,
         // capability-free shape) so its absence unambiguously means "server
         // too old to declare", not "declares nothing".
-        "capabilities": encoder_settings(args).required_capabilities(),
+        "capabilities": serve_capabilities(args),
         "name": name,
         "boundingBox": [
             [min_lon.unwrap_or(-180.0), min_lat.unwrap_or(-90.0)],
@@ -1196,6 +1210,27 @@ fn encoder_settings(args: &Args) -> EncoderSettings {
     }
 }
 
+/// The `/tilejson` capability list: the encoder-settings capabilities plus the
+/// ones a live server can only declare from its FLAGS.
+///
+/// TB-12's `triangles-partial` is the latter kind. Offline, the builder waits
+/// and declares it only if some layer really mixed empty and baked triangle
+/// lists; a server publishes `/tilejson` before it has encoded a single tile, so
+/// it has nothing to observe. It therefore declares the honest dataset-level
+/// claim — "a tile from this server MAY carry per-feature triangle lists" —
+/// which is the same standard `time-delta` is held to. Over-declaring costs an
+/// old client an archive it could have read; under-declaring costs it geometry
+/// it never learns is missing.
+fn serve_capabilities(args: &Args) -> Vec<String> {
+    let mut caps = encoder_settings(args).required_capabilities();
+    if args.partial_triangles && !args.pre_tessellate {
+        caps.push(stt_core::pack::CAPABILITY_TRIANGLES_PARTIAL.to_string());
+        caps.sort();
+        caps.dedup();
+    }
+    caps
+}
+
 /// Build the full per-tile [`TileConfig`] from the CLI flags, sharing the exact
 /// builders the offline CLI uses, plus a resolved [`EncoderConfig`] passed
 /// EXPLICITLY to the encoder per request (no process-wide globals — so the
@@ -1385,10 +1420,29 @@ fn build_config(
         temporal_bucket_ms: bucket_ms,
         clip_trajectories: !args.no_clip,
         clip_min_vertices: args.clip_min_vertices,
+        // TB-7: the same tile-relative line buffer the offline builder uses, so
+        // a served tile matches its built counterpart at the seam.
+        clip_buffer_px: stt_build::clip::DEFAULT_CLIP_BUFFER_PX,
+        clip_buffer_degrees: None,
         simplify: args.simplify,
         simplify_max_zoom: args.simplify_max_zoom,
         simplify_metric: args.simplify_metric,
         pre_tessellate: args.pre_tessellate,
+        // TB-12: the offline builder reads this flag back after tiling to decide
+        // whether the manifest owes `triangles-partial`. A live server cannot —
+        // it declares its capabilities in `/tilejson` BEFORE it has encoded
+        // anything — so it declares from the setting instead (see the
+        // `triangles-partial` arm in `required_capabilities`). Kept here so the
+        // shared `TileConfig` has one meaning, not two.
+        //
+        // TB-10 is inert here for a structural reason, not a policy one: adaptive
+        // temporal windowing is rejected outright by `build_config` (a single-tile
+        // request cannot reproduce a cell-wide partition), so neither the exact
+        // solver nor the shared boundary set has anything to act on.
+        adaptive_greedy: false,
+        adaptive_boundaries: Vec::new(),
+        partial_triangles: args.partial_triangles,
+        partial_triangles_observed: Default::default(),
         temporal_lod,
         min_features_per_tile: args.min_features_per_tile,
         time_aware_simplify: args.time_aware_simplify,

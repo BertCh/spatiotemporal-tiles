@@ -19,7 +19,7 @@
 //! | `vertex_value_matrix` | as `vertex_value`               | per-vertex × per-bucket series (optional) |
 //! | `triangles`   | `List<UInt16>` or `List<UInt32>`        | pre-baked earcut indices, feature-local (optional; polygon only) |
 //! | `part_offsets`| `List<UInt32>`                          | per-feature MultiPolygon part boundaries as ring indices (optional; polygon only — absent ⇒ every feature is single-part) |
-//! | `<property>`  | `Float64` or `Dictionary<UInt16,Utf8>`   | one column per property       |
+//! | `<property>`  | `Float64`, `Utf8`, or `Dictionary<UInt16,Utf8>` | one column per property; categorical representation is chosen per tile |
 //!
 //! All layers in one tile are concatenated with a tiny frame so a tile can
 //! carry, say, a linestring layer and a point layer side by side.

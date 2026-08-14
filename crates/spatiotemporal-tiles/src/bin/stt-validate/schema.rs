@@ -22,7 +22,7 @@
 //! | `vertex_value_matrix` | `List<Float32>`                             | opt |
 //! | `triangles`           | `List<UInt16>` or `List<UInt32>`            | opt |
 //! | `part_offsets`        | `List<UInt32>`                              | opt |
-//! | `<property>`          | `Float64` or `Dictionary<UInt16,Utf8>`      | opt |
+//! | `<property>`          | `Float64`, `Utf8`, or `Dictionary<UInt16,Utf8>` | opt |
 //!
 //! `vertex_time` sizes itself per tile off a narrowest-first delta ladder
 //! (`UInt16` then `UInt32`, both at the finest step that fits) before falling
@@ -211,7 +211,7 @@ fn check_layer_schema(layer: &DecodedLayer, findings: &mut SchemaFindings) {
     check_vertex_time_metadata(layer, issues);
     check_vertex_value_buckets(layer, issues);
 
-    // (d) every remaining (property) column must be one of the two encodable
+    // (d) every remaining (property) column must be an encodable
     // property shapes the producer emits — anything else is producer drift.
     for field in schema.fields() {
         let n = field.name().as_str();
@@ -221,8 +221,8 @@ fn check_layer_schema(layer: &DecodedLayer, findings: &mut SchemaFindings) {
         if !is_valid_property_field(field) {
             issues.push(format!(
                 "layer '{name}': property column '{n}' has type {:?}, expected Float64, \
-                 Dictionary<UInt16,Utf8>, or a quantized UInt16/Int32 carrying a valid \
-                 '{STT_QUANT_ATTR_META_KEY}' affine",
+                 Utf8, Dictionary<UInt16,Utf8>, or a quantized UInt16/Int32 carrying a \
+                 valid '{STT_QUANT_ATTR_META_KEY}' affine",
                 field.data_type()
             ));
         }
@@ -475,14 +475,15 @@ fn is_list_like(dt: &DataType) -> bool {
 }
 
 /// A property column is one of the shapes `encode_layer` emits: a plain
-/// `Float64` (numeric), a `Dictionary<UInt16, Utf8>` (categorical), an
+/// `Float64` (numeric), `Utf8` or `Dictionary<UInt16, Utf8>` (adaptive
+/// categorical), an
 /// interleaved `FixedSizeList<Float32|UInt8, N>` vector (`--vector-group`), or —
 /// when the build opts a numeric column into quantization (`--quantize-attr`) —
 /// a fixed-point `UInt16`/`Int32` leaf carrying the `stt:qa` reconstruction
 /// affine in its field metadata (the reader rebuilds Float64 from `{o,s}`).
 fn is_valid_property_field(field: &Field) -> bool {
     match field.data_type() {
-        DataType::Float64 => true,
+        DataType::Float64 | DataType::Utf8 => true,
         DataType::Dictionary(k, v) => {
             matches!(k.as_ref(), DataType::UInt16) && matches!(v.as_ref(), DataType::Utf8)
         }
@@ -607,11 +608,14 @@ pub enum ColumnDrift {
     ///   is defined ("no feature is multi-part", "no baked tessellation", "no
     ///   per-vertex times"), so a reader is never handed a different meaning —
     ///   it is handed the documented default.
+    /// * **Categorical representation.** Tile-local categorical strings may
+    ///   switch between plain `Utf8` and `Dictionary<UInt16,Utf8>` according
+    ///   to which is smaller; both carry the same logical strings.
     AdaptiveWidth,
     /// A structural disagreement: a PROPERTY column present in one tile and
-    /// absent from the other, or any column whose type CLASS changed
-    /// (dictionary vs numeric). A consumer reading that column gets a different
-    /// thing per tile — the original purpose of the drift check.
+    /// absent from the other, or an incompatible type-class change (for
+    /// example categorical vs numeric). A consumer reading that column gets a
+    /// different thing per tile — the original purpose of the drift check.
     Structural,
 }
 
@@ -647,6 +651,10 @@ pub fn classify_column_drift(column: &str, a: Option<&str>, b: Option<&str>) -> 
     };
     if a == b {
         return ColumnDrift::AdaptiveWidth; // not a difference at all
+    }
+    let categorical = |t: &str| t == "Utf8" || t == "Dictionary(UInt16, Utf8)";
+    if categorical(a) && categorical(b) {
+        return ColumnDrift::AdaptiveWidth;
     }
     // Longest-first, and the `U`-prefixed names BEFORE their unsigned-less
     // substrings: "UInt32" contains "Int32", so replacing "Int32" first would
@@ -1300,6 +1308,18 @@ mod tests {
                 None,
                 Some("List(Field { data_type: Float64 })")
             ),
+            ColumnDrift::Structural
+        );
+    }
+
+    #[test]
+    fn categorical_utf8_and_dictionary_drift_is_adaptive_not_structural() {
+        assert_eq!(
+            classify_column_drift("kind", Some("Utf8"), Some("Dictionary(UInt16, Utf8)")),
+            ColumnDrift::AdaptiveWidth
+        );
+        assert_eq!(
+            classify_column_drift("kind", Some("Utf8"), Some("Float64")),
             ColumnDrift::Structural
         );
     }

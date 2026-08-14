@@ -8,7 +8,7 @@
 //! I/O is inverted. This reader answers *which bytes it needs next*
 //! ([`Archive::directory_key`], [`TileRef::pack_id`] + `offset`/`length`) and
 //! the host hands them back. Everything between those two points — manifest
-//! checks, the v5 directory codec, CRC32C, zstd, the layer frame, GeoArrow —
+//! checks, the v6 directory codec, CRC32C, zstd, the layer frame, GeoArrow —
 //! is `stt_core`'s, unchanged.
 //!
 //! This module is plain Rust with no `wasm_bindgen` in it, so the decode path
@@ -181,7 +181,7 @@ impl Archive {
         &self.manifest
     }
 
-    /// The manifest's authoritative `formatVersion` (1 | 2).
+    /// The manifest's authoritative packed `formatVersion` (3).
     pub fn format_version(&self) -> u32 {
         self.manifest.format_version
     }
@@ -338,7 +338,7 @@ impl Archive {
     /// local-file shape (a Python caller with the dataset on disk, or a JS
     /// caller that already cached the pack).
     ///
-    /// Under formatVersion 2 blob offsets are object-absolute, so the slice
+    /// Under formatVersion 3 blob offsets are object-absolute, so the slice
     /// math is version-independent.
     pub fn decode_tile_in_pack(&self, index: usize, pack_bytes: &[u8]) -> Result<Vec<LayerIpc>> {
         let entry = self.tile(index)?.entry().clone();

@@ -7,6 +7,8 @@
 //! [`TemplateCollector`] and decode-side [`TemplateRegistry`], and the
 //! [`TileMeta`] section payload.
 
+use arrow::datatypes::DataType;
+use arrow::ipc::reader::StreamReader;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -124,6 +126,250 @@ impl TemplateCollector {
     /// Whether no template has been recorded.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The |T| ACCOUNTING report: one row per distinct schema SHAPE, as
+    /// `(shape description, templates carrying it, total template bytes)`,
+    /// sorted by description.
+    ///
+    /// This is the instrument defect D6 lacked. Every per-tile encoding choice
+    /// — the dictionary-vs-`Utf8` verdict, the `UInt16`/`Int32` leaf width, the
+    /// `EndTimeForm::Zero` omission, whether a sidecar column is present — forks
+    /// a schema template when it differs from tile to tile, and until now no
+    /// encoder could see the fork it caused, let alone price it. The report is
+    /// what makes `|T|` observable at the end of a build, and it is the evidence
+    /// [`template_cost_justifies`] is meant to be calibrated against.
+    ///
+    /// The description is a canonicalization of the template's Arrow schema
+    /// (sorted schema metadata + the field list as `name:type`), NOT of its
+    /// bytes: a `count` above 1 therefore means two templates that describe the
+    /// same shape still hash apart — a byte-level fork the shape vocabulary
+    /// cannot explain (the one known candidate is Arrow's `HashMap`-backed
+    /// schema metadata, whose iteration order reaches the flatbuffer, and which
+    /// the encoder's byte-reproducibility tests track separately). Surfacing
+    /// that is the point; `count == 1` everywhere is the healthy state.
+    ///
+    /// Deterministic: the underlying snapshot is hash-sorted and deduped, the
+    /// grouping key is a pure function of the template bytes, and the rows come
+    /// out in `BTreeMap` (description) order.
+    pub fn template_report(&self) -> Vec<(String, usize, u64)> {
+        let mut by_shape: BTreeMap<String, (usize, u64)> = BTreeMap::new();
+        for (_, bytes) in self.snapshot() {
+            let entry = by_shape
+                .entry(describe_template_shape(&bytes))
+                .or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += bytes.len() as u64;
+        }
+        by_shape
+            .into_iter()
+            .map(|(shape, (count, bytes))| (shape, count, bytes))
+            .collect()
+    }
+
+    /// Total bytes of every distinct template recorded — the `Σ|τ|` term of the
+    /// §3.8 objective, as opposed to the per-tile tail term.
+    pub fn total_template_bytes(&self) -> u64 {
+        self.templates
+            .lock()
+            .unwrap()
+            .values()
+            .map(|t| t.len() as u64)
+            .sum()
+    }
+
+    /// Measured marginal cost of one more template: the mean recorded template
+    /// size, or `None` when nothing has been recorded yet.
+    ///
+    /// This is the "template size read from a trial [`TemplateCollector`]
+    /// snapshot" a width/type decision should price itself against — pass it to
+    /// [`template_cost_justifies_with`] in preference to the
+    /// [`DEFAULT_TEMPLATE_COST_BYTES`] fallback whenever a real collector is in
+    /// hand, because a dataset with wide property schemas pays far more per fork
+    /// than the fixture-derived default assumes.
+    pub fn mean_template_bytes(&self) -> Option<u64> {
+        // One lock for both the count and the sum: a collector is still being
+        // written to during a parallel encode, and a mean assembled from two
+        // different instants of it would be a number nothing produced.
+        let templates = self.templates.lock().unwrap();
+        let n = templates.len() as u64;
+        let total: u64 = templates.values().map(|t| t.len() as u64).sum();
+        (n > 0).then(|| total / n)
+    }
+
+    /// Cross-check the REALIZED template count against pass 1's PREDICTED shape
+    /// count, returning a warning line when the build forked more shapes than
+    /// were predicted (and `None` when it did not).
+    ///
+    /// The assertion behind mechanism M2: once the dataset-global pins decide
+    /// each column's Arrow type and leaf width, a per-tile encoder must not be
+    /// able to invent a shape the pass-1 scan did not foresee. An overshoot is
+    /// not a hard error — an unpredicted fork costs bytes, never correctness,
+    /// and failing a long build over it would be the wrong trade — so this
+    /// hands back a message for the caller to log loudly.
+    ///
+    /// Realized BELOW the prediction is fine and silent: a dataset whose tiles
+    /// never realize some predicted shape (an empty layer kind, say) simply
+    /// costs less than forecast.
+    pub fn unpredicted_fork_warning(&self, predicted: usize) -> Option<String> {
+        // Counted off the SAME snapshot the detail lines come from, so the
+        // headline number and the shapes below it can never disagree.
+        let report = self.template_report();
+        let realized: usize = report.iter().map(|(_, count, _)| *count).sum();
+        if realized <= predicted {
+            return None;
+        }
+        let forks: Vec<String> = report
+            .iter()
+            .filter(|(_, count, _)| *count > 1)
+            .map(|(shape, count, bytes)| format!("{count}× {shape} ({bytes} B)"))
+            .collect();
+        let detail = if forks.is_empty() {
+            format!("{} distinct shapes, none duplicated", report.len())
+        } else {
+            format!("duplicated shapes: {}", forks.join("; "))
+        };
+        Some(format!(
+            "schema templates: {realized} realized vs {predicted} predicted by pass 1 \
+             (+{} unpredicted fork(s)); {detail}",
+            realized - predicted
+        ))
+    }
+}
+
+// ----------------------------------------------------------------------------
+// The schema-template cost term |T| — mechanism M2 / defect D6.
+//
+// §3.8's objective is `Σ_τ |τ| + Σ_t (|TILEMETA_t| + 16·refs + |tail_t|)`: every
+// distinct realized shape costs a whole template, and that second-order cost is
+// what every per-tile encoding choice externalizes. The partition of keys
+// between TEMPLATE and TILE_META is NOT in question here — it is exactly optimal
+// given the known variability structure and this file leaves it alone. What is
+// added is the price tag a choice can consult before it forks a shape.
+// ----------------------------------------------------------------------------
+
+/// Default marginal cost of one extra schema template, in bytes — the `c_tmpl`
+/// constant of the §3.8 objective when no measured collector is available.
+///
+/// Measured over the v2 golden fixture's `manifest.schemas`: five templates of
+/// 128, 192, 720, 728 and 888 raw bytes, mean 531. A deliberate UNDER-estimate
+/// of the true archive cost, on two counts — `manifest.schemas` stores each
+/// template base64'd (×4/3), and a manifest is fetched by every client on open
+/// while a per-row saving is paid once — because under-pricing templates biases
+/// [`template_cost_justifies`] toward the INCUMBENT encoding. A cost term that
+/// only ever fires when the win is unambiguous is the right default for a term
+/// whose whole job is to stop unpriced churn.
+///
+/// Callers holding a real [`TemplateCollector`] should prefer its measured
+/// [`mean_template_bytes`](TemplateCollector::mean_template_bytes).
+pub const DEFAULT_TEMPLATE_COST_BYTES: u64 = 531;
+
+/// Is an encoding choice that adds `shape_delta` schema templates justified by
+/// `byte_savings` bytes of payload it saves?
+///
+/// **The gate every future menu extension must call.** §2.6's narrower
+/// compact-time tiers (`UInt16` offsets, bucket-anchored anchors) are the
+/// motivating case and are deliberately NOT in this window: adding a form to the
+/// menu adds a realized core shape, and the incumbent's answer to that coupling
+/// is one hand-rolled special case — the empty-layer pin, which refuses to
+/// compact a zero-feature layer because "a compact verdict over zero features
+/// would fork the layer's schema template". That special case is exactly
+/// `template_cost_justifies(1, 0) == false`; this function generalizes it so the
+/// next extension states its trade instead of re-deriving one.
+///
+/// What it does NOT do is re-open the choices already made. The per-layer
+/// `EndTimeForm::Zero` / `Dur32` verdicts stay per layer: they are
+/// feasibility-gated and within-family optimal (0 < 4 < 8 bytes a row, feasibility
+/// monotone), so the cost term is offered to them and their extensions rather
+/// than imposed on them.
+///
+/// Strict inequality: a break-even fork is not worth taking, and saturating
+/// arithmetic keeps a nonsense `shape_delta` from wrapping into a cheap verdict.
+pub fn template_cost_justifies(shape_delta: usize, byte_savings: u64) -> bool {
+    template_cost_justifies_with(shape_delta, byte_savings, DEFAULT_TEMPLATE_COST_BYTES)
+}
+
+/// [`template_cost_justifies`] against a MEASURED per-template cost — normally
+/// [`TemplateCollector::mean_template_bytes`] off a trial encode of the dataset.
+pub fn template_cost_justifies_with(
+    shape_delta: usize,
+    byte_savings: u64,
+    template_cost_bytes: u64,
+) -> bool {
+    byte_savings > (shape_delta as u64).saturating_mul(template_cost_bytes)
+}
+
+/// Canonical, human-readable SHAPE of a schema template: sorted schema
+/// metadata plus the field list as `name:type`.
+///
+/// The grouping key of [`TemplateCollector::template_report`], and usable
+/// directly against a [`TemplateRegistry`]'s entries by a tool inspecting a
+/// built archive. Schema metadata is sorted because Arrow carries it in a
+/// `HashMap`, whose iteration order must never leak into a report that a build
+/// compares across runs.
+///
+/// A template that will not parse yields a fixed sentinel rather than the parse
+/// error, so the grouping key stays stable (and so a corrupt entry shows up as
+/// one row instead of scattering).
+pub fn describe_template_shape(template: &[u8]) -> String {
+    let Ok(reader) = StreamReader::try_new(std::io::Cursor::new(template), None) else {
+        return "<unparseable schema template>".to_string();
+    };
+    let schema = reader.schema();
+    let mut meta: Vec<(&str, &str)> = schema
+        .metadata()
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    meta.sort_unstable();
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|f| format!("{}:{}", f.name(), compact_type_name(f.data_type())))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if meta.is_empty() {
+        format!("[{fields}]")
+    } else {
+        let meta = meta
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{{{meta}}} [{fields}]")
+    }
+}
+
+/// Compact spelling of an Arrow type for a shape description.
+///
+/// Hand-written rather than `Debug`-derived for the nested types: arrow's
+/// `Debug` for a `List` prints the whole inner `Field` (metadata, nullability,
+/// dict id), which would make one shape row unreadable AND make the grouping key
+/// sensitive to details that are not the shape. Leaf types fall through to
+/// `Debug`, which prints exactly `Float64` / `UInt16` / `Utf8`.
+fn compact_type_name(dt: &DataType) -> String {
+    match dt {
+        DataType::List(f) => format!("List<{}>", compact_type_name(f.data_type())),
+        DataType::LargeList(f) => format!("LargeList<{}>", compact_type_name(f.data_type())),
+        DataType::FixedSizeList(f, n) => {
+            format!("FixedSizeList<{},{n}>", compact_type_name(f.data_type()))
+        }
+        DataType::Dictionary(k, v) => {
+            format!(
+                "Dictionary<{},{}>",
+                compact_type_name(k),
+                compact_type_name(v)
+            )
+        }
+        DataType::Struct(fields) => {
+            let inner = fields
+                .iter()
+                .map(|f| format!("{}:{}", f.name(), compact_type_name(f.data_type())))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("Struct<{inner}>")
+        }
+        leaf => format!("{leaf:?}"),
     }
 }
 
@@ -257,6 +503,19 @@ pub struct TileMeta {
     /// as `[origin_ms, step_ms]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vt: Option<(i64, u32)>,
+    /// The `stt:vertex_time_feature_step_ms` schema-metadata value (TB-11
+    /// extension 2): the step for FEATURE-ANCHORED per-vertex time deltas.
+    ///
+    /// A separate key rather than a reshaped [`Self::vt`], because TILE_META is
+    /// EXTENDED and never mutated: a reader that understands only `vt` would
+    /// otherwise resolve feature-anchored deltas against a layer origin that
+    /// does not exist, placing every vertex at the wrong instant with no error.
+    /// Emitting it therefore also declares the `vertex-time-feature-anchor`
+    /// capability, which makes that a refusal at open instead.
+    ///
+    /// Mutually exclusive with `vt`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vtf: Option<u32>,
 }
 /// Arrow schema-metadata keys for the DELTA per-vertex time encoding: the
 /// absolute origin (Unix ms) the deltas are measured from, and the ms step each
@@ -265,6 +524,15 @@ pub struct TileMeta {
 /// absolute times.
 pub(crate) const VERTEX_TIME_ORIGIN_KEY: &str = "stt:vertex_time_origin_ms";
 pub(crate) const VERTEX_TIME_STEP_KEY: &str = "stt:vertex_time_step_ms";
+/// Arrow schema-metadata key for the FEATURE-ANCHORED per-vertex time encoding
+/// (TB-11 extension 2): the ms step each `List<UInt16>` delta counts, measured
+/// from **each feature's own `start_time`** rather than a layer-wide origin.
+///
+/// There is deliberately no companion origin key — the anchor already ships in
+/// the CORE `start_time` column, which is what makes this tier free on the wire.
+/// Present exactly when [`TileMeta::vtf`] is, and never together with
+/// [`VERTEX_TIME_ORIGIN_KEY`]/[`VERTEX_TIME_STEP_KEY`].
+pub(crate) const VERTEX_TIME_FEATURE_STEP_KEY: &str = "stt:vertex_time_feature_step_ms";
 /// Number of time buckets packed into each row of the `vertex_value_matrix`
 /// column. The renderer reshapes the flat vertex-major list back into a
 /// `[vertex][bucket]` grid using this count.
@@ -275,3 +543,243 @@ pub(crate) const VERTEX_VALUE_BUCKETS_KEY: &str = "stt:vertex_value_buckets";
 /// over the whole start-time column. Mirrors exactly what the decoder computes
 /// (the min of the `start_time` column) — see `packages/core/src/tile.ts`.
 pub(crate) const TIME_OFFSET_MS_KEY: &str = "stt:time_offset_ms";
+
+#[cfg(test)]
+mod template_cost_tests {
+    use super::*;
+    use crate::arrow_tile::{
+        encode_tile_with, ColumnarLayer, EncoderConfig, GeometryColumn, PropertyColumn,
+    };
+
+    fn point_layer() -> ColumnarLayer {
+        ColumnarLayer {
+            name: "points".to_string(),
+            feature_ids: vec![1, 2, 3],
+            start_times: vec![1000, 2000, 3000],
+            end_times: vec![1500, 2500, 3500],
+            geometry: GeometryColumn::Point(vec![[-122.4, 37.7], [-122.5, 37.8], [-122.6, 37.9]]),
+            vertex_times: None,
+            vertex_values: None,
+            vertex_value_matrix: None,
+            triangles: None,
+            polygon_parts: None,
+            properties: vec![(
+                "speed".to_string(),
+                PropertyColumn::Numeric(vec![Some(10.0), None, Some(30.0)]),
+            )],
+        }
+    }
+
+    fn line_layer() -> ColumnarLayer {
+        ColumnarLayer {
+            name: "tracks".to_string(),
+            feature_ids: vec![10, 11],
+            start_times: vec![0, 100],
+            end_times: vec![50, 200],
+            geometry: GeometryColumn::LineString(vec![
+                vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]],
+                vec![[5.0, 5.0], [6.0, 6.0]],
+            ]),
+            vertex_times: None,
+            vertex_values: None,
+            vertex_value_matrix: None,
+            triangles: None,
+            polygon_parts: None,
+            properties: vec![],
+        }
+    }
+
+    fn collecting_config() -> (EncoderConfig, Arc<TemplateCollector>) {
+        let collector = Arc::new(TemplateCollector::new());
+        let cfg = EncoderConfig {
+            template_collector: Some(collector.clone()),
+            ..EncoderConfig::default()
+        };
+        (cfg, collector)
+    }
+
+    /// The gate prices a fork strictly, saturates safely, and reproduces the
+    /// incumbent's one hand-rolled special case: an EMPTY layer saves nothing by
+    /// compacting its time columns, so the fork it would cost is not justified.
+    #[test]
+    fn template_cost_justifies_generalizes_the_empty_layer_pin() {
+        // The empty-layer pin (encode.rs `choose_time_forms`): one extra core
+        // shape, zero features, therefore zero bytes saved.
+        assert!(!template_cost_justifies(1, 0));
+        // A layer with 10 000 features saving 4 B on each does justify it.
+        assert!(template_cost_justifies(1, 10_000 * 4));
+        // Break-even is not worth a fork; one byte past it is.
+        assert!(!template_cost_justifies(1, DEFAULT_TEMPLATE_COST_BYTES));
+        assert!(template_cost_justifies(1, DEFAULT_TEMPLATE_COST_BYTES + 1));
+        // Forking nothing is justified by any positive saving, and by nothing
+        // less — a neutral change is not a reason to churn bytes.
+        assert!(template_cost_justifies(0, 1));
+        assert!(!template_cost_justifies(0, 0));
+        // Two shapes cost two templates.
+        assert!(!template_cost_justifies_with(2, 2_000, 1_000));
+        assert!(template_cost_justifies_with(2, 2_001, 1_000));
+        // Nonsense inputs saturate instead of wrapping into a cheap verdict.
+        assert!(!template_cost_justifies_with(
+            usize::MAX,
+            u64::MAX - 1,
+            u64::MAX
+        ));
+    }
+
+    /// A hand-built two-shape dataset: three distinct templates, one row each,
+    /// bytes accounted exactly.
+    #[test]
+    fn template_report_counts_a_two_shape_dataset() {
+        let (cfg, collector) = collecting_config();
+        // Two geometry kinds — the deliberately-forking build. The point layer
+        // carries a property column (CORE + PROPS templates); the line layer has
+        // none (CORE only).
+        encode_tile_with(&[point_layer()], &cfg).unwrap();
+        encode_tile_with(&[line_layer()], &cfg).unwrap();
+
+        let report = collector.template_report();
+        assert_eq!(collector.len(), 3, "point CORE + point PROPS + line CORE");
+        assert_eq!(report.len(), 3, "three distinct shapes");
+        for (shape, count, bytes) in &report {
+            assert_eq!(*count, 1, "no shape forked a second template: {shape}");
+            assert!(*bytes > 0);
+        }
+        assert_eq!(
+            report.iter().map(|(_, _, b)| *b).sum::<u64>(),
+            collector.total_template_bytes()
+        );
+        assert_eq!(
+            collector.mean_template_bytes(),
+            Some(collector.total_template_bytes() / 3)
+        );
+
+        let shapes: Vec<&str> = report.iter().map(|(s, _, _)| s.as_str()).collect();
+        assert_eq!(
+            shapes
+                .iter()
+                .filter(|s| s.contains("stt:geometry=geoarrow.point"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            shapes
+                .iter()
+                .filter(|s| s.contains("stt:geometry=geoarrow.linestring"))
+                .count(),
+            1
+        );
+        // The PROPS template carries no schema-level metadata at all — every
+        // dataset-constant key lives on the CORE template.
+        let props: Vec<&&str> = shapes.iter().filter(|s| s.starts_with('[')).collect();
+        assert_eq!(props.len(), 1, "exactly one PROPS shape");
+        assert!(
+            props[0].contains("speed:Float64"),
+            "PROPS shape names its column and type: {}",
+            props[0]
+        );
+
+        // Re-encoding the SAME shapes records nothing new: |T| counts distinct
+        // shapes, not tiles.
+        encode_tile_with(&[point_layer()], &cfg).unwrap();
+        encode_tile_with(&[line_layer()], &cfg).unwrap();
+        assert_eq!(collector.template_report(), report);
+    }
+
+    /// The report is a pure function of the recorded SET — same rows whichever
+    /// order the templates arrived in, and stable across repeated calls.
+    #[test]
+    fn template_report_is_deterministic_and_order_independent() {
+        let (forward_cfg, forward) = collecting_config();
+        encode_tile_with(&[point_layer()], &forward_cfg).unwrap();
+        encode_tile_with(&[line_layer()], &forward_cfg).unwrap();
+
+        let (reverse_cfg, reverse) = collecting_config();
+        encode_tile_with(&[line_layer()], &reverse_cfg).unwrap();
+        encode_tile_with(&[point_layer()], &reverse_cfg).unwrap();
+
+        assert_eq!(forward.template_report(), reverse.template_report());
+        assert_eq!(
+            forward.total_template_bytes(),
+            reverse.total_template_bytes()
+        );
+        // Idempotent: re-running the report cannot move a byte of it.
+        let once = forward.template_report();
+        assert_eq!(once, forward.template_report());
+        assert_eq!(once, forward.template_report());
+        // Rows come out sorted by shape description — a total order, so a build
+        // that logs the report emits the same lines every run.
+        let mut sorted = once.clone();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(once, sorted);
+    }
+
+    /// The finalize-time cross-check: silent when the realized shape count is
+    /// within the pass-1 prediction, loud and specific when it is not.
+    #[test]
+    fn unpredicted_fork_warning_fires_only_on_an_overshoot() {
+        let (cfg, collector) = collecting_config();
+        encode_tile_with(&[point_layer()], &cfg).unwrap();
+        encode_tile_with(&[line_layer()], &cfg).unwrap();
+        assert_eq!(collector.len(), 3);
+
+        assert_eq!(
+            collector.unpredicted_fork_warning(3),
+            None,
+            "exact forecast"
+        );
+        assert_eq!(
+            collector.unpredicted_fork_warning(4),
+            None,
+            "under-realizing a forecast is free and silent"
+        );
+        let warning = collector
+            .unpredicted_fork_warning(2)
+            .expect("an overshoot must warn");
+        assert!(warning.contains("3 realized vs 2 predicted"), "{warning}");
+        assert!(warning.contains("+1 unpredicted fork"), "{warning}");
+        assert!(warning.contains("none duplicated"), "{warning}");
+
+        // An empty collector never warns.
+        assert_eq!(TemplateCollector::new().unpredicted_fork_warning(0), None);
+        assert_eq!(TemplateCollector::new().mean_template_bytes(), None);
+        assert_eq!(TemplateCollector::new().total_template_bytes(), 0);
+    }
+
+    /// The shape description is derived from the schema, sorts its metadata, and
+    /// degrades to one stable key rather than an error string.
+    #[test]
+    fn describe_template_shape_is_schema_derived_and_stable() {
+        let (cfg, collector) = collecting_config();
+        encode_tile_with(&[point_layer()], &cfg).unwrap();
+        let snapshot = collector.snapshot();
+        let core = snapshot
+            .iter()
+            .map(|(_, bytes)| describe_template_shape(bytes))
+            .find(|s| s.contains("stt:geometry"))
+            .expect("a CORE template");
+        // Metadata block first, sorted: `stt:geometry` before `stt:layer`.
+        let geometry_at = core.find("stt:geometry").unwrap();
+        let layer_at = core.find("stt:layer").unwrap();
+        assert!(geometry_at < layer_at, "metadata is sorted: {core}");
+        assert!(core.contains("stt:layer=points"), "{core}");
+        // The reserved core columns, named with compact type spellings.
+        for expected in [
+            "id:UInt64",
+            "start_time:",
+            "geometry:FixedSizeList<Float64,2>",
+        ] {
+            assert!(core.contains(expected), "{core} is missing {expected}");
+        }
+
+        // Not a schema template at all → one stable sentinel key, so a corrupt
+        // entry groups as a single report row instead of scattering.
+        assert_eq!(
+            describe_template_shape(&[0u8, 1, 2, 3]),
+            "<unparseable schema template>"
+        );
+        assert_eq!(
+            describe_template_shape(&[]),
+            "<unparseable schema template>"
+        );
+    }
+}

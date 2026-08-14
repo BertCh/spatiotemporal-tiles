@@ -27,11 +27,68 @@
 //!    feature `end_time` across the tile's layers (readers prune interval
 //!    queries on it — a nominal bucket end silently hides interval features).
 //! 10. When the metadata declares a summary tier, every summary-layer `id` is
-//!    a valid H3/Quadbin cell index at the tier's resolution for the tile's
-//!    zoom (a sequential id column — the blank-render bug — fails).
+//!     a valid H3/Quadbin cell index at the tier's resolution for the tile's
+//!     zoom (a sequential id column — the blank-render bug — fails).
 //! 11. Metadata totals (`tile_count`/`feature_count`) match the
-//!    directory-derived totals; zero totals from pre-0.1.1 writers warn
-//!    instead (rebuilding with current stt-build repopulates them).
+//!     directory-derived totals; zero totals from pre-0.1.1 writers warn
+//!     instead (rebuilding with current stt-build repopulates them).
+//! 12. SEMANTIC CONTENT FINGERPRINT. When `metadata.content_fingerprint` is
+//!     present, the decoded content's vertex bbox, z range, per-column numeric
+//!     ranges and categorical cardinalities are recomputed and compared —
+//!     *containment* under `--sample` (every observed value must lie inside the
+//!     declared extent), *containment plus equality* within the declared
+//!     tolerances under a full decode. Declared tolerances are rejected unless
+//!     their matching capability (`coord-quant`, `attr-quant`) is declared, so a
+//!     writer cannot buy slack it did not earn.
+//!
+//!     FEATURE LOSS is caught by the **decoded-row floor**: on a full decode
+//!     the rows at the FULLEST SINGLE ZOOM must be at least the declared
+//!     `distinct_feature_count`, because every source feature appears at least
+//!     once at the deepest tier that survives it and clipping only ever adds
+//!     rows. Per-zoom and not per-archive on purpose — a 600-feature, 7-level
+//!     pyramid decodes 4 200 rows in total, so a whole-archive floor would need
+//!     >85 % loss to fire. Under `--sample` the same shortfall is the sampling
+//!     warning.
+//!
+//!     The declared count is compared against the DECODED ID COUNT only on an
+//!     archive whose wire `id` really is a dataset-wide key, and that is decided
+//!     by the WRITER's recorded id construction
+//!     (`metadata.properties.feature_id_construction`) — never by inferring it
+//!     from the numbers agreeing:
+//!
+//!       * `source` / `anchor-hash` → the two counts are the same quantity. An
+//!         id-less LINE or POLYGON gets the whole-feature anchor hash, which the
+//!         tiler copies into every clipped piece, so this is the ordinary state
+//!         of a line/polygon archive and it is CHECKED. That matters because the
+//!         row floor is loose exactly there: a surviving line replicated across
+//!         tiles contributes rows that cover for the features a rebuild dropped.
+//!       * `row-index` (an id-less point, whose id is the per-tile row index, so
+//!         a healthy 600-feature build decodes 5 distinct ids) and
+//!         `segment-hash` (an id-less clipped trajectory, which mints a fresh id
+//!         per segment) → different quantities, and the deviation is a NOTE.
+//!
+//!     `feature_id_scope=global` and the `global-feature-ids` capability still
+//!     arm it explicitly, and `feature_id_scope=local` still disarms it (the
+//!     documented rollback). On an armed archive a SHORTFALL over a full decode
+//!     is an ERROR, a shortfall under `--sample` and any overshoot are warnings,
+//!     and each is worded so the three can never be confused.
+//!
+//!     When the fingerprint is ABSENT — every archive published before it
+//!     existed — the run warns and continues, exactly like the missing-CRS84
+//!     case. See `fingerprint.rs`; this is the check that would have caught the
+//!     coordinate scramble that structural validation passed on 106 archives.
+//! 13. DECLARED BOUNDS CONTAINMENT. `metadata.bounds` must CONTAIN the decoded
+//!     vertex bbox (and `metadata.z_range`, when declared, the decoded vertical
+//!     extent). The direction is asymmetric on purpose: a declared box that is
+//!     too SMALL is silent data loss at query time — tile selection, frustum
+//!     pre-culling and the opening camera pre-intersect query boxes against it,
+//!     so they discard tiles that really do carry visible data — while a box
+//!     that is too LARGE keeps every reader sound and is at most a warning.
+//!     Severity mirrors check 12: an ERROR on an archive that ATTESTS
+//!     vertex-derived bounds (it carries a content fingerprint, or a
+//!     `bounds_mode=vertex` property), a WARNING naming the rebuild on every
+//!     legacy archive, whose centroid-derived bbox under-states non-point
+//!     geometry by construction. Rides check 12's accumulator — no extra decode.
 //!
 //! The integrity, header, content-address, per-entry temporal-bound and
 //! metadata-total checks (1–3, 7, 11) are cheap and always run over **every**
@@ -39,16 +96,20 @@
 //! deterministic representative sample with `--sample N` for very large
 //! archives; the report then states clearly how many tiles were decoded.
 //!
-//! Exits non-zero on any failure; warnings (tolerated legacy gaps) are
-//! reported but never affect the exit code. With `--json` emits a
-//! machine-readable report; without it emits a short human summary.
+//! Exits non-zero on any failure; warnings (tolerated legacy gaps) and notes
+//! (observations that are not defects — a distinct-id deviation on an archive
+//! whose ids were never a dataset-wide key) are reported but never affect the
+//! exit code. With `--json` emits a machine-readable report; without it emits a
+//! short human summary.
 
+mod fingerprint;
 mod schema;
 mod summary;
 mod temporal;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use fingerprint::FingerprintAccumulator;
 use indicatif::{ProgressBar, ProgressStyle};
 use schema::{
     check_tile_schema, classify_column_drift, layer_schema_columns, schema_signature, ColumnDrift,
@@ -84,6 +145,28 @@ first offender); directory time_end tightness (must equal the max feature \
 end_time — interval queries prune on it); and summary-tier cell-id validity \
 (H3/Quadbin cells at the tier's resolution for the tile zoom).
 
+SEMANTIC TIER (check 12, only when the archive declares one): the decoded \
+vertex bbox, z range, per-column numeric ranges and categorical \
+cardinalities are recomputed and compared against \
+metadata.content_fingerprint — containment under --sample, containment plus \
+equality within the declared tolerances under a full decode. The declared \
+distinct-feature count is compared too: decoding materially FEWER distinct \
+feature ids than declared on a full decode is FEATURE LOSS and fails the run \
+(--allow-distinct-shortfall demotes it to a warning); under --sample, and for \
+any overshoot, it warns. An archive with \
+no fingerprint warns (its CONTENT is unverified) but never fails. \
+--emit-fingerprint / --expect-fingerprint drive the same comparison against \
+an EXTERNAL file, which is how a lossless transform is accepted without \
+being allowed to vouch for itself.
+
+BOUNDS TIER (check 13, on every archive): metadata.bounds must CONTAIN the \
+decoded vertex bbox, and metadata.z_range the decoded vertical extent. Too \
+SMALL is the failure — readers pre-intersect query boxes against bounds, so an \
+under-stated box silently discards tiles that hold visible data; too LARGE is \
+merely conservative and warns at most. An ERROR when the archive attests \
+vertex-derived bounds (a content fingerprint, or a bounds_mode=vertex \
+property), a WARNING naming the rebuild otherwise.
+
 Warnings never affect the exit code."
 )]
 struct Args {
@@ -112,13 +195,55 @@ struct Args {
     /// report makes clear that the decode was sampled rather than exhaustive.
     #[arg(long, value_name = "N")]
     sample: Option<usize>,
+
+    /// Write the OBSERVED content fingerprint (check 12) to PATH as JSON.
+    ///
+    /// This is the *capture* half of transform acceptance: run it against a
+    /// TRUSTED archive, then check the transformed copy with
+    /// `--expect-fingerprint`. Requires a full decode — a fingerprint captured
+    /// from a `--sample`d or `--skip-decode`d run understates the content, and
+    /// an understated expectation is a check that cannot fail.
+    ///
+    /// ⚠️ A losslessly-transforming tool must never use this to re-stamp its
+    /// OWN output: recomputing a fingerprint from the output is exactly how a
+    /// corrupting transform would self-certify.
+    #[arg(long, value_name = "PATH")]
+    emit_fingerprint: Option<PathBuf>,
+
+    /// Compare the decoded content against an EXTERNAL fingerprint file
+    /// (written by `--emit-fingerprint`) in addition to any the manifest
+    /// declares.
+    ///
+    /// The acceptance gate for a lossless transform (reorder, repack,
+    /// re-optimize): the expectation comes from the archive as it was BEFORE
+    /// the transform, so the transform cannot vouch for itself.
+    #[arg(long, value_name = "PATH")]
+    expect_fingerprint: Option<PathBuf>,
+
+    /// Downgrade check 12's FEATURE-LOSS errors back to warnings — both of
+    /// them: the decoded-ROW floor (the fullest zoom carrying fewer rows than
+    /// the declared `distinct_feature_count`) and, on an archive that attests
+    /// globally distinct ids, the distinct-id shortfall.
+    ///
+    /// The documented escape hatch for the benign causes: a source whose
+    /// features carry (or hash to) colliding ids, and features the tiler could
+    /// not place at all — neither of which the archive can tell apart from
+    /// features that were dropped. It suppresses NOTHING else, and the
+    /// downgraded finding is still reported, labelled with this flag.
+    ///
+    /// ⚠️ Reach for it only once you know where the features went. A rebuild
+    /// that silently drops them produces exactly the same finding.
+    #[arg(long)]
+    allow_distinct_shortfall: bool,
 }
 
 #[derive(Serialize, Default)]
 struct Report {
     archive: String,
-    /// The packed directory codec version (5).
-    version: u8,
+    /// Packed archive manifest version.
+    format_version: u32,
+    /// Directory codec version.
+    directory_version: u8,
     compression: String,
     tile_count: usize,
     /// Number of tiles actually decoded (== `tile_count` unless `--sample`/
@@ -138,11 +263,58 @@ struct Report {
     distinct_schemas: usize,
     payload_bytes_compressed: u64,
     payload_bytes_uncompressed: u64,
+    /// True when check 12 actually compared decoded content against a declared
+    /// (or `--expect-fingerprint`ed) semantic fingerprint. False means the
+    /// archive's CONTENT was not verified — only its structure — which is the
+    /// state every pre-SH-1 archive is in.
+    fingerprint_checked: bool,
+    /// True when check 13 actually compared `metadata.bounds` against a decoded
+    /// vertex bbox. False means no tile was decoded (or none carried a walkable
+    /// coordinate), so the manifest's spatial claim went unverified.
+    bounds_checked: bool,
+    /// True when a check-13 under-statement would FAIL rather than warn — i.e.
+    /// the archive attests vertex-derived bounds. False is the pre-R1 fleet,
+    /// where the declared bbox is centroid-derived and legitimately loose.
+    bounds_enforced: bool,
+    /// What check 12 was allowed to compare `distinct_feature_count` against:
+    /// `"source-features"` (the default and the whole current fleet — the
+    /// declared count and the decoded id count are different quantities) or
+    /// `"decoded-ids"` (the archive attests globally distinct ids, so a
+    /// shortfall is real feature loss).
+    ///
+    /// Resolved from the WRITER's recorded id construction
+    /// (`metadata.properties.feature_id_construction`), or from an explicit
+    /// attestation (`feature_id_scope`, the `global-feature-ids` capability) —
+    /// and never from the numbers happening to agree. Empty only when the run
+    /// aborted before the fingerprint finalizer.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    distinct_id_basis: &'static str,
+    /// The writer's own `metadata.properties.feature_id_construction`, echoed
+    /// verbatim: `source` / `anchor-hash` (a dataset-wide key, so
+    /// `distinct_id_basis` is `decoded-ids`), `row-index` / `segment-hash` (not
+    /// a key). Empty on an archive that predates the key.
+    ///
+    /// Reported beside the basis because the basis alone used to MISDESCRIBE the
+    /// archive: every non-attesting one was explained with the point-archive
+    /// row-index story even when the writer had used a stable anchor hash.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    feature_id_construction: String,
     elapsed_ms: u128,
     errors: Vec<String>,
     /// Non-fatal findings (tolerated legacy gaps, e.g. missing CRS84 metadata
     /// or zeroed pre-0.1.1 manifest totals). Never affect the exit code.
     warnings: Vec<String>,
+    /// Below a warning: observations worth STATING that are not defects and are
+    /// not actionable — a distinct-id deviation on an archive whose ids were
+    /// never a dataset-wide key, say.
+    ///
+    /// Deliberately NOT warnings. Warnings are the noise budget the 2026-08
+    /// optimization program drives to zero (objective O4); filing a finding
+    /// that is expected on every archive in the fleet as a warning would
+    /// inflate exactly that number and teach operators to skim the block. Never
+    /// affect the exit code.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -233,7 +405,8 @@ fn validate_packed(manifest_path: &Path, args: &Args, report: &mut Report) -> Re
     let reader = PackedReader::open(manifest_path)
         .with_context(|| format!("failed to open packed dataset {}", manifest_path.display()))?;
     let manifest = Manifest::from_json_bytes(&std::fs::read(manifest_path)?)?;
-    report.version = manifest.directory.directory_version;
+    report.format_version = manifest.format_version;
+    report.directory_version = manifest.directory.directory_version;
     report.compression = manifest.compression.clone();
 
     verify_paged_directly(manifest_path, &manifest, args, report)?;
@@ -256,7 +429,8 @@ fn validate_bundle(bundle_path: &Path, args: &Args, report: &mut Report) -> Resu
     let reader = PackedReader::open_bundle(bundle_path)
         .with_context(|| format!("failed to open bundle {}", bundle_path.display()))?;
     let manifest = stt_core::pack::read_bundle_manifest(bundle_path)?;
-    report.version = manifest.directory.directory_version;
+    report.format_version = manifest.format_version;
+    report.directory_version = manifest.directory.directory_version;
     report.compression = manifest.compression.clone();
 
     validate_with_reader(&reader, args, report)
@@ -274,6 +448,11 @@ fn validate_with_reader(
     let entries = reader.entries().to_vec();
     report.tile_count = entries.len();
 
+    // Check 12's accumulator rides the SAME decode pass as the schema/temporal
+    // checks — no second read of any payload.
+    let mut accumulator =
+        FingerprintAccumulator::new().skipping_layers(fingerprint::skipped_layers(&metadata));
+
     let pb = make_progress(args, entries.len());
     validate_entries(
         &entries,
@@ -283,13 +462,190 @@ fn validate_with_reader(
         args,
         report,
         pb.as_ref(),
+        &mut accumulator,
     )?;
     if let Some(p) = &pb {
         p.finish_and_clear();
     }
 
     finalize_feature_check(args, report, &metadata);
+    // One observation, two consumers: check 12 compares it against the
+    // fingerprint block, check 13 against `metadata.bounds`.
+    let observed = accumulator.finish();
+    finalize_fingerprint_check(args, report, &metadata, reader.capabilities(), &observed)?;
+    finalize_bounds_check(args, report, &metadata, &observed)?;
     Ok(metadata)
+}
+
+/// Check 13: the declared `metadata.bounds` must CONTAIN the decoded vertex
+/// bbox.
+///
+/// Its own finalizer rather than a limb of [`finalize_fingerprint_check`]:
+/// check 13 runs on **every** archive (the bbox is not optional the way a
+/// fingerprint is), and the two have independent severity gates that a shared
+/// function would tangle.
+fn finalize_bounds_check(
+    args: &Args,
+    report: &mut Report,
+    metadata: &Metadata,
+    observed: &fingerprint::ObservedFingerprint,
+) -> Result<()> {
+    report.bounds_enforced = fingerprint::bounds_are_attested(metadata);
+    // Nothing decoded ⇒ nothing observed to contain. Saying "bounds verified"
+    // off an empty decode would be the same lie check 12 refuses to tell.
+    if report.tiles_decoded == 0 || observed.bbox.is_none() {
+        return Ok(());
+    }
+    report.bounds_checked = true;
+
+    let findings = fingerprint::check_declared_bounds(metadata, observed, decode_is_complete(args));
+    for issue in findings.errors {
+        push_err(report, args.fail_fast, format!("declared bounds: {issue}"))?;
+    }
+    for warning in findings.warnings {
+        push_warn(report, format!("declared bounds: {warning}"));
+    }
+    Ok(())
+}
+
+/// Check 12: compare the decoded content against the declared fingerprint (and
+/// against `--expect-fingerprint`, when given), then service
+/// `--emit-fingerprint`.
+///
+/// Split out of [`finalize_feature_check`] rather than folded into it: that
+/// function is the metadata-total reconciliation and has its own unit test
+/// pinning its signature and its two-warning shape.
+fn finalize_fingerprint_check(
+    args: &Args,
+    report: &mut Report,
+    metadata: &Metadata,
+    capabilities: &[String],
+    observed: &fingerprint::ObservedFingerprint,
+) -> Result<()> {
+    let complete = decode_is_complete(args);
+
+    // Nothing was decoded at all: there is no observation to compare, and
+    // saying "content verified" off an empty decode would be a lie.
+    let decoded_anything = report.tiles_decoded > 0;
+
+    // BLOCKER A/1: WHAT the declared `distinct_feature_count` may be compared
+    // against. Keyed on the WRITER's recorded id construction
+    // (`feature_id_construction`) — a fact the builder always knows — plus the
+    // explicit `feature_id_scope` / capability attestations, and NEVER inferred
+    // from the numbers happening to agree. On a construction that is not a
+    // dataset-wide key the declared count (source features) and the decoded id
+    // count (a per-tile row index, or one id per clipped segment) are different
+    // quantities, and their difference is a note rather than a finding. See
+    // `stt_core::metadata::DistinctIdBasis`.
+    let basis = fingerprint::distinct_id_basis(metadata, capabilities);
+    report.distinct_id_basis = match basis {
+        fingerprint::DistinctIdBasis::DecodedIds => "decoded-ids",
+        fingerprint::DistinctIdBasis::SourceFeatures => "source-features",
+    };
+    report.feature_id_construction = metadata
+        .properties
+        .get(stt_core::metadata::FEATURE_ID_CONSTRUCTION_PROPERTY)
+        .cloned()
+        .unwrap_or_default();
+
+    let declared = metadata.content_fingerprint.as_ref();
+    match declared {
+        Some(declared) if decoded_anything => {
+            let findings = fingerprint::check_fingerprint_with(
+                declared,
+                observed,
+                complete,
+                capabilities,
+                basis,
+            );
+            push_fingerprint_findings(args, report, "content fingerprint", findings)?;
+            report.fingerprint_checked = true;
+        }
+        Some(_) => push_warn(
+            report,
+            "metadata.content_fingerprint is present but nothing was decoded, so the \
+             archive's CONTENT was not verified"
+                .to_string(),
+        ),
+        None => push_warn(report, fingerprint::absent_fingerprint_warning()),
+    }
+
+    if let Some(path) = &args.expect_fingerprint {
+        let expected = fingerprint::read_fingerprint_file(path)?;
+        if !decoded_anything {
+            push_err(
+                report,
+                args.fail_fast,
+                format!(
+                    "--expect-fingerprint {}: nothing was decoded, so the expectation could \
+                     not be checked (drop --skip-decode)",
+                    path.display()
+                ),
+            )?;
+        } else {
+            let findings = fingerprint::check_fingerprint_with(
+                &expected,
+                observed,
+                complete,
+                capabilities,
+                basis,
+            );
+            let label = format!("expected fingerprint ({})", path.display());
+            push_fingerprint_findings(args, report, &label, findings)?;
+            report.fingerprint_checked = true;
+        }
+    }
+
+    if let Some(path) = &args.emit_fingerprint {
+        if !complete {
+            anyhow::bail!(
+                "--emit-fingerprint needs a FULL decode: a fingerprint captured from a \
+                 sampled or skipped decode understates the archive's content, and using it \
+                 as an expectation later would be a check that cannot fail. Re-run without \
+                 --sample / --skip-decode."
+            );
+        }
+        fingerprint::write_fingerprint_file(
+            path,
+            &fingerprint::observed_as_declared(observed, declared),
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Route one fingerprint comparison's findings into the report under `label`.
+///
+/// The one piece of policy here is `--allow-distinct-shortfall`: it, and only
+/// it, demotes the FEATURE-LOSS error (check 12's distinct-count shortfall) to
+/// a warning. The demotion is explicit in the reported text — a suppressed
+/// finding that reads like a clean run is how the 106-archive defect survived
+/// in the first place — and every other error is untouchable.
+fn push_fingerprint_findings(
+    args: &Args,
+    report: &mut Report,
+    label: &str,
+    findings: fingerprint::FingerprintFindings,
+) -> Result<()> {
+    for issue in findings.errors {
+        if args.allow_distinct_shortfall
+            && issue.starts_with(stt_core::metadata::FEATURE_LOSS_PREFIX)
+        {
+            push_warn(
+                report,
+                format!("{label} [DOWNGRADED by --allow-distinct-shortfall]: {issue}"),
+            );
+            continue;
+        }
+        push_err(report, args.fail_fast, format!("{label}: {issue}"))?;
+    }
+    for warning in findings.warnings {
+        push_warn(report, format!("{label}: {warning}"));
+    }
+    for note in findings.notes {
+        push_note(report, format!("{label}: {note}"));
+    }
+    Ok(())
 }
 
 /// Run the paged-structure check (leaf-descriptor bounds cover their entries,
@@ -330,7 +686,7 @@ fn verify_paged_directly(
     };
     let zstd =
         manifest.directory.encoding.as_deref() == Some(stt_core::pack::DIRECTORY_ENCODING_ZSTD);
-    // formatVersion 2 prefixes the object with the 8-byte STTD magic; the
+    // formatVersion 3 prefixes the object with the 8-byte STTD magic; the
     // codec bytes (and rootLength math) start after it. Malformed magic is
     // already reported by the integrity pass — skip the re-check here.
     let Ok(codec_bytes) =
@@ -377,6 +733,11 @@ fn sample_stride(total: usize, n: usize) -> usize {
 /// hashes via `read_payload`) run for **every** entry. The expensive
 /// Arrow-decode + schema + feature-count checks run for every entry too, unless
 /// `--sample N` restricts them to a deterministic stride of the directory.
+///
+/// The parameter list is long because this is the single decode pass every
+/// per-tile check rides (bundling them into a context struct would only move
+/// the list); check 12's accumulator is the eighth.
+#[allow(clippy::too_many_arguments)]
 fn validate_entries(
     entries: &[TileEntry],
     metadata: &Metadata,
@@ -385,6 +746,7 @@ fn validate_entries(
     args: &Args,
     report: &mut Report,
     pb: Option<&ProgressBar>,
+    accumulator: &mut FingerprintAccumulator,
 ) -> Result<()> {
     let meta_start = metadata.time_range.start as i64;
     let meta_end = metadata.time_range.end as i64;
@@ -456,7 +818,7 @@ fn validate_entries(
         };
 
         if decode_this {
-            // formatVersion-2 frames reference schema templates by hash;
+            // formatVersion-3 frames reference schema templates by hash;
             // resolve them through the manifest's registry (v1 datasets have
             // none and take the plain path).
             let decoded = match templates {
@@ -482,6 +844,16 @@ fn validate_entries(
                             ),
                         )?;
                     }
+
+                    // Check 12: fold this tile's decoded content into the
+                    // semantic fingerprint. Done here, inside the one decode
+                    // pass, so the content check costs no extra payload read.
+                    //
+                    // `_at_zoom` books the rows against this tile's zoom, which
+                    // is what feeds the decoded-ROW floor — the loss detection
+                    // that survives the distinct-id basis gate. A caller that
+                    // used the plain `ingest` would silently disable it.
+                    accumulator.ingest_at_zoom(entry.zoom, &layers);
 
                     // Schema / column-type contract per layer.
                     let findings = check_tile_schema(&layers);
@@ -738,9 +1110,17 @@ fn push_warn(report: &mut Report, msg: String) {
     report.warnings.push(msg);
 }
 
+/// Below a warning: stated, counted separately, never fatal. See
+/// [`Report::notes`] for why this is not simply a warning.
+fn push_note(report: &mut Report, msg: String) {
+    eprintln!("note: {msg}");
+    report.notes.push(msg);
+}
+
 fn print_summary(report: &Report, metadata: &Metadata) {
     println!("dataset          {}", report.archive);
-    println!("version          {}", report.version);
+    println!("format version   {}", report.format_version);
+    println!("directory version {}", report.directory_version);
     println!("compression      {}", report.compression);
     println!("name             {}", metadata.name);
     println!("tiles            {}", report.tile_count);
@@ -792,7 +1172,52 @@ fn print_summary(report: &Report, metadata: &Metadata) {
         "zoom range       {} .. {}",
         metadata.min_zoom, metadata.max_zoom
     );
+    println!(
+        "content check    {}",
+        if report.fingerprint_checked {
+            "semantic fingerprint compared"
+        } else {
+            "STRUCTURE ONLY (no content fingerprint)"
+        }
+    );
+    println!(
+        "bounds check     {}",
+        match (report.bounds_checked, report.bounds_enforced) {
+            (true, true) => "declared bounds contain the decoded vertices (enforced)",
+            (true, false) => "declared bounds compared (legacy centroid bbox — warn only)",
+            (false, _) => "NOT CHECKED (nothing decoded carried a coordinate)",
+        }
+    );
+    if !report.distinct_id_basis.is_empty() {
+        // The construction is what the basis was DERIVED from, so it is printed
+        // beside it: "source-features" on its own used to read as a statement
+        // about the archive when it was only a statement about the check.
+        let how = match report.feature_id_construction.as_str() {
+            "" => String::new(),
+            kind => format!(" [id construction: {kind}]"),
+        };
+        println!(
+            "id basis         {}{how}",
+            match report.distinct_id_basis {
+                "decoded-ids" =>
+                    "decoded ids ARE the source features — a shortfall is feature loss",
+                _ =>
+                    "source features — the id column is not a dataset-wide key, so loss is \
+                      caught by the decoded-row floor instead (which is LOOSE on clipped \
+                      geometry)",
+            }
+        );
+    }
     println!("elapsed          {} ms", report.elapsed_ms);
+    if !report.notes.is_empty() {
+        println!(
+            "\n{} note(s) (not defects; never affect the exit code):",
+            report.notes.len()
+        );
+        for n in &report.notes {
+            println!("  - {n}");
+        }
+    }
     if !report.warnings.is_empty() {
         println!(
             "\n{} warning(s) (never affect the exit code):",
@@ -912,6 +1337,100 @@ mod tests {
             report.warnings.is_empty(),
             "warnings were: {:?}",
             report.warnings
+        );
+    }
+
+    /// Check 12's LEGACY path, which every published archive takes: no
+    /// fingerprint ⇒ one warning, zero errors, and `fingerprint_checked` false
+    /// so no report can claim the content was verified when it was not.
+    ///
+    /// Same severity shape as the missing-CRS84 warning, and for the same
+    /// reason: a writer MUST newer than the deployed fleet must not turn the
+    /// fleet red.
+    #[test]
+    fn absent_content_fingerprint_warns_and_never_errors() {
+        use clap::Parser as _;
+        let args = Args::parse_from(["stt-validate", "dataset"]);
+
+        let mut report = Report {
+            tiles_decoded: 4,
+            ..Default::default()
+        };
+        finalize_fingerprint_check(
+            &args,
+            &mut report,
+            &Metadata::new("legacy"),
+            &[],
+            &fingerprint::FingerprintAccumulator::new().finish(),
+        )
+        .expect("the legacy path never fails the run");
+        assert!(report.errors.is_empty(), "errors were: {:?}", report.errors);
+        assert_eq!(report.warnings.len(), 1, "warnings: {:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("content_fingerprint is absent"),
+            "warnings: {:?}",
+            report.warnings
+        );
+        assert!(
+            !report.fingerprint_checked,
+            "an unverified archive must not report as verified"
+        );
+    }
+
+    /// Check 13's finalizer: an under-stated bbox fails an attesting archive
+    /// and only warns on a legacy one, and neither path can claim the bounds
+    /// were checked when nothing was decoded.
+    #[test]
+    fn declared_bounds_finalizer_gates_severity_on_attestation() {
+        use clap::Parser as _;
+        use stt_core::types::BoundingBox;
+        let args = Args::parse_from(["stt-validate", "dataset"]);
+
+        // The archive decodes vertices in the western hemisphere...
+        let observed = fingerprint::ObservedFingerprint {
+            bbox: Some([-122.5, 37.7, -122.3, 37.8]),
+            rows: 4,
+            ..Default::default()
+        };
+        // ...while declaring a bbox in the eastern one.
+        let wrong = BoundingBox::new(100.0, 37.7, 110.0, 37.8);
+
+        let mut report = Report {
+            tiles_decoded: 4,
+            ..Default::default()
+        };
+        let legacy = Metadata::new("legacy").with_bounds(wrong);
+        finalize_bounds_check(&args, &mut report, &legacy, &observed).unwrap();
+        assert!(report.errors.is_empty(), "errors were: {:?}", report.errors);
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(report.bounds_checked && !report.bounds_enforced);
+
+        let mut report = Report {
+            tiles_decoded: 4,
+            ..Default::default()
+        };
+        let mut attested = Metadata::new("attested").with_bounds(wrong);
+        attested
+            .properties
+            .insert("bounds_mode".into(), "vertex".into());
+        finalize_bounds_check(&args, &mut report, &attested, &observed).unwrap();
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(report.errors[0].starts_with("declared bounds: "));
+        assert!(report.bounds_checked && report.bounds_enforced);
+
+        // --skip-decode: no observation, so no claim either way.
+        let mut report = Report::default();
+        finalize_bounds_check(
+            &args,
+            &mut report,
+            &attested,
+            &fingerprint::ObservedFingerprint::default(),
+        )
+        .unwrap();
+        assert!(report.errors.is_empty() && report.warnings.is_empty());
+        assert!(
+            !report.bounds_checked,
+            "an undecoded archive must not report its bounds as verified"
         );
     }
 }

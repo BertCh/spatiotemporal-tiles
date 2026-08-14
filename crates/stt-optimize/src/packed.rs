@@ -147,7 +147,7 @@ mod tests {
     fn tiny_tile(seed: u64, w: &PackWriter) -> Vec<u8> {
         let n = 4usize;
         let cfg = EncoderConfig {
-            format_version: w.format_version(),
+            format_version: stt_core::arrow_tile::LAYER_FRAME_VERSION,
             template_collector: Some(w.template_collector()),
             ..EncoderConfig::default()
         };

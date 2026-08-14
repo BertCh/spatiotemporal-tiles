@@ -109,6 +109,12 @@ const DERIVED_COLUMNS: [&str; 2] = ["triangles", "part_offsets"];
 /// absolute per-vertex times (`origin + delta * step`) — shipping raw deltas
 /// would export a column whose numbers mean nothing outside this format.
 const VERTEX_TIME_ORIGIN_KEY: &str = "stt:vertex_time_origin_ms";
+/// TB-11 extension 2: per-vertex time deltas measured from each feature's own
+/// `start_time`. Present INSTEAD of the origin/step pair above.
+const VERTEX_TIME_FEATURE_STEP_KEY: &str = "stt:vertex_time_feature_step_ms";
+/// The tile's absolute time anchor, added back to a compact `UInt32`
+/// `start_time` before it can serve as a vertex-time anchor.
+const TIME_OFFSET_MS_KEY: &str = "stt:time_offset_ms";
 const VERTEX_TIME_STEP_KEY: &str = "stt:vertex_time_step_ms";
 
 /// How the geometry column is typed in the written Parquet file.
@@ -351,6 +357,11 @@ enum ColumnPlan {
     /// `List<UInt16>` per-vertex time deltas → `List<Int64>` absolute Unix ms
     /// via `origin + delta * step`.
     VertexTimeDeltas { origin: i64, step: i64 },
+    /// TB-11 extension 2. `anchors[row] + delta * step`, so unlike every other
+    /// plan this one depends on a SECOND column (`start_time`) and must be
+    /// built with the batch in hand. Anchors are already row-selected to match
+    /// the array being inflated.
+    VertexTimeFeatureDeltas { step: i64, anchors: Arc<Vec<i64>> },
     /// Derived renderer state — not exported.
     Drop,
 }
@@ -388,6 +399,22 @@ fn plan_column(
             if let (Some(origin), Some(step)) = (origin, step) {
                 return ColumnPlan::VertexTimeDeltas { origin, step };
             }
+            // TB-11 extension 2. The step is in the schema; the ANCHORS are in
+            // the batch's `start_time` column, which this function does not
+            // have. Return the variant with empty anchors — enough to type the
+            // output column as Int64 — and let the apply loop fill them in.
+            // Falling through to a plain `Pass` instead would export RAW DELTAS
+            // as if they were epoch millis, the failure the comment above warns
+            // about wearing a different hat.
+            if let Some(step) = schema_meta
+                .get(VERTEX_TIME_FEATURE_STEP_KEY)
+                .and_then(|v| v.parse::<i64>().ok())
+            {
+                return ColumnPlan::VertexTimeFeatureDeltas {
+                    step,
+                    anchors: Arc::new(Vec::new()),
+                };
+            }
         }
         return ColumnPlan::Pass;
     }
@@ -415,11 +442,13 @@ fn output_field(field: &Field, plan: &ColumnPlan) -> Option<Field> {
             nullable,
         ),
         ColumnPlan::DequantizeAttr(_) => Field::new(name, DataType::Float64, true),
-        ColumnPlan::VertexTimeDeltas { .. } => Field::new(
-            name,
-            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
-            nullable,
-        ),
+        ColumnPlan::VertexTimeFeatureDeltas { .. } | ColumnPlan::VertexTimeDeltas { .. } => {
+            Field::new(
+                name,
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                nullable,
+            )
+        }
     })
 }
 
@@ -433,6 +462,9 @@ fn apply_plan(array: &ArrayRef, plan: &ColumnPlan, out_type: &DataType) -> Resul
         ColumnPlan::DequantizeAttr(q) => dequantize_attr(array, q)?,
         ColumnPlan::VertexTimeDeltas { origin, step } => {
             vertex_times_absolute(array, *origin, *step)?
+        }
+        ColumnPlan::VertexTimeFeatureDeltas { step, anchors } => {
+            vertex_times_feature_absolute(array, *step, anchors)?
         }
     })
 }
@@ -449,6 +481,76 @@ fn dequantize_attr(array: &ArrayRef, q: &AttrQuant) -> Result<ArrayRef> {
         .ok_or_else(|| anyhow!("quantized property column did not cast to Int64"))?;
     let values: Float64Array = idx.iter().map(|v| v.map(|q_i| q.value(q_i))).collect();
     Ok(Arc::new(values))
+}
+
+/// The absolute `start_time` of each selected row — the anchor TB-11's
+/// feature-anchored vertex times are measured from.
+///
+/// `start_time` ships either as absolute `Int64` or, under compact times, as a
+/// `UInt32` offset from the tile's `t0`. Both are reconstructed here, because
+/// reading the compact form as absolute would place every vertex in 1970 — and
+/// the encoder anchored against the ABSOLUTE value.
+fn feature_anchors(
+    batch: &RecordBatch,
+    schema_meta: &std::collections::HashMap<String, String>,
+    indices: &UInt32Array,
+) -> Result<Vec<i64>> {
+    let col = batch
+        .column_by_name("start_time")
+        .ok_or_else(|| anyhow!("feature-anchored vertex times need a start_time column"))?;
+    let taken = arrow::compute::take(col, indices, None)
+        .context("selecting rows of 'start_time' for the vertex-time anchor")?;
+    let as_i64 = arrow::compute::cast(&taken, &DataType::Int64)
+        .context("casting start_time to Int64 for the vertex-time anchor")?;
+    let as_i64 = as_i64
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("start_time did not cast to Int64"))?;
+    // Compact times store an offset from t0; absolute times store no t0 to add.
+    let t0 = if matches!(taken.data_type(), DataType::UInt32) {
+        schema_meta
+            .get(TIME_OFFSET_MS_KEY)
+            .and_then(|v| v.parse::<i64>().ok())
+            .ok_or_else(|| anyhow!("compact start_time without a {} anchor", TIME_OFFSET_MS_KEY))?
+    } else {
+        0
+    };
+    Ok(as_i64.iter().map(|v| t0 + v.unwrap_or(0)).collect())
+}
+
+/// `List<UInt16>` deltas → `List<Int64>` absolute Unix ms, anchored PER FEATURE.
+fn vertex_times_feature_absolute(array: &ArrayRef, step: i64, anchors: &[i64]) -> Result<ArrayRef> {
+    let list = array
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("vertex_time column is not a List"))?;
+    let child = arrow::compute::cast(list.values(), &DataType::Int64)
+        .context("casting vertex_time deltas to Int64")?;
+    let child = child
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("vertex_time child did not cast to Int64"))?;
+    let offsets = list.offsets();
+    let mut out: Vec<Option<i64>> = Vec::with_capacity(child.len());
+    for row in 0..list.len() {
+        let anchor = *anchors
+            .get(row)
+            .ok_or_else(|| anyhow!("vertex-time anchor missing for row {row}"))?;
+        let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
+        for j in lo..hi {
+            out.push(if child.is_null(j) {
+                None
+            } else {
+                Some(anchor + child.value(j) * step)
+            });
+        }
+    }
+    Ok(Arc::new(ListArray::new(
+        Arc::new(Field::new("item", DataType::Int64, true)),
+        list.offsets().clone(),
+        Arc::new(Int64Array::from(out)),
+        list.nulls().cloned(),
+    )))
 }
 
 /// `List<UInt16>` deltas → `List<Int64>` absolute Unix ms.
@@ -1191,7 +1293,15 @@ fn tile_batch(
         }
         match schema.index_of(name) {
             Ok(idx) => {
-                let plan = plan_column(schema.field(idx), meta);
+                let mut plan = plan_column(schema.field(idx), meta);
+                // TB-11 extension 2: bind the per-feature anchors, row-selected
+                // the same way the column about to be inflated is.
+                if let ColumnPlan::VertexTimeFeatureDeltas { step, .. } = plan {
+                    plan = ColumnPlan::VertexTimeFeatureDeltas {
+                        step,
+                        anchors: Arc::new(feature_anchors(batch, meta, &indices)?),
+                    };
+                }
                 let taken = arrow::compute::take(batch.column(idx), &indices, None)
                     .with_context(|| format!("selecting rows of column '{name}'"))?;
                 columns.push(apply_plan(&taken, &plan, field.data_type())?);
@@ -1353,6 +1463,7 @@ mod tests {
             y: 2,
             time_start: 0,
             time_end: 3_599_999,
+            variant_id: stt_core::tile::RAW_VARIANT_ID,
             pack_id: 0,
             offset: 0,
             length: 1,
@@ -1381,6 +1492,7 @@ mod tests {
             y: 0,
             time_start: 0,
             time_end: 3_599_999,
+            variant_id: stt_core::tile::RAW_VARIANT_ID,
             pack_id: 0,
             offset: 0,
             length: 1,

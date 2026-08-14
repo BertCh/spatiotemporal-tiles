@@ -169,7 +169,7 @@ fn wasm_facade_decodes_a_real_tile() {
 
     let manifest_bytes = fs::read(root.join("manifest.json")).unwrap();
     let mut archive = SttArchive::open(&manifest_bytes).unwrap();
-    assert_eq!(archive.format_version(), 2);
+    assert_eq!(archive.format_version(), 3);
     assert!(archive
         .metadata_json()
         .unwrap()
@@ -307,7 +307,7 @@ fn open_refuses_manifests_it_cannot_read() {
         "got: {err}"
     );
 
-    let future_version = text.replacen("\"formatVersion\": 2", "\"formatVersion\": 99", 1);
+    let future_version = text.replacen("\"formatVersion\": 3", "\"formatVersion\": 99", 1);
     let err = refusal(Archive::open(future_version.as_bytes()));
     assert!(
         err.contains("unsupported packed formatVersion 99"),

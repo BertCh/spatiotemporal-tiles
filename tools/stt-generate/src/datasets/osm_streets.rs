@@ -170,46 +170,48 @@ impl OsmNetwork {
         let mut wanted: HashSet<i64> = HashSet::new();
         let reader = ElementReader::from_path(path)
             .with_context(|| format!("opening OSM pbf {}", path.display()))?;
-        reader.for_each(|element| {
-            if let Element::Way(w) = element {
-                let mut class: Option<RoadClass> = None;
-                for (k, v) in w.tags() {
-                    if k == "highway" {
-                        class = RoadClass::from_highway_with_mode(v, mode);
-                        break;
+        reader
+            .for_each(|element| {
+                if let Element::Way(w) = element {
+                    let mut class: Option<RoadClass> = None;
+                    for (k, v) in w.tags() {
+                        if k == "highway" {
+                            class = RoadClass::from_highway_with_mode(v, mode);
+                            break;
+                        }
                     }
+                    let Some(class) = class else { return };
+                    let refs: Vec<i64> = w.refs().collect();
+                    if refs.len() < 2 {
+                        return;
+                    }
+                    for &r in &refs {
+                        wanted.insert(r);
+                    }
+                    ways.insert(w.id(), WayRec { refs, class });
                 }
-                let Some(class) = class else { return };
-                let refs: Vec<i64> = w.refs().collect();
-                if refs.len() < 2 {
-                    return;
-                }
-                for &r in &refs {
-                    wanted.insert(r);
-                }
-                ways.insert(w.id(), WayRec { refs, class });
-            }
-        })
-        .with_context(|| "OSM pbf ways pass")?;
+            })
+            .with_context(|| "OSM pbf ways pass")?;
 
         // ---- Pass B: nodes ----
         let mut node_coords: HashMap<i64, (f64, f64)> = HashMap::with_capacity(wanted.len());
         let reader = ElementReader::from_path(path)
             .with_context(|| format!("re-opening OSM pbf {}", path.display()))?;
-        reader.for_each(|element| match element {
-            Element::DenseNode(n) => {
-                if wanted.contains(&n.id()) {
-                    node_coords.insert(n.id(), (n.lon(), n.lat()));
+        reader
+            .for_each(|element| match element {
+                Element::DenseNode(n) => {
+                    if wanted.contains(&n.id()) {
+                        node_coords.insert(n.id(), (n.lon(), n.lat()));
+                    }
                 }
-            }
-            Element::Node(n) => {
-                if wanted.contains(&n.id()) {
-                    node_coords.insert(n.id(), (n.lon(), n.lat()));
+                Element::Node(n) => {
+                    if wanted.contains(&n.id()) {
+                        node_coords.insert(n.id(), (n.lon(), n.lat()));
+                    }
                 }
-            }
-            _ => {}
-        })
-        .with_context(|| "OSM pbf nodes pass")?;
+                _ => {}
+            })
+            .with_context(|| "OSM pbf nodes pass")?;
 
         Ok(Self::build_indices(node_coords, ways))
     }
@@ -255,7 +257,9 @@ impl OsmNetwork {
         node_ids.sort_unstable();
         for id in node_ids {
             let (lon, lat) = node_coords[&id];
-            coord_to_node.entry(quant(lon, lat, MATCH_QUANT_DEG)).or_insert(id);
+            coord_to_node
+                .entry(quant(lon, lat, MATCH_QUANT_DEG))
+                .or_insert(id);
         }
 
         // edge_grid: edge midpoint → cell (for the nearest-edge fallback).
@@ -305,8 +309,12 @@ impl OsmNetwork {
     /// direct edge — i.e. [`Self::match_segment`] took the exact (not fallback)
     /// path. Used only for match-quality reporting.
     pub fn is_exact_pair(&self, p0: [f64; 2], p1: [f64; 2]) -> bool {
-        let na = self.coord_to_node.get(&quant(p0[0], p0[1], MATCH_QUANT_DEG));
-        let nb = self.coord_to_node.get(&quant(p1[0], p1[1], MATCH_QUANT_DEG));
+        let na = self
+            .coord_to_node
+            .get(&quant(p0[0], p0[1], MATCH_QUANT_DEG));
+        let nb = self
+            .coord_to_node
+            .get(&quant(p1[0], p1[1], MATCH_QUANT_DEG));
         match (na, nb) {
             (Some(&a), Some(&b)) => a != b && self.edge_way.contains_key(&edge_key(a, b)),
             _ => false,
@@ -319,8 +327,12 @@ impl OsmNetwork {
     /// Returns `None` when nothing is within threshold (a true miss).
     pub fn match_segment(&self, p0: [f64; 2], p1: [f64; 2]) -> Option<EdgeKey> {
         // (a) exact endpoint match.
-        let na = self.coord_to_node.get(&quant(p0[0], p0[1], MATCH_QUANT_DEG));
-        let nb = self.coord_to_node.get(&quant(p1[0], p1[1], MATCH_QUANT_DEG));
+        let na = self
+            .coord_to_node
+            .get(&quant(p0[0], p0[1], MATCH_QUANT_DEG));
+        let nb = self
+            .coord_to_node
+            .get(&quant(p1[0], p1[1], MATCH_QUANT_DEG));
         if let (Some(&a), Some(&b)) = (na, nb) {
             if a != b {
                 let key = edge_key(a, b);
@@ -368,7 +380,11 @@ impl OsmNetwork {
             let dy = p0[1] - ny;
             dx * dx + dy * dy
         };
-        Some(if d2_from_p0(a) <= d2_from_p0(b) { (a, b) } else { (b, a) })
+        Some(if d2_from_p0(a) <= d2_from_p0(b) {
+            (a, b)
+        } else {
+            (b, a)
+        })
     }
 
     /// Longitude scale `cos(mean_lat)` for this network — exposed so stroke
@@ -382,7 +398,15 @@ impl OsmNetwork {
 /// Squared distance from point to segment, with longitude scaled by `lon_scale`
 /// (= cos(mean_lat)) so the metric is ~isotropic in metres (good enough at city
 /// scale) regardless of the network's latitude.
-fn point_seg_dist2_scaled(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64, lon_scale: f64) -> f64 {
+fn point_seg_dist2_scaled(
+    px: f64,
+    py: f64,
+    ax: f64,
+    ay: f64,
+    bx: f64,
+    by: f64,
+    lon_scale: f64,
+) -> f64 {
     let s = lon_scale;
     let (px, ax, bx) = (px * s, ax * s, bx * s);
     let (abx, aby) = (bx - ax, by - ay);
@@ -413,11 +437,17 @@ mod tests {
         let mut ways = HashMap::new();
         ways.insert(
             10,
-            WayRec { refs: vec![1, 2, 3], class: RoadClass::Primary },
+            WayRec {
+                refs: vec![1, 2, 3],
+                class: RoadClass::Primary,
+            },
         );
         ways.insert(
             20,
-            WayRec { refs: vec![2, 4], class: RoadClass::Residential },
+            WayRec {
+                refs: vec![2, 4],
+                class: RoadClass::Residential,
+            },
         );
         OsmNetwork::build_indices(node_coords, ways)
     }
@@ -425,9 +455,18 @@ mod tests {
     #[test]
     fn exact_match_resolves_edges() {
         let n = net();
-        assert_eq!(n.match_segment([-74.000, 40.000], [-73.999, 40.000]), Some((1, 2)));
-        assert_eq!(n.match_segment([-73.999, 40.000], [-73.998, 40.000]), Some((2, 3)));
-        assert_eq!(n.match_segment([-73.999, 40.000], [-73.999, 40.001]), Some((2, 4)));
+        assert_eq!(
+            n.match_segment([-74.000, 40.000], [-73.999, 40.000]),
+            Some((1, 2))
+        );
+        assert_eq!(
+            n.match_segment([-73.999, 40.000], [-73.998, 40.000]),
+            Some((2, 3))
+        );
+        assert_eq!(
+            n.match_segment([-73.999, 40.000], [-73.999, 40.001]),
+            Some((2, 4))
+        );
     }
 
     #[test]
@@ -454,8 +493,20 @@ mod tests {
         node_coords.insert(2, (-73.999, 40.000));
         node_coords.insert(3, (-73.998, 40.000));
         let mut ways = HashMap::new();
-        ways.insert(20, WayRec { refs: vec![2, 3], class: RoadClass::Residential });
-        ways.insert(10, WayRec { refs: vec![2, 3], class: RoadClass::Primary });
+        ways.insert(
+            20,
+            WayRec {
+                refs: vec![2, 3],
+                class: RoadClass::Residential,
+            },
+        );
+        ways.insert(
+            10,
+            WayRec {
+                refs: vec![2, 3],
+                class: RoadClass::Primary,
+            },
+        );
         let n = OsmNetwork::build_indices(node_coords, ways);
         assert_eq!(n.edge_way_id((2, 3)), Some(10)); // primary (z9) beats residential (z12)
     }
@@ -463,10 +514,30 @@ mod tests {
     #[test]
     fn class_min_zoom_table() {
         use NetworkMode::Roads;
-        assert_eq!(RoadClass::from_highway_with_mode("motorway", Roads).unwrap().min_zoom(), 8);
-        assert_eq!(RoadClass::from_highway_with_mode("primary_link", Roads).unwrap().min_zoom(), 9);
-        assert_eq!(RoadClass::from_highway_with_mode("residential", Roads).unwrap().min_zoom(), 12);
-        assert_eq!(RoadClass::from_highway_with_mode("service", Roads).unwrap().min_zoom(), 13);
+        assert_eq!(
+            RoadClass::from_highway_with_mode("motorway", Roads)
+                .unwrap()
+                .min_zoom(),
+            8
+        );
+        assert_eq!(
+            RoadClass::from_highway_with_mode("primary_link", Roads)
+                .unwrap()
+                .min_zoom(),
+            9
+        );
+        assert_eq!(
+            RoadClass::from_highway_with_mode("residential", Roads)
+                .unwrap()
+                .min_zoom(),
+            12
+        );
+        assert_eq!(
+            RoadClass::from_highway_with_mode("service", Roads)
+                .unwrap()
+                .min_zoom(),
+            13
+        );
         assert!(RoadClass::from_highway_with_mode("footway", Roads).is_none());
         assert!(RoadClass::from_highway_with_mode("cycleway", Roads).is_none());
     }
@@ -479,7 +550,12 @@ mod tests {
             RoadClass::from_highway_with_mode("cycleway", Bike),
             Some(RoadClass::Cycleway)
         );
-        assert_eq!(RoadClass::from_highway_with_mode("path", Bike).unwrap().min_zoom(), 11);
+        assert_eq!(
+            RoadClass::from_highway_with_mode("path", Bike)
+                .unwrap()
+                .min_zoom(),
+            11
+        );
         // Minor foot/shared ways land at the deepest tier.
         assert_eq!(
             RoadClass::from_highway_with_mode("footway", Bike),
@@ -502,10 +578,19 @@ mod tests {
         node_coords.insert(1, (-73.585, 45.500));
         node_coords.insert(2, (-73.580, 45.500));
         let mut ways = HashMap::new();
-        ways.insert(10, WayRec { refs: vec![1, 2], class: RoadClass::Cycleway });
+        ways.insert(
+            10,
+            WayRec {
+                refs: vec![1, 2],
+                class: RoadClass::Cycleway,
+            },
+        );
         let n = OsmNetwork::build_indices(node_coords, ways);
         assert!((n.lon_scale - 45.5_f64.to_radians().cos()).abs() < 1e-9);
         // Exact match still resolves at this latitude.
-        assert_eq!(n.match_segment([-73.585, 45.500], [-73.580, 45.500]), Some((1, 2)));
+        assert_eq!(
+            n.match_segment([-73.585, 45.500], [-73.580, 45.500]),
+            Some((1, 2))
+        );
     }
 }

@@ -135,7 +135,7 @@ fn sample_polygon_layer() -> ColumnarLayer {
 }
 
 #[test]
-fn categorical_columns_use_dictionary_encoding() {
+fn small_categorical_columns_use_plain_utf8() {
     let layer = ColumnarLayer {
         polygon_parts: None,
         name: "cars".into(),
@@ -161,38 +161,56 @@ fn categorical_columns_use_dictionary_encoding() {
     let ipc = encode_layer(&layer).unwrap();
     let batch = decode_layer(&ipc).unwrap();
     let field = batch.schema().field_with_name("kind").unwrap().clone();
-    match field.data_type() {
-        DataType::Dictionary(k, v) => {
-            assert_eq!(k.as_ref(), &DataType::UInt16);
-            assert_eq!(v.as_ref(), &DataType::Utf8);
-        }
-        other => panic!("expected Dictionary<UInt16, Utf8>, got {other:?}"),
-    }
-
+    assert_eq!(field.data_type(), &DataType::Utf8);
     let col = batch
         .column_by_name("kind")
         .unwrap()
         .as_any()
-        .downcast_ref::<DictionaryArray<UInt16Type>>()
+        .downcast_ref::<StringArray>()
         .unwrap();
-    let values = col.values().as_any().downcast_ref::<StringArray>().unwrap();
-    // First-seen order: "car" then "bus".
-    let mut categories: Vec<&str> = (0..values.len()).map(|i| values.value(i)).collect();
-    categories.sort();
-    assert_eq!(categories, vec!["bus", "car"]);
-
-    // The 4th row is null; others reference one of the two slots.
+    assert_eq!(col.value(0), "car");
+    assert_eq!(col.value(1), "bus");
+    assert_eq!(col.value(2), "car");
     assert!(col.is_null(3));
-    let keys = col.keys();
-    for i in [0usize, 1, 2, 4] {
-        assert!(keys.value(i) < values.len() as u16);
+    assert_eq!(col.value(4), "car");
+}
+
+#[test]
+fn repeated_categorical_columns_use_dictionary_encoding() {
+    let n = 1_000;
+    let kinds = (0..n)
+        .map(|i| Some(if i % 2 == 0 { "car" } else { "bus" }.to_string()))
+        .collect();
+    let layer = ColumnarLayer {
+        polygon_parts: None,
+        name: "vehicles".into(),
+        feature_ids: (0..n as u64).collect(),
+        start_times: vec![0; n],
+        end_times: vec![1; n],
+        geometry: GeometryColumn::Point(vec![[0.0, 0.0]; n]),
+        vertex_times: None,
+        vertex_values: None,
+        triangles: None,
+        vertex_value_matrix: None,
+        properties: vec![("kind".into(), PropertyColumn::Categorical(kinds))],
+    };
+    let ipc = encode_layer(&layer).unwrap();
+    let batch = decode_layer(&ipc).unwrap();
+    let schema = batch.schema();
+    let field = schema.field_with_name("kind").unwrap();
+    match field.data_type() {
+        DataType::Dictionary(key, value) => {
+            assert_eq!(key.as_ref(), &DataType::UInt16);
+            assert_eq!(value.as_ref(), &DataType::Utf8);
+        }
+        other => panic!("expected Dictionary<UInt16, Utf8>, got {other:?}"),
     }
 }
 
 #[test]
-fn categorical_overflow_errors_instead_of_corrupting() {
-    // A column whose distinct-value count exceeds the UInt16 dictionary
-    // key space must be rejected, not silently collapsed onto one index.
+fn categorical_overflow_falls_back_to_exact_utf8() {
+    // A column whose distinct-value count exceeds the UInt16 key space remains
+    // lossless by using plain Utf8 rather than failing or dropping values.
     let n = u16::MAX as usize + 1; // 65_536 distinct strings
     let kinds: Vec<Option<String>> = (0..n).map(|i| Some(format!("c{i}"))).collect();
     let layer = ColumnarLayer {
@@ -208,11 +226,19 @@ fn categorical_overflow_errors_instead_of_corrupting() {
         vertex_value_matrix: None,
         properties: vec![("kind".into(), PropertyColumn::Categorical(kinds))],
     };
-    let err = encode_layer(&layer).expect_err("overflowing dictionary must error");
-    assert!(
-        err.to_string().contains("distinct values"),
-        "unexpected error: {err}"
-    );
+    let ipc = encode_layer(&layer).expect("high-cardinality strings remain encodable");
+    let batch = decode_layer(&ipc).unwrap();
+    let schema = batch.schema();
+    let field = schema.field_with_name("kind").unwrap();
+    assert_eq!(field.data_type(), &DataType::Utf8);
+    let col = batch
+        .column_by_name("kind")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(col.value(0), "c0");
+    assert_eq!(col.value(n - 1), format!("c{}", n - 1));
 }
 
 #[test]
@@ -1925,7 +1951,7 @@ fn quantized_attr_index_beyond_i32_errors_instead_of_clamping() {
 }
 
 // ------------------------------------------------------------------
-// Layer frame v2 (packed formatVersion 2)
+// Layer frame v2 (packed formatVersion 3)
 // ------------------------------------------------------------------
 
 /// Layer-frame config in SELF-CONTAINED mode (inline schema sections, no registry
@@ -2237,6 +2263,10 @@ fn v2_tile_meta_is_canonical_json_and_ignores_unknown_keys() {
             (-2.5, 0.001),
         )])),
         vt: Some((1_577_836_800_000, 1000)),
+        // `vtf` is the OTHER vertex-time form and never ships beside `vt`; the
+        // canonical bytes below therefore stay exactly as they were before it
+        // existed, which is the point of an additive key.
+        vtf: None,
     };
     assert_eq!(
         serde_json::to_string(&meta).unwrap(),
@@ -3493,4 +3523,1193 @@ fn part_offsets_handle_an_empty_polygon_layer() {
         .batch;
     assert_eq!(batch.num_rows(), 0);
     assert!(batch.column_by_name("part_offsets").is_none());
+}
+
+// ----------------------------------------------------------------------------
+// TB-3 / TB-4 — the dataset-global categorical verdict and the dictionary hoist
+// ----------------------------------------------------------------------------
+//
+// The defect both items repair is per-tile greed where a dataset-global pin is
+// wanted: the incumbent encoder decides `Dictionary<UInt16, Utf8>` vs plain
+// `Utf8` from the rows that happened to land in ONE tile, so a column is a
+// dictionary in the dense tiles and a `Utf8` in the sparse ones. That forks a
+// PROPS schema template per variant (§13.2's conformance-invariance rule broken
+// by construction) and re-ships the category list in every single tile.
+//
+// TB-3 makes the verdict a function of `EncoderConfig::global_pins` — the
+// dataset DOMAIN — so one column is one Arrow type everywhere. TB-4 then moves
+// the now-provably-constant `DictionaryBatch` message into the schema TEMPLATE,
+// where the category list is stored once per realized layer shape.
+
+/// A `Dictionary` verdict over `categories`, in first-seen order.
+fn dict_verdict(categories: &[&str]) -> GlobalDictVerdict {
+    GlobalDictVerdict::Dictionary(Arc::new(
+        categories.iter().map(|s| (*s).to_string()).collect(),
+    ))
+}
+
+/// An [`EncoderConfig`] carrying exactly these categorical pins.
+fn cfg_with_dict_pins(
+    base: &EncoderConfig,
+    entries: &[(&str, GlobalDictVerdict)],
+) -> EncoderConfig {
+    let mut pins = GlobalColumnPins::default();
+    for (name, verdict) in entries {
+        pins.dict.insert((*name).to_string(), verdict.clone());
+    }
+    EncoderConfig {
+        global_pins: Some(Arc::new(pins)),
+        ..base.clone()
+    }
+}
+
+/// A point layer with one categorical column, sized by `values`.
+///
+/// Every feature shares `start_time == end_time == 0` so the CORE schema (and
+/// therefore the CORE template) is constant across every tile these tests build
+/// — which is what lets the PROPS template count be read directly off the
+/// collector.
+fn kind_layer(values: &[Option<&str>]) -> ColumnarLayer {
+    kind_layer_named("kind", values)
+}
+
+fn kind_layer_named(column: &str, values: &[Option<&str>]) -> ColumnarLayer {
+    let n = values.len();
+    ColumnarLayer {
+        polygon_parts: None,
+        name: "kinds".into(),
+        feature_ids: (0..n as u64).collect(),
+        start_times: vec![0; n],
+        end_times: vec![0; n],
+        geometry: GeometryColumn::Point(vec![[-122.4, 37.7]; n]),
+        vertex_times: None,
+        vertex_values: None,
+        triangles: None,
+        vertex_value_matrix: None,
+        properties: vec![(
+            column.to_string(),
+            PropertyColumn::Categorical(values.iter().map(|v| v.map(str::to_string)).collect()),
+        )],
+    }
+}
+
+/// A tile so sparse the per-tile surrogate always picks `Utf8` (3 rows: the
+/// dictionary's fixed IPC allowance dwarfs 6 bytes of values).
+fn sparse_kind_layer() -> ColumnarLayer {
+    kind_layer(&[Some("car"), Some("bus"), None])
+}
+
+/// A tile so dense the per-tile surrogate always picks `Dictionary` (1 000 rows
+/// over 2 categories).
+fn dense_kind_layer() -> ColumnarLayer {
+    let values: Vec<Option<&str>> = (0..1_000)
+        .map(|i| Some(if i % 2 == 0 { "car" } else { "bus" }))
+        .collect();
+    kind_layer(&values)
+}
+
+/// Arrow IPC message headers of a byte run, in order. Tolerates a bare TAIL
+/// (a message sequence that does not begin with a Schema), which is exactly what
+/// the hoist has to be inspected on.
+fn ipc_message_kinds(bytes: &[u8]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 8 <= bytes.len() {
+        assert_eq!(
+            &bytes[pos..pos + 4],
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            "message at offset {pos} must start with the continuation marker"
+        );
+        let meta_len = i32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
+        if meta_len <= 0 {
+            out.push("EOS");
+            break;
+        }
+        let header_end = pos + 8 + meta_len as usize;
+        let msg = arrow::ipc::root_as_message(&bytes[pos + 8..header_end]).unwrap();
+        out.push(match msg.header_type() {
+            arrow::ipc::MessageHeader::Schema => "Schema",
+            arrow::ipc::MessageHeader::DictionaryBatch => "DictionaryBatch",
+            arrow::ipc::MessageHeader::RecordBatch => "RecordBatch",
+            _ => "Other",
+        });
+        pos = header_end + msg.bodyLength() as usize;
+    }
+    out
+}
+
+/// The decoded categorical column's `(categories, per-row values)`.
+fn decoded_categorical(batch: &RecordBatch, column: &str) -> (Vec<String>, Vec<Option<String>>) {
+    let col = batch.column_by_name(column).expect("column present");
+    match col.data_type() {
+        DataType::Dictionary(..) => {
+            let dict = col
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt16Type>>()
+                .expect("Dictionary<UInt16, _>");
+            let values = dict
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 dictionary values");
+            let categories: Vec<String> =
+                (0..values.len()).map(|i| values.value(i).into()).collect();
+            let rows = (0..dict.len())
+                .map(|i| {
+                    dict.is_valid(i)
+                        .then(|| categories[dict.keys().value(i) as usize].clone())
+                })
+                .collect();
+            (categories, rows)
+        }
+        DataType::Utf8 => {
+            let s = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 column");
+            let rows: Vec<Option<String>> = (0..s.len())
+                .map(|i| s.is_valid(i).then(|| s.value(i).to_string()))
+                .collect();
+            (Vec::new(), rows)
+        }
+        other => panic!("unexpected categorical storage type {other:?}"),
+    }
+}
+
+// --- TB-3: one column, one Arrow type, everywhere --------------------------
+
+/// The pinned verdict wins over the per-tile surrogate in BOTH directions: a
+/// sparse tile whose own arithmetic says `Utf8` still ships a dictionary under a
+/// `Dictionary` pin, and a dense tile whose own arithmetic says `Dictionary`
+/// still ships plain strings under a `Utf8` pin.
+///
+/// This is the §13.2 invariance rule made executable — the Arrow type is a
+/// function of the pin and of nothing the tile carries.
+#[test]
+fn pinned_dict_verdict_overrides_the_per_tile_surrogate_in_both_directions() {
+    let base = EncoderConfig::default();
+    let sparse = sparse_kind_layer();
+    let dense = dense_kind_layer();
+
+    // Baseline: the incumbent per-tile decision genuinely disagrees across the
+    // two tiles. (If it did not, this test would prove nothing.)
+    let field_type = |layer: &ColumnarLayer, cfg: &EncoderConfig| {
+        let batch = decode_layer(&encode_layer_with(layer, cfg).unwrap()).unwrap();
+        batch
+            .schema()
+            .field_with_name("kind")
+            .unwrap()
+            .data_type()
+            .clone()
+    };
+    assert_eq!(field_type(&sparse, &base), DataType::Utf8);
+    assert!(matches!(
+        field_type(&dense, &base),
+        DataType::Dictionary(..)
+    ));
+
+    // Pin Dictionary: the SPARSE tile flips to a dictionary.
+    let pinned_dict = cfg_with_dict_pins(&base, &[("kind", dict_verdict(&["car", "bus"]))]);
+    assert!(matches!(
+        field_type(&sparse, &pinned_dict),
+        DataType::Dictionary(..)
+    ));
+    assert!(matches!(
+        field_type(&dense, &pinned_dict),
+        DataType::Dictionary(..)
+    ));
+
+    // Pin Utf8: the DENSE tile flips to plain strings.
+    let pinned_utf8 = cfg_with_dict_pins(&base, &[("kind", GlobalDictVerdict::Utf8)]);
+    assert_eq!(field_type(&dense, &pinned_utf8), DataType::Utf8);
+    assert_eq!(field_type(&sparse, &pinned_utf8), DataType::Utf8);
+}
+
+/// GUARD (the partial-hoist boundary from the other side): a column pinned
+/// `Utf8` emits NO dictionary anywhere — not in a dense tile, not in the
+/// template, not in the tail. A dictionary that exists in only some tiles is
+/// precisely the fork TB-3 removes.
+#[test]
+fn pinned_utf8_never_emits_a_dictionary_anywhere() {
+    let cfg = cfg_with_dict_pins(
+        &EncoderConfig::default(),
+        &[("kind", GlobalDictVerdict::Utf8)],
+    );
+    for layer in [
+        sparse_kind_layer(),
+        dense_kind_layer(),
+        kind_layer(&[None; 4]),
+    ] {
+        // Standalone-layer shape.
+        let ipc = encode_layer_with(&layer, &cfg).unwrap();
+        assert!(
+            !ipc_message_kinds(&ipc).contains(&"DictionaryBatch"),
+            "a Utf8-pinned column must not emit a dictionary message"
+        );
+        // Frame shape: neither template nor tail may carry one.
+        let enc = encode_layer_v2_parts(&layer, &cfg).unwrap();
+        let (template, tail) = enc.props.expect("the layer has a property column");
+        assert_eq!(ipc_message_kinds(&template), vec!["Schema"]);
+        assert_eq!(ipc_message_kinds(&tail), vec!["RecordBatch", "EOS"]);
+    }
+}
+
+/// Exact strings and NULLs survive identically on both pinned paths — the
+/// verdict is a storage choice, never a data change.
+#[test]
+fn pinned_verdicts_preserve_exact_strings_and_nulls_on_both_paths() {
+    let base = EncoderConfig::default();
+    let values = [Some("car"), None, Some("bus"), Some("car"), None];
+    let layer = kind_layer(&values);
+    let expected: Vec<Option<String>> = values.iter().map(|v| v.map(str::to_string)).collect();
+
+    for cfg in [
+        cfg_with_dict_pins(&base, &[("kind", dict_verdict(&["car", "bus"]))]),
+        cfg_with_dict_pins(&base, &[("kind", GlobalDictVerdict::Utf8)]),
+        base.clone(),
+    ] {
+        let batch = decode_layer(&encode_layer_with(&layer, &cfg).unwrap()).unwrap();
+        let (_, rows) = decoded_categorical(&batch, "kind");
+        assert_eq!(rows, expected, "exact strings and nulls must round-trip");
+    }
+}
+
+/// The template-fork this item exists to kill: WITHOUT a pin a dense tile and a
+/// sparse tile of the same layer shape mint TWO PROPS templates; WITH one they
+/// share a single template, so `manifest.schemas` stops growing an entry per
+/// (dense-tile, sparse-tile) split.
+#[test]
+fn pinned_dict_verdict_collapses_the_props_template_fork() {
+    let layers = [sparse_kind_layer(), dense_kind_layer()];
+
+    let unpinned_collector = Arc::new(TemplateCollector::new());
+    let unpinned = v2_hashed(&EncoderConfig::default(), &unpinned_collector);
+    for layer in &layers {
+        encode_tile_with(std::slice::from_ref(layer), &unpinned).unwrap();
+    }
+    assert_eq!(
+        unpinned_collector.len(),
+        3,
+        "per-tile verdicts fork the PROPS template: 1 core + Utf8 props + Dictionary props"
+    );
+
+    let pinned_collector = Arc::new(TemplateCollector::new());
+    let pinned = v2_hashed(
+        &cfg_with_dict_pins(
+            &EncoderConfig::default(),
+            &[("kind", dict_verdict(&["car", "bus"]))],
+        ),
+        &pinned_collector,
+    );
+    let payloads: Vec<Vec<u8>> = layers
+        .iter()
+        .map(|layer| encode_tile_with(std::slice::from_ref(layer), &pinned).unwrap())
+        .collect();
+    assert_eq!(
+        pinned_collector.len(),
+        2,
+        "one global verdict ⇒ exactly one CORE + one PROPS template"
+    );
+
+    // ...and both tiles still decode, through the registry those templates build.
+    let registry = registry_from(&pinned_collector);
+    for payload in &payloads {
+        decode_tile_with_templates(payload, &registry).unwrap();
+    }
+}
+
+// --- TB-4: the dictionary hoist -------------------------------------------
+
+/// `split_ipc_after_dictionaries` walks 0, 1 and n `DictionaryBatch` messages
+/// and lands exactly on the RecordBatch. With zero dictionaries it agrees with
+/// `split_ipc_at_schema` (reached here through the frame path, which uses that
+/// splitter whenever nothing is hoistable).
+///
+/// The exact counts are also the DELTA-DICTIONARY assertion the hoist depends
+/// on: k dictionary columns must produce exactly k messages. arrow-rs writes
+/// delta dictionaries only when asked and this writer never asks, but if that
+/// default ever moved, a second (delta) message for a column would land on the
+/// template side and make it tile-dependent — so the count is pinned here.
+#[test]
+fn split_ipc_after_dictionaries_walks_zero_one_and_many_dictionaries() {
+    let base = EncoderConfig::default();
+
+    // 0 dictionaries — a Utf8-pinned column.
+    let none = encode_layer_with(
+        &sparse_kind_layer(),
+        &cfg_with_dict_pins(&base, &[("kind", GlobalDictVerdict::Utf8)]),
+    )
+    .unwrap();
+    // 1 dictionary — one pinned categorical column.
+    let one = encode_layer_with(
+        &sparse_kind_layer(),
+        &cfg_with_dict_pins(&base, &[("kind", dict_verdict(&["car", "bus"]))]),
+    )
+    .unwrap();
+    // 2 dictionaries — two pinned categorical columns on one layer.
+    let mut two_col = sparse_kind_layer();
+    two_col.properties.push((
+        "colour".into(),
+        PropertyColumn::Categorical(vec![
+            Some("red".into()),
+            Some("blue".into()),
+            Some("red".into()),
+        ]),
+    ));
+    let two = encode_layer_with(
+        &two_col,
+        &cfg_with_dict_pins(
+            &base,
+            &[
+                ("kind", dict_verdict(&["car", "bus"])),
+                ("colour", dict_verdict(&["red", "blue"])),
+            ],
+        ),
+    )
+    .unwrap();
+
+    for (ipc, dictionaries) in [(&none, 0usize), (&one, 1), (&two, 2)] {
+        let boundary = split_ipc_after_dictionaries(ipc).unwrap();
+        let mut expected = vec!["Schema"];
+        expected.extend(std::iter::repeat_n("DictionaryBatch", dictionaries));
+        assert_eq!(
+            ipc_message_kinds(&ipc[..boundary]),
+            expected,
+            "template side for {dictionaries} dictionary message(s)"
+        );
+        assert_eq!(
+            ipc_message_kinds(&ipc[boundary..]),
+            vec!["RecordBatch", "EOS"],
+            "tail side for {dictionaries} dictionary message(s)"
+        );
+    }
+}
+
+/// Malformed framing errors LOUDLY rather than cutting in the wrong place — a
+/// mis-cut template splices into a stream arrow-rs decodes as EMPTY, which is
+/// the one failure mode that must never be quiet. Mirrors (and reaches through
+/// to) `split_ipc_at_schema`'s own error cases.
+#[test]
+fn split_ipc_after_dictionaries_rejects_malformed_framing() {
+    let msg = |bytes: &[u8]| split_ipc_after_dictionaries(bytes).unwrap_err().to_string();
+
+    // Shared with split_ipc_at_schema: no encapsulated message, and an
+    // end-of-stream marker where a schema belongs.
+    assert!(msg(&[]).contains("does not start with an encapsulated message"));
+    assert!(msg(&[0u8; 16]).contains("does not start with an encapsulated message"));
+    assert!(msg(&[0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]).contains("end-of-stream marker"));
+
+    let ipc = encode_layer_with(
+        &sparse_kind_layer(),
+        &cfg_with_dict_pins(
+            &EncoderConfig::default(),
+            &[("kind", dict_verdict(&["car", "bus"]))],
+        ),
+    )
+    .unwrap();
+    let schema_end = {
+        let meta_len = i32::from_le_bytes(ipc[4..8].try_into().unwrap()) as usize;
+        8 + meta_len
+    };
+
+    // Truncated right after the schema: nothing left to walk.
+    assert!(msg(&ipc[..schema_end]).contains("no record batch"));
+    assert!(msg(&ipc[..schema_end + 4]).contains("no record batch"));
+
+    // A corrupted continuation marker at the dictionary boundary.
+    let mut corrupt = ipc.clone();
+    corrupt[schema_end] = 0x00;
+    assert!(msg(&corrupt).contains("continuation marker"));
+
+    // A dictionary header whose declared body runs off the end of the stream.
+    let dict_meta_len =
+        i32::from_le_bytes(ipc[schema_end + 4..schema_end + 8].try_into().unwrap()) as usize;
+    assert!(msg(&ipc[..schema_end + 8 + dict_meta_len]).contains("body overruns the stream"));
+
+    // A dictionary header whose declared metadata runs off the end.
+    assert!(
+        msg(&ipc[..schema_end + 8 + dict_meta_len - 1]).contains("metadata overruns the stream")
+    );
+}
+
+/// The headline round-trip: with the hoist on, tiles carrying a STRICT SUBSET of
+/// the pinned categories — and tiles carrying none at all — decode to their
+/// exact strings through `decode_tile_with_templates`, and they all share ONE
+/// PROPS template.
+#[test]
+fn hoisted_dictionary_round_trips_subsets_and_all_null_tiles() {
+    let categories = ["car", "bus", "tram", "ferry", "bike"];
+    let collector = Arc::new(TemplateCollector::new());
+    let cfg = v2_hashed(
+        &cfg_with_dict_pins(
+            &EncoderConfig::default(),
+            &[("kind", dict_verdict(&categories))],
+        ),
+        &collector,
+    );
+
+    let cases: Vec<Vec<Option<&str>>> = vec![
+        vec![
+            Some("car"),
+            Some("bus"),
+            Some("tram"),
+            Some("ferry"),
+            Some("bike"),
+        ], // all
+        vec![Some("ferry")],                    // one only
+        vec![Some("bike"), None, Some("bike")], // subset + null
+        vec![None, None],                       // all null
+        vec![],                                 // empty tile
+    ];
+    let payloads: Vec<Vec<u8>> = cases
+        .iter()
+        .map(|values| encode_tile_with(&[kind_layer(values)], &cfg).unwrap())
+        .collect();
+
+    let registry = registry_from(&collector);
+    for (values, payload) in cases.iter().zip(&payloads) {
+        let decoded = decode_tile_with_templates(payload, &registry).unwrap();
+        let (cats, rows) = decoded_categorical(&decoded[0].batch, "kind");
+        assert_eq!(
+            cats,
+            categories.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "every tile ships the FULL pinned list, in first-seen order"
+        );
+        assert_eq!(
+            rows,
+            values
+                .iter()
+                .map(|v| v.map(str::to_string))
+                .collect::<Vec<_>>(),
+            "exact strings (and nulls) round-trip through the hoisted dictionary"
+        );
+    }
+
+    // An EMPTY layer's compact-time forms differ from a populated one's, so it
+    // legitimately mints its own CORE template; the PROPS template is shared by
+    // all five.
+    let props_templates: std::collections::BTreeSet<Vec<u8>> = cases
+        .iter()
+        .map(|values| {
+            encode_layer_v2_parts(&kind_layer(values), &cfg)
+                .unwrap()
+                .props
+                .expect("props present")
+                .0
+        })
+        .collect();
+    assert_eq!(
+        props_templates.len(),
+        1,
+        "the hoisted PROPS template must be byte-identical across every tile"
+    );
+}
+
+/// Where the bytes actually move: the `DictionaryBatch` message leaves the
+/// per-tile TAIL and lands in the TEMPLATE, and the CORE stream — which has no
+/// dictionary columns by construction — is untouched.
+#[test]
+fn hoist_moves_the_dictionary_message_from_tail_to_template() {
+    let layer = dense_kind_layer();
+    let base = EncoderConfig::default();
+
+    // Incumbent: the dictionary rides the tail, once per tile.
+    let unpinned = encode_layer_v2_parts(&layer, &base).unwrap();
+    let (unpinned_template, unpinned_tail) = unpinned.props.expect("props present");
+    assert_eq!(ipc_message_kinds(&unpinned_template), vec!["Schema"]);
+    assert_eq!(
+        ipc_message_kinds(&unpinned_tail),
+        vec!["DictionaryBatch", "RecordBatch", "EOS"]
+    );
+
+    // Hoisted: the same message is template-resident, and the tail is keys-only.
+    let pinned_cfg = cfg_with_dict_pins(&base, &[("kind", dict_verdict(&["car", "bus"]))]);
+    let pinned = encode_layer_v2_parts(&layer, &pinned_cfg).unwrap();
+    let (template, tail) = pinned.props.expect("props present");
+    assert_eq!(
+        ipc_message_kinds(&template),
+        vec!["Schema", "DictionaryBatch"]
+    );
+    assert_eq!(ipc_message_kinds(&tail), vec!["RecordBatch", "EOS"]);
+    assert!(
+        template.len() > unpinned_template.len(),
+        "the template absorbs the category list"
+    );
+    assert!(
+        tail.len() < unpinned_tail.len(),
+        "the per-tile tail sheds it ({} vs {} bytes)",
+        tail.len(),
+        unpinned_tail.len()
+    );
+
+    // CORE carries no dictionary either way — the core split is untouched.
+    assert_eq!(ipc_message_kinds(&pinned.core_template), vec!["Schema"]);
+    assert_eq!(pinned.core_template, unpinned.core_template);
+}
+
+/// ALL-OR-NOTHING, observed: a tile holding ONE of five categories still ships
+/// all five. A tile-local subset would fork a template per subset, and the
+/// encoder has no way to spell one (`PinnedCategories` has a single constructor,
+/// whose only input is the pin).
+#[test]
+fn hoist_ships_the_full_pinned_list_from_a_single_category_tile() {
+    let categories = ["car", "bus", "tram", "ferry", "bike"];
+    let cfg = cfg_with_dict_pins(
+        &EncoderConfig::default(),
+        &[("kind", dict_verdict(&categories))],
+    );
+    let batch =
+        decode_layer(&encode_layer_with(&kind_layer(&[Some("tram"), Some("tram")]), &cfg).unwrap())
+            .unwrap();
+    let (cats, rows) = decoded_categorical(&batch, "kind");
+    assert_eq!(cats.len(), 5);
+    assert_eq!(cats[0], "car", "first-seen order is the pin's order");
+    assert_eq!(cats[4], "bike");
+    assert_eq!(rows, vec![Some("tram".into()), Some("tram".into())]);
+}
+
+/// A tile-local dictionary must never block the hoist by *degrading the whole
+/// stream to `Tail`* — because `Tail` puts EVERY dictionary in the tail, the
+/// pinned one included, and the pinned one is the dataset's entire list.
+///
+/// This test used to pin the opposite contract, and the bytes it asserted were
+/// the defect: `tail = [DictionaryBatch, DictionaryBatch, RecordBatch, EOS]`
+/// with a 2 002-category pin measured **55 128 B per tile** against a 240-B
+/// template. The stream is now made hoistable instead, by demoting the UNPINNED
+/// column to `Utf8` (`unpinned_categoricals_take_utf8`): same layer, same pin,
+/// **50 672 B of template stored once + 8 480 B per tile** (−84.6 % per tile).
+/// The invariant the old test protected — no per-tile template — still holds,
+/// and now holds without the per-tile list.
+#[test]
+fn an_unpinned_dictionary_column_does_not_drag_the_pinned_list_into_every_tile() {
+    let mut layer = dense_kind_layer();
+    // A second categorical column, dense enough that the per-tile surrogate
+    // picks a dictionary for it, and deliberately left out of the pins.
+    layer.properties.push((
+        "colour".into(),
+        PropertyColumn::Categorical(
+            (0..1_000)
+                .map(|i| Some(if i % 3 == 0 { "red" } else { "blue" }.to_string()))
+                .collect(),
+        ),
+    ));
+    let cfg = cfg_with_dict_pins(
+        &EncoderConfig::default(),
+        &[("kind", dict_verdict(&["car", "bus"]))],
+    );
+
+    let enc = encode_layer_v2_parts(&layer, &cfg).unwrap();
+    let (template, tail) = enc.props.expect("props present");
+    assert_eq!(
+        ipc_message_kinds(&template),
+        vec!["Schema", "DictionaryBatch"],
+        "the pinned dictionary is dataset-constant and belongs in the template"
+    );
+    assert_eq!(
+        ipc_message_kinds(&tail),
+        vec!["RecordBatch", "EOS"],
+        "no dictionary may ride the per-tile tail once a pin is in play"
+    );
+
+    // The pinned column still gets its GLOBAL type and list (TB-3 holds
+    // independently of TB-4), and the tile decodes.
+    let batch = decode_layer(&encode_layer_with(&layer, &cfg).unwrap()).unwrap();
+    let (cats, rows) = decoded_categorical(&batch, "kind");
+    assert_eq!(cats, vec!["car".to_string(), "bus".to_string()]);
+    assert_eq!(rows[0], Some("car".to_string()));
+    // The demoted sibling keeps its exact strings.
+    let (_, colours) = decoded_categorical(&batch, "colour");
+    assert_eq!(colours[0], Some("red".to_string()));
+    assert_eq!(colours[1], Some("blue".to_string()));
+}
+
+/// Data outside the pin is a HARD ERROR, never a silent degrade: it means pass 1
+/// and the encoded feature stream disagree about the column's domain, and every
+/// guarantee downstream (one type everywhere, a constant dictionary message, a
+/// hoistable template) rests on them agreeing.
+#[test]
+fn pinned_dictionary_rejects_a_value_absent_from_the_pin() {
+    let cfg = cfg_with_dict_pins(
+        &EncoderConfig::default(),
+        &[("kind", dict_verdict(&["car"]))],
+    );
+    let err = encode_layer_with(&kind_layer(&[Some("car"), Some("bus")]), &cfg)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("absent"), "{err}");
+    assert!(err.contains("\"bus\""), "{err}");
+    assert!(
+        err.contains("--single-pass"),
+        "the escape hatch is named: {err}"
+    );
+}
+
+/// READER CONTRACT: a pinned list that could mint the key `0xffff` degrades to
+/// `Utf8` for the WHOLE dataset.
+///
+/// The TS reader spells "this row has no category" as the in-band sentinel
+/// `0xffff` in its `Uint16Array` of indices, so a live key of 65 535 would be
+/// indistinguishable from a null. The per-tile builder can never produce one
+/// (`build_dictionary_indices` stops at `u16::MAX` categories) but pass 1's cap
+/// is `MAX_CATEGORIES = 65 536`, one wider — so the pin can, and must not.
+#[test]
+fn an_oversize_pin_degrades_to_utf8_for_the_whole_dataset() {
+    let base = EncoderConfig::default();
+    let at_limit: Vec<String> = (0..u16::MAX as usize).map(|i| format!("c{i}")).collect();
+    let over_limit: Vec<String> = (0..u16::MAX as usize + 1)
+        .map(|i| format!("c{i}"))
+        .collect();
+    let layer = kind_layer(&[Some("c0"), Some("c1")]);
+
+    let cfg_at = EncoderConfig {
+        global_pins: Some(Arc::new(GlobalColumnPins {
+            attr: Default::default(),
+            dict: [(
+                "kind".to_string(),
+                GlobalDictVerdict::Dictionary(Arc::new(at_limit)),
+            )]
+            .into_iter()
+            .collect(),
+        })),
+        ..base.clone()
+    };
+    let cfg_over = EncoderConfig {
+        global_pins: Some(Arc::new(GlobalColumnPins {
+            attr: Default::default(),
+            dict: [(
+                "kind".to_string(),
+                GlobalDictVerdict::Dictionary(Arc::new(over_limit)),
+            )]
+            .into_iter()
+            .collect(),
+        })),
+        ..base.clone()
+    };
+
+    // Exactly `u16::MAX` categories ⇒ keys 0..=65_534, still below the sentinel.
+    let ipc_at = encode_layer_with(&layer, &cfg_at).unwrap();
+    assert!(matches!(
+        decode_layer(&ipc_at)
+            .unwrap()
+            .schema()
+            .field_with_name("kind")
+            .unwrap()
+            .data_type(),
+        DataType::Dictionary(..)
+    ));
+
+    // One more ⇒ Utf8 everywhere, and no dictionary message anywhere.
+    let ipc_over = encode_layer_with(&layer, &cfg_over).unwrap();
+    let batch = decode_layer(&ipc_over).unwrap();
+    assert_eq!(
+        batch.schema().field_with_name("kind").unwrap().data_type(),
+        &DataType::Utf8
+    );
+    assert!(!ipc_message_kinds(&ipc_over).contains(&"DictionaryBatch"));
+    let (_, rows) = decoded_categorical(&batch, "kind");
+    assert_eq!(rows, vec![Some("c0".to_string()), Some("c1".to_string())]);
+}
+
+/// DETERMINISM (the mandatory byte-identical re-run): the pinned + hoisted
+/// encode is a pure function of `(layer, pins)`. Two runs in one process, and
+/// two independently-constructed but equal pin structs, produce identical bytes
+/// — the property content-addressed pack dedup rests on.
+#[test]
+fn pinned_encode_is_byte_identical_across_runs() {
+    let layers = [dense_kind_layer(), sparse_kind_layer()];
+    let make_cfg = || {
+        cfg_with_dict_pins(
+            &EncoderConfig {
+                quantize_attrs_auto: true,
+                ..EncoderConfig::default()
+            },
+            &[("kind", dict_verdict(&["car", "bus"]))],
+        )
+    };
+    for layer in &layers {
+        let a = encode_tile_with(std::slice::from_ref(layer), &make_cfg()).unwrap();
+        let b = encode_tile_with(std::slice::from_ref(layer), &make_cfg()).unwrap();
+        let c = encode_tile_with(std::slice::from_ref(layer), &make_cfg()).unwrap();
+        assert_eq!(a, b, "two encodes under equal pins must be byte-identical");
+        assert_eq!(b, c);
+
+        // ...and so is the template/tail split the frame is assembled from.
+        let x = encode_layer_v2_parts(layer, &make_cfg()).unwrap();
+        let y = encode_layer_v2_parts(layer, &make_cfg()).unwrap();
+        assert_eq!(x.props, y.props);
+        assert_eq!(x.core_template, y.core_template);
+        assert_eq!(x.core_tail, y.core_tail);
+        assert_eq!(x.tile_meta_json, y.tile_meta_json);
+    }
+}
+
+/// THE FALLBACK IS BYTE-NEUTRAL: an encode with no pins — and an encode whose
+/// pins name only OTHER columns — takes the incumbent per-tile path and emits
+/// exactly the pre-M2 bytes. This is what `--single-pass` restores and what
+/// keeps every un-pinned caller (`stt-serve` without a sidecar, a one-shot
+/// external caller) unaffected.
+#[test]
+fn an_encode_with_no_applicable_pins_is_byte_identical_to_the_incumbent() {
+    let base = EncoderConfig::default();
+    let unrelated = cfg_with_dict_pins(&base, &[("some_other_column", dict_verdict(&["a", "b"]))]);
+    let empty_pins = EncoderConfig {
+        global_pins: Some(Arc::new(GlobalColumnPins::default())),
+        ..base.clone()
+    };
+    for layer in [sparse_kind_layer(), dense_kind_layer()] {
+        let incumbent = encode_tile_with(std::slice::from_ref(&layer), &base).unwrap();
+        assert_eq!(
+            encode_tile_with(std::slice::from_ref(&layer), &unrelated).unwrap(),
+            incumbent,
+            "a pin for a different column must not move a byte"
+        );
+        assert_eq!(
+            encode_tile_with(std::slice::from_ref(&layer), &empty_pins).unwrap(),
+            incumbent,
+            "an empty pin set must not move a byte"
+        );
+    }
+}
+
+/// The hoisted form decodes identically through BOTH template modes (inline
+/// schema sections and hash references) and against the caller's own baseline —
+/// the same decode-equivalence contract every other encoding owes.
+#[test]
+fn hoisted_dictionary_decodes_equivalently_in_every_template_mode() {
+    let cfg = cfg_with_dict_pins(
+        &EncoderConfig::default(),
+        &[
+            ("kind", dict_verdict(&["car", "bus", "tram"])),
+            ("colour", dict_verdict(&["red", "blue"])),
+        ],
+    );
+    let mut two_dicts = kind_layer(&[Some("tram"), None, Some("car")]);
+    two_dicts.properties.push((
+        "colour".into(),
+        PropertyColumn::Categorical(vec![Some("blue".into()), Some("red".into()), None]),
+    ));
+    assert_v2_decodes_like_v1(&[two_dicts], &cfg, "hoisted dictionaries");
+    assert_v2_decodes_like_v1(
+        &[kind_layer(&[None, None])],
+        &cfg,
+        "hoisted dictionary, all-null tile",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The MIXED stream: one pinned column beside an unpinned one
+// ---------------------------------------------------------------------------
+//
+// The hoist is a whole-stream verdict, so before `unpinned_categoricals_take_utf8`
+// a layer holding one PINNED categorical and one UNPINNED categorical whose
+// per-tile surrogate chose a dictionary fell to `DictHoist::Tail` — which puts
+// EVERY dictionary in the tail, the pinned one included. The dataset-global
+// list then shipped in every tile, un-deduplicated: worse than hoisting AND
+// worse than not pinning. The likeliest home for the shape is a summary/LOD
+// tier, where derived columns are unpinned by design.
+
+/// A dense layer with a pinned `kind` column and an unpinned `derived` column
+/// whose 1 000 rows over 2 categories make the per-tile surrogate choose a
+/// dictionary — the exact combination that used to fall to `Tail`.
+fn mixed_pinned_and_unpinned_layer(pinned_categories: usize) -> ColumnarLayer {
+    let mut layer = dense_kind_layer();
+    let n = layer.feature_ids.len();
+    layer.properties.push((
+        "derived".into(),
+        PropertyColumn::Categorical(
+            (0..n)
+                .map(|i| {
+                    Some(if i % 2 == 0 {
+                        "lo".to_string()
+                    } else {
+                        "hi".to_string()
+                    })
+                })
+                .collect(),
+        ),
+    ));
+    // Widen `kind`'s PIN (not its values) so the hoisted list is big enough for
+    // the byte difference between the two splits to be unmissable.
+    let _ = pinned_categories;
+    layer
+}
+
+/// A wide pin for `kind`: the two categories the rows actually use plus a long
+/// tail the tile never references — a dataset-global list, which is exactly
+/// what a pin is.
+fn wide_kind_pin(extra: usize) -> GlobalDictVerdict {
+    let mut categories = vec!["car".to_string(), "bus".to_string()];
+    categories.extend((0..extra).map(|i| format!("filler-category-{i:05}")));
+    GlobalDictVerdict::Dictionary(Arc::new(categories))
+}
+
+/// THE REGRESSION THIS FIXES, stated in bytes: with a sibling unpinned
+/// categorical present, the pinned column's whole global list must NOT end up
+/// in the per-tile tail.
+#[test]
+fn a_mixed_pinned_unpinned_stream_never_ships_the_global_list_in_the_tail() {
+    let layer = mixed_pinned_and_unpinned_layer(0);
+    let cfg = cfg_with_dict_pins(&EncoderConfig::default(), &[("kind", wide_kind_pin(2_000))]);
+    let parts = encode_layer_v2_parts(&layer, &cfg).unwrap();
+    let (template, tail) = parts.props.as_ref().expect("props present");
+
+    // The hoist survived the mixed stream: dictionaries are template-resident.
+    assert_eq!(
+        ipc_message_kinds(template),
+        vec!["Schema", "DictionaryBatch"],
+        "the pinned dictionary must live in the TEMPLATE, stored once per layer shape"
+    );
+    assert_eq!(
+        ipc_message_kinds(tail),
+        vec!["RecordBatch", "EOS"],
+        "the per-tile tail must carry no dictionary at all"
+    );
+
+    // The 2 002-category pin is ~30 KB. If it were in the tail it would be in
+    // every tile; the point of the fix is that the tail is small and constant.
+    assert!(
+        template.len() > 20_000,
+        "sanity: the wide pin should dominate the template ({} B)",
+        template.len()
+    );
+    assert!(
+        tail.len() < template.len() / 4,
+        "the per-tile tail ({} B) must not carry the global list ({} B template)",
+        tail.len(),
+        template.len()
+    );
+}
+
+/// ...and the sibling column is the one that gives way: an UNPINNED categorical
+/// in a stream that has a pin takes `Utf8`, which also removes its per-tile
+/// dictionary-vs-`Utf8` flip — the very template fork TB-3 exists to kill.
+#[test]
+fn an_unpinned_categorical_beside_a_pinned_one_takes_utf8_in_every_tile() {
+    let cfg = cfg_with_dict_pins(
+        &EncoderConfig::default(),
+        &[("kind", dict_verdict(&["car", "bus"]))],
+    );
+
+    // Dense: the per-tile surrogate would have chosen Dictionary for `derived`.
+    let dense = mixed_pinned_and_unpinned_layer(0);
+    let dense_batch = decode_layer(&encode_layer_with(&dense, &cfg).unwrap()).unwrap();
+    assert_eq!(
+        dense_batch
+            .schema()
+            .field_with_name("derived")
+            .unwrap()
+            .data_type(),
+        &DataType::Utf8,
+        "an unpinned sibling of a pinned column must not mint a tile-local dictionary"
+    );
+    assert!(matches!(
+        dense_batch
+            .schema()
+            .field_with_name("kind")
+            .unwrap()
+            .data_type(),
+        DataType::Dictionary(..)
+    ));
+
+    // Sparse: the surrogate would have chosen Utf8 anyway. Same type ⇒ ONE
+    // PROPS schema across both densities, which is the fork collapse.
+    let mut sparse = kind_layer(&[Some("car"), Some("bus"), None]);
+    sparse.properties.push((
+        "derived".into(),
+        PropertyColumn::Categorical(vec![Some("lo".into()), Some("hi".into()), None]),
+    ));
+    let sparse_batch = decode_layer(&encode_layer_with(&sparse, &cfg).unwrap()).unwrap();
+    assert_eq!(
+        dense_batch.schema().fields(),
+        sparse_batch.schema().fields(),
+        "dense and sparse tiles of a mixed layer must share one PROPS schema"
+    );
+
+    // Exact strings survive on both sides.
+    let (_, rows) = decoded_categorical(&sparse_batch, "derived");
+    assert_eq!(
+        rows,
+        vec![Some("lo".to_string()), Some("hi".to_string()), None]
+    );
+}
+
+/// The demotion is scoped to streams that actually carry a pin. With NO pins
+/// (the `--single-pass` fallback, or any external one-shot caller) the
+/// incumbent per-tile path is untouched, byte for byte.
+#[test]
+fn the_unpinned_demotion_does_not_fire_without_a_pin() {
+    let layer = mixed_pinned_and_unpinned_layer(0);
+    let base = EncoderConfig::default();
+    let batch = decode_layer(&encode_layer_with(&layer, &base).unwrap()).unwrap();
+    for column in ["kind", "derived"] {
+        assert!(
+            matches!(
+                batch.schema().field_with_name(column).unwrap().data_type(),
+                DataType::Dictionary(..)
+            ),
+            "{column}: with no pins the dense per-tile surrogate must still choose Dictionary"
+        );
+    }
+    // A pin naming only an UNRELATED column is also not a pin on this stream.
+    let unrelated = cfg_with_dict_pins(&base, &[("elsewhere", dict_verdict(&["a", "b"]))]);
+    assert_eq!(
+        encode_layer_with(&layer, &unrelated).unwrap(),
+        encode_layer_with(&layer, &base).unwrap(),
+        "a pin for a column this layer does not have must not move a byte"
+    );
+}
+
+/// The dataset-scale surrogate is the DATASET sibling of the per-tile one, and
+/// its whole point is that the per-tile IPC allowance is charged ONCE (the
+/// hoisted message serves the entire dataset) instead of per tile. A sparse
+/// per-tile sample and the dataset it belongs to can therefore disagree — which
+/// is exactly the D5 defect being repaired, not a bug.
+#[test]
+fn the_dataset_surrogate_amortizes_what_the_per_tile_one_repeats() {
+    // One 3-row tile of a 2-category column: the per-tile comparison says Utf8.
+    let values = [Some("car".to_string()), Some("bus".to_string()), None];
+    let categories = ["car".to_string(), "bus".to_string()];
+    assert!(!categorical_dictionary_is_smaller(&values, &categories));
+
+    // The same column across a million rows: the dictionary wins comfortably.
+    assert!(dataset_dictionary_is_smaller(
+        3_000_000, // total value bytes
+        1_000_000, // rows
+        6,         // category bytes
+        2,         // distinct categories
+    ));
+
+    // A near-unique column is not helped by a dictionary at either scale.
+    assert!(!dataset_dictionary_is_smaller(
+        1_000_000, 100_000, 1_000_000, 100_000
+    ));
+
+    // Saturating arithmetic: absurd inputs must not panic.
+    assert!(!dataset_dictionary_is_smaller(
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX
+    ));
+}
+
+// ------------------------------------------------------------------
+// TB-11 — bucket-proportional vertex-time ceiling (§2.5)
+// ------------------------------------------------------------------
+
+/// A coarse tier scales the ceiling proportionally; the base tier does not.
+#[test]
+fn vertex_time_ceiling_scales_with_the_tier_bucket() {
+    let cfg = EncoderConfig {
+        vertex_time_max_step_ms: 1_000,
+        ..EncoderConfig::default()
+    };
+    let hour = 3_600_000u64;
+
+    // Base tier — unchanged, so the default path stays byte-identical.
+    assert_eq!(cfg.vertex_time_step_for_bucket(None, hour), 1_000);
+    assert_eq!(cfg.vertex_time_step_for_bucket(Some(hour), hour), 1_000);
+
+    // A 24x coarser tier tolerates a 24x coarser step at equal perceptual error.
+    assert_eq!(
+        cfg.vertex_time_step_for_bucket(Some(24 * hour), hour),
+        24_000
+    );
+    // 30-day tier over an hourly base.
+    assert_eq!(
+        cfg.vertex_time_step_for_bucket(Some(720 * hour), hour),
+        720_000
+    );
+}
+
+/// Degenerate inputs never scale and never panic — an unknown base bucket must
+/// leave the incumbent ceiling exactly in place.
+#[test]
+fn an_unknown_or_finer_bucket_leaves_the_ceiling_alone() {
+    let cfg = EncoderConfig {
+        vertex_time_max_step_ms: 1_000,
+        ..EncoderConfig::default()
+    };
+    assert_eq!(cfg.vertex_time_step_for_bucket(Some(3_600_000), 0), 1_000);
+    assert_eq!(cfg.vertex_time_step_for_bucket(None, 0), 1_000);
+    // A tier FINER than base is not a tier; leave it alone.
+    assert_eq!(
+        cfg.vertex_time_step_for_bucket(Some(1_000), 3_600_000),
+        1_000
+    );
+    // Saturating rather than overflowing.
+    let big = EncoderConfig {
+        vertex_time_max_step_ms: u32::MAX,
+        ..EncoderConfig::default()
+    };
+    assert_eq!(big.vertex_time_step_for_bucket(Some(u64::MAX), 1), u32::MAX);
+}
+
+/// The base tier BORROWS the config — no clone, no divergence — so the common
+/// path allocates nothing and encodes identically.
+#[test]
+fn the_base_tier_borrows_the_config_unchanged() {
+    let cfg = EncoderConfig {
+        vertex_time_max_step_ms: 1_000,
+        ..EncoderConfig::default()
+    };
+    let hour = 3_600_000u64;
+    let base = cfg.for_temporal_tier(None, hour);
+    assert!(matches!(base, std::borrow::Cow::Borrowed(_)));
+    assert_eq!(base.vertex_time_max_step_ms, 1_000);
+
+    let tier = cfg.for_temporal_tier(Some(24 * hour), hour);
+    assert!(matches!(tier, std::borrow::Cow::Owned(_)));
+    assert_eq!(tier.vertex_time_max_step_ms, 24_000);
+    // And nothing else about the config moved.
+    assert_eq!(tier.quantize_attrs_auto, cfg.quantize_attrs_auto);
+    assert_eq!(tier.compact_times, cfg.compact_times);
+}
+
+// ── TB-11 extension 2 — the feature-anchored vertex-time tier ───────────────
+
+/// A trip-shaped layer: a WIDE layer span (trips spread over `layer_span_ms`)
+/// with a NARROW per-feature span (each trip lasts `trip_ms`). This is the shape
+/// the layer-anchored tiers price badly and the feature anchor rescues.
+fn trip_shaped_layer(features: usize, layer_span_ms: i64, trip_ms: i64) -> ColumnarLayer {
+    let starts: Vec<i64> = (0..features as i64)
+        .map(|i| i * (layer_span_ms / features.max(1) as i64))
+        .collect();
+    let vertex_times: Vec<Vec<i64>> = starts
+        .iter()
+        .map(|&s| vec![s, s + trip_ms / 2, s + trip_ms])
+        .collect();
+    ColumnarLayer {
+        polygon_parts: None,
+        name: "trips".into(),
+        feature_ids: (1..=features as u64).collect(),
+        start_times: starts.clone(),
+        end_times: starts.iter().map(|s| s + trip_ms).collect(),
+        geometry: GeometryColumn::LineString(
+            (0..features)
+                .map(|i| {
+                    let x = i as f64 * 0.001;
+                    vec![[x, 0.0], [x + 0.0005, 0.5], [x + 0.001, 1.0]]
+                })
+                .collect(),
+        ),
+        vertex_times: Some(vertex_times),
+        vertex_values: None,
+        triangles: None,
+        vertex_value_matrix: None,
+        properties: vec![],
+    }
+}
+
+/// The feature-anchored step from the decoded schema metadata.
+fn vertex_time_feature_step_of(batch: &RecordBatch) -> Option<u32> {
+    batch
+        .schema()
+        .metadata()
+        .get("stt:vertex_time_feature_step_ms")
+        .map(|v| v.parse().unwrap())
+}
+
+#[test]
+fn a_trip_shaped_layer_takes_the_feature_anchored_tier_at_exact_precision() {
+    // Layer span 30 days — u16 at step 1 covers only 65.5 s, so the
+    // layer-anchored u16 tier needs step 39_582, far past the 1000 ms ceiling.
+    // Per-trip span 60 s, which fits u16 at step 1 when anchored per feature.
+    let layer = trip_shaped_layer(64, 30 * 86_400_000, 60_000);
+    let batch = decode_layer(&encode_layer(&layer).unwrap()).unwrap();
+
+    assert_eq!(
+        vertex_time_encoding_of(&batch),
+        None,
+        "the layer-anchored form must not be declared alongside the feature-anchored one"
+    );
+    assert_eq!(
+        vertex_time_feature_step_of(&batch),
+        Some(1),
+        "a 60-second per-trip span fits u16 at EXACT millisecond precision"
+    );
+
+    // Round-trip: every vertex time is recovered exactly.
+    let vt = batch
+        .column_by_name("vertex_time")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let expected = layer.vertex_times.as_ref().unwrap();
+    for (i, want) in expected.iter().enumerate() {
+        let row = vt.value(i);
+        let deltas = row
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("the feature-anchored tier is UInt16");
+        let anchor = layer.start_times[i];
+        let got: Vec<i64> = deltas.values().iter().map(|&d| anchor + d as i64).collect();
+        assert_eq!(&got, want, "feature {i} did not round-trip");
+    }
+}
+
+#[test]
+fn the_feature_anchor_is_not_used_when_the_layer_anchor_already_fits() {
+    // A narrow layer span: the layer-anchored u16 tier wins outright, and
+    // claiming the feature anchor would owe a capability for nothing.
+    let layer = trip_shaped_layer(8, 30_000, 5_000);
+    let batch = decode_layer(&encode_layer(&layer).unwrap()).unwrap();
+    assert!(vertex_time_encoding_of(&batch).is_some());
+    assert_eq!(vertex_time_feature_step_of(&batch), None);
+}
+
+#[test]
+fn the_feature_anchor_declines_rather_than_wrapping_a_pre_start_vertex() {
+    // A vertex BEFORE its feature's own start_time cannot be an UNSIGNED delta
+    // from it. The tier must decline — never wrap into a wildly wrong instant —
+    // and the scan then continues to the next tier as if the form did not exist.
+    let mut layer = trip_shaped_layer(4, 30 * 86_400_000, 60_000);
+    // Same layer, unmutated, DOES take the feature anchor: that is what makes
+    // this test about the pre-start vertex and not about the layer's shape.
+    let clean = decode_layer(&encode_layer(&layer).unwrap()).unwrap();
+    assert_eq!(vertex_time_feature_step_of(&clean), Some(1));
+
+    layer.vertex_times.as_mut().unwrap()[2][0] = layer.start_times[2] - 1;
+    let batch = decode_layer(&encode_layer(&layer).unwrap()).unwrap();
+    assert_eq!(
+        vertex_time_feature_step_of(&batch),
+        None,
+        "one un-anchorable vertex must disqualify the form for the whole layer"
+    );
+    // The scan falls through to the layer-anchored u32 tier, which at a 30-day
+    // span is exact (step 1) — wider bytes, no precision lost.
+    // Origin 0: feature 0 still starts the layer, and the mutated vertex sits
+    // 15 days in, so the layer minimum is unmoved.
+    assert_eq!(vertex_time_encoding_of(&batch), Some((0, 1)));
+    let vt = batch
+        .column_by_name("vertex_time")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let row = vt.value(2);
+    let deltas = row.as_any().downcast_ref::<UInt32Array>().unwrap();
+    assert_eq!(
+        deltas.value(0) as i64,
+        layer.start_times[2] - 1,
+        "the pre-start vertex must still round-trip exactly"
+    );
+}
+
+#[test]
+fn the_feature_anchored_form_is_observed_for_the_capability() {
+    let layer = trip_shaped_layer(64, 30 * 86_400_000, 60_000);
+    let cfg = EncoderConfig::default();
+    let (_, observed) = crate::arrow_tile::encode_tile_observed(&[layer], &cfg).unwrap();
+    assert!(
+        observed.feature_anchored_vertex_times,
+        "the writer learns it owes vertex-time-feature-anchor only by encoding"
+    );
+
+    // ...and a layer that does not use the form observes nothing, so no
+    // capability is owed and no reader is locked out gratuitously.
+    let narrow = trip_shaped_layer(8, 30_000, 5_000);
+    let (_, observed) = crate::arrow_tile::encode_tile_observed(&[narrow], &cfg).unwrap();
+    assert!(!observed.feature_anchored_vertex_times);
 }

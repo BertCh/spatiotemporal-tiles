@@ -610,6 +610,7 @@ impl RowSchema {
             foreign_members: None,
         };
         Ok(RowOutcome::Feature(Box::new(ParsedFeature {
+            home_zoom: None,
             geojson: feature,
             shared_properties,
             timestamp,

@@ -67,7 +67,10 @@ pub(crate) fn check_osrm_connectivity(osrm_url: &str) -> Result<()> {
         .context("Failed to connect to OSRM server. Is it running?")?;
 
     if !response.status().is_success() {
-        return Err(anyhow!("OSRM server returned error status: {}", response.status()));
+        return Err(anyhow!(
+            "OSRM server returned error status: {}",
+            response.status()
+        ));
     }
 
     let body: serde_json::Value = response.json()?;
@@ -270,15 +273,20 @@ mod tests {
         // Coords still returned when timing is unusable, so callers can bake
         // geometry and let stt-build interpolate.
         assert!(route_geometry(&mk_route(&coords, None)).1.is_none()); // no annotations
-        assert!(route_geometry(&mk_route(&coords, Some(vec![10.0]))).1.is_none()); // wrong count
-        assert!(route_geometry(&mk_route(&coords, Some(vec![0.0, 0.0]))).1.is_none()); // zero total
+        assert!(route_geometry(&mk_route(&coords, Some(vec![10.0])))
+            .1
+            .is_none()); // wrong count
+        assert!(route_geometry(&mk_route(&coords, Some(vec![0.0, 0.0])))
+            .1
+            .is_none()); // zero total
     }
 
     #[test]
     fn route_wrapper_rescales_end_to_end() {
         let coords = [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]];
         // Same rescale as the durations path: 0%, 75%, 100% of a 40s window.
-        let vt = vertex_timestamps_from_route(&mk_route(&coords, Some(vec![30.0, 10.0])), 1_000, 41_000);
+        let vt =
+            vertex_timestamps_from_route(&mk_route(&coords, Some(vec![30.0, 10.0])), 1_000, 41_000);
         assert_eq!(vt, Some(vec![1_000, 31_000, 41_000]));
         // No annotations → None so the caller falls back to uniform-by-distance.
         assert!(vertex_timestamps_from_route(&mk_route(&coords, None), 0, 1_000).is_none());

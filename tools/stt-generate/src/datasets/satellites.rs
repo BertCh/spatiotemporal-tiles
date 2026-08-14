@@ -21,7 +21,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// CelesTrak TLE data URL for all active satellites
-const CELESTRAK_ACTIVE_URL: &str = "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle";
+const CELESTRAK_ACTIVE_URL: &str =
+    "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle";
 
 /// Earth radius in km (WGS84)
 const EARTH_RADIUS_KM: f64 = 6378.137;
@@ -69,10 +70,10 @@ pub struct Args {
 /// Satellite orbit classification based on altitude
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OrbitType {
-    LEO,  // Low Earth Orbit: < 2000 km
-    MEO,  // Medium Earth Orbit: 2000 - 35786 km
-    GEO,  // Geostationary/Geosynchronous: ~35786 km
-    HEO,  // High Earth Orbit: > 35786 km
+    LEO, // Low Earth Orbit: < 2000 km
+    MEO, // Medium Earth Orbit: 2000 - 35786 km
+    GEO, // Geostationary/Geosynchronous: ~35786 km
+    HEO, // High Earth Orbit: > 35786 km
 }
 
 impl OrbitType {
@@ -133,8 +134,8 @@ pub fn run(args: Args) -> Result<()> {
                 // Estimate altitude from mean motion (orbits per day)
                 let mean_motion = e.mean_motion; // revolutions per day
                 let period_minutes = 24.0 * 60.0 / mean_motion;
-                let semi_major_axis_km = ((period_minutes * 60.0 / (2.0 * PI))
-                    .powi(2) * 398600.4418_f64)
+                let semi_major_axis_km = ((period_minutes * 60.0 / (2.0 * PI)).powi(2)
+                    * 398600.4418_f64)
                     .powf(1.0 / 3.0);
                 let altitude_km = semi_major_axis_km - EARTH_RADIUS_KM;
                 let orbit_type = OrbitType::from_altitude_km(altitude_km);
@@ -149,7 +150,10 @@ pub fn run(args: Args) -> Result<()> {
 
     // Limit number of satellites if specified
     let elements_list: Vec<Elements> = if args.max_satellites > 0 {
-        elements_list.into_iter().take(args.max_satellites).collect()
+        elements_list
+            .into_iter()
+            .take(args.max_satellites)
+            .collect()
     } else {
         elements_list
     };
@@ -178,7 +182,8 @@ pub fn run(args: Args) -> Result<()> {
     // stt-build only accepts GeoParquet input (the GeoJSON path was retired in
     // the Arrow migration), so write a Parquet intermediate when the final
     // output is an .stt archive; otherwise honour the requested extension.
-    let build_stt = args.output.extension().map(|e| e == "stt").unwrap_or(false) && !args.skip_build;
+    let build_stt =
+        args.output.extension().map(|e| e == "stt").unwrap_or(false) && !args.skip_build;
     let intermediate_path = if build_stt {
         args.output.with_extension("parquet")
     } else {
@@ -204,7 +209,8 @@ pub fn run(args: Args) -> Result<()> {
         PropertyColumn::numeric("mean_motion"),
         PropertyColumn::numeric("segment"),
     ];
-    let mut writer = StreamingLineStringParquetWriter::with_columns(&intermediate_path, property_columns)?;
+    let mut writer =
+        StreamingLineStringParquetWriter::with_columns(&intermediate_path, property_columns)?;
     for record in &records {
         writer.write_linestring(record)?;
     }
@@ -258,7 +264,7 @@ fn download_tle(url: &str, output_path: &PathBuf) -> Result<()> {
 
 /// Propagate satellite orbits and generate GeoJSON features
 /// Each satellite may produce multiple features if the orbit crosses discontinuities
-/// 
+///
 /// Performance: Uses Rayon parallel iterators to propagate all satellites concurrently
 fn propagate_orbits(
     elements_list: &[Elements],
@@ -334,7 +340,7 @@ fn propagate_single_satellite(
     // Pre-calculate expected number of positions for better allocation
     let total_duration = end_time.signed_duration_since(start_time);
     let expected_positions = (total_duration.num_seconds() / step.num_seconds() + 1) as usize;
-    
+
     // Store positions with altitude: (time, lon, lat, altitude_meters)
     let mut positions: Vec<(DateTime<Utc>, f64, f64, f64)> = Vec::with_capacity(expected_positions);
     let mut current_time = start_time;
@@ -365,7 +371,7 @@ fn propagate_single_satellite(
                 let earth_radius_km = 6371.0;
                 // Scale: altitude as fraction of Earth radius, with log compression for high orbits
                 // LEO (~400 km) -> ~100km visual altitude
-                // GEO (~35786 km) -> ~500km visual altitude  
+                // GEO (~35786 km) -> ~500km visual altitude
                 let visual_altitude_km = if alt_km < 2000.0 {
                     // LEO: linear scale (1:10)
                     alt_km * 0.05
@@ -403,7 +409,7 @@ fn propagate_single_satellite(
 
     // Split path at large longitude jumps (antimeridian crossings, polar passes)
     let segments = split_at_discontinuities(&positions);
-    
+
     // Create a separate LineString record for each segment with proper timestamps
     let mut records = Vec::new();
 
@@ -424,19 +430,34 @@ fn propagate_single_satellite(
             .collect();
 
         // Calculate average altitude for the segment (for properties)
-        let avg_altitude: f64 = segment.iter().map(|(_, _, _, alt)| alt).sum::<f64>()
-            / segment.len() as f64;
+        let avg_altitude: f64 =
+            segment.iter().map(|(_, _, _, alt)| alt).sum::<f64>() / segment.len() as f64;
 
         // Build properties (string-typed in the Parquet writer). `timestamp` /
         // `end_timestamp` are carried by the record's time fields, not here.
         let mut properties = Map::new();
-        properties.insert("object_name".to_string(), json!(elements.object_name.clone().unwrap_or_default()));
+        properties.insert(
+            "object_name".to_string(),
+            json!(elements.object_name.clone().unwrap_or_default()),
+        );
         properties.insert("norad_id".to_string(), json!(elements.norad_id));
-        properties.insert("intl_designator".to_string(), json!(elements.international_designator.clone().unwrap_or_default()));
+        properties.insert(
+            "intl_designator".to_string(),
+            json!(elements
+                .international_designator
+                .clone()
+                .unwrap_or_default()),
+        );
         properties.insert("orbit_type".to_string(), json!(orbit_type.as_str()));
         // Store altitude in km as f64 to avoid integer overflow for high-altitude orbits
-        properties.insert("altitude".to_string(), json!((avg_altitude / 1000.0).round())); // km for display
-        properties.insert("inclination".to_string(), json!(elements.inclination * 180.0 / PI));
+        properties.insert(
+            "altitude".to_string(),
+            json!((avg_altitude / 1000.0).round()),
+        ); // km for display
+        properties.insert(
+            "inclination".to_string(),
+            json!(elements.inclination * 180.0 / PI),
+        );
         properties.insert("eccentricity".to_string(), json!(elements.eccentricity));
         properties.insert("mean_motion".to_string(), json!(elements.mean_motion));
         properties.insert("segment".to_string(), json!(seg_idx));
@@ -453,32 +474,34 @@ fn propagate_single_satellite(
 }
 
 /// Split positions into segments only at antimeridian crossings
-/// 
+///
 /// We detect antimeridian crossings when:
 /// - Previous longitude is near +180 AND current longitude is near -180 (or vice versa)
 /// - This would create a visual artifact of the path going "the long way" around the map
-/// 
+///
 /// We do NOT split for polar passes where longitude changes rapidly but legitimately.
 /// Input/output: (time, lon, lat, altitude_meters)
-fn split_at_discontinuities(positions: &[(DateTime<Utc>, f64, f64, f64)]) -> Vec<Vec<(DateTime<Utc>, f64, f64, f64)>> {
+fn split_at_discontinuities(
+    positions: &[(DateTime<Utc>, f64, f64, f64)],
+) -> Vec<Vec<(DateTime<Utc>, f64, f64, f64)>> {
     let mut segments: Vec<Vec<(DateTime<Utc>, f64, f64, f64)>> = Vec::new();
     let mut current_segment: Vec<(DateTime<Utc>, f64, f64, f64)> = Vec::new();
-    
+
     for (i, pos) in positions.iter().enumerate() {
         if i == 0 {
             current_segment.push(*pos);
             continue;
         }
-        
+
         let prev_lon = positions[i - 1].1;
         let curr_lon = pos.1;
-        
+
         // Detect antimeridian crossing: both points near ±180° but on opposite sides
         // This is the case where drawing a straight line would go "the wrong way" around
-        let crosses_antimeridian = 
-            (prev_lon > ANTIMERIDIAN_THRESHOLD && curr_lon < -ANTIMERIDIAN_THRESHOLD) ||
-            (prev_lon < -ANTIMERIDIAN_THRESHOLD && curr_lon > ANTIMERIDIAN_THRESHOLD);
-        
+        let crosses_antimeridian = (prev_lon > ANTIMERIDIAN_THRESHOLD
+            && curr_lon < -ANTIMERIDIAN_THRESHOLD)
+            || (prev_lon < -ANTIMERIDIAN_THRESHOLD && curr_lon > ANTIMERIDIAN_THRESHOLD);
+
         if crosses_antimeridian {
             // Split at antimeridian crossing to avoid rendering artifacts
             if current_segment.len() >= 2 {
@@ -489,12 +512,12 @@ fn split_at_discontinuities(positions: &[(DateTime<Utc>, f64, f64, f64)]) -> Vec
             current_segment.push(*pos);
         }
     }
-    
+
     // Add final segment
     if current_segment.len() >= 2 {
         segments.push(current_segment);
     }
-    
+
     segments
 }
 
@@ -551,10 +574,9 @@ fn calculate_gmst(time: DateTime<Utc>) -> f64 {
     let t_ut1 = (jd - 2451545.0) / 36525.0;
 
     // GMST in seconds
-    let gmst_sec: f64 = 67310.54841
-        + (876600.0 * 3600.0 + 8640184.812866) * t_ut1
-        + 0.093104 * t_ut1.powi(2)
-        - 6.2e-6 * t_ut1.powi(3);
+    let gmst_sec: f64 =
+        67310.54841 + (876600.0 * 3600.0 + 8640184.812866) * t_ut1 + 0.093104 * t_ut1.powi(2)
+            - 6.2e-6 * t_ut1.powi(3);
 
     // Convert to radians (mod 2π)
     let gmst_rad = (gmst_sec / 240.0_f64).to_radians() % (2.0 * PI);
@@ -638,4 +660,3 @@ mod tests {
         );
     }
 }
-

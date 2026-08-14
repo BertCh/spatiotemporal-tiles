@@ -68,6 +68,52 @@ fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>> {
     zstd::stream::decode_all(data).map_err(|e| Error::Decompression(e.to_string()))
 }
 
+/// Decompress a zstd frame while refusing to produce more than `max_output`
+/// bytes.
+///
+/// `zstd::stream::decode_all` is convenient for trusted build artifacts, but
+/// it cannot enforce the packed format's decompression-bomb rule: a corrupt
+/// frame can allocate arbitrarily before the caller gets a chance to compare
+/// the decoded length with the directory entry. This streaming path reads at
+/// most `max_output + 1` bytes, where the extra byte distinguishes an exact
+/// fit from an over-limit frame.
+fn decompress_zstd_bounded(data: &[u8], dict: Option<&[u8]>, max_output: usize) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut out = Vec::new();
+    let read_limit = max_output.checked_add(1).ok_or_else(|| {
+        Error::Decompression(format!(
+            "declared decompression limit {max_output} cannot be represented"
+        ))
+    })?;
+
+    match dict {
+        Some(dict) => {
+            let decoder = zstd::stream::Decoder::with_dictionary(data, dict)
+                .map_err(|e| Error::Decompression(e.to_string()))?;
+            decoder
+                .take(read_limit as u64)
+                .read_to_end(&mut out)
+                .map_err(|e| Error::Decompression(e.to_string()))?;
+        }
+        None => {
+            let decoder = zstd::stream::Decoder::new(data)
+                .map_err(|e| Error::Decompression(e.to_string()))?;
+            decoder
+                .take(read_limit as u64)
+                .read_to_end(&mut out)
+                .map_err(|e| Error::Decompression(e.to_string()))?;
+        }
+    }
+
+    if out.len() > max_output {
+        return Err(Error::Decompression(format!(
+            "zstd frame expands beyond the declared {max_output}-byte limit"
+        )));
+    }
+    Ok(out)
+}
+
 /// Compress a payload with zstd using an optional pre-shared dictionary, at the
 /// default level ([`ZSTD_LEVEL`]). Thin wrapper over
 /// [`compress_zstd_with_dict_level`] — kept as the stable call site for the
@@ -123,6 +169,19 @@ pub fn decompress_zstd_with_dict(data: &[u8], dict: Option<&[u8]>) -> Result<Vec
     Ok(out)
 }
 
+/// Decompress zstd data with an explicit output ceiling.
+///
+/// Packed readers must use this for all attacker-controlled frames, passing
+/// the tile's declared `uncompressed_size` or a directory bound derived from
+/// its declared entry/page count.
+pub fn decompress_zstd_with_dict_bounded(
+    data: &[u8],
+    dict: Option<&[u8]>,
+    max_output: usize,
+) -> Result<Vec<u8>> {
+    decompress_zstd_bounded(data, dict, max_output)
+}
+
 /// Train a zstd dictionary from a sample of payloads.
 ///
 /// Returns `None` when the sample is too small for zstd's dictionary builder
@@ -170,5 +229,21 @@ mod tests {
 
         let decompressed = decompress(&compressed, Compression::None).unwrap();
         assert_eq!(&decompressed, data);
+    }
+
+    #[test]
+    fn bounded_zstd_decode_accepts_exact_size_and_rejects_one_byte_less() {
+        let data = vec![0x5a; 128 * 1024];
+        let compressed = compress_zstd_with_dict(&data, None).unwrap();
+
+        let decoded = decompress_zstd_with_dict_bounded(&compressed, None, data.len()).unwrap();
+        assert_eq!(decoded, data);
+
+        let error =
+            decompress_zstd_with_dict_bounded(&compressed, None, data.len() - 1).unwrap_err();
+        assert!(
+            error.to_string().contains("expands beyond"),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -51,6 +51,7 @@ fn config(min_zoom: u8, max_zoom: u8) -> TileConfig {
 fn parsed_from_geometry(geom: geojson::Geometry) -> ParsedFeature {
     let (lon, lat) = rep_point(&geom.value);
     ParsedFeature {
+        home_zoom: None,
         geojson: geojson::Feature {
             bbox: None,
             geometry: Some(geom),
@@ -74,6 +75,7 @@ fn rep_point(v: &geojson::Value) -> (f64, f64) {
     match v {
         geojson::Value::Polygon(rings) => (rings[0][0][0], rings[0][0][1]),
         geojson::Value::MultiPolygon(polys) => (polys[0][0][0][0], polys[0][0][0][1]),
+        geojson::Value::LineString(c) => (c[0][0], c[0][1]),
         _ => panic!("fixture must be a Polygon or MultiPolygon"),
     }
 }
@@ -544,4 +546,239 @@ fn property_random_crossing_polygons_split_cleanly() {
             "case {case}: z1 area not conserved: got {got}, want {want}"
         );
     }
+}
+
+// ----------------------------------------------------------------------
+// The seam ↔ `metadata.bounds` interaction (the finding behind check 13's
+// antimeridian-seam exemption).
+//
+// `profile_features_with` folds a plain min/max over the SOURCE vertices, so a
+// ±180°-straddling dataset declares a loose, nearly full-width, *unwrapped*
+// interval — deliberately, and pinned by
+// `antimeridian_crossing_yields_a_loose_unwrapped_bbox_that_still_contains_everything`
+// (`vertex_bounds_multi_tile.rs`). That pin uses LINES, and lines are exactly
+// the geometry class the builder does NOT split at the seam. For POLYGONS the
+// A1 split above synthesises vertices at exactly ±180 that no source vertex
+// carried, so the honest source bbox provably fails to contain the archive's
+// own decoded output. The two tests below pin both halves.
+// ----------------------------------------------------------------------
+
+/// Longitude extent over every decoded vertex in `tiles`, plus the latitude
+/// extent, as `[min_lon, min_lat, max_lon, max_lat]` — the same quantity
+/// `stt-validate`'s check 13 accumulates from a decode.
+fn decoded_bbox(tiles: &[GeneratedTile]) -> [f64; 4] {
+    let mut b = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+    let mut fold = |c: &[f64; 2]| {
+        b[0] = b[0].min(c[0]);
+        b[1] = b[1].min(c[1]);
+        b[2] = b[2].max(c[0]);
+        b[3] = b[3].max(c[1]);
+    };
+    for tile in tiles {
+        for layer in &tile.layers {
+            match &layer.geometry {
+                GeometryColumn::Point(pts) => pts.iter().for_each(&mut fold),
+                GeometryColumn::LineString(runs) => {
+                    runs.iter().flatten().for_each(&mut fold);
+                }
+                GeometryColumn::Polygon(feats) => {
+                    feats.iter().flatten().flatten().for_each(&mut fold);
+                }
+            }
+        }
+    }
+    b
+}
+
+/// Every decoded LineString run, flattened out of the tiles.
+fn decoded_runs(tiles: &[GeneratedTile]) -> Vec<Vec<[f64; 2]>> {
+    let mut out = Vec::new();
+    for tile in tiles {
+        for layer in &tile.layers {
+            if let GeometryColumn::LineString(runs) = &layer.geometry {
+                out.extend(runs.iter().cloned());
+            }
+        }
+    }
+    out
+}
+
+fn vertex_bounds(feat: &ParsedFeature) -> stt_core::types::BoundingBox {
+    stt_build::input::profile_features_with(
+        std::slice::from_ref(feat),
+        &stt_build::input::FeatureProfileOptions {
+            bounds_mode: stt_build::input::BoundsMode::Vertex,
+            elevation_column: None,
+        },
+    )
+    .expect("profile")
+    .bounds
+}
+
+/// ⭐ THE FINDING. A seam-crossing POLYGON is **split, not dropped** — and the
+/// split is precisely why the declared `metadata.bounds` cannot contain the
+/// archive: `split_polygon_at_antimeridian` synthesises seam vertices at
+/// exactly ±180°, while `profile_features_with` folds min/max over the SOURCE
+/// vertices, which stop 2° short of the seam on either side.
+///
+/// So on an archive that ATTESTS vertex-derived bounds, `stt-validate`'s check
+/// 13 sees a genuine containment failure produced by correct, deliberate writer
+/// behaviour. This test pins the exact shape the validator's seam exemption
+/// keys on, so that exemption can never be widened past what the builder
+/// actually does:
+///
+///   1. the escape is on the LONGITUDE axis only (a meridian cannot move
+///      latitude), and latitude containment is exact;
+///   2. every escaping longitude edge lands on the seam **exactly** (±180.0);
+///   3. the declared interval is already wider than 180° — the signature of a
+///      plain min/max fold over a dataset with vertices on both sides of ±180.
+#[test]
+fn seam_split_synthesises_pm180_vertices_the_declared_source_bbox_cannot_contain() {
+    let feat = parsed_from_geometry(geojson::Geometry::new(geojson::Value::Polygon(vec![ring(
+        &[(178.0, -5.0), (-178.0, -5.0), (-178.0, 5.0), (178.0, 5.0)],
+    )])));
+
+    // What the writer declares: a plain, unwrapped min/max over the SOURCE.
+    let declared = vertex_bounds(&feat);
+    assert_eq!(
+        (declared.min_lon, declared.max_lon),
+        (-178.0, 178.0),
+        "the writer folds source vertices only — it never widens to the seam"
+    );
+    assert_eq!((declared.min_lat, declared.max_lat), (-5.0, 5.0));
+
+    // What the archive decodes to, after the A1 split.
+    let tiles = generate_tiles(std::slice::from_ref(&feat), &config(1, 3), 1).unwrap();
+    let o = decoded_bbox(&tiles);
+    assert_eq!(
+        (o[0], o[2]),
+        (-180.0, 180.0),
+        "the split must reach the seam on BOTH sides — that is what it is for"
+    );
+
+    // (1) Longitude escapes on both sides; latitude does not escape at all.
+    assert!(o[0] < declared.min_lon, "low edge must escape: {o:?}");
+    assert!(o[2] > declared.max_lon, "high edge must escape: {o:?}");
+    assert_eq!(
+        (o[1], o[3]),
+        (declared.min_lat, declared.max_lat),
+        "a meridian cannot move latitude: {o:?}"
+    );
+
+    // (2) Each escaping edge lands ON the seam, to the bit.
+    assert_eq!(o[0], -180.0);
+    assert_eq!(o[2], 180.0);
+
+    // (3) The declared interval is already wider than half the world.
+    assert!(
+        declared.max_lon - declared.min_lon > 180.0,
+        "declared width {} must exceed 180°",
+        declared.max_lon - declared.min_lon
+    );
+
+    // Nothing was dropped: the pieces land on both dateline columns, and the
+    // gate above (`assert_gate`) already holds for this shape.
+    assert_gate(&feat, 1, 3);
+}
+
+/// The contrast, and the second half of the finding: a seam-crossing
+/// **LineString** is NOT split. `clip_trajectory` breaks the run at the
+/// `|Δlon| > 180°` edge and simply never emits that edge — no ±180 vertex is
+/// synthesised, so the source bbox still contains the decode and check 13 stays
+/// silent on lines. The geometry loss is real, uncounted and invisible to the
+/// validator; it is reported, not fixed, here (splitting a line at the seam is
+/// the polygon splitter's job and is deep surgery).
+///
+/// Both statements are asserted, because the *combination* is the point: the
+/// only geometry class check 13 fires on is the one the builder handles
+/// CORRECTLY, and the class the builder silently truncates sails through.
+#[test]
+fn a_seam_crossing_line_loses_its_crossing_edge_instead_of_being_split() {
+    let feat = parsed_from_geometry(geojson::Geometry::new(geojson::Value::LineString(vec![
+        vec![170.0, 0.0],
+        vec![178.0, 1.0],
+        vec![-178.0, 2.0],
+        vec![-170.0, 3.0],
+    ])));
+
+    let declared = vertex_bounds(&feat);
+    assert_eq!((declared.min_lon, declared.max_lon), (-178.0, 178.0));
+
+    let tiles = generate_tiles(std::slice::from_ref(&feat), &config(1, 3), 1).unwrap();
+    let o = decoded_bbox(&tiles);
+
+    // No seam vertex is ever synthesised for a line …
+    assert!(
+        o[0] >= -178.0 && o[2] <= 178.0,
+        "a line must not reach the seam: {o:?}"
+    );
+    // … so the declared source bbox DOES contain the decode, and check 13 —
+    // which only ever compares these two boxes — cannot see the loss.
+    assert!(
+        o[0] >= declared.min_lon
+            && o[2] <= declared.max_lon
+            && o[1] >= declared.min_lat
+            && o[3] <= declared.max_lat,
+        "declared {declared:?} must contain {o:?}"
+    );
+
+    // The loss itself: no surviving run carries the crossing edge, and the two
+    // vertices that flanked it never share a run.
+    let runs = decoded_runs(&tiles);
+    assert!(!runs.is_empty(), "the line must still produce tiles");
+    for run in &runs {
+        for w in run.windows(2) {
+            assert!(
+                (w[1][0] - w[0][0]).abs() <= 180.0,
+                "a |Δlon|>180 edge survived: {run:?}"
+            );
+        }
+        let has_west = run.iter().any(|c| c[0] > 0.0);
+        let has_east = run.iter().any(|c| c[0] < 0.0);
+        assert!(
+            !(has_west && has_east),
+            "the two hemispheres must never share a run once the edge is dropped: {run:?}"
+        );
+    }
+}
+
+/// The degenerate corner of the same behaviour: a **2-vertex** line straddling
+/// the seam splits into two runs of one vertex each, both below
+/// `ClipConfig::min_vertices`, so nothing survives the clipper and
+/// `place_polyline` dead-letters the WHOLE feature to `place_whole_feature`.
+/// The result is one tile carrying the original trans-seam coordinates — an
+/// edge that spans 356° of longitude baked into a single tile, with no counter
+/// and no warning anywhere.
+///
+/// Pinned so the behaviour cannot change silently in either direction; it is
+/// reported as a builder gap, not fixed here.
+#[test]
+fn a_two_vertex_seam_crossing_line_dead_letters_into_one_tile_uncounted() {
+    let feat = parsed_from_geometry(geojson::Geometry::new(geojson::Value::LineString(vec![
+        vec![178.0, 0.0],
+        vec![-178.0, 0.0],
+    ])));
+
+    let mut writer = NullWriter;
+    let stats =
+        generate_tiles_streaming(std::slice::from_ref(&feat), &config(3, 3), &mut writer, 1)
+            .unwrap();
+    assert_eq!(
+        stats.antimeridian_fallbacks, 0,
+        "the polygon fallback counter does not cover the line path — the dead-letter is UNCOUNTED"
+    );
+
+    let tiles = generate_tiles(std::slice::from_ref(&feat), &config(3, 3), 1).unwrap();
+    assert_eq!(
+        tiles.len(),
+        1,
+        "the whole feature lands in exactly one tile"
+    );
+    let runs = decoded_runs(&tiles);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0], vec![[178.0, 0.0], [-178.0, 0.0]]);
+    assert!(
+        (runs[0][1][0] - runs[0][0][0]).abs() > 180.0,
+        "the trans-seam edge is preserved verbatim inside the single tile"
+    );
 }

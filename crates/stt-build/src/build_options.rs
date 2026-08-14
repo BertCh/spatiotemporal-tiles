@@ -51,12 +51,70 @@ pub fn parse_duration(s: &str) -> Result<u64> {
     Ok((value * multiplier as f64) as u64)
 }
 
+/// Fraction of total estimated byte mass a defaulted coarse tier may cover
+/// (TB-9, §2.4). A coarse tier exists to serve LOW-zoom queries; emitting it at
+/// every zoom is maximal duplication, and the duplication term is dominated by
+/// the high-zoom byte share.
+pub const DEFAULT_LOD_MASS_FRACTION: f64 = 0.25;
+
+/// The default zoom cutoff for an un-annotated temporal-LOD tier: the largest
+/// `z` whose cumulative estimated byte mass stays within
+/// [`DEFAULT_LOD_MASS_FRACTION`] of the total (TB-9).
+///
+/// `zoom_mass[i]` is the estimated byte mass of zoom `zoom_range.0 + i`.
+/// Coarser tiers (higher `tier_index`) are clamped strictly below finer ones so
+/// the ladder stays monotone, and everything is clamped into the build's zoom
+/// range. With no mass information the caller keeps the legacy
+/// `fallback_max_zoom` behaviour.
+pub fn default_lod_cutoff(
+    zoom_mass: &[u64],
+    zoom_range: (u8, u8),
+    tier_index: usize,
+    fallback_max_zoom: u8,
+) -> u8 {
+    let (min_zoom, max_zoom) = zoom_range;
+    let total: u128 = zoom_mass.iter().map(|&m| u128::from(m)).sum();
+    if total == 0 || zoom_mass.is_empty() {
+        return fallback_max_zoom;
+    }
+    let budget = (total as f64 * DEFAULT_LOD_MASS_FRACTION) as u128;
+    let mut cumulative: u128 = 0;
+    // Always admit the shallowest zoom: a tier that covers nothing is useless,
+    // and z=min_zoom is where a coarse tier is most valuable.
+    let mut cutoff = min_zoom;
+    for (i, &mass) in zoom_mass.iter().enumerate() {
+        cumulative += u128::from(mass);
+        if cumulative > budget {
+            break;
+        }
+        cutoff = min_zoom.saturating_add(i as u8);
+    }
+    // Each successively coarser tier sits strictly below the previous one.
+    let stepped = cutoff.saturating_sub(tier_index as u8);
+    stepped.clamp(min_zoom, max_zoom.max(min_zoom))
+}
+
 /// Parse a `--temporal-lod` spec like `"1d,30d"` or `"1d@8,30d@4"`. Each entry
 /// is `<duration>` (applies at every zoom) or `<duration>@<zoom>` (applies at
 /// zoom <= the given level). Entries are returned in input order so the caller
 /// can re-validate sorting against the base bucket.
+///
+/// Un-annotated entries keep the legacy "every zoom" default here; see
+/// [`parse_temporal_lod_with_mass`] for TB-9's byte-mass-aware default.
 pub fn parse_temporal_lod(s: &str, fallback_max_zoom: u8) -> Result<Vec<TemporalLodLevel>> {
+    parse_temporal_lod_with_mass(s, fallback_max_zoom, None, (0, fallback_max_zoom))
+}
+
+/// [`parse_temporal_lod`], with TB-9's byte-mass-aware default for un-annotated
+/// tiers. An explicit `@z` ALWAYS wins.
+pub fn parse_temporal_lod_with_mass(
+    s: &str,
+    fallback_max_zoom: u8,
+    zoom_mass: Option<&[u64]>,
+    zoom_range: (u8, u8),
+) -> Result<Vec<TemporalLodLevel>> {
     let mut levels = Vec::new();
+    let mut defaulted = 0usize;
     for piece in s.split(',') {
         let piece = piece.trim();
         if piece.is_empty() {
@@ -70,13 +128,27 @@ pub fn parse_temporal_lod(s: &str, fallback_max_zoom: u8) -> Result<Vec<Temporal
                     .with_context(|| format!("invalid zoom in temporal-lod entry '{piece}'"))?;
                 (d.trim(), z)
             }
-            None => (piece, fallback_max_zoom),
+            None => {
+                // TB-9: an un-annotated tier no longer defaults to EVERY zoom.
+                let z = match zoom_mass {
+                    Some(mass) => {
+                        default_lod_cutoff(mass, zoom_range, defaulted, fallback_max_zoom)
+                    }
+                    None => fallback_max_zoom,
+                };
+                defaulted += 1;
+                (piece, z)
+            }
         };
         let bucket_ms = parse_duration(dur)
             .with_context(|| format!("invalid duration in temporal-lod entry '{piece}'"))?;
         levels.push(TemporalLodLevel {
             bucket_ms,
             max_zoom_level: zoom,
+            // DT-1: `--temporal-lod` builds exact re-bucketed tiers, which is
+            // the `union` contract. Absent = union, so this stays byte-identical.
+            contract: None,
+            method: None,
         });
     }
     Ok(levels)
@@ -315,7 +387,11 @@ pub fn build_tile_budget(
     } else {
         ImportanceScorer::Combined
     };
-    Some(TileBudget::new(max_bytes, max_bytes, max_features).with_scorer(scorer))
+    // One cap, one argument: the byte cap is UNCOMPRESSED (what
+    // `--maximum-tile-bytes` documents and what `enforce_indexed` binds on).
+    // The old constructor took `max_bytes` twice to fill a `max_compressed_size`
+    // nothing ever read; that field is deleted (see `TileBudget`'s type docs).
+    Some(TileBudget::new(max_bytes, max_features).with_scorer(scorer))
 }
 
 /// Resolve `--exclude` / `--include` / `--exclude-all` into an
@@ -515,5 +591,86 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("mag"), "got: {err}");
+    }
+
+    // ------------------------------------------------------------------
+    // TB-9 — temporal-LOD default zoom cutoffs (§2.4)
+    // ------------------------------------------------------------------
+
+    /// Byte mass grows steeply with zoom, so a defaulted coarse tier stops well
+    /// short of the deepest zoom instead of covering every level.
+    #[test]
+    fn an_unannotated_tier_no_longer_defaults_to_every_zoom() {
+        // z0..z8, each level ~4x the previous — the usual pyramid shape.
+        let mass: Vec<u64> = (0..9).map(|z| 4u64.pow(z)).collect();
+        let cutoff = default_lod_cutoff(&mass, (0, 8), 0, 8);
+        assert!(
+            cutoff < 8,
+            "a defaulted tier must not reach the deepest zoom (got z{cutoff})"
+        );
+        let levels = parse_temporal_lod_with_mass("30d", 8, Some(&mass), (0, 8)).unwrap();
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].max_zoom_level, cutoff);
+        // The legacy path still covers everything, so the change is visible.
+        let legacy = parse_temporal_lod("30d", 8).unwrap();
+        assert_eq!(legacy[0].max_zoom_level, 8);
+        assert!(levels[0].max_zoom_level < legacy[0].max_zoom_level);
+    }
+
+    /// An explicit `@z` always wins — the default only fills in what the user
+    /// left unsaid.
+    #[test]
+    fn an_explicit_zoom_annotation_always_wins() {
+        let mass: Vec<u64> = (0..9).map(|z| 4u64.pow(z)).collect();
+        let levels = parse_temporal_lod_with_mass("30d@7,1h@3", 8, Some(&mass), (0, 8)).unwrap();
+        assert_eq!(levels[0].max_zoom_level, 7);
+        assert_eq!(levels[1].max_zoom_level, 3);
+    }
+
+    /// Successively coarser tiers step strictly downward, so the ladder stays
+    /// monotone and two tiers never claim the same zoom.
+    #[test]
+    fn defaulted_tiers_step_strictly_downward() {
+        let mass: Vec<u64> = (0..9).map(|z| 4u64.pow(z)).collect();
+        let levels = parse_temporal_lod_with_mass("1h,6h,30d", 8, Some(&mass), (0, 8)).unwrap();
+        for w in levels.windows(2) {
+            assert!(
+                w[1].max_zoom_level < w[0].max_zoom_level,
+                "coarser tier must sit strictly below: {:?}",
+                levels
+            );
+        }
+    }
+
+    /// No mass information (a `--single-pass` build) reproduces the legacy
+    /// behaviour exactly — the documented fallback.
+    #[test]
+    fn without_byte_mass_the_legacy_default_is_reproduced() {
+        for spec in ["30d", "1h,6h,30d", "30d@4"] {
+            let legacy = parse_temporal_lod(spec, 9).unwrap();
+            let none = parse_temporal_lod_with_mass(spec, 9, None, (0, 9)).unwrap();
+            assert_eq!(legacy, none, "spec {spec:?}");
+        }
+    }
+
+    /// Degenerate mass never produces a cutoff outside the build's zoom range.
+    #[test]
+    fn the_cutoff_is_always_inside_the_zoom_range() {
+        assert_eq!(
+            default_lod_cutoff(&[], (2, 9), 0, 9),
+            9,
+            "no mass = fallback"
+        );
+        assert_eq!(
+            default_lod_cutoff(&[0, 0, 0], (2, 9), 0, 9),
+            9,
+            "zero mass = fallback"
+        );
+        // A deep tier index cannot step below min_zoom.
+        let mass: Vec<u64> = (0..8).map(|z| 4u64.pow(z)).collect();
+        for tier in 0..12 {
+            let z = default_lod_cutoff(&mass, (2, 9), tier, 9);
+            assert!((2..=9).contains(&z), "tier {tier} produced z{z}");
+        }
     }
 }

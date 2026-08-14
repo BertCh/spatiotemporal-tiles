@@ -5,6 +5,7 @@
 //! on the world-anchored grid built by [`world_grid_affine`]) and
 //! [`AttrQuant`] (numeric property columns).
 
+use super::config::{AttrPinned, EncoderConfig, PinnedLeaf};
 use crate::error::{Error, Result};
 use arrow::array::{ArrayRef, Int32Builder, UInt16Builder};
 use std::sync::Arc;
@@ -332,6 +333,26 @@ impl QuantLeaf {
             QuantLeaf::I32 => i32::MAX as f64,
         }
     }
+
+    /// The encoder-side leaf a dataset-global [`PinnedLeaf`] verdict selects.
+    ///
+    /// The two enums are deliberately separate — [`PinnedLeaf`] is a
+    /// wire-visible verdict that survives into the manifest's `encoderPins`
+    /// sidecar and back, `QuantLeaf` is this module's encode-time detail — and
+    /// this exhaustive match is the seam that keeps them in lockstep. It is
+    /// also the executable form of the standing boundary: the menu is EXACTLY
+    /// two rates, and widening it (per-column rate selection, which only
+    /// becomes representable once the affine is a function of the dataset
+    /// rather than of a tile's sample) is deferred work with its own unpriced
+    /// schema-template cost. Add a third variant to either enum and this stops
+    /// compiling.
+    #[inline]
+    fn from_pinned(leaf: PinnedLeaf) -> Self {
+        match leaf {
+            PinnedLeaf::U16 => QuantLeaf::U16,
+            PinnedLeaf::I32 => QuantLeaf::I32,
+        }
+    }
 }
 
 /// One pass of the statistics every auto-quantization decision needs.
@@ -515,6 +536,172 @@ pub(crate) fn build_quantized_numeric_auto(values: &[Option<f64>]) -> Option<(Ar
     ))
 }
 
+// ----------------------------------------------------------------------------
+// The dataset-global attribute-range pin (mechanism M2)
+//
+// Everything above this line decides the affine from the values ONE TILE holds.
+// That is the recorded defect: the offset is the tile's minimum, so the same
+// source value lands on a different index — and therefore decodes to a
+// different number — in every tile that catches a different sample. The
+// functions below apply an affine resolved ONCE from the column's dataset
+// domain (the builder's pass-1 scan, `stt_build::dataset_stats`), which makes
+// the verdict a function of the domain rather than of the sample. The per-tile
+// functions stay exactly as they are and remain the documented fallback for an
+// unpinned encode (`--single-pass`, one-shot external callers, a tile server
+// with no pin sidecar).
+// ----------------------------------------------------------------------------
+
+/// Build the fixed-point column for a PINNED affine, erroring on any value the
+/// pin does not cover instead of clamping it.
+///
+/// This is [`quantize_with`] with its clamp turned into a hard error, and the
+/// difference is the whole point. On the per-tile path the clamp is provably a
+/// no-op — the offset IS that tile's minimum and the leaf was chosen to hold
+/// that tile's span — so clamping can never fire. A pinned affine is derived
+/// somewhere else entirely (pass 1, possibly a previous build read back from
+/// the manifest's `encoderPins`), so an out-of-range index is real evidence
+/// that the pin no longer describes the data. Clamping it would snap the value
+/// onto the domain edge and ship a wrong number with no trace, which is exactly
+/// the failure [`QuantAffine::qz`] refuses to commit for altitudes.
+fn quantize_pinned_with(
+    values: &[Option<f64>],
+    affine: AttrQuant,
+    leaf: QuantLeaf,
+) -> Result<(ArrayRef, String)> {
+    let hi = leaf.max_index();
+    let index = |x: f64| -> Result<f64> {
+        let q = ((x - affine.o) / affine.s).round();
+        // Negated bounds so a NaN index (unreachable from a finite value and a
+        // finite affine, but not worth trusting silently) routes to the error
+        // rather than past the check.
+        if !(q >= 0.0 && q <= hi) {
+            return Err(Error::Other(format!(
+                "numeric property value {x} escapes its dataset-global quantization pin \
+                 (offset {}, step {}): index {q} is outside the leaf's [0, {hi}]. The pin \
+                 is derived from the whole dataset in pass 1, so a tile value outside it \
+                 means the pins no longer describe the data — rebuild them, or pass \
+                 --single-pass to restore the per-tile affine.",
+                affine.o, affine.s
+            )));
+        }
+        Ok(q)
+    };
+    let array: ArrayRef = match leaf {
+        QuantLeaf::U16 => {
+            let mut b = UInt16Builder::with_capacity(values.len());
+            for v in values {
+                match v {
+                    Some(x) if x.is_finite() => b.append_value(index(*x)? as u16),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        QuantLeaf::I32 => {
+            let mut b = Int32Builder::with_capacity(values.len());
+            for v in values {
+                match v {
+                    Some(x) if x.is_finite() => b.append_value(index(*x)? as i32),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+    };
+    Ok((array, affine.to_json()))
+}
+
+/// Apply a column's dataset-global pin to one tile's values — the automatic
+/// (`--quantize-attrs-auto`) path's counterpart to
+/// [`build_quantized_numeric_auto`], with the rule tree already evaluated.
+///
+/// `None` iff `pin.refuse` (the magnitude refusal), so the column stays
+/// `Float64` in EVERY tile — including a tile whose own sample is small enough
+/// that the per-tile rule would happily have quantized it. That inversion is
+/// the fix: refusal is a property of the column's domain, and a tile that
+/// happens to hold only the small end of an identifier column must not
+/// re-decide it.
+///
+/// Otherwise the affine is applied verbatim: `index = round((value - o) / s)`
+/// in `pin.leaf`. Because `o`, `s` and the leaf are the same in every tile of
+/// the dataset:
+///
+/// * the same source value decodes to the same number everywhere (the §3.3
+///   constraint the per-tile affine cannot satisfy, and the reason a value read
+///   off two adjacent tiles used to disagree);
+/// * the column has ONE Arrow type dataset-wide, so it stops forking a PROPS
+///   schema template per width verdict and `stt-validate`'s width-drift warning
+///   has nothing left to report;
+/// * identical columns still quantize identically — better than before, since
+///   the offset no longer varies with the sample — so content-addressed blob
+///   dedup is preserved.
+///
+/// Nulls and non-finite cells become Arrow nulls, exactly as on the per-tile
+/// path. Errors only when a value escapes the pinned domain (see
+/// [`quantize_pinned_with`]).
+///
+/// Deliberately NOT a per-tile fallback: there is no "the pin is a bad fit for
+/// this tile, quantize locally instead" branch anywhere below, because that
+/// branch is the defect. Per-tile grids are a standing rejection (measured +61 %
+/// on a dedup-heavy dataset for the coordinate analogue); this is the opposite
+/// move.
+pub fn build_quantized_numeric_pinned(
+    values: &[Option<f64>],
+    pin: &AttrPinned,
+) -> Result<Option<(ArrayRef, String)>> {
+    if pin.refuse {
+        return Ok(None);
+    }
+    let affine = AttrQuant { o: pin.o, s: pin.s };
+    Ok(Some(quantize_pinned_with(
+        values,
+        affine,
+        QuantLeaf::from_pinned(pin.leaf),
+    )?))
+}
+
+/// Resolve the quantized form of one numeric property column under an explicit
+/// [`EncoderConfig`] — the single decision site the encoder's property loop
+/// calls, with the dataset-global pins consulted first.
+///
+/// Precedence is the incumbent's, unchanged: an explicit
+/// `--quantize-attr name=prec` wins; otherwise `--quantize-attrs-auto` decides;
+/// otherwise the column stays `Float64`. What the pins change is the EVIDENCE
+/// each of those rules sees, never the rule:
+///
+/// * auto → [`build_quantized_numeric_pinned`] when the column carries a pin,
+///   [`build_quantized_numeric_auto`] when it does not;
+/// * explicit → the user's step with the offset pinned to the dataset minimum
+///   ([`build_quantized_numeric_with_pin`]).
+///
+/// With `cfg.global_pins == None` — `--single-pass`, a one-shot external caller
+/// through the [`EncoderConfig::from_globals`] wrappers, or a tile server with
+/// no pin sidecar — every call below is the incumbent per-tile function with
+/// the incumbent arguments, so an unpinned encode is byte-identical to a
+/// pre-pin encode. A column absent from `global_pins.attr` is likewise
+/// unpinned: derived summary-tier columns (`count`, `sum_*`) that pass 1 never
+/// saw keep the per-tile path rather than being forced onto a pin that does not
+/// describe them.
+pub fn build_quantized_numeric_for_column(
+    name: &str,
+    values: &[Option<f64>],
+    cfg: &EncoderConfig,
+) -> Result<Option<(ArrayRef, String)>> {
+    let pin: Option<&AttrPinned> = cfg.global_pins.as_ref().and_then(|p| p.attr.get(name));
+    if let Some(prec) = cfg.quantize_attrs.get(name).copied().filter(|p| *p > 0.0) {
+        if let Some(quantized) = build_quantized_numeric_with_pin(values, prec, pin)? {
+            return Ok(Some(quantized));
+        }
+    }
+    if !cfg.quantize_attrs_auto {
+        return Ok(None);
+    }
+    match pin {
+        Some(pin) => build_quantized_numeric_pinned(values, pin),
+        None => Ok(build_quantized_numeric_auto(values)),
+    }
+}
+
 /// Quantize a numeric property column to the smallest integer leaf at `prec`
 /// units, with the offset pinned to the column minimum. Returns
 /// `(array, affine_json)` — a `UInt16` leaf when the quantized range fits 16
@@ -544,9 +731,52 @@ pub(crate) fn build_quantized_numeric_auto(values: &[Option<f64>]) -> Option<(Ar
 /// bytes a row — and snapping it to step 1 would want 1 000 001, widening it to
 /// `Int32` and DOUBLING the column that was supposed to shrink. Past that point
 /// the requested precision stands untouched, overflow error included.
+///
+/// ⚠️ `#[allow(dead_code)]` is load-bearing, not rot. Since TB-2 routed the
+/// encoder's property loop through [`build_quantized_numeric_for_column`], the
+/// explicit path reaches [`build_quantized_numeric_with_pin`] directly (with
+/// `pin = None` on an unpinned build, which is this function verbatim). This
+/// no-pin spelling stays as the documented incumbent — the register's rule is
+/// that the fallback path stays in the code — and as the shape the in-file and
+/// `arrow_tile::tests` cases pin the per-tile behaviour against.
+#[allow(dead_code)]
 pub(crate) fn build_quantized_numeric(
     values: &[Option<f64>],
     prec: f64,
+) -> Result<Option<(ArrayRef, String)>> {
+    build_quantized_numeric_with_pin(values, prec, None)
+}
+
+/// [`build_quantized_numeric`] with the column's dataset-global pin, when the
+/// build has one.
+///
+/// `pin = None` is the incumbent, byte-for-byte: the offset is this tile's
+/// minimum and the step-1 snap is decided from this tile's statistics.
+///
+/// With a pin, two things become dataset-global and one deliberately does not:
+///
+/// * **The offset** becomes the column's dataset minimum instead of the tile's.
+///   That is the whole §3.3 fix carried onto the explicit path — the user chose
+///   the STEP, but the origin was never theirs to choose and its per-tile drift
+///   moved every decoded value. The global minimum is ≤ every tile's minimum,
+///   so indices only grow; a value that lands below it is stale-pin evidence
+///   and errors rather than clamping to 0.
+/// * **The step-1 snap** is decided from the pin instead of from this tile.
+///   `s == 1.0` with a `U16` leaf is precisely the auto rule tree's exact-integer
+///   verdict (or its degenerate constant-column case), i.e. "the DATASET is
+///   integer-valued and its span fits 16 bits" — the two conditions the per-tile
+///   snap tests locally. Reading them off the pin is what stops a tile that
+///   happens to hold only integers from snapping while its neighbour does not.
+/// * **The leaf width** stays per-tile (`max_q` below). The user's step is not
+///   the pin's step, so the pin's leaf does not describe this encoding, and
+///   width is a schema-template question rather than a decode-value one: both
+///   leaves reconstruct through the same affine, so no value decodes two ways.
+///   Pinning it needs the global span at the user's step, which is the
+///   template-cost trade its own item owns.
+pub(crate) fn build_quantized_numeric_with_pin(
+    values: &[Option<f64>],
+    prec: f64,
+    pin: Option<&AttrPinned>,
 ) -> Result<Option<(ArrayRef, String)>> {
     if !(prec > 0.0) {
         return Ok(None);
@@ -555,26 +785,53 @@ pub(crate) fn build_quantized_numeric(
     if st.finite == 0 {
         return Ok(None); // no finite values — keep Float64
     }
-    let min = st.min;
-    let step = if prec >= 1.0
-        && st.all_integer
-        && st.max_abs <= F64_EXACT_INT_LIMIT
-        // Only when step 1 keeps the leaf at UInt16 — see the doc comment: past
-        // this the "exact" step is a 2x size regression on an explicit request
-        // to shrink the column.
-        && st.max - st.min <= QuantLeaf::U16.max_index()
-    {
-        1.0
-    } else {
-        prec
+    // A refused pin carries no usable affine (its `o`/`s`/`leaf` are documented
+    // as meaningless), so the explicit path keeps the per-tile origin for such a
+    // column and says so. The refusal itself is an AUTO-path verdict: an
+    // explicit `--quantize-attr` request is the user overriding it on purpose.
+    let global = pin.filter(|p| !p.refuse);
+    let min = match global {
+        Some(p) => p.o,
+        None => st.min,
     };
+    let snap_to_one = match global {
+        // The global exact-integer verdict, read off the pin. See the doc
+        // comment: `s == 1` in the U16 leaf IS "integer-valued dataset whose
+        // span fits 16 bits".
+        Some(p) => prec >= 1.0 && p.s == 1.0 && p.leaf == PinnedLeaf::U16,
+        None => {
+            prec >= 1.0
+                && st.all_integer
+                && st.max_abs <= F64_EXACT_INT_LIMIT
+                // Only when step 1 keeps the leaf at UInt16 — see the doc comment: past
+                // this the "exact" step is a 2x size regression on an explicit request
+                // to shrink the column.
+                && st.max - st.min <= QuantLeaf::U16.max_index()
+        }
+    };
+    let step = if snap_to_one { 1.0 } else { prec };
     let affine = AttrQuant { o: min, s: step };
     let mut q: Vec<Option<i64>> = Vec::with_capacity(values.len());
     let mut max_q: i64 = 0;
     for v in values {
         match v {
             Some(x) if x.is_finite() => {
-                let qi = (((*x - affine.o) / affine.s).round() as i64).max(0);
+                let raw = ((*x - affine.o) / affine.s).round();
+                // Under a pin the offset comes from somewhere else, so a
+                // negative index is real evidence the pin is stale rather than
+                // the arithmetic no-op it is on the per-tile path. Erroring
+                // mirrors the overflow error below; clamping to 0 would ship
+                // the column minimum in its place, silently.
+                if global.is_some() && raw < 0.0 {
+                    return Err(Error::Other(format!(
+                        "numeric property value {x} sits below its dataset-global \
+                         quantization origin {min}: index {raw} is negative. The origin is \
+                         the column's dataset minimum, resolved in pass 1, so a value \
+                         beneath it means the pins no longer describe the data — rebuild \
+                         them, or pass --single-pass to restore the per-tile affine."
+                    )));
+                }
+                let qi = (raw as i64).max(0);
                 if qi > i32::MAX as i64 {
                     return Err(Error::Other(format!(
                         "numeric property quantization overflows: value {x} at precision \
@@ -612,4 +869,491 @@ pub(crate) fn build_quantized_numeric(
         Arc::new(b.finish())
     };
     Ok(Some((array, affine.to_json())))
+}
+
+// ----------------------------------------------------------------------------
+// The global attribute-range pin, in-file tests.
+//
+// The auto path's per-tile behaviour is covered in `arrow_tile/tests.rs`; these
+// cover what the PIN adds, and every one of them is written as a comparison
+// against the per-tile function on the same values — because the claim is not
+// "the pinned encoder works" but "the pinned encoder decides the same thing in
+// every tile where the per-tile encoder decided differently".
+// ----------------------------------------------------------------------------
+#[cfg(test)]
+mod pinned_tests {
+    use super::*;
+    use crate::arrow_tile::GlobalColumnPins;
+    use arrow::array::{Array, Int32Array, UInt16Array};
+    use arrow::datatypes::DataType;
+
+    /// Pass 1's numeric scan at test scale: the dataset-wide statistics
+    /// `AttrPinned::derive_auto` consumes, taken over the UNION of every tile.
+    /// This is what the builder computes once and hands the encoder.
+    fn pin_over(tiles: &[&[Option<f64>]]) -> AttrPinned {
+        let all: Vec<Option<f64>> = tiles.iter().flat_map(|t| t.iter().copied()).collect();
+        let st = numeric_column_stats(&all);
+        AttrPinned::derive_auto(st.min, st.max, st.max_abs, st.all_integer, st.finite as u64)
+    }
+
+    /// Decode a quantized column exactly the way both reference readers do:
+    /// parse the shipped affine, reconstruct every non-null cell through it.
+    fn decode(quantized: &(ArrayRef, String)) -> (DataType, AttrQuant, Vec<Option<f64>>) {
+        let (array, json) = quantized;
+        let affine = AttrQuant::from_json(json).expect("a quantized column must ship a valid qa");
+        let dt = array.data_type().clone();
+        let back: Vec<Option<f64>> = match &dt {
+            DataType::UInt16 => {
+                let c = array.as_any().downcast_ref::<UInt16Array>().unwrap();
+                (0..c.len())
+                    .map(|i| (!c.is_null(i)).then(|| affine.value(c.value(i) as i64)))
+                    .collect()
+            }
+            DataType::Int32 => {
+                let c = array.as_any().downcast_ref::<Int32Array>().unwrap();
+                (0..c.len())
+                    .map(|i| (!c.is_null(i)).then(|| affine.value(c.value(i) as i64)))
+                    .collect()
+            }
+            other => panic!("quantized property leaf must be UInt16/Int32, got {other:?}"),
+        };
+        (dt, affine, back)
+    }
+
+    fn v(xs: &[f64]) -> Vec<Option<f64>> {
+        xs.iter().copied().map(Some).collect()
+    }
+
+    /// A single pinned column, wrapped as the encoder config would carry it.
+    fn cfg_with(name: &str, pin: AttrPinned, auto: bool) -> EncoderConfig {
+        let mut pins = GlobalColumnPins::default();
+        pins.attr.insert(name.to_string(), pin);
+        EncoderConfig {
+            quantize_attrs_auto: auto,
+            global_pins: Some(Arc::new(pins)),
+            ..EncoderConfig::default()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The pinned auto path.
+    // ------------------------------------------------------------------
+
+    /// The pin is applied verbatim — offset, step and leaf all come off the
+    /// pin, and the shipped affine JSON is the pin's own affine.
+    #[test]
+    fn pinned_affine_is_applied_verbatim() {
+        let pin = AttrPinned {
+            refuse: false,
+            o: -5.0,
+            s: 1.0,
+            leaf: PinnedLeaf::U16,
+        };
+        let values = vec![Some(-5.0), Some(0.0), None, Some(3.0), Some(f64::NAN)];
+        let out = build_quantized_numeric_pinned(&values, &pin)
+            .unwrap()
+            .expect("a non-refusing pin always quantizes");
+        assert_eq!(out.1, AttrQuant { o: -5.0, s: 1.0 }.to_json());
+        let (dt, _, back) = decode(&out);
+        assert_eq!(dt, DataType::UInt16);
+        // Non-finite and null cells both become Arrow nulls, as on the
+        // per-tile path.
+        assert_eq!(
+            back,
+            vec![Some(-5.0), Some(0.0), None, Some(3.0), None],
+            "the pinned affine must reconstruct exactly at step 1"
+        );
+        let c = out.0.as_any().downcast_ref::<UInt16Array>().unwrap();
+        assert_eq!((c.value(0), c.value(1), c.value(3)), (0, 5, 8));
+    }
+
+    /// A refused pin keeps the column `Float64` in EVERY tile — including a
+    /// tile whose own sample the per-tile rule would happily have quantized.
+    ///
+    /// This inversion is the point: refusal is a property of the column's
+    /// DOMAIN (an identifier column is huge somewhere), and a tile holding only
+    /// the small end of it must not re-decide the column's Arrow type. The
+    /// per-tile assertion below is the control — it is what ships today.
+    #[test]
+    fn refusal_pin_keeps_float64_even_where_the_tile_would_quantize() {
+        let small_tile = v(&[1.0, 2.0, 3.0]);
+        let huge_tile = v(&[0.0, AUTO_QUANT_MAX_ABS + 1.0]);
+        let pin = pin_over(&[&small_tile, &huge_tile]);
+        assert!(pin.refuse, "the union's magnitude must trip the refusal");
+
+        assert!(
+            build_quantized_numeric_pinned(&small_tile, &pin)
+                .unwrap()
+                .is_none(),
+            "the refusal is global: the small tile stays Float64 too"
+        );
+        assert!(build_quantized_numeric_pinned(&huge_tile, &pin)
+            .unwrap()
+            .is_none());
+        // The control: left to itself, the small tile quantizes — which is
+        // exactly the structural schema drift the pin removes.
+        assert!(
+            build_quantized_numeric_auto(&small_tile).is_some(),
+            "control: the per-tile path quantizes the small tile"
+        );
+    }
+
+    /// A globally integer-valued column round-trips bit-for-bit through the
+    /// pinned step-1 affine, in every tile.
+    #[test]
+    fn pinned_step_one_integer_roundtrip_is_exact() {
+        let a = v(&[0.0, 7.0, 12.0]);
+        let b = v(&[-3.0, 40000.0]);
+        let pin = pin_over(&[&a, &b]);
+        assert_eq!((pin.refuse, pin.o, pin.s), (false, -3.0, 1.0));
+        for tile in [&a, &b] {
+            let out = build_quantized_numeric_pinned(tile, &pin).unwrap().unwrap();
+            let (_, _, back) = decode(&out);
+            assert_eq!(back, **tile, "the step-1 pin must round-trip bit-for-bit");
+        }
+    }
+
+    /// The pinned LEAF is used even where the tile's own span fits a narrower
+    /// one. That kills the residual `AdaptiveWidth` drift: one column, one
+    /// Arrow type, one PROPS schema template.
+    #[test]
+    fn pinned_leaf_is_used_even_where_the_tile_fits_a_narrower_one() {
+        let dense = v(&[0.0, 1.0, 2.0]);
+        let wide = v(&[70_000.0]);
+        let pin = pin_over(&[&dense, &wide]);
+        assert_eq!(pin.leaf, PinnedLeaf::I32, "the global span exceeds 16 bits");
+
+        let pinned = build_quantized_numeric_pinned(&dense, &pin)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode(&pinned).0, DataType::Int32);
+        // Control: the per-tile path narrows this tile to UInt16, forking the
+        // column's template between dense and wide tiles.
+        let per_tile = build_quantized_numeric_auto(&dense).unwrap();
+        assert_eq!(decode(&per_tile).0, DataType::UInt16);
+    }
+
+    /// **The headline claim, as a hand-checked example.** One source value,
+    /// present in two tiles with different local samples, decodes to ONE number
+    /// under the pin and to two different numbers without it.
+    #[test]
+    fn one_value_decodes_one_way_in_every_tile_under_the_pin() {
+        // Fractional, so the range-adaptive branch (whose step depends on the
+        // span) is what runs — the integer branch is exact either way.
+        let a = v(&[0.0, 1.0, 0.25]);
+        let b = v(&[0.0, 100.0, 0.25]);
+        let pin = pin_over(&[&a, &b]);
+
+        let pa = decode(&build_quantized_numeric_pinned(&a, &pin).unwrap().unwrap());
+        let pb = decode(&build_quantized_numeric_pinned(&b, &pin).unwrap().unwrap());
+        assert_eq!(pa.1, pb.1, "both tiles must ship the SAME affine");
+        assert_eq!(pa.0, pb.0, "both tiles must ship the same Arrow type");
+        assert_eq!(
+            pa.2[2], pb.2[2],
+            "0.25 must decode identically in both tiles"
+        );
+
+        // Control: the shipped per-tile encoder decodes the same 0.25 two ways.
+        let qa = decode(&build_quantized_numeric_auto(&a).unwrap());
+        let qb = decode(&build_quantized_numeric_auto(&b).unwrap());
+        assert_ne!(
+            qa.2[2], qb.2[2],
+            "control: the per-tile affine is what makes one value decode two ways"
+        );
+    }
+
+    /// A column with no finite value anywhere in the dataset keeps the
+    /// historical all-null `UInt16` at `{o: 0, s: 1}` — unchanged by pinning.
+    #[test]
+    fn globally_empty_column_matches_the_incumbent() {
+        let tile: Vec<Option<f64>> = vec![None, Some(f64::INFINITY), None];
+        let pin = pin_over(&[&tile]);
+        let pinned = build_quantized_numeric_pinned(&tile, &pin)
+            .unwrap()
+            .unwrap();
+        let incumbent = build_quantized_numeric_auto(&tile).unwrap();
+        assert_eq!(pinned.1, incumbent.1);
+        assert_eq!(pinned.0.to_data(), incumbent.0.to_data());
+    }
+
+    /// A value the pin does not cover ERRORS rather than clamping onto the
+    /// domain edge, in both directions. Clamping would ship a wrong number with
+    /// no trace — the failure mode `QuantAffine::qz` already refuses for
+    /// altitudes.
+    #[test]
+    fn value_outside_the_pinned_domain_errors_instead_of_clamping() {
+        let pin = AttrPinned {
+            refuse: false,
+            o: 0.0,
+            s: 1.0,
+            leaf: PinnedLeaf::U16,
+        };
+        let above = build_quantized_numeric_pinned(&v(&[100_000.0]), &pin);
+        assert!(above.is_err(), "an index past the leaf ceiling must error");
+        let below = build_quantized_numeric_pinned(&v(&[-1.0]), &pin);
+        assert!(below.is_err(), "an index below the origin must error");
+        // ...and an in-domain tile is untroubled.
+        assert!(build_quantized_numeric_pinned(&v(&[0.0, 65535.0]), &pin).is_ok());
+    }
+
+    /// Determinism: the pinned encode is a pure function of (values, pin).
+    #[test]
+    fn pinned_quantization_is_deterministic() {
+        let tile = vec![Some(1.5), None, Some(9.25), Some(-4.0)];
+        let pin = pin_over(&[&tile, &v(&[100.0])]);
+        let a = build_quantized_numeric_pinned(&tile, &pin)
+            .unwrap()
+            .unwrap();
+        let b = build_quantized_numeric_pinned(&tile, &pin)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.1, b.1);
+        assert_eq!(a.0.to_data(), b.0.to_data());
+    }
+
+    // ------------------------------------------------------------------
+    // The explicit `--quantize-attr name=prec` path.
+    // ------------------------------------------------------------------
+
+    /// The user's STEP is untouched; the ORIGIN becomes the dataset minimum.
+    #[test]
+    fn explicit_precision_uses_the_global_origin() {
+        let a = v(&[10.5, 20.5]);
+        let b = v(&[0.5, 100.5]);
+        let pin = pin_over(&[&a, &b]);
+        assert_eq!(pin.o, 0.5);
+        assert_ne!(pin.s, 1.0, "a fractional domain must not snap to step 1");
+
+        let pinned = build_quantized_numeric_with_pin(&a, 2.0, Some(&pin))
+            .unwrap()
+            .unwrap();
+        let (_, affine, _) = decode(&pinned);
+        assert_eq!(affine, AttrQuant { o: 0.5, s: 2.0 });
+        let c = pinned.0.as_any().downcast_ref::<UInt16Array>().unwrap();
+        assert_eq!((c.value(0), c.value(1)), (5, 10));
+
+        // Control: unpinned, the offset is this tile's own minimum, so the same
+        // 10.5 indexes to 0 here and to something else in the neighbouring tile.
+        let per_tile = build_quantized_numeric(&a, 2.0).unwrap().unwrap();
+        assert_eq!(decode(&per_tile).1, AttrQuant { o: 10.5, s: 2.0 });
+    }
+
+    /// The step-1 snap follows the GLOBAL integer verdict: it fires when the
+    /// dataset is integer-valued and narrow...
+    #[test]
+    fn explicit_precision_snaps_to_step_one_on_a_global_integer_domain() {
+        let a = v(&[0.0, 10.0]);
+        let b = v(&[100.0]);
+        let pin = pin_over(&[&a, &b]);
+        assert_eq!((pin.s, pin.leaf), (1.0, PinnedLeaf::U16));
+
+        let out = build_quantized_numeric_with_pin(&a, 10.0, Some(&pin))
+            .unwrap()
+            .unwrap();
+        let (_, affine, back) = decode(&out);
+        assert_eq!(affine, AttrQuant { o: 0.0, s: 1.0 }, "step snapped to 1");
+        assert_eq!(back, vec![Some(0.0), Some(10.0)], "and the snap is exact");
+    }
+
+    /// ...and does NOT fire for a tile that merely happens to hold integers
+    /// inside a fractional dataset. That local coincidence is precisely the
+    /// per-tile drift being removed.
+    #[test]
+    fn explicit_precision_snap_does_not_fire_on_a_locally_integer_tile() {
+        let a = v(&[3.0, 7.0]); // locally all-integer
+        let b = v(&[0.5, 100.5]); // ...but the dataset is not
+        let pin = pin_over(&[&a, &b]);
+
+        let pinned = build_quantized_numeric_with_pin(&a, 2.0, Some(&pin))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode(&pinned).1, AttrQuant { o: 0.5, s: 2.0 });
+
+        // Control: alone, this tile snaps to step 1 at its own minimum — a
+        // different affine for the same column in the very next tile.
+        let per_tile = build_quantized_numeric(&a, 2.0).unwrap().unwrap();
+        assert_eq!(decode(&per_tile).1, AttrQuant { o: 3.0, s: 1.0 });
+    }
+
+    /// A REFUSED pin carries no usable affine, so the explicit path — which is
+    /// the user overriding the auto verdict on purpose — keeps the per-tile
+    /// origin. The residual is documented, not silent.
+    #[test]
+    fn explicit_precision_falls_back_to_the_tile_origin_under_a_refusal_pin() {
+        let tile = v(&[1.0e12, 1.0e12 + 4.0]);
+        let pin = pin_over(&[&tile]);
+        assert!(pin.refuse);
+        let pinned = build_quantized_numeric_with_pin(&tile, 2.0, Some(&pin))
+            .unwrap()
+            .unwrap();
+        let per_tile = build_quantized_numeric(&tile, 2.0).unwrap().unwrap();
+        assert_eq!(pinned.1, per_tile.1);
+        assert_eq!(pinned.0.to_data(), per_tile.0.to_data());
+    }
+
+    /// A value below the pinned origin errors on the explicit path too.
+    #[test]
+    fn explicit_precision_errors_below_the_global_origin() {
+        let pin = AttrPinned {
+            refuse: false,
+            o: 10.0,
+            s: 1.0,
+            leaf: PinnedLeaf::U16,
+        };
+        assert!(build_quantized_numeric_with_pin(&v(&[5.0]), 2.0, Some(&pin)).is_err());
+    }
+
+    /// `pin = None` is the incumbent, byte for byte — the `--single-pass`
+    /// rollback and the one-shot-caller path.
+    #[test]
+    fn unpinned_explicit_path_is_byte_identical_to_the_incumbent() {
+        for values in [
+            v(&[1.0, 2.0, 3.0]),
+            v(&[0.25, 1000.5]),
+            vec![None, Some(-7.0), Some(70_000.0)],
+        ] {
+            for prec in [0.5, 1.0, 10.0] {
+                let a = build_quantized_numeric(&values, prec).unwrap();
+                let b = build_quantized_numeric_with_pin(&values, prec, None).unwrap();
+                match (a, b) {
+                    (None, None) => {}
+                    (Some(a), Some(b)) => {
+                        assert_eq!(a.1, b.1);
+                        assert_eq!(a.0.to_data(), b.0.to_data());
+                    }
+                    _ => panic!("pinned/unpinned disagreed on whether to quantize"),
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The encoder's decision site.
+    // ------------------------------------------------------------------
+
+    /// With no pins attached, the dispatch is the incumbent property loop:
+    /// explicit precision, else auto, else `Float64`.
+    #[test]
+    fn dispatch_without_pins_is_the_incumbent() {
+        let values = v(&[0.25, 1.0, 2.0]);
+        let auto_only = EncoderConfig {
+            quantize_attrs_auto: true,
+            ..EncoderConfig::default()
+        };
+        let got = build_quantized_numeric_for_column("speed", &values, &auto_only)
+            .unwrap()
+            .unwrap();
+        let want = build_quantized_numeric_auto(&values).unwrap();
+        assert_eq!(got.1, want.1);
+        assert_eq!(got.0.to_data(), want.0.to_data());
+
+        // Neither lever set → the column stays Float64.
+        assert!(
+            build_quantized_numeric_for_column("speed", &values, &EncoderConfig::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// With pins attached, the auto path takes the pin.
+    #[test]
+    fn dispatch_consults_the_pin_on_the_auto_path() {
+        let tile = v(&[0.0, 1.0, 0.25]);
+        let pin = pin_over(&[&tile, &v(&[100.0])]);
+        let cfg = cfg_with("speed", pin, true);
+        let got = build_quantized_numeric_for_column("speed", &tile, &cfg)
+            .unwrap()
+            .unwrap();
+        let want = build_quantized_numeric_pinned(&tile, &pin)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.1, want.1);
+        assert_eq!(got.0.to_data(), want.0.to_data());
+        // ...and it differs from what the tile would have chosen alone.
+        assert_ne!(got.1, build_quantized_numeric_auto(&tile).unwrap().1);
+    }
+
+    /// A column with no pin keeps the per-tile path even when other columns are
+    /// pinned — the fallback that makes the pin set additive (derived
+    /// summary-tier columns pass 1 never saw land here).
+    #[test]
+    fn dispatch_leaves_unpinned_columns_on_the_per_tile_path() {
+        let tile = v(&[0.0, 1.0, 0.25]);
+        let pin = pin_over(&[&tile, &v(&[100.0])]);
+        let cfg = cfg_with("other", pin, true);
+        let got = build_quantized_numeric_for_column("speed", &tile, &cfg)
+            .unwrap()
+            .unwrap();
+        let want = build_quantized_numeric_auto(&tile).unwrap();
+        assert_eq!(got.1, want.1);
+        assert_eq!(got.0.to_data(), want.0.to_data());
+    }
+
+    /// An explicit precision still wins over auto, and it is the PINNED
+    /// explicit path that runs.
+    #[test]
+    fn dispatch_prefers_explicit_precision_over_auto() {
+        let a = v(&[10.5, 20.5]);
+        let pin = pin_over(&[&a, &v(&[0.5, 100.5])]);
+        let mut cfg = cfg_with("speed", pin, true);
+        cfg.quantize_attrs.insert("speed".to_string(), 2.0);
+        let got = build_quantized_numeric_for_column("speed", &a, &cfg)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode(&got).1, AttrQuant { o: 0.5, s: 2.0 });
+    }
+
+    /// The incumbent's `.or_else`: an explicit request over a column with no
+    /// finite value in this tile falls through to auto rather than dropping the
+    /// quantization.
+    #[test]
+    fn dispatch_falls_back_to_auto_when_the_tile_has_no_finite_value() {
+        let tile: Vec<Option<f64>> = vec![None, None];
+        let mut cfg = EncoderConfig {
+            quantize_attrs_auto: true,
+            ..EncoderConfig::default()
+        };
+        cfg.quantize_attrs.insert("speed".to_string(), 2.0);
+        let got = build_quantized_numeric_for_column("speed", &tile, &cfg)
+            .unwrap()
+            .expect("auto keeps the all-null UInt16");
+        assert_eq!(decode(&got).0, DataType::UInt16);
+    }
+
+    // ------------------------------------------------------------------
+    // Rejected-design boundary.
+    // ------------------------------------------------------------------
+
+    /// **Guard: the rate menu is not widened by making the verdict global.**
+    ///
+    /// Per-column rate selection beyond `{UInt16, Int32}` only becomes
+    /// representable once the affine is a function of the dataset rather than
+    /// of a tile's sample — and is deliberately not exercised here, so the
+    /// change surface stays reviewable and the extra menu entries keep their
+    /// unpriced schema-template cost. Both matches below are exhaustive: a
+    /// third variant in either enum stops this compiling.
+    #[test]
+    fn pinned_rate_menu_is_exactly_two_leaves() {
+        for pinned in [PinnedLeaf::U16, PinnedLeaf::I32] {
+            let leaf = QuantLeaf::from_pinned(pinned);
+            match (pinned, leaf) {
+                (PinnedLeaf::U16, QuantLeaf::U16) => {
+                    assert_eq!(leaf.max_index(), u16::MAX as f64)
+                }
+                (PinnedLeaf::I32, QuantLeaf::I32) => {
+                    assert_eq!(leaf.max_index(), i32::MAX as f64)
+                }
+                (p, l) => panic!("pinned leaf {p:?} must not map to encoder leaf {l:?}"),
+            }
+            assert_eq!(pinned.max_index(), leaf.max_index());
+        }
+        // Every pin the derivation can produce lands in that two-entry menu.
+        for pin in [
+            AttrPinned::derive_auto(0.0, 10.0, 10.0, true, 3),
+            AttrPinned::derive_auto(0.0, 70_000.0, 70_000.0, true, 3),
+            AttrPinned::derive_auto(0.0, 1.0, 1.0, false, 3),
+        ] {
+            assert!(matches!(pin.leaf, PinnedLeaf::U16 | PinnedLeaf::I32));
+        }
+    }
 }

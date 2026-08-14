@@ -100,6 +100,12 @@ pub struct TileConfig {
     pub clip_trajectories: bool,
     /// Minimum vertices required before a trajectory is clipped.
     pub clip_min_vertices: usize,
+    /// TB-7: LINE clip buffer in pixels of a 256-px tile, resolved per zoom.
+    /// Polygons are unaffected — their buffer is pinned at 0.
+    pub clip_buffer_px: f64,
+    /// TB-7 rollback: pin the LINE clip buffer to a fixed degree value,
+    /// reproducing the pre-TB-7 behaviour exactly. `None` = tile-relative.
+    pub clip_buffer_degrees: Option<f64>,
     /// Whether to simplify geometry at lower zoom levels.
     pub simplify: bool,
     /// Highest zoom that still receives simplification.
@@ -108,8 +114,25 @@ pub struct TileConfig {
     /// `triangles` sidecar column — letting the renderer skip its own CPU
     /// tessellation at tile-arrival time.
     pub pre_tessellate: bool,
+    /// TB-10 ROLLBACK (debug-only, one release): use the incumbent first-fit
+    /// greedy for `--adaptive-temporal` instead of the exact balanced partition.
+    pub adaptive_greedy: bool,
+    /// TB-10 shared candidate boundary set: the dataset-wide quantiles adaptive
+    /// window keys snap DOWN onto, so adjacent spatial cells land on the same
+    /// fetch instants. ASCENDING and deduplicated. Empty = no snapping (every
+    /// window keeps its own first timestamp, the pre-TB-10 behaviour).
+    pub adaptive_boundaries: Vec<u64>,
+    /// TB-12 per-feature triangle emission; forwarded to
+    /// [`ColumnarOptions::partial_triangles`], whose docs carry the rationale
+    /// and the rollback. BYTE-CHANGING when true (the default).
+    pub partial_triangles: bool,
+    /// TB-12 observation out-parameter, forwarded to
+    /// [`ColumnarOptions::partial_triangles_observed`]. Read AFTER tiling to
+    /// decide whether the manifest must declare
+    /// [`stt_core::pack::CAPABILITY_TRIANGLES_PARTIAL`].
+    pub partial_triangles_observed: Arc<std::sync::atomic::AtomicBool>,
     /// Optional temporal LOD pyramid. When non-empty, the build emits an
-    /// extra aggregate tile per (zoom, spatial cell, lod-bucket) using the
+    /// extra coarse-bucket tile per (zoom, spatial cell, lod-bucket) using the
     /// LOD level's `bucket_ms` instead of the base `temporal_bucket_ms`.
     /// Each level applies up to (and including) `max_zoom_level`. Levels
     /// MUST be sorted by ascending bucket size and every bucket MUST be a
@@ -185,9 +208,11 @@ impl Default for TileConfig {
             temporal_bucket_ms: 3600 * 1000,
             clip_trajectories: true,
             clip_min_vertices: 2,
+            clip_buffer_px: crate::clip::DEFAULT_CLIP_BUFFER_PX,
+            clip_buffer_degrees: None,
             simplify: false,
             simplify_max_zoom: 14,
-            simplify_metric: false,
+            simplify_metric: true,
             pre_tessellate: false,
             temporal_lod: Vec::new(),
             min_features_per_tile: 1,
@@ -198,6 +223,10 @@ impl Default for TileConfig {
             tile_budget: None,
             attribute_filter: AttributeFilter::KeepAll,
             property_types: Arc::default(),
+            adaptive_greedy: false,
+            adaptive_boundaries: Vec::new(),
+            partial_triangles: true,
+            partial_triangles_observed: Arc::default(),
         }
     }
 }
@@ -210,6 +239,14 @@ impl TileConfig {
             pre_tessellate: self.pre_tessellate,
             attribute_filter: self.attribute_filter.clone(),
             property_types: Arc::clone(&self.property_types),
+            partial_triangles: self.partial_triangles,
+            partial_triangles_observed: Arc::clone(&self.partial_triangles_observed),
+            // Everything the tiler does not model itself takes the columnar
+            // default — today that is `synthetic_point_row_ids: true`, the R1
+            // ids-after-sort default. Threading its `--single-pass` rollback
+            // down to here needs one field on `TileConfig` and one line in
+            // `stt-build.rs`; both live outside this change's ownership.
+            ..ColumnarOptions::default()
         }
     }
 }
@@ -229,8 +266,8 @@ impl TileConfig {
 /// A generated tile tagged with the temporal-LOD bucket it represents.
 ///
 /// `bucket_ms == None` means "base tile" (use the archive's
-/// `temporal_bucket_ms`). `Some(b)` means this is an aggregate tile produced
-/// for an LOD level; the writer records `b` in the directory so the reader
+/// `temporal_bucket_ms`). `Some(b)` means this is a lossless coarse-bucket
+/// replica produced for an LOD level; the writer records `b` in the directory so the reader
 /// can dispatch on bucket size at lookup time.
 #[derive(Debug)]
 pub struct LodTaggedTile {
@@ -325,7 +362,8 @@ impl PlacementCounters {
 }
 
 /// Generate every tile into memory across all configured zoom levels,
-/// returning base tiles + LOD aggregate tiles tagged with their bucket size.
+/// returning base tiles + lossless coarse-bucket LOD tiles tagged with their
+/// bucket size.
 ///
 /// The base tiles are tagged `Some(config.temporal_bucket_ms)` so the
 /// writer can record the bucket size on every directory entry — that's
@@ -372,18 +410,12 @@ pub fn generate_tiles_with_lod(
     Ok(out)
 }
 
-/// Emit aggregate tiles for one temporal LOD level.
+/// Emit lossless coarse-bucket tiles for one temporal LOD level.
 ///
-/// The aggregator follows the spatial-summary pattern: features are placed
-/// onto the spatial tile grid, then *re-bucketed by the LOD's bucket size*
-/// rather than the base. Each (zoom, spatial cell, lod_bucket) becomes one
-/// aggregate tile. Within a tile the existing layer builder handles the
-/// per-cell aggregation (sum/mean/count fall out of the regrouping for
-/// numeric properties).
-///
-/// The scaffold *re-bucketes only* — feature-level simplification (collapse
-/// 1000 points per cell into 50 means) is left as a follow-up; the format
-/// already supports it because the per-tile aggregator is plugged in here.
+/// Features are placed onto the same spatial tile grid and re-bucketed by the
+/// LOD bucket size. Every usable feature and property is preserved; this tier
+/// reduces the number of tile requests needed for a long-range scrub, not the
+/// archive's raw feature count. Spatial summaries are a separate opt-in tier.
 fn generate_lod_level(
     features: &[ParsedFeature],
     level: &stt_core::metadata::TemporalLodLevel,
@@ -670,7 +702,14 @@ fn build_pool(workers: usize) -> Result<rayon::ThreadPool> {
 fn clip_config_from(config: &TileConfig) -> ClipConfig {
     ClipConfig {
         min_vertices: config.clip_min_vertices,
-        buffer_degrees: 0.001,
+        buffer_degrees: crate::clip::LEGACY_CLIP_BUFFER_DEGREES,
+        // TB-7: tile-relative line buffer. `clip_buffer_degrees` is the
+        // documented rollback (`--clip-buffer-degrees`); when it is unset the
+        // buffer scales with tile width at every zoom.
+        line_buffer: match config.clip_buffer_degrees {
+            Some(d) => crate::clip::LineBuffer::FixedDegrees(d),
+            None => crate::clip::LineBuffer::TileRelativePx(config.clip_buffer_px),
+        },
         polygon_buffer_degrees: 0.0,
         // With adaptive temporal windows there's no fixed grid to slice
         // trajectories against, so disable fixed-bucket temporal slicing in that
@@ -692,12 +731,24 @@ fn clip_config_from(config: &TileConfig) -> ClipConfig {
 /// Read a feature's LOD floor from the configured `min_zoom_field` property:
 /// the shallowest zoom the feature appears at. `None` = always shown.
 fn feature_min_zoom(feature: &ParsedFeature, field: &Option<String>) -> Option<u8> {
+    // DT-2: an assigned home zoom IS the band, and it wins over any configured
+    // field — `--additive-lod` refuses to run alongside `--min-zoom-field`
+    // precisely so these two can never disagree.
+    if let Some(home) = feature.home_zoom {
+        return Some(home);
+    }
     feature_zoom_bound(feature, field)
 }
 
 /// Read a feature's LOD ceiling from the configured `max_zoom_field` property:
 /// the deepest zoom the feature appears at. `None` = no ceiling.
 fn feature_max_zoom(feature: &ParsedFeature, field: &Option<String>) -> Option<u8> {
+    // DT-2: under additive decomposition a feature lives at EXACTLY one zoom,
+    // so its ceiling is its floor. That is what makes the partition additive
+    // (O(N) stored rows) rather than replicated (O(|Z|·N)).
+    if let Some(home) = feature.home_zoom {
+        return Some(home);
+    }
     feature_zoom_bound(feature, field)
 }
 
@@ -772,6 +823,8 @@ fn place_multipoint<'a>(
                     x,
                     y,
                     TileFeature::Derived(ParsedFeature {
+                        // A clipped piece keeps its parent's home zoom.
+                        home_zoom: feature.home_zoom,
                         geojson: geojson::Feature {
                             bbox: None,
                             geometry: Some(geojson::Geometry::new(geojson::Value::Point(
@@ -929,6 +982,8 @@ fn place_polygon<'a>(
                     x,
                     y,
                     TileFeature::Derived(ParsedFeature {
+                        // A clipped piece keeps its parent's home zoom.
+                        home_zoom: feature.home_zoom,
                         geojson: geojson::Feature {
                             bbox: None,
                             geometry: Some(geojson::Geometry::new(geometry)),
@@ -1025,6 +1080,36 @@ fn place_polygon<'a>(
 /// own segment run (temporal slicing, matrix pinning and per-vertex-array
 /// interpolation apply exactly as for LineString trajectories); per-vertex
 /// arrays sized to the whole geometry are sliced per part.
+///
+/// # ⚠️ Antimeridian: lines are BROKEN at the seam, not split there
+///
+/// Unlike [`place_polygon`] — which routes a `|Δlon| > 180°` ring through
+/// `clip::split_polygon_at_antimeridian` and gets per-hemisphere pieces that
+/// meet at synthesised ±180 vertices — `clip_trajectory` merely ends the run at
+/// such an edge and starts a new one after it. The crossing edge itself is
+/// **never emitted**: no ±180 vertex is synthesised, so a Fiji-crossing track
+/// decodes with a hole between its extreme source vertices (4° wide for a
+/// 178°E→178°W pair). Two consequences worth knowing before touching this:
+///
+/// * The loss is **uncounted** — `TileStats::antimeridian_fallbacks` covers the
+///   polygon dead-letter only — and it is **invisible to `stt-validate` check
+///   13**, because dropping the edge keeps the decode strictly inside the
+///   source-vertex bbox the manifest declares. Pinned by
+///   `a_seam_crossing_line_loses_its_crossing_edge_instead_of_being_split`
+///   (`tests/antimeridian_polygon.rs`).
+/// * A **2-vertex** crossing line degenerates further: both runs fall below
+///   `ClipConfig::min_vertices`, nothing survives the clipper, and the whole
+///   feature dead-letters through [`place_whole_feature`] into ONE tile still
+///   carrying its 356°-wide edge. Pinned by
+///   `a_two_vertex_seam_crossing_line_dead_letters_into_one_tile_uncounted`.
+///
+/// The run break is deliberate and load-bearing (see the long note in
+/// `clip.rs`: `supercover_segment` would otherwise walk the *long* way round a
+/// clamped tile space and bake a globe-spanning sliver into every column). The
+/// gap is that nothing replaces the dropped edge with the two seam-terminated
+/// pieces the polygon path produces. Fixing that is the polygon splitter's
+/// shape applied to lines and is out of scope for a validator-gate wave —
+/// documented here rather than left as folklore.
 fn place_polyline<'a>(
     feature: &'a ParsedFeature,
     parts: &[Vec<Vec<f64>>],
@@ -1056,7 +1141,7 @@ fn place_polyline<'a>(
     // longitude jumps.)
     if let Ok((fx, fy)) = projection::lonlat_to_tile(feature.lon, feature.lat, zoom) {
         let (bl, bb, br, bt) =
-            crate::clip::buffered_tile_bounds(fx, fy, zoom, clip_config.buffer_degrees);
+            crate::clip::buffered_tile_bounds(fx, fy, zoom, clip_config.line_buffer_degrees(zoom));
         if min_lon >= bl && max_lon <= br && min_lat >= bb && max_lat <= bt {
             return vec![(fx, fy, TileFeature::Original(feature))];
         }
@@ -1245,6 +1330,8 @@ fn place_polyline<'a>(
                 x,
                 y,
                 TileFeature::Derived(ParsedFeature {
+                    // A clipped piece keeps its parent's home zoom.
+                    home_zoom: feature.home_zoom,
                     geojson: geojson::Feature {
                         bbox: None,
                         geometry: Some(geojson::Geometry::new(geometry)),
@@ -1416,6 +1503,29 @@ fn process_zoom_level(
         .into_par_iter()
         .map(|((x, y), feats)| -> Result<Vec<GeneratedTile>> {
             let buckets = match config.adaptive_target_features {
+                // TB-10: the exact balanced partition with snapped keys, unless
+                // `--adaptive-greedy` asks for the incumbent first-fit sweep.
+                Some(target) if !config.adaptive_greedy => {
+                    let mut collisions = 0usize;
+                    let b = chunk_adaptive_dp(
+                        feats,
+                        target,
+                        &config.adaptive_boundaries,
+                        &mut collisions,
+                    );
+                    if collisions > 0 {
+                        // Not an error: a collided window keeps its own exact
+                        // timestamp, so the archive stays correct — it just
+                        // forfeits the shared boundary for that one window.
+                        tracing::debug!(
+                            "adaptive cell ({x},{y}) z{zoom}: {collisions} of {} windows could \
+                             not use a shared boundary (two windows snapped to the same \
+                             candidate); those keep their exact first timestamp",
+                            b.len()
+                        );
+                    }
+                    b
+                }
                 Some(target) => chunk_adaptive_by_count(feats, target),
                 None => chunk_by_temporal_bucket(feats, config.temporal_bucket_ms),
             };
@@ -1493,6 +1603,277 @@ fn chunk_adaptive_by_count(
     out
 }
 
+/// Atom sizes for a TIMESTAMP-SORTED feature slice: the run length of each
+/// distinct timestamp.
+///
+/// Features sharing a timestamp are INSEPARABLE — splitting them would put two
+/// windows at the same instant, and a `TileId` is keyed on the window start, so
+/// the two would collide. Every partition below therefore operates on atoms,
+/// never on individual features.
+fn timestamp_atoms(features: &[TileFeature<'_>]) -> Vec<usize> {
+    let mut atoms: Vec<usize> = Vec::new();
+    let mut prev: Option<u64> = None;
+    for f in features {
+        let ts = f.timestamp();
+        if prev == Some(ts) {
+            *atoms.last_mut().expect("prev implies a pushed atom") += 1;
+        } else {
+            atoms.push(1);
+            prev = Some(ts);
+        }
+    }
+    atoms
+}
+
+/// Can `atoms` be packed into at most `k` contiguous windows of at most `cap`
+/// features each? The feasibility oracle the min-max search binaries over.
+fn atoms_fit(atoms: &[usize], cap: usize, k: usize) -> bool {
+    if atoms.iter().any(|&a| a > cap) {
+        return false; // an atom is unsplittable, so it can never fit
+    }
+    let mut windows = 1usize;
+    let mut acc = 0usize;
+    for &a in atoms {
+        if acc + a > cap {
+            windows += 1;
+            acc = 0;
+            if windows > k {
+                return false;
+            }
+        }
+        acc += a;
+    }
+    windows <= k
+}
+
+/// TB-10 — EXACT min-max partition of `features` into `k` contiguous windows.
+///
+/// Returns the atom-index cut points (window `i` spans atoms
+/// `cuts[i]..cuts[i+1]`), `cuts.len() == k + 1`.
+///
+/// The incumbent greedy closes a window the moment it reaches `target`, which
+/// makes every window ≥ target and shunts the remainder into a final runt — the
+/// per-tile byte variance the item is out to reduce. This solves the balanced
+/// problem exactly instead: binary-search the smallest achievable maximum window
+/// size, then lay the windows down left to right taking the LARGEST prefix that
+/// still leaves enough atoms to fill the remaining windows. That look-ahead is
+/// what keeps the tail from starving, and it makes the reconstruction a pure
+/// function of (atoms, k) — no ties to break, so the output is deterministic.
+///
+/// `O(m log n)` for `m` atoms and `n` features, which is far below the `O(mK)`
+/// DP the plan budgeted for and exact for the same objective.
+fn partition_atoms_min_max(atoms: &[usize], k: usize) -> Vec<usize> {
+    let m = atoms.len();
+    let k = k.clamp(1, m.max(1));
+    if m == 0 {
+        return vec![0];
+    }
+    let total: usize = atoms.iter().sum();
+    // The cap can never be below the largest single atom, nor above everything.
+    let mut lo = *atoms.iter().max().expect("m > 0");
+    let mut hi = total;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if atoms_fit(atoms, mid, k) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let cap = lo;
+
+    // Suffix atom counts, so "how much is left?" is O(1).
+    let mut suffix = vec![0usize; m + 1];
+    for i in (0..m).rev() {
+        suffix[i] = suffix[i + 1] + atoms[i];
+    }
+
+    // `min_windows[i]` = the fewest windows of capacity `cap` that can hold
+    // `atoms[i..]`. A sum bound is NOT enough here — atoms are unsplittable, so
+    // `18 <= 2*9` says nothing about whether `[5, 6, 7]` fits in two windows of
+    // 9 (it does not). This is the real feasibility oracle, in O(m): `reach[i]`
+    // is the furthest a single window starting at `i` can go, and the count
+    // follows from the right.
+    let mut reach = vec![0usize; m + 1];
+    {
+        let mut j = 0usize;
+        let mut acc = 0usize;
+        for i in 0..m {
+            if j < i {
+                j = i;
+                acc = 0;
+            }
+            while j < m && acc + atoms[j] <= cap {
+                acc += atoms[j];
+                j += 1;
+            }
+            reach[i] = j.max(i + 1); // cap >= max atom, so this always advances
+            acc -= atoms[i];
+        }
+        reach[m] = m;
+    }
+    let mut min_windows = vec![0usize; m + 1];
+    for i in (0..m).rev() {
+        min_windows[i] = 1 + min_windows[reach[i]];
+    }
+
+    let mut cuts = Vec::with_capacity(k + 1);
+    cuts.push(0);
+    let mut i = 0usize;
+    for w in 0..k {
+        let windows_left = k - w;
+        if windows_left == 1 {
+            i = m; // the last window takes whatever is left
+            cuts.push(i);
+            break;
+        }
+        // The balanced AIM: an even share of what is left, never above the
+        // optimum. Aiming rather than taking the largest legal prefix is the
+        // difference between a balanced partition and the greedy's front-loaded
+        // one — the largest-prefix rule hits `cap` every time and starves the
+        // TAIL, which is the very failure this item exists to remove.
+        let aim = suffix[i].div_ceil(windows_left).min(cap);
+        let mut acc = 0usize;
+        while i < m {
+            // Always leave at least one atom for each remaining window: a
+            // window with no atoms would be a tile that does not exist, and the
+            // cut list must stay a genuine cover.
+            if m - i <= windows_left - 1 {
+                break;
+            }
+            let a = atoms[i];
+            if acc > 0 {
+                if acc + a > cap {
+                    break;
+                }
+                // Stop at the balanced aim ONLY once the tail can actually be
+                // packed into the windows that remain. While it cannot, this
+                // window must keep taking — taking more is what makes the tail
+                // feasible, so optimality always beats balance here.
+                if min_windows[i] <= windows_left - 1 && acc + a > aim {
+                    break;
+                }
+            }
+            acc += a;
+            i += 1;
+        }
+        cuts.push(i);
+    }
+    // Anything left over (unreachable: the last window takes the remainder)
+    // joins the final window rather than being dropped.
+    if i < m {
+        *cuts.last_mut().expect("pushed above") = m;
+    }
+    cuts
+}
+
+/// TB-10 — adaptive temporal chunking by EXACT balanced partition, with window
+/// keys snapped onto a dataset-wide candidate boundary set.
+///
+/// Two changes over [`chunk_adaptive_by_count`]:
+///
+///  * **Exact partition.** Windows are balanced rather than first-fit, cutting
+///    the per-tile byte variance the greedy's trailing runt creates. The window
+///    COUNT is taken from the greedy so the change stays a rebalancing rather
+///    than a re-cardinalisation — and it also makes the dominance property free:
+///    the greedy's own partition is feasible at that count, so the exact
+///    solution's largest window can never be larger.
+///  * **Shared boundaries.** Each window's key is snapped DOWN to the largest
+///    candidate `s ∈ boundaries` with `s ≤` the window's first timestamp. Two
+///    adjacent spatial cells covering the same timeline then land on the same
+///    fetch instants, which is what makes adaptive-mode keys enumerable by a
+///    prefetcher. Without it, every cell invents its own instants and multi-cell
+///    prefetch degenerates — the recorded production gotcha.
+///
+/// A snap that would collide with the previous window's key falls back to the
+/// window's own first timestamp (and is counted, for the caller to log): a
+/// distinct `(z,x,y,t)` per window is a hard invariant, and sharing boundaries
+/// is only an optimisation.
+///
+/// Losslessness: every atom lands in exactly one window; no feature is dropped.
+fn chunk_adaptive_dp<'a>(
+    mut features: Vec<TileFeature<'a>>,
+    target: u32,
+    boundaries: &[u64],
+    collisions: &mut usize,
+) -> Vec<(u64, Vec<TileFeature<'a>>)> {
+    let target = target.max(1) as usize;
+    features.sort_by_key(|f| f.timestamp());
+    if features.is_empty() {
+        return Vec::new();
+    }
+    let atoms = timestamp_atoms(&features);
+
+    // The greedy's window count, computed on atoms (identical to what
+    // `chunk_adaptive_by_count` would produce), used as the exact solver's `k`.
+    let mut k = 1usize;
+    let mut acc = 0usize;
+    for &a in &atoms {
+        if acc >= target {
+            k += 1;
+            acc = 0;
+        }
+        acc += a;
+    }
+
+    let cuts = partition_atoms_min_max(&atoms, k);
+
+    // Atom index -> feature index.
+    let mut atom_start = Vec::with_capacity(atoms.len() + 1);
+    let mut pos = 0usize;
+    for &a in &atoms {
+        atom_start.push(pos);
+        pos += a;
+    }
+    atom_start.push(pos);
+
+    let mut out: Vec<(u64, Vec<TileFeature>)> = Vec::with_capacity(cuts.len());
+    let mut last_key: Option<u64> = None;
+    // Walk windows in time order, draining `features` from the front so each
+    // feature moves exactly once.
+    let mut drain = features.into_iter();
+    let mut taken = 0usize;
+    for w in 0..cuts.len().saturating_sub(1) {
+        let (a0, a1) = (cuts[w], cuts[w + 1]);
+        if a0 == a1 {
+            continue; // empty window (only when k > atom count)
+        }
+        let want = atom_start[a1] - atom_start[a0];
+        let chunk: Vec<TileFeature> = drain.by_ref().take(want).collect();
+        taken += chunk.len();
+        let first_ts = chunk
+            .first()
+            .expect("a non-empty atom range yields features")
+            .timestamp();
+        let snapped = snap_down(boundaries, first_ts).unwrap_or(first_ts);
+        // Keys must be strictly increasing: a snap that lands on (or before) the
+        // previous window's key would collide, so keep the true timestamp.
+        let key = if last_key.is_some_and(|prev| snapped <= prev) {
+            *collisions += 1;
+            first_ts
+        } else {
+            snapped
+        };
+        last_key = Some(key);
+        out.push((key, chunk));
+    }
+    debug_assert_eq!(
+        taken,
+        atom_start[atoms.len()],
+        "TB-10 partition lost features"
+    );
+    out
+}
+
+/// Largest `s` in the ASCENDING slice `boundaries` with `s <= t`, or `None`.
+fn snap_down(boundaries: &[u64], t: u64) -> Option<u64> {
+    match boundaries.binary_search(&t) {
+        Ok(i) => Some(boundaries[i]),
+        Err(0) => None,
+        Err(i) => Some(boundaries[i - 1]),
+    }
+}
+
 /// Build one tile's layers from a chunk of features.
 fn build_tile(
     id: TileId,
@@ -1529,19 +1910,21 @@ fn build_tile(
 
     let mut layers: Vec<ColumnarLayer> = Vec::new();
 
-    // A failure building ONE layer must not discard the whole tile's other
-    // features (the clipped-segment layer and the whole-feature layer are
-    // independent). Log the failing layer's feature count and skip just that
-    // layer; if every layer fails the tile collapses to `Ok(None)` below,
-    // exactly as an empty tile would.
+    // A layer-construction error means source features would be omitted from a
+    // seemingly-successful archive. Fail the build with tile/layer context;
+    // lossy input salvage is an explicit CLI policy and must not be reintroduced
+    // here as an implicit per-tile drop.
     if !segments.is_empty() {
-        match build_layer_from_segments(&segments, &config.layer_name, &config.columnar_options()) {
-            Ok(layer) => layers.push(layer),
-            Err(e) => tracing::warn!(
-                "tile {id:?}: dropping {} clipped-segment feature(s); layer build failed: {e}",
+        let layer =
+            build_layer_from_segments(&segments, &config.layer_name, &config.columnar_options())
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                "tile {id:?}: failed to build layer {:?} from {} clipped segment(s): {error}",
+                config.layer_name,
                 segments.len()
-            ),
-        }
+            )
+                })?;
+        layers.push(layer);
     }
     if !originals.is_empty() {
         // Suffix the originals layer name when clipped segments are also
@@ -1551,13 +1934,14 @@ fn build_tile(
         } else {
             format!("{}_originals", config.layer_name)
         };
-        match build_layers_from_features_with(&originals, &base, config.columnar_options()) {
-            Ok(built) => layers.extend(built),
-            Err(e) => tracing::warn!(
-                "tile {id:?}: dropping {} whole-feature(s); layer build failed: {e}",
+        let built = build_layers_from_features_with(&originals, &base, config.columnar_options())
+            .map_err(|error| {
+            anyhow::anyhow!(
+                "tile {id:?}: failed to build layer {base:?} from {} whole feature(s): {error}",
                 originals.len()
-            ),
-        }
+            )
+        })?;
+        layers.extend(built);
     }
 
     if layers.is_empty() {
@@ -1687,9 +2071,18 @@ const ENCODE_CHUNK: usize = 1024;
 fn encode_and_add_tiles(
     writer: &mut stt_core::PackWriter,
     tiles: &[(&GeneratedTile, Option<u64>)],
-    mut on_written: impl FnMut(),
+    base_bucket_ms: u64,
+    mut on_written: impl FnMut() + Send,
 ) -> Result<()> {
     let encoder = writer.encoder_config();
+    // TB-11 extension 2 observation. The feature-anchored vertex-time tier
+    // fires or not depending on the DATA, so the capability it owes can only be
+    // learned by encoding. A monotone OR across every tile, hence
+    // order-independent and deterministic regardless of worker scheduling;
+    // read after the pool joins, below.
+    let feature_anchored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // TB-11: the archive's base bucket, so a tier tile's vertex-time ceiling
+    // can be scaled by its own width relative to it.
     let budget = writer.memory_budget();
     let byte_cap: u64 = if budget > 0 {
         (budget / 4).max(1)
@@ -1704,38 +2097,100 @@ fn encode_and_add_tiles(
     } else {
         ENCODE_CHUNK
     };
+    // TB-13: grow ONE sub-batch, wave by wave, up to the byte cap. Returns the
+    // encoded payloads and the exclusive end index. Split out so the pipeline
+    // below can call it for batch j+1 while batch j is still flushing.
+    let encode_batch = |chunk: &[(&GeneratedTile, Option<u64>)],
+                        start: usize,
+                        cap: u64|
+     -> std::result::Result<(Vec<Vec<u8>>, usize), stt_core::Error> {
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        let mut bytes = 0u64;
+        let mut end = start;
+        while end < chunk.len() && (end == start || bytes < cap) {
+            let wave_end = (end + wave).min(chunk.len());
+            let encoded: Vec<Vec<u8>> = chunk[end..wave_end]
+                .par_iter()
+                .map(|(tile, bucket)| {
+                    // TB-11: a coarse temporal-LOD tile tolerates a
+                    // proportionally coarser per-vertex time step at equal
+                    // perceptual error. Base-tier tiles borrow the config
+                    // unchanged, so the common path is byte-identical.
+                    let cfg = encoder.for_temporal_tier(*bucket, base_bucket_ms);
+                    let (payload, observed) =
+                        stt_core::arrow_tile::encode_tile_observed(&tile.layers, cfg.as_ref())?;
+                    if observed.feature_anchored_vertex_times {
+                        feature_anchored.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(payload)
+                })
+                .collect::<std::result::Result<Vec<_>, stt_core::Error>>()?;
+            bytes += encoded.iter().map(|p| p.len() as u64).sum::<u64>();
+            payloads.extend(encoded);
+            end = wave_end;
+        }
+        Ok((payloads, end))
+    };
+
+    // Each pipelined half gets half the cap, so peak transient bytes with TWO
+    // batches in flight stay at the SAME bound the serial path held with one.
+    let half_cap = (byte_cap / 2).max(1);
+    // `rayon::scope` cannot return `?` out of the flush closure, so the first
+    // write error is parked here and re-raised once the scope joins.
+    let mut flush_err: Option<stt_core::Error> = None;
+
     for chunk in tiles.chunks(ENCODE_CHUNK) {
+        // Prime the pipeline with batch 0.
         let mut start = 0usize;
-        while start < chunk.len() {
-            // Grow the sub-batch wave by wave until the running encoded-byte
-            // total reaches the cap (always at least one wave).
-            let mut payloads: Vec<Vec<u8>> = Vec::new();
-            let mut bytes = 0u64;
-            let mut end = start;
-            while end < chunk.len() && (end == start || bytes < byte_cap) {
-                let wave_end = (end + wave).min(chunk.len());
-                let encoded: Vec<Vec<u8>> = chunk[end..wave_end]
-                    .par_iter()
-                    .map(|(tile, _)| stt_core::arrow_tile::encode_tile_with(&tile.layers, &encoder))
-                    .collect::<std::result::Result<Vec<_>, stt_core::Error>>()?;
-                bytes += encoded.iter().map(|p| p.len() as u64).sum::<u64>();
-                payloads.extend(encoded);
-                end = wave_end;
+        let mut pending = if start < chunk.len() {
+            Some(encode_batch(chunk, start, half_cap)?)
+        } else {
+            None
+        };
+
+        while let Some((payloads, end)) = pending.take() {
+            // Encode batch j+1 on the pool WHILE this thread flushes batch j.
+            // `PackWriter` never migrates threads — it stays `&mut` on the
+            // caller — so the writer's ordering and its finalize are untouched.
+            let mut next: std::result::Result<Option<(Vec<Vec<u8>>, usize)>, stt_core::Error> =
+                Ok(None);
+            rayon::scope(|scope| {
+                if end < chunk.len() {
+                    scope.spawn(|_| {
+                        next = encode_batch(chunk, end, half_cap).map(Some);
+                    });
+                }
+                // The flush half. Hand-off ORDER is unchanged from the serial
+                // path, which is what keeps this byte-neutral: batch j's tiles
+                // are still added in index order, before any of batch j+1's.
+                for ((tile, bucket), payload) in chunk[start..end].iter().zip(payloads) {
+                    if let Err(e) = writer.add_tile_full(
+                        &tile.id,
+                        tile.time_start,
+                        tile.time_end,
+                        Some(tile.cover_t_min),
+                        tile.feature_count(),
+                        *bucket,
+                        &payload,
+                    ) {
+                        flush_err = Some(e);
+                        break;
+                    }
+                    on_written();
+                }
+            });
+            if let Some(e) = flush_err.take() {
+                return Err(e.into());
             }
-            for ((tile, bucket), payload) in chunk[start..end].iter().zip(payloads) {
-                writer.add_tile_full(
-                    &tile.id,
-                    tile.time_start,
-                    tile.time_end,
-                    Some(tile.cover_t_min),
-                    tile.feature_count(),
-                    *bucket,
-                    &payload,
-                )?;
-                on_written();
-            }
+            pending = next?;
             start = end;
         }
+    }
+    // TB-11 extension 2: the pool has joined, so the observation is settled.
+    // Declared on the writer rather than returned, because the writer is what
+    // finalizes the manifest and it already owns the capability set.
+    if feature_anchored.load(std::sync::atomic::Ordering::Relaxed) {
+        writer.declare_capability(stt_core::pack::CAPABILITY_VERTEX_TIME_FEATURE_ANCHOR);
     }
     Ok(())
 }
@@ -1751,8 +2206,23 @@ pub fn write_tiles_parallel(
     workers: usize,
     on_written: impl FnMut() + Send,
 ) -> Result<()> {
+    // Base bucket unknown at this entry point ⇒ TB-11 scaling is inert, which
+    // is the byte-identical default.
+    write_tiles_parallel_with_base_bucket(writer, tiles, workers, 0, on_written)
+}
+
+/// [`write_tiles_parallel`] told the archive's BASE temporal bucket, so TB-11
+/// can scale a coarse tier tile's per-vertex time ceiling proportionally.
+/// `base_bucket_ms == 0` disables the scaling entirely.
+pub fn write_tiles_parallel_with_base_bucket(
+    writer: &mut stt_core::PackWriter,
+    tiles: &[(&GeneratedTile, Option<u64>)],
+    workers: usize,
+    base_bucket_ms: u64,
+    on_written: impl FnMut() + Send,
+) -> Result<()> {
     let pool = build_pool(workers)?;
-    pool.install(|| encode_and_add_tiles(writer, tiles, on_written))
+    pool.install(|| encode_and_add_tiles(writer, tiles, base_bucket_ms, on_written))
 }
 
 /// Stream generated tiles straight into a packed-format [`stt_core::PackWriter`].
@@ -1783,7 +2253,7 @@ impl TileWriter for stt_core::PackWriter {
     /// and strictly ordered hand-off — see [`encode_and_add_tiles`].
     fn write_tiles(&mut self, tiles: &[&GeneratedTile]) -> Result<()> {
         let tagged: Vec<(&GeneratedTile, Option<u64>)> = tiles.iter().map(|t| (*t, None)).collect();
-        encode_and_add_tiles(self, &tagged, || {})
+        encode_and_add_tiles(self, &tagged, 0, || {})
     }
 }
 
@@ -1830,6 +2300,7 @@ mod tests {
             .cloned()
             .and_then(crate::props::FeatureProperties::from_map);
         ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::Point(vec![lon, lat]))),
@@ -1926,6 +2397,7 @@ mod tests {
             .collect();
         let first = coords[0].clone();
         ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::LineString(coords))),
@@ -1967,6 +2439,7 @@ mod tests {
         // Flat vertex-major matrix: nverts * num_buckets.
         let matrix: Vec<f32> = (0..nverts * num_buckets).map(|i| i as f32).collect();
         let feature = ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::LineString(coords))),
@@ -1990,6 +2463,8 @@ mod tests {
             temporal_bucket_ms: bucket_ms,
             clip_trajectories: true,
             clip_min_vertices: 2,
+            clip_buffer_px: crate::clip::DEFAULT_CLIP_BUFFER_PX,
+            clip_buffer_degrees: None,
             ..TileConfig::default()
         };
 
@@ -2155,6 +2630,74 @@ mod tests {
     /// unit-level pin for the E1 "parallel encode, deterministic write order"
     /// contract.
     #[test]
+    /// **TB-13 pin.** The pipelined encode/flush path is BYTE-NEUTRAL.
+    ///
+    /// The unbudgeted path was already covered by
+    /// `parallel_encode_writes_byte_identical_dataset`; this one forces a SMALL
+    /// memory budget so the two-half pipeline (encode batch j+1 while flushing
+    /// batch j) is the code actually under test, and sweeps worker counts so a
+    /// scheduling-order dependence would show up as a hash mismatch.
+    ///
+    /// Byte-neutrality is the whole claim of TB-13: batch boundaries cannot
+    /// change output bytes, because per-tile encoding is deterministic and the
+    /// hand-off ORDER is unchanged.
+    #[test]
+    fn pipelined_encode_is_byte_identical_under_a_small_budget() {
+        let hour = 3_600_000u64;
+        let mut features = Vec::new();
+        for i in 0..240u64 {
+            let lon = -122.45 + (i % 12) as f64 * 0.01;
+            let lat = 37.75 + (i / 12) as f64 * 0.01;
+            let ts = 1_600_000_000_000 + (i % 3) * hour + i * 1000;
+            features.push(point(lon, lat, ts));
+        }
+        let config = TileConfig {
+            min_zoom: 8,
+            max_zoom: 11,
+            temporal_bucket_ms: hour,
+            ..TileConfig::default()
+        };
+        let tiles = generate_tiles(&features, &config, 2).unwrap();
+        assert!(
+            tiles.len() > 8,
+            "want a multi-batch run, got {}",
+            tiles.len()
+        );
+
+        // Sequential reference, unbudgeted.
+        let dir_seq = tempfile::tempdir().unwrap();
+        let mut w_seq =
+            PackWriter::create(dir_seq.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
+        for tile in &tiles {
+            w_seq.write_tile(tile).unwrap();
+        }
+        let m_seq = w_seq.finalize(&Metadata::new("tb13")).unwrap();
+
+        let tagged: Vec<(&GeneratedTile, Option<u64>)> = tiles.iter().map(|t| (t, None)).collect();
+
+        // A budget small enough that the cap is reached repeatedly, so the
+        // pipeline actually cycles rather than degenerating to one batch.
+        for workers in [1usize, 4] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024)
+                .expect("small-budget writer");
+            let mut written = 0usize;
+            write_tiles_parallel(&mut w, &tagged, workers, || written += 1).unwrap();
+            assert_eq!(written, tiles.len(), "workers={workers}");
+            let m = w.finalize(&Metadata::new("tb13")).unwrap();
+
+            assert_eq!(
+                m_seq.directory.key, m.directory.key,
+                "directory hash differs at workers={workers} — the pipeline is not byte-neutral"
+            );
+            assert_eq!(
+                m_seq.packs.iter().map(|p| &p.key).collect::<Vec<_>>(),
+                m.packs.iter().map(|p| &p.key).collect::<Vec<_>>(),
+                "pack hashes differ at workers={workers}"
+            );
+        }
+    }
+
     fn parallel_encode_writes_byte_identical_dataset() {
         let hour = 3_600_000u64;
         let mut features = Vec::new();
@@ -2247,6 +2790,8 @@ mod tests {
             temporal_bucket_ms: 3_600_000,
             clip_trajectories: true,
             clip_min_vertices: 2,
+            clip_buffer_px: crate::clip::DEFAULT_CLIP_BUFFER_PX,
+            clip_buffer_degrees: None,
             ..TileConfig::default()
         };
 
@@ -2305,6 +2850,8 @@ mod tests {
             temporal_lod: vec![TemporalLodLevel {
                 bucket_ms: day,
                 max_zoom_level: 9,
+                contract: None,
+                method: None,
             }],
             ..TileConfig::default()
         };
@@ -2340,6 +2887,8 @@ mod tests {
             temporal_lod: vec![TemporalLodLevel {
                 bucket_ms: day,
                 max_zoom_level: 4,
+                contract: None,
+                method: None,
             }],
             ..TileConfig::default()
         };
@@ -2368,6 +2917,8 @@ mod tests {
             temporal_lod: vec![TemporalLodLevel {
                 bucket_ms: 3_600_000 + 1, // not a multiple
                 max_zoom_level: 6,
+                contract: None,
+                method: None,
             }],
             ..TileConfig::default()
         };
@@ -2384,10 +2935,14 @@ mod tests {
                 TemporalLodLevel {
                     bucket_ms: 24 * 3_600_000,
                     max_zoom_level: 6,
+                    contract: None,
+                    method: None,
                 },
                 TemporalLodLevel {
                     bucket_ms: 2 * 3_600_000,
                     max_zoom_level: 6,
+                    contract: None,
+                    method: None,
                 },
             ],
             ..TileConfig::default()
@@ -2414,6 +2969,8 @@ mod tests {
             temporal_lod: vec![TemporalLodLevel {
                 bucket_ms: day,
                 max_zoom_level: 9,
+                contract: None,
+                method: None,
             }],
             ..TileConfig::default()
         };
@@ -2432,6 +2989,8 @@ mod tests {
             .with_temporal_lod(vec![TemporalLodLevel {
                 bucket_ms: day,
                 max_zoom_level: 9,
+                contract: None,
+                method: None,
             }])
             .unwrap();
         writer.finalize(&metadata).unwrap();
@@ -2464,6 +3023,7 @@ mod tests {
             .collect();
         let first = coords[0].clone();
         let feat = ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::LineString(coords))),
@@ -2573,6 +3133,333 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // TB-10 — exact balanced partition + shared boundary snapping
+    // ------------------------------------------------------------------
+
+    /// Exhaustive optimality: for every small atom multiset and every `k`, the
+    /// partition's largest window must equal the true optimum found by brute
+    /// force over all contiguous cut placements.
+    #[test]
+    fn the_partition_is_exactly_min_max_against_brute_force() {
+        fn brute_force(atoms: &[usize], k: usize) -> usize {
+            let m = atoms.len();
+            if k >= m {
+                return *atoms.iter().max().unwrap_or(&0);
+            }
+            // Every way to choose k-1 interior cuts from m-1 positions.
+            let mut best = usize::MAX;
+            let positions = m - 1;
+            for mask in 0u32..(1u32 << positions) {
+                if mask.count_ones() as usize != k - 1 {
+                    continue;
+                }
+                let mut worst = 0usize;
+                let mut acc = 0usize;
+                for i in 0..m {
+                    acc += atoms[i];
+                    if i < positions && (mask >> i) & 1 == 1 {
+                        worst = worst.max(acc);
+                        acc = 0;
+                    }
+                }
+                worst = worst.max(acc);
+                best = best.min(worst);
+            }
+            best
+        }
+
+        // A deterministic spread of shapes: uniform, spiky, and heavy-tailed.
+        let cases: Vec<Vec<usize>> = vec![
+            vec![1, 1, 1, 1, 1, 1],
+            vec![5, 1, 1, 1, 1, 5],
+            vec![1, 9, 1, 1, 1],
+            vec![3, 3, 3, 3],
+            vec![7],
+            vec![2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+            vec![1, 2, 3, 4, 5, 6, 7],
+            vec![10, 1, 1, 10, 1, 1],
+        ];
+        for atoms in &cases {
+            for k in 1..=atoms.len() {
+                let cuts = partition_atoms_min_max(atoms, k);
+                // Structural: a genuine contiguous cover of every atom.
+                assert_eq!(cuts[0], 0);
+                assert_eq!(*cuts.last().unwrap(), atoms.len());
+                assert!(cuts.windows(2).all(|w| w[0] <= w[1]), "cuts not monotone");
+
+                let sizes: Vec<usize> = cuts
+                    .windows(2)
+                    .map(|w| atoms[w[0]..w[1]].iter().sum::<usize>())
+                    .collect();
+                assert_eq!(
+                    sizes.iter().copied().max().unwrap_or(0),
+                    brute_force(atoms, k),
+                    "not optimal for atoms={atoms:?} k={k}: cuts={cuts:?}"
+                );
+                // No window may be EMPTY. Optimality on the maximum alone is
+                // satisfied by a front-loaded partition that starves the tail —
+                // the incumbent greedy's exact failure — so the minimum is
+                // pinned too, or the fix would silently regress.
+                assert!(
+                    sizes.iter().all(|&s| s > 0),
+                    "empty window for atoms={atoms:?} k={k}: sizes={sizes:?}"
+                );
+            }
+        }
+    }
+
+    /// Dominance: because `k` is taken from the greedy, the greedy's own
+    /// partition is always feasible, so the exact solution can never produce a
+    /// LARGER maximum window. Checked over bursty inputs, where the greedy's
+    /// trailing runt is worst.
+    #[test]
+    fn the_exact_partition_never_loses_to_the_greedy_on_bursty_input() {
+        for seed in 0..40u64 {
+            // A crude deterministic LCG — bursts of repeated timestamps.
+            let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 33) as usize
+            };
+            let mut features: Vec<ParsedFeature> = Vec::new();
+            let mut t = 1_700_000_000_000u64;
+            for _ in 0..25 {
+                let burst = 1 + next() % 9;
+                for _ in 0..burst {
+                    features.push(point(-122.45, 37.75, t));
+                }
+                t += 60_000 * (1 + next() % 5) as u64;
+            }
+            let refs: Vec<&ParsedFeature> = features.iter().collect();
+            let tf: Vec<TileFeature<'_>> = refs.into_iter().map(TileFeature::Original).collect();
+
+            let target = 7u32;
+            let greedy = chunk_adaptive_by_count(tf.clone(), target);
+            let mut collisions = 0;
+            let exact = chunk_adaptive_dp(tf, target, &[], &mut collisions);
+
+            let gmax = greedy.iter().map(|(_, c)| c.len()).max().unwrap_or(0);
+            let emax = exact.iter().map(|(_, c)| c.len()).max().unwrap_or(0);
+            assert!(
+                emax <= gmax,
+                "seed {seed}: exact max window {emax} exceeded greedy {gmax}"
+            );
+            // Losslessness, and no atom split across windows.
+            let total: usize = exact.iter().map(|(_, c)| c.len()).sum();
+            assert_eq!(total, features.len(), "seed {seed}: features lost");
+            let mut seen_ts = std::collections::HashSet::new();
+            for (_, chunk) in &exact {
+                let ts: std::collections::HashSet<u64> =
+                    chunk.iter().map(|f| f.timestamp()).collect();
+                for t in ts {
+                    assert!(
+                        seen_ts.insert(t),
+                        "seed {seed}: timestamp {t} spans two windows — atom split"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Snapped keys come from the candidate set (or are an exact atom timestamp
+    /// when the snap would collide), and they stay strictly increasing.
+    #[test]
+    fn snapped_keys_are_candidates_or_the_documented_fallback() {
+        let boundaries: Vec<u64> = (0..8).map(|i| 1_700_000_000_000 + i * 600_000).collect();
+        let features: Vec<ParsedFeature> = (0..40u64)
+            .map(|i| point(-122.45, 37.75, 1_700_000_000_000 + i * 60_000))
+            .collect();
+        let refs: Vec<&ParsedFeature> = features.iter().collect();
+        let tf: Vec<TileFeature<'_>> = refs.into_iter().map(TileFeature::Original).collect();
+        let exact_ts: std::collections::HashSet<u64> =
+            features.iter().map(|f| f.timestamp).collect();
+
+        let mut collisions = 0;
+        let windows = chunk_adaptive_dp(tf, 5, &boundaries, &mut collisions);
+        let mut prev: Option<u64> = None;
+        for (key, _) in &windows {
+            assert!(
+                boundaries.contains(key) || exact_ts.contains(key),
+                "key {key} is neither a candidate boundary nor a real timestamp"
+            );
+            if let Some(p) = prev {
+                assert!(
+                    *key > p,
+                    "keys must be strictly increasing ({p} then {key})"
+                );
+            }
+            prev = Some(*key);
+        }
+    }
+
+    /// The cross-cell alignment claim, as a unit-level simulation.
+    ///
+    /// Two properties, and they are NOT the same strength:
+    ///
+    ///  * **Enumerability (the one that fixes the gotcha).** Every window key
+    ///    comes from the shared candidate set, so a prefetcher enumerating that
+    ///    set covers the cell without knowing its contents. This holds whenever
+    ///    the snap does not collide, and collisions are the documented, counted
+    ///    exception.
+    ///  * **Sharing.** Two neighbouring cells choose the SAME candidates. This
+    ///    is what actually collapses multi-cell fetches, and it is conditional:
+    ///    it holds for neighbours of comparable density and degrades as their
+    ///    densities diverge, because two cells with different window COUNTS
+    ///    cannot pick the same instants however the grid is drawn. The plan's
+    ///    >0.9 acceptance is stated unconditionally; it is met for comparable
+    ///    neighbours and not for strongly mismatched ones, and this test pins
+    ///    both so the limit is a measured fact rather than a surprise.
+    #[test]
+    fn adjacent_cells_share_window_keys_after_snapping() {
+        let t0 = 1_700_000_000_000u64;
+        // Candidate boundaries at 10-minute spacing over the timeline.
+        let boundaries: Vec<u64> = (0..64).map(|i| t0 + i * 600_000).collect();
+
+        let cell = |lon: f64, n: u64, phase: u64, step: u64| -> Vec<ParsedFeature> {
+            (0..n)
+                .map(|i| point(lon, 37.75, t0 + phase + i * step))
+                .collect()
+        };
+        let chunk = |feats: &[ParsedFeature], bounds: &[u64]| -> Vec<u64> {
+            let tf: Vec<TileFeature<'_>> = feats.iter().map(TileFeature::Original).collect();
+            let mut c = 0;
+            chunk_adaptive_dp(tf, 12, bounds, &mut c)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        };
+        let share = |a: &[ParsedFeature], b: &[ParsedFeature], bounds: &[u64]| -> (usize, f64) {
+            let ka: std::collections::BTreeSet<u64> = chunk(a, bounds).into_iter().collect();
+            let kb: std::collections::BTreeSet<u64> = chunk(b, bounds).into_iter().collect();
+            let shared = ka.intersection(&kb).count();
+            let denom = ka.len().min(kb.len()).max(1);
+            (shared, shared as f64 / denom as f64)
+        };
+
+        // ── Enumerability: every key is a candidate, for both cells. ──────────
+        let dense = cell(-122.45, 120, 0, 60_000);
+        let sparse = cell(-122.40, 90, 17_000, 80_000);
+        for feats in [&dense, &sparse] {
+            let keys = chunk(feats, &boundaries);
+            let from_set = keys.iter().filter(|k| boundaries.contains(k)).count();
+            assert_eq!(
+                from_set,
+                keys.len(),
+                "every key should come from the candidate set: {keys:?}"
+            );
+        }
+
+        // ── Sharing, comparable neighbours: the plan's >0.9 acceptance. ───────
+        let near = cell(-122.40, 118, 3_000, 61_000);
+        let (_, close_frac) = share(&dense, &near, &boundaries);
+        assert!(
+            close_frac > 0.9,
+            "comparable-density neighbours should share >90% of keys, got {close_frac:.2}"
+        );
+
+        // ── Sharing, mismatched neighbours: better than nothing, below 0.9. ───
+        let (snapped_shared, mismatch_frac) = share(&dense, &sparse, &boundaries);
+        let (raw_shared, _) = share(&dense, &sparse, &[]);
+        assert_eq!(
+            raw_shared, 0,
+            "unsnapped, two cells invent their own instants and share nothing"
+        );
+        assert!(
+            snapped_shared > raw_shared,
+            "snapping must strictly increase sharing ({snapped_shared} vs {raw_shared})"
+        );
+        // Recorded, not asserted upward: this is the measured ceiling for
+        // strongly mismatched neighbours under a fixed candidate grid.
+        assert!(
+            mismatch_frac > 0.4,
+            "mismatched neighbours still share a substantial fraction, got {mismatch_frac:.2}"
+        );
+    }
+
+    /// Determinism: the partition and the snapping are pure functions of their
+    /// inputs, so a rebuild is identical — including under a shuffled input,
+    /// since the chunker sorts first.
+    #[test]
+    fn adaptive_chunking_is_deterministic_under_input_permutation() {
+        let t0 = 1_700_000_000_000u64;
+        let boundaries: Vec<u64> = (0..32).map(|i| t0 + i * 300_000).collect();
+        let features: Vec<ParsedFeature> = (0..77u64)
+            .map(|i| point(-122.45, 37.75, t0 + (i % 40) * 90_000))
+            .collect();
+
+        let run = |order: &[usize]| -> Vec<(u64, usize)> {
+            let tf: Vec<TileFeature<'_>> = order
+                .iter()
+                .map(|&i| TileFeature::Original(&features[i]))
+                .collect();
+            let mut c = 0;
+            chunk_adaptive_dp(tf, 9, &boundaries, &mut c)
+                .into_iter()
+                .map(|(k, chunk)| (k, chunk.len()))
+                .collect()
+        };
+
+        let forward: Vec<usize> = (0..features.len()).collect();
+        let backward: Vec<usize> = (0..features.len()).rev().collect();
+        assert_eq!(run(&forward), run(&backward));
+        assert_eq!(run(&forward), run(&forward));
+    }
+
+    /// The rollback flag really restores the incumbent greedy.
+    #[test]
+    fn adaptive_greedy_rollback_reproduces_the_incumbent_windows() {
+        let t0 = 1_700_000_000_000u64;
+        let features: Vec<ParsedFeature> = (0..53u64)
+            .map(|i| point(-122.45, 37.75, t0 + i * 60_000))
+            .collect();
+        let base = TileConfig {
+            min_zoom: 8,
+            max_zoom: 8,
+            layer_name: "default".to_string(),
+            temporal_bucket_ms: 3_600_000,
+            clip_trajectories: false,
+            adaptive_target_features: Some(10),
+            ..TileConfig::default()
+        };
+        let greedy_cfg = TileConfig {
+            adaptive_greedy: true,
+            ..base.clone()
+        };
+        let tiles = generate_tiles(&features, &greedy_cfg, 1).unwrap();
+
+        let tf: Vec<TileFeature<'_>> = features.iter().map(TileFeature::Original).collect();
+        let expected = chunk_adaptive_by_count(tf, 10);
+        let mut got: Vec<(i64, usize)> = tiles
+            .iter()
+            .map(|t| (t.time_start, t.feature_count() as usize))
+            .collect();
+        got.sort();
+        let mut want: Vec<(i64, usize)> =
+            expected.iter().map(|(k, c)| (*k as i64, c.len())).collect();
+        want.sort();
+        assert_eq!(got, want);
+
+        // ...and the default (exact) path really is a different partition here.
+        let exact_tiles = generate_tiles(&features, &base, 1).unwrap();
+        let mut exact_sizes: Vec<usize> = exact_tiles
+            .iter()
+            .map(|t| t.feature_count() as usize)
+            .collect();
+        exact_sizes.sort_unstable();
+        let mut greedy_sizes: Vec<usize> = got.iter().map(|(_, n)| *n).collect();
+        greedy_sizes.sort_unstable();
+        assert_ne!(
+            exact_sizes, greedy_sizes,
+            "53 features at target 10 should rebalance (greedy leaves a runt)"
+        );
+        // Losslessness on both paths.
+        assert_eq!(exact_sizes.iter().sum::<usize>(), 53);
+        assert_eq!(greedy_sizes.iter().sum::<usize>(), 53);
+    }
+
+    // ------------------------------------------------------------------
     // Time-aware (SED) simplification (WS-8)
     // ------------------------------------------------------------------
 
@@ -2588,6 +3475,8 @@ mod tests {
             simplify: true,
             time_aware_simplify: true,
             simplify_max_zoom: 14,
+            // Explicitly the legacy degree table: this test predates TB-8 and
+            // pins the time-aware path, not the tolerance model.
             simplify_metric: false,
             ..TileConfig::default()
         };
@@ -2641,12 +3530,47 @@ mod tests {
         assert_eq!(total, 30, "no budget => no features dropped");
     }
 
+    #[test]
+    fn layer_construction_failure_aborts_tile_instead_of_dropping_it() {
+        let invalid_line = ParsedFeature {
+            home_zoom: None,
+            geojson: Feature {
+                bbox: None,
+                geometry: Some(Geometry::new(GeomValue::LineString(Vec::new()))),
+                id: None,
+                properties: None,
+                foreign_members: None,
+            },
+            shared_properties: None,
+            timestamp: 1_700_000_000_000,
+            end_timestamp: None,
+            vertex_timestamps: None,
+            vertex_values: None,
+            vertex_value_matrix: None,
+            lon: -122.4,
+            lat: 37.75,
+        };
+        let assigned = [TileFeature::Original(&invalid_line)];
+        let error = build_tile(
+            TileId::new(10, 0, 0, invalid_line.timestamp),
+            &assigned,
+            &TileConfig::default(),
+            invalid_line.timestamp as i64,
+            invalid_line.timestamp as i64,
+        )
+        .err()
+        .expect("invalid layer must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("failed to build layer"), "{message}");
+        assert!(message.contains("whole feature"), "{message}");
+    }
+
     /// `--maximum-tile-features` caps the per-tile count and drops the surplus.
     #[test]
     fn maximum_tile_features_caps_feature_count() {
         let (features, mut config) = dense_single_tile_features(30);
         config.tile_budget = Some(
-            TileBudget::new(usize::MAX, usize::MAX, 10)
+            TileBudget::new(usize::MAX, 10)
                 .with_scorer(stt_core::budget::ImportanceScorer::Combined),
         );
         let tiles = generate_tiles(&features, &config, 1).unwrap();
@@ -2663,7 +3587,7 @@ mod tests {
     #[test]
     fn budget_under_cap_is_noop() {
         let (features, mut config) = dense_single_tile_features(5);
-        config.tile_budget = Some(TileBudget::new(usize::MAX, usize::MAX, 10));
+        config.tile_budget = Some(TileBudget::new(usize::MAX, 10));
         let tiles = generate_tiles(&features, &config, 1).unwrap();
         let total: u32 = tiles.iter().map(|t| t.feature_count()).sum();
         assert_eq!(total, 5, "under-cap tile keeps every feature");
@@ -2675,7 +3599,7 @@ mod tests {
     fn maximum_tile_bytes_drops_to_fit() {
         let (features, mut config) = dense_single_tile_features(30);
         // ~48 bytes per point estimate; a 200-byte cap keeps only a few.
-        config.tile_budget = Some(TileBudget::new(200, 200, usize::MAX));
+        config.tile_budget = Some(TileBudget::new(200, usize::MAX));
         let tiles = generate_tiles(&features, &config, 1).unwrap();
         let total: u32 = tiles.iter().map(|t| t.feature_count()).sum();
         assert!(total < 30, "byte cap must drop some features, kept {total}");
@@ -2702,6 +3626,7 @@ mod tests {
     fn polygon_feature(rings: Vec<Vec<Vec<f64>>>, ts: u64) -> ParsedFeature {
         let first = rings[0][0].clone();
         ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::Polygon(rings))),
@@ -2882,6 +3807,7 @@ mod tests {
         let coords = vec![vec![-0.1, 0.05], vec![0.1, 0.05]];
         let first = coords[0].clone();
         let feat = ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::LineString(coords))),
@@ -2935,6 +3861,7 @@ mod tests {
         use stt_core::arrow_tile::GeometryColumn;
         let members = vec![vec![-0.1, 0.05], vec![0.1, 0.05]];
         let feat = ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::MultiPoint(members.clone()))),
@@ -2988,6 +3915,7 @@ mod tests {
             vec![vec![-0.1, 0.02], vec![0.1, 0.02]],
         ];
         let feat = ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::MultiLineString(parts))),
@@ -3265,6 +4193,7 @@ mod tests {
             vec![-2.0, 10.0],
         ]];
         let feature = ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::MultiPolygon(vec![

@@ -183,26 +183,28 @@ const MAX_SUPPORTED_ZOOM: u8 = 18;
 /// `WORLD_CIRCUMFERENCE_M / 2^z`.
 const WORLD_CIRCUMFERENCE_M: f64 = 40_075_016.686;
 
+/// Bounding extent (degrees, either axis) at or above which zoom 0 is a
+/// legitimate overview level and no floor is raised.
+///
+/// ⚠️ Mirrors `doctor::Z0_EXTENT_DEG`, deliberately. The post-build `z0-bomb`
+/// lint fires on exactly the complementary condition — a shallow pyramid under
+/// bounds spanning less than this in BOTH axes — so keeping the two equal is
+/// what makes "build the recommended recipe, then run `stt-optimize doctor` on
+/// it" come out clean. (`doctor.rs` keeps its own copy because that module is
+/// the post-build side of the same rule and this crate does not re-export
+/// either; if one moves, move both.)
+const OVERVIEW_EXTENT_DEG: f64 = 2.0;
+
+/// Lowest zoom the small-extent overview raise will ever recommend.
+/// Mirrors `doctor::Z0_MIN_ZOOM` — see [`OVERVIEW_EXTENT_DEG`].
+const OVERVIEW_MIN_ZOOM: u8 = 4;
+
 /// Recommend min and max zoom levels based on coverage and feature density.
 fn recommend_zoom_levels(
     coverage: &[ZoomCoverage],
     data: &LoadedData,
     total_features: usize,
 ) -> (u8, u8) {
-    // ---- Min zoom -------------------------------------------------------
-    // Find min zoom: the coarsest level that still aggregates meaningfully.
-    // Start from zoom 0 and go up until average features per tile drops too low.
-    let mut min_zoom = 0u8;
-    for cov in coverage.iter() {
-        // If average features per tile drops below 2, we are too zoomed in to
-        // be a useful *minimum* (overview) level; back off one.
-        if cov.avg_features_per_tile < 2.0 && cov.zoom > 0 {
-            min_zoom = cov.zoom.saturating_sub(1);
-            break;
-        }
-        min_zoom = cov.zoom;
-    }
-
     // ---- Max zoom (density-derived, Tippecanoe `-zg` style) -------------
     // Pick the zoom at which features sit roughly one tile apart, so detail is
     // preserved without generating wastefully deep, near-empty tiles.
@@ -224,15 +226,95 @@ fn recommend_zoom_levels(
         }
     }
 
-    // Ensure min <= max
-    if min_zoom > max_zoom {
-        min_zoom = 0;
-    }
-
     // Cap at the analyzed window.
     max_zoom = max_zoom.min(MAX_SUPPORTED_ZOOM);
 
+    // ---- Min zoom (the overview floor) ---------------------------------
+    let min_zoom = overview_min_zoom(&data.bounds, max_zoom);
+
     (min_zoom, max_zoom)
+}
+
+/// The coarsest zoom worth generating: the dataset's overview floor.
+///
+/// # What a minimum zoom is for
+///
+/// Every zoom level in `[min_zoom, max_zoom]` re-tiles the WHOLE dataset — the
+/// archive carries one full copy of every feature per level. So `min_zoom`
+/// answers exactly one question: below which zoom does an extra full copy stop
+/// buying anything a viewer can see? Coarser than the level at which the data
+/// covers about one tile, every level is the same near-duplicate blob; that is
+/// the `z0-bomb` the post-build doctor already lints for, and this is the same
+/// arithmetic applied as advice *before* the build instead of as a complaint
+/// after it.
+///
+/// * Extent ≥ [`OVERVIEW_EXTENT_DEG`] in either axis ⇒ **0**. A continental or
+///   global dataset genuinely resolves structure at z0-z2, and every
+///   hand-written build recipe in `scripts/data-generation` for such data
+///   passes `--min-zoom 0` (wpc-fronts, GOES lightning, ECCO, MRMS).
+/// * Smaller extents ⇒ `ceil(log2(360 / extent°))`, the zoom whose tile is
+///   about as wide as the data, clamped into
+///   `[OVERVIEW_MIN_ZOOM, max_zoom]`.
+///
+/// # ⚠️ What this replaced, and why (F6)
+///
+/// The incumbent walked UP from z0 and returned the deepest zoom whose tiles
+/// still averaged ≥ 2 features — a MAXIMUM-shaped quantity wearing a minimum's
+/// name. On dense data it never terminated below the top of the scan window, so
+/// `min_zoom` either collapsed onto `max_zoom` (measured on the real corpus:
+/// wpc-fronts z8-8, osm-nyc z18-18, cpc-rainfall z11-11, bixi z18-18) or, when
+/// it overshot `max_zoom`, was reset to 0 by the `min > max` guard. Both
+/// outcomes are wrong, and the first is worse than wrong: a single-zoom
+/// recommendation is an archive that renders nothing at any other zoom, and it
+/// leaves the byte budget solver with no zoom level it is allowed to clamp —
+/// which is how `--target-size` came to have no effect at all. See
+/// [`crate::budget_solver::candidate_classes`].
+///
+/// The incumbent's computation is kept as
+/// [`legacy_deepest_aggregating_zoom`], exercised by the regression test that
+/// pins WHY it was not a minimum.
+fn overview_min_zoom(bounds: &stt_core::types::BoundingBox, max_zoom: u8) -> u8 {
+    let lon_ext = (bounds.max_lon - bounds.min_lon).abs();
+    let lat_ext = (bounds.max_lat - bounds.min_lat).abs();
+    if !lon_ext.is_finite() || !lat_ext.is_finite() {
+        return 0;
+    }
+    if lon_ext >= OVERVIEW_EXTENT_DEG || lat_ext >= OVERVIEW_EXTENT_DEG {
+        return 0;
+    }
+    // One axis of the world is 360° wide and a tile at z spans 360/2^z degrees,
+    // so this is the zoom whose tile first stops dwarfing the data.
+    let max_ext = lon_ext.max(lat_ext).max(1e-9);
+    let raw = (360.0 / max_ext).log2().ceil();
+    let raw = if raw.is_finite() {
+        raw as i64
+    } else {
+        i64::from(MAX_SUPPORTED_ZOOM)
+    };
+    // `OVERVIEW_MIN_ZOOM` mirrors the doctor's lower clamp. It is inert given
+    // the extent gate above (an extent under 2° already forces `raw >= 8`) and
+    // is kept so the two copies of this rule read identically.
+    let floor = raw.max(i64::from(OVERVIEW_MIN_ZOOM));
+    // Never above the deepest level the data supports: a floor past `max_zoom`
+    // would leave no zoom range at all.
+    floor.clamp(0, i64::from(max_zoom)) as u8
+}
+
+/// The incumbent min-zoom rule, kept for the regression test that documents why
+/// it was not one: it returns the DEEPEST zoom whose tiles still average ≥ 2
+/// features, i.e. a quantity that grows with density exactly like a *maximum*
+/// zoom does. See [`overview_min_zoom`].
+#[cfg(test)]
+fn legacy_deepest_aggregating_zoom(coverage: &[ZoomCoverage]) -> u8 {
+    let mut min_zoom = 0u8;
+    for cov in coverage.iter() {
+        if cov.avg_features_per_tile < 2.0 && cov.zoom > 0 {
+            min_zoom = cov.zoom.saturating_sub(1);
+            break;
+        }
+        min_zoom = cov.zoom;
+    }
+    min_zoom
 }
 
 /// Estimate the max zoom from the typical inter-feature spacing.
@@ -562,6 +644,88 @@ mod tests {
         assert_eq!(density_based_max_zoom(&data, 1), 0);
         let empty = make_data(&[]);
         assert_eq!(density_based_max_zoom(&empty, 0), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // The overview floor (F6): a minimum zoom that is actually a minimum
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn wide_extent_data_keeps_zoom_zero_as_its_overview_floor() {
+        // Continental and global extents resolve real structure at z0-z2, and
+        // every hand-written recipe in scripts/data-generation for such data
+        // passes `--min-zoom 0`.
+        for (name, bbox) in [
+            ("global", BoundingBox::new(-180.0, -85.0, 180.0, 85.0)),
+            ("conus", BoundingBox::new(-125.0, 24.0, -66.0, 50.0)),
+            // Exactly at the gate: 2.0° is "wide enough" (>=), like the doctor.
+            ("at-the-gate", BoundingBox::new(0.0, 0.0, 2.0, 0.5)),
+        ] {
+            assert_eq!(overview_min_zoom(&bbox, 12), 0, "{name}");
+        }
+    }
+
+    #[test]
+    fn tiny_extent_data_raises_the_floor_to_where_one_tile_covers_it() {
+        // A ~0.6° city bbox: a tile at z is 360/2^z degrees wide, so the first
+        // zoom whose tile stops dwarfing the data is ceil(log2(360/0.59)) = 10.
+        let nyc = BoundingBox::new(-74.05, 40.65, -73.46, 41.08);
+        assert_eq!(overview_min_zoom(&nyc, 18), 10);
+        // …and the floor never eats the whole range.
+        assert_eq!(overview_min_zoom(&nyc, 8), 8);
+        assert_eq!(overview_min_zoom(&nyc, 0), 0);
+
+        // A degenerate (zero-extent) bbox cannot divide: it must still return a
+        // usable floor rather than an infinity.
+        let dot = BoundingBox::new(1.0, 2.0, 1.0, 2.0);
+        assert!(overview_min_zoom(&dot, 14) <= 14);
+    }
+
+    #[test]
+    fn the_recommended_range_is_never_a_single_zoom_on_wide_data() {
+        // THE F6 REGRESSION. Before the overview floor existed, `analyze` on
+        // this shape returned min == max (measured on the real corpus:
+        // wpc-fronts z8-8, osm-nyc z18-18, cpc-rainfall z11-11), which left the
+        // `--target-size` solver with no zoom level it was allowed to clamp.
+        let mut pts = Vec::new();
+        for i in 0..60 {
+            for j in 0..40 {
+                // ~55° x 25° — a CONUS-shaped footprint.
+                pts.push((-125.0 + i as f64 * 0.95, 25.0 + j as f64 * 0.62));
+            }
+        }
+        let data = make_data(&pts);
+        let analysis = analyze(&data).unwrap();
+        assert_eq!(
+            analysis.recommended_min_zoom, 0,
+            "a continental extent must keep z0 as its overview level"
+        );
+        assert!(
+            analysis.recommended_max_zoom > analysis.recommended_min_zoom,
+            "a single-zoom recommendation ({}-{}) is an archive that renders at \
+             exactly one zoom and a budget solver with nothing to clamp",
+            analysis.recommended_min_zoom,
+            analysis.recommended_max_zoom
+        );
+
+        // …and the incumbent rule, kept verbatim, is why: it returns a value
+        // that RISES with density, so on this data it lands at or above the
+        // max zoom rather than below it.
+        let coverage: Vec<ZoomCoverage> = (0..=MAX_SUPPORTED_ZOOM)
+            .map(|z| analyze_zoom_level(&data, z))
+            .collect();
+        let legacy = legacy_deepest_aggregating_zoom(&coverage);
+        assert!(
+            legacy + 1 >= analysis.recommended_max_zoom,
+            "the incumbent min-zoom rule computed a maximum-shaped quantity — it should land at \
+             or just under the max zoom, leaving no clampable depth: {legacy} vs max {}",
+            analysis.recommended_max_zoom
+        );
+        assert!(
+            analysis.recommended_max_zoom - analysis.recommended_min_zoom
+                > analysis.recommended_max_zoom.saturating_sub(legacy),
+            "the overview floor must open up more clampable depth than the incumbent did"
+        );
     }
 
     #[test]

@@ -12,22 +12,21 @@ use super::columns::{
     build_vertex_time_array, build_vertex_value_array, group_vector_properties,
     infer_vertex_value_buckets,
 };
-use super::config::EncoderConfig;
+use super::config::{EncoderConfig, GlobalDictVerdict};
 use super::frame::{
     EndTimeForm, StartTimeForm, TileMeta, FRAME_ALIGN, FRAME_V2_ESCAPE, FRAME_V2_VERSION,
     LAYER_FRAME_VERSION, REF_KIND_INLINE, REF_KIND_NO_PROPS, REF_KIND_TEMPLATE_HASH,
     SECTION_CORE_BATCH, SECTION_INLINE_SCHEMA_CORE, SECTION_INLINE_SCHEMA_PROPS,
-    SECTION_PROPS_BATCH, SECTION_TILE_META, TIME_OFFSET_MS_KEY, VERTEX_TIME_ORIGIN_KEY,
-    VERTEX_TIME_STEP_KEY, VERTEX_VALUE_BUCKETS_KEY,
+    SECTION_PROPS_BATCH, SECTION_TILE_META, TIME_OFFSET_MS_KEY, VERTEX_TIME_FEATURE_STEP_KEY,
+    VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY, VERTEX_VALUE_BUCKETS_KEY,
 };
 use super::layer::{
     ColumnarLayer, GeometryColumn, PropertyColumn, VectorElem, GEOARROW_CRS_METADATA,
     GEOARROW_EXT_KEY, GEOARROW_EXT_META_KEY, TRIANGLES_METADATA_KEY,
 };
 use super::quantize::{
-    build_quantized_numeric, build_quantized_numeric_auto, validate_quantize_coords_m,
-    world_grid_affine, world_grid_affine_3d, AttrQuant, STT_QUANT_ATTR_META_KEY,
-    STT_QUANT_META_KEY,
+    build_quantized_numeric_for_column, validate_quantize_coords_m, world_grid_affine,
+    world_grid_affine_3d, AttrQuant, STT_QUANT_ATTR_META_KEY, STT_QUANT_META_KEY,
 };
 use crate::error::{Error, Result};
 use arrow::array::{
@@ -41,7 +40,336 @@ use arrow::ipc::{root_as_message, MessageHeader, MetadataVersion};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::sync::Arc;
+
+// Arrow IPC dictionaries add a schema/dictionary-message cost that dominates
+// tiny tile-local columns. Keep the estimate deliberately conservative: the
+// variable buffers are exact, while this allowance covers IPC framing and
+// alignment that is otherwise difficult to predict without encoding twice.
+//
+// This allowance is charged ONCE PER TILE, which is what makes it dominate a
+// sparse tile — and it is exactly the term that stops being true under the
+// dataset-global dictionary hoist, where one dictionary message serves the
+// whole dataset. See [`dataset_dictionary_is_smaller`], the dataset-scale
+// sibling of the comparison below, and the `global_pins` path in
+// [`build_layer_parts`], on which this constant is dead.
+const CATEGORICAL_DICTIONARY_IPC_OVERHEAD: usize = 192;
+
+pub(crate) fn categorical_dictionary_is_smaller(
+    values: &[Option<String>],
+    categories: &[String],
+) -> bool {
+    let plain_value_bytes = values
+        .iter()
+        .filter_map(Option::as_ref)
+        .map(String::len)
+        .sum::<usize>();
+    let dictionary_value_bytes = categories.iter().map(String::len).sum::<usize>();
+
+    // Utf8 uses an i32 offset per row plus one terminal offset. Dictionary
+    // values have their own offset buffer and UInt16 keys for every row.
+    let plain_bytes =
+        plain_value_bytes.saturating_add((values.len() + 1).saturating_mul(size_of::<i32>()));
+    let dictionary_bytes = dictionary_value_bytes
+        .saturating_add((categories.len() + 1).saturating_mul(size_of::<i32>()))
+        .saturating_add(values.len().saturating_mul(size_of::<u16>()))
+        .saturating_add(CATEGORICAL_DICTIONARY_IPC_OVERHEAD);
+
+    dictionary_bytes < plain_bytes
+}
+
+// ----------------------------------------------------------------------------
+// Dataset-global categorical verdicts (TB-3) and the dictionary hoist (TB-4)
+// ----------------------------------------------------------------------------
+
+/// The dataset-scale sibling of [`categorical_dictionary_is_smaller`]: the
+/// pre-compression surrogate applied to a COLUMN's dataset totals rather than to
+/// one tile's sample, for deriving a
+/// [`GlobalDictVerdict`](super::config::GlobalDictVerdict).
+///
+/// Two things change when the comparison moves from a tile to the dataset, and
+/// both push the verdict toward the dictionary:
+///
+/// 1. **The IPC allowance is charged once, not per tile.** Under the hoist the
+///    dictionary message is template-resident — one copy for the whole dataset —
+///    so the 192-byte per-tile allowance that dominates a sparse tile's
+///    arithmetic simply does not apply. It is still charged here, once, so the
+///    comparison stays conservative in the same direction it always was.
+/// 2. **The category list is counted once, not once per tile.** That is the
+///    43.9 %-of-uncompressed-bytes prize the hoist is chasing.
+///
+/// This is the FALLBACK derivation. The measured one is the trial-encode oracle
+/// (`stt_optimize::oracle`'s `Candidate::CategoricalDict`), which prices both
+/// forms POST-ZSTD over a real sample — the D4 correction, because a
+/// heavy-repeat `Utf8` column compresses far closer to its own dictionary than
+/// this arithmetic claims. Where the oracle is available its verdict wins; this
+/// function is what a caller with no sample reaches for.
+///
+/// **Boundary:** the result is a DATASET verdict. It must never be evaluated per
+/// tile — a verdict that depends on which rows a tile caught is precisely the
+/// §13.2 conformance-invariance violation the pin exists to remove.
+///
+/// - `total_value_bytes` / `values`: summed UTF-8 length of every non-null value
+///   in the column, and the number of rows (null or not) across the dataset.
+/// - `category_bytes` / `categories`: summed UTF-8 length of the distinct
+///   category set, and its cardinality.
+pub fn dataset_dictionary_is_smaller(
+    total_value_bytes: u64,
+    values: u64,
+    category_bytes: u64,
+    categories: u64,
+) -> bool {
+    // Utf8: one i32 offset per row plus one terminal offset, and every value's
+    // bytes. Dictionary: the category set's bytes and offsets ONCE, plus a
+    // UInt16 key per row, plus one IPC allowance for the single hoisted message.
+    let plain = total_value_bytes.saturating_add(values.saturating_add(1).saturating_mul(4));
+    let dictionary = category_bytes
+        .saturating_add(categories.saturating_add(1).saturating_mul(4))
+        .saturating_add(values.saturating_mul(2))
+        .saturating_add(CATEGORICAL_DICTIONARY_IPC_OVERHEAD as u64);
+    dictionary < plain
+}
+
+/// The largest pinned category list this encoder will dictionary-encode:
+/// `u16::MAX` entries, i.e. keys `0..=65_534`.
+///
+/// One below the full `UInt16` key space on purpose, and the bound is a READER
+/// contract rather than an arithmetic one. The TS reader publishes a categorical
+/// column as `{indices: Uint16Array, categories: string[]}` and spells "this row
+/// has no category" as the IN-BAND sentinel `0xffff`
+/// (`packages/core/src/tile.ts`), so a live key of 65_535 would be
+/// indistinguishable from a null. The incumbent per-tile builder can never mint
+/// one — `build_dictionary_indices` stops accepting new categories at
+/// `u16::MAX` — but pass 1's distinct-set cap is `MAX_CATEGORIES = 65_536`, one
+/// wider, so a *pinned* list can reach the sentinel where a tile-local one
+/// cannot. A pin above this bound degrades to `Utf8`, and does so for the WHOLE
+/// dataset: the degrade is a function of the pin, so one column is still one
+/// type everywhere and §13.2 holds.
+const MAX_PINNED_CATEGORIES: usize = u16::MAX as usize;
+
+/// The all-or-nothing rule, made unrepresentable.
+///
+/// TB-4 hoists a categorical column's category list out of every tile and into
+/// the schema TEMPLATE, which is only sound if the list is *provably* identical
+/// in every tile. The failure mode to design out is a PARTIAL hoist — a tile
+/// whose hoisted dictionary carries only the categories that tile happened to
+/// contain. That forks a template per category subset, which is strictly worse
+/// than not hoisting at all.
+///
+/// The module below is the entire enforcement mechanism: [`PinnedCategories`]
+/// wraps a borrowed slice whose field is private to this module, and the module
+/// exposes exactly one constructor, whose only input is a pin. There is no
+/// `From<Vec<String>>`, no constructor over tile values, and no way to shorten
+/// or filter one. A tile-local subset therefore cannot be *spelled* anywhere in
+/// this encoder, so it cannot be encoded — the rule is a property of the type,
+/// not of reviewer vigilance.
+mod pinned {
+    use super::{GlobalDictVerdict, MAX_PINNED_CATEGORIES};
+
+    /// A dataset-global category list, in the only form the hoist accepts: the
+    /// WHOLE list, borrowed straight out of the pin that declared it.
+    #[derive(Clone, Copy)]
+    pub(super) struct PinnedCategories<'a> {
+        /// PRIVATE to `mod pinned`, and that is the whole point — see the
+        /// module doc. Nothing outside these few lines can put a value here.
+        categories: &'a [String],
+    }
+
+    impl<'a> PinnedCategories<'a> {
+        /// The ONLY constructor. `None` means "do not dictionary-encode this
+        /// column anywhere in the dataset", for either of two reasons:
+        ///
+        /// - the pin is [`GlobalDictVerdict::Utf8`] — the dataset-scale verdict
+        ///   (or a pass-1 cap overflow) chose plain strings; or
+        /// - the pinned list exceeds [`MAX_PINNED_CATEGORIES`], which would
+        ///   collide with the reader's in-band null sentinel.
+        ///
+        /// Both are functions of the pin alone, so both are dataset-global.
+        pub(super) fn from_verdict(verdict: &'a GlobalDictVerdict) -> Option<Self> {
+            match verdict {
+                GlobalDictVerdict::Utf8 => None,
+                GlobalDictVerdict::Dictionary(categories) => {
+                    (categories.len() <= MAX_PINNED_CATEGORIES).then(|| PinnedCategories {
+                        categories: categories.as_slice(),
+                    })
+                }
+            }
+        }
+
+        /// The pinned list, verbatim and complete — first-seen order preserved.
+        pub(super) fn as_slice(self) -> &'a [String] {
+            self.categories
+        }
+    }
+}
+use pinned::PinnedCategories;
+
+/// How ONE categorical column is typed in EVERY tile of the dataset (TB-3).
+///
+/// The three arms are the whole contract, and the first two are dataset-global
+/// by construction: they are resolved from `EncoderConfig::global_pins` and from
+/// nothing else, so no property of the tile being encoded can reach them. That
+/// is the §13.2 invariance rule — a column's Arrow type is a function of the
+/// dataset DOMAIN, never of which rows a tile caught.
+enum CategoricalPlan<'a> {
+    /// Pinned dictionary: build against this exact global list in every tile,
+    /// including tiles holding a strict subset of it and tiles holding none of
+    /// it at all.
+    Dictionary(PinnedCategories<'a>),
+    /// Pinned `Utf8`: plain strings in every tile, and no dictionary message
+    /// anywhere in the dataset for this column.
+    Utf8,
+    /// UNPINNED — the incumbent per-tile size comparison
+    /// ([`categorical_dictionary_is_smaller`]). This is the documented fallback
+    /// that keeps the change additive and reversible: an encode with no pins
+    /// (`--single-pass`, a one-shot external caller, `stt-serve` without a pin
+    /// sidecar) is byte-identical to a pre-M2 encode.
+    PerTile,
+}
+
+/// Resolve one categorical column's dataset-global plan from the config's pins.
+fn categorical_plan<'a>(cfg: &'a EncoderConfig, name: &str) -> CategoricalPlan<'a> {
+    let Some(verdict) = cfg
+        .global_pins
+        .as_deref()
+        .and_then(|pins| pins.dict.get(name))
+    else {
+        return CategoricalPlan::PerTile;
+    };
+    match PinnedCategories::from_verdict(verdict) {
+        Some(categories) => CategoricalPlan::Dictionary(categories),
+        None => CategoricalPlan::Utf8,
+    }
+}
+
+/// Build one categorical column against the PINNED dataset-global category
+/// list — the writer half of TB-4.
+///
+/// Every tile ships the same `DictionaryArray` value array (the full list, in
+/// dataset-wide first-seen order), so the Arrow `DictionaryBatch` message is
+/// byte-identical in every tile and can move into the schema template. Keys are
+/// `UInt16` indices into that list; a null value stays a null key.
+///
+/// A value absent from the pin is a HARD ERROR, never a silent degrade: it means
+/// pass 1 and the encoded feature stream disagree about the column's domain, and
+/// every downstream guarantee (one type everywhere, a constant dictionary
+/// message, a hoistable template) rests on them agreeing.
+fn build_pinned_dictionary_column(
+    name: &str,
+    values: &[Option<String>],
+    pinned: PinnedCategories<'_>,
+) -> Result<ArrayRef> {
+    let categories = pinned.as_slice();
+    // Lookup only — never iterated — so the HashMap contributes no ordering
+    // non-determinism to the output. `or_insert` keeps the FIRST index for a
+    // (malformed) duplicated pin entry, which is what a first-seen list means.
+    let mut lookup: HashMap<&str, u16> = HashMap::with_capacity(categories.len());
+    for (index, category) in categories.iter().enumerate() {
+        debug_assert!(
+            index <= u16::MAX as usize,
+            "bounded by MAX_PINNED_CATEGORIES"
+        );
+        lookup.entry(category.as_str()).or_insert(index as u16);
+    }
+
+    let mut indices: Vec<Option<u16>> = Vec::with_capacity(values.len());
+    for value in values {
+        match value {
+            None => indices.push(None),
+            Some(s) => match lookup.get(s.as_str()) {
+                Some(&index) => indices.push(Some(index)),
+                None => {
+                    return Err(Error::Other(format!(
+                        "categorical column '{name}' carries the value {s:?}, which is absent \
+                         from its dataset-global dictionary pin ({} categories). Pass-1 \
+                         statistics and the encoded features disagree about this column's \
+                         domain — re-run pass 1 over the same feature set, or fall back with \
+                         --single-pass.",
+                        categories.len()
+                    )))
+                }
+            },
+        }
+    }
+
+    let value_array: ArrayRef = Arc::new(StringArray::from(
+        categories
+            .iter()
+            .map(|s| Some(s.as_str()))
+            .collect::<Vec<_>>(),
+    ));
+    let key_array = UInt16Array::from(indices);
+    Ok(Arc::new(
+        DictionaryArray::<UInt16Type>::try_new(key_array, value_array).map_err(|e| {
+            Error::Other(format!("pinned dictionary build failed for '{name}': {e}"))
+        })?,
+    ))
+}
+
+/// Where a PROPS stream's Arrow `DictionaryBatch` messages belong.
+///
+/// This is TB-4's split decision, and it is deliberately a whole-STREAM verdict
+/// rather than a per-column one: the template/tail cut is a single byte offset
+/// into one IPC stream, so either every dictionary message before the record
+/// batch is dataset-constant and they all move, or none do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DictHoist {
+    /// Leave them in the per-tile TAIL — the incumbent split. Either the stream
+    /// carries no dictionary at all, or at least one of its dictionaries is
+    /// tile-local (an unpinned column that the per-tile surrogate happened to
+    /// dictionary-encode). Hoisting a tile-local dictionary would mint a
+    /// template per tile, which is far worse than not hoisting.
+    ///
+    /// **The mixed stream is designed out rather than tolerated here.** A
+    /// stream carrying one PINNED and one tile-local dictionary would land on
+    /// this arm and ship the pinned column's FULL dataset-global list in every
+    /// tile's tail, un-deduplicated — strictly worse than both alternatives.
+    /// [`unpinned_categoricals_take_utf8`] makes that combination unreachable,
+    /// so `Tail` now means only "no pin reached this stream at all".
+    Tail,
+    /// Every dictionary in the stream was built against a pinned dataset-global
+    /// list, so the messages are byte-identical across every tile of this layer
+    /// shape and belong in the TEMPLATE — stored once in `manifest.schemas`
+    /// instead of once per tile.
+    Template,
+}
+
+/// Does any categorical property column in this layer carry a pinned
+/// dictionary? If so, the columns that DON'T must take `Utf8` rather than a
+/// tile-local dictionary.
+///
+/// # The worst-of-both-worlds case this removes
+///
+/// The hoist is a whole-stream verdict (see [`DictHoist`]). Before this rule, a
+/// layer mixing a pinned column with an unpinned one whose per-tile surrogate
+/// happened to choose a dictionary fell to [`DictHoist::Tail`] — and `Tail`
+/// puts *every* DictionaryBatch in the tail, including the pinned one. The
+/// pinned column's whole dataset-global category list then rode in every single
+/// tile, once per tile, with no template dedup: bigger than the un-pinned
+/// encoding AND bigger than the hoisted one. The likeliest place to hit it is a
+/// summary/LOD tier, where derived columns are unpinned by design.
+///
+/// The unpinned column also re-introduces the very fork TB-3 exists to kill:
+/// its per-tile verdict flips with tile density, so the PROPS schema (and hence
+/// the template) differs between dense and sparse tiles.
+///
+/// Both are fixed by the same one-line rule, and the rule is invariance-safe:
+/// its input is the (config pins × layer column set) pair, never a tile's rows,
+/// so a column's Arrow type still cannot depend on which features a tile
+/// caught. It is also a no-op on the two common shapes — no pins at all
+/// (`--single-pass`, `stt-serve` without a sidecar) leaves every column on the
+/// incumbent per-tile path, and an all-pinned layer never had an unpinned
+/// column to demote.
+fn unpinned_categoricals_take_utf8(
+    cfg: &EncoderConfig,
+    props: &[(String, PropertyColumn)],
+) -> bool {
+    props.iter().any(|(name, col)| {
+        matches!(col, PropertyColumn::Categorical(_))
+            && matches!(categorical_plan(cfg, name), CategoricalPlan::Dictionary(_))
+    })
+}
 
 // ----------------------------------------------------------------------------
 // Encoding
@@ -142,6 +470,9 @@ struct LayerParts {
     end_time_form: Option<EndTimeForm>,
     /// `(origin_ms, step_ms)` of a delta-encoded `vertex_time` column.
     vertex_time_encoding: Option<(i64, u32)>,
+    /// `TILE_META.vtf` — TB-11 extension 2's feature-anchored step. Mutually
+    /// exclusive with [`Self::vertex_time_encoding`].
+    vertex_time_feature_step: Option<u32>,
     /// The `stt:vertex_value_buckets` schema key on the standalone IPC shape,
     /// `TILE_META.vb` in the layer frame.
     vertex_value_buckets: Option<u32>,
@@ -149,6 +480,11 @@ struct LayerParts {
     /// value column that shipped a `UInt16` leaf. Empty ⇒ raw `List<Float32>`.
     vertex_value_quant: BTreeMap<String, (f64, f64)>,
     has_triangles: bool,
+    /// TB-4: whether the PROPS stream's `DictionaryBatch` messages are provably
+    /// dataset-constant and so belong in the schema TEMPLATE rather than the
+    /// per-tile tail. Always [`DictHoist::Tail`] without pins, which is what
+    /// keeps an unpinned encode byte-identical to a pre-M2 one.
+    props_dict_hoist: DictHoist,
 }
 
 /// Pick the compact form of a layer's two feature-time columns from that
@@ -355,9 +691,13 @@ fn build_layer_parts(
     // Track per-layer vertex-time encoding so the schema metadata (set
     // below) records the origin/step needed for the u16-delta reader path.
     let mut vertex_time_encoding: Option<(i64, u32)> = None;
-    if let Some(vt_col) =
-        build_vertex_time_array(&layer.vertex_times, n, cfg.vertex_time_max_step_ms)
-    {
+    let mut vertex_time_feature_step: Option<u32> = None;
+    if let Some(vt_col) = build_vertex_time_array(
+        &layer.vertex_times,
+        n,
+        cfg.vertex_time_max_step_ms,
+        &layer.start_times,
+    ) {
         fields.push(Arc::new(Field::new(
             "vertex_time",
             vt_col.array.data_type().clone(),
@@ -365,6 +705,7 @@ fn build_layer_parts(
         )));
         columns.push(vt_col.array);
         vertex_time_encoding = vt_col.encoding;
+        vertex_time_feature_step = vt_col.feature_anchored_step;
     }
 
     // Optional per-vertex scalar column (e.g. sea-surface temperature),
@@ -481,6 +822,15 @@ fn build_layer_parts(
     let grouped =
         group_vector_properties(&layer.properties, layer.feature_count(), &cfg.vector_groups);
     let props_iter: &[(String, PropertyColumn)] = grouped.as_deref().unwrap_or(&layer.properties);
+    // TB-4 bookkeeping: how many PROPS columns emit an Arrow dictionary, and how
+    // many of those were built against a pinned dataset-global list. The stream
+    // is hoistable only when the two agree and are non-zero.
+    let mut dict_columns = 0usize;
+    let mut pinned_dict_columns = 0usize;
+    // Whole-stream pre-pass: with any pin in play, an unpinned categorical
+    // column may not mint a tile-local dictionary. See
+    // [`unpinned_categoricals_take_utf8`] for the shape this designs out.
+    let demote_unpinned_categoricals = unpinned_categoricals_take_utf8(cfg, props_iter);
     for (name, col) in props_iter {
         // The point-elevation column now lives in the geometry's 3rd coordinate;
         // don't also emit it as a scalar property.
@@ -495,17 +845,17 @@ fn build_layer_parts(
                 // For a LiDAR `z` column this is the single largest size lever
                 // after `id` — a raw Float64 elevation barely compresses, while
                 // the i16 grid is both smaller and far more compressible.
-                let quantized = match cfg.quantize_attrs.get(name).copied().filter(|p| *p > 0.0) {
-                    Some(p) => build_quantized_numeric(values, p)?,
-                    None => None,
-                }
-                .or_else(|| {
-                    // No explicit precision — fall back to the configured
-                    // automatic range-adaptive quantization when enabled.
-                    cfg.quantize_attrs_auto
-                        .then(|| build_quantized_numeric_auto(values))
-                        .flatten()
-                });
+                //
+                // TB-2: the decision goes through the one dispatch that can see
+                // `cfg.global_pins`, so with pins attached the affine is the
+                // column's DATASET-global one and the same source value decodes
+                // to the same number in every tile. The precedence it applies is
+                // the incumbent's (explicit `--quantize-attr` wins, then auto,
+                // then Float64), and with `global_pins == None` — `--single-pass`,
+                // a one-shot external caller, a tile server with no pin sidecar
+                // — every branch of it is the per-tile function this line used to
+                // call directly, with the same arguments.
+                let quantized = build_quantized_numeric_for_column(name, values, cfg)?;
                 match quantized {
                     Some((array, affine_json)) => {
                         let mut m = HashMap::new();
@@ -522,25 +872,76 @@ fn build_layer_parts(
                 }
             }
             PropertyColumn::Categorical(values) => {
-                // Build a Dictionary<UInt16, Utf8>: deduplicate strings once
-                // here so the TS reader can lift the dictionary table out of
-                // the Arrow batch directly instead of rebuilding it per tile.
-                let (indices, categories) = build_dictionary_indices(values)?;
-                let key_type = DataType::UInt16;
-                let value_type = DataType::Utf8;
-                let dict_type = DataType::Dictionary(Box::new(key_type), Box::new(value_type));
-                fields.push(Arc::new(Field::new(name, dict_type, true)));
+                // TB-3: one column, ONE Arrow type, everywhere. With a pin the
+                // verdict is a function of the dataset's domain and the tile's
+                // own values cannot reach it; without one, the incumbent
+                // per-tile comparison below is unchanged. Exact strings are
+                // preserved on every branch.
+                let dict_type =
+                    || DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8));
+                let push_utf8 = |fields: &mut Vec<Arc<Field>>, columns: &mut Vec<ArrayRef>| {
+                    fields.push(Arc::new(Field::new(name, DataType::Utf8, true)));
+                    columns.push(Arc::new(StringArray::from_iter(
+                        values.iter().map(|value| value.as_deref()),
+                    )));
+                };
+                match categorical_plan(cfg, name) {
+                    // Pinned dictionary: the FULL global list in this tile too,
+                    // whatever subset of it the tile's rows use.
+                    CategoricalPlan::Dictionary(pinned) => {
+                        let array = build_pinned_dictionary_column(name, values, pinned)?;
+                        fields.push(Arc::new(Field::new(name, dict_type(), true)));
+                        columns.push(array);
+                        dict_columns += 1;
+                        pinned_dict_columns += 1;
+                    }
+                    // Pinned Utf8: no dictionary for this column, in any tile.
+                    CategoricalPlan::Utf8 => push_utf8(&mut fields, &mut columns),
+                    CategoricalPlan::PerTile => {
+                        // Dictionary batches carry meaningful fixed IPC
+                        // overhead. On sparse tiles (or high-cardinality
+                        // strings) plain Utf8 is smaller and avoids repeating a
+                        // tiny dictionary batch in every tile. Choose from the
+                        // actual tile values, preserving the exact strings
+                        // either way. A >UInt16 cardinality column falls back to
+                        // Utf8 instead of failing/dropping rows.
+                        //
+                        // ...unless a SIBLING column in this stream is pinned,
+                        // in which case a tile-local dictionary here would drag
+                        // the sibling's hoisted list back into every tile's
+                        // tail. Then the answer is `Utf8`, unconditionally.
+                        let dictionary = if demote_unpinned_categoricals {
+                            None
+                        } else {
+                            build_dictionary_indices(values).ok()
+                        };
+                        let use_dictionary = dictionary.as_ref().is_some_and(|(_, categories)| {
+                            categorical_dictionary_is_smaller(values, categories)
+                        });
+                        if use_dictionary {
+                            let (indices, categories) = dictionary.expect("checked above");
+                            fields.push(Arc::new(Field::new(name, dict_type(), true)));
 
-                let value_array: ArrayRef = Arc::new(StringArray::from(
-                    categories
-                        .iter()
-                        .map(|s| Some(s.as_str()))
-                        .collect::<Vec<_>>(),
-                ));
-                let key_array = UInt16Array::from(indices);
-                let dict = DictionaryArray::<UInt16Type>::try_new(key_array, value_array)
-                    .map_err(|e| Error::Other(format!("dictionary build failed: {e}")))?;
-                columns.push(Arc::new(dict));
+                            let value_array: ArrayRef = Arc::new(StringArray::from(
+                                categories
+                                    .iter()
+                                    .map(|s| Some(s.as_str()))
+                                    .collect::<Vec<_>>(),
+                            ));
+                            let key_array = UInt16Array::from(indices);
+                            let dict =
+                                DictionaryArray::<UInt16Type>::try_new(key_array, value_array)
+                                    .map_err(|e| {
+                                        Error::Other(format!("dictionary build failed: {e}"))
+                                    })?;
+                            columns.push(Arc::new(dict));
+                            // Tile-local contents: this stream is NOT hoistable.
+                            dict_columns += 1;
+                        } else {
+                            push_utf8(&mut fields, &mut columns);
+                        }
+                    }
+                }
             }
             PropertyColumn::Vector {
                 width,
@@ -596,9 +997,19 @@ fn build_layer_parts(
         start_time_form,
         end_time_form,
         vertex_time_encoding,
+        vertex_time_feature_step,
         vertex_value_buckets,
         vertex_value_quant,
         has_triangles,
+        // All-or-nothing across the whole PROPS stream: hoist only when there
+        // IS a dictionary and EVERY dictionary in the stream came from a pin.
+        // A single unpinned dictionary column keeps the incumbent split, so a
+        // mixed layer degrades to "no hoist" rather than to a per-tile template.
+        props_dict_hoist: if dict_columns > 0 && dict_columns == pinned_dict_columns {
+            DictHoist::Template
+        } else {
+            DictHoist::Tail
+        },
     })
 }
 
@@ -684,6 +1095,13 @@ fn assemble_layer_ipc_self_describing(parts: LayerParts) -> Result<Vec<u8>> {
         schema_meta.insert(VERTEX_TIME_ORIGIN_KEY.to_string(), origin.to_string());
         schema_meta.insert(VERTEX_TIME_STEP_KEY.to_string(), step.to_string());
     }
+    // TB-11 extension 2: the feature-anchored tier records only a step — the
+    // origin is each feature's own `start_time`, which already ships in CORE.
+    // A DISTINCT key, never a reshaped `vt`: a reader that knows only `vt`
+    // must not silently read these deltas against a layer origin it invented.
+    if let Some(step) = parts.vertex_time_feature_step {
+        schema_meta.insert(VERTEX_TIME_FEATURE_STEP_KEY.to_string(), step.to_string());
+    }
     if let Some(buckets) = parts.vertex_value_buckets {
         schema_meta.insert(VERTEX_VALUE_BUCKETS_KEY.to_string(), buckets.to_string());
     }
@@ -707,6 +1125,9 @@ pub(crate) struct EncodedLayerV2 {
     /// property columns (`ref_kind_props = 2`).
     pub(crate) props: Option<(Vec<u8>, Vec<u8>)>,
     pub(crate) tile_meta_json: String,
+    /// This layer used the TB-11 feature-anchored vertex-time form. Bubbles up
+    /// to [`EncodeObservations`] so the writer can declare the capability.
+    pub(crate) feature_anchored_vertex_times: bool,
 }
 
 /// Locate the end of the leading schema message by walking the Arrow IPC
@@ -745,6 +1166,73 @@ fn split_ipc_at_schema(ipc: &[u8]) -> Result<usize> {
         ));
     }
     Ok(boundary)
+}
+
+/// Locate the RecordBatch boundary of an Arrow IPC stream — i.e. the end of the
+/// leading schema message AND of every `DictionaryBatch` message that follows
+/// it. The template-hoisting sibling of [`split_ipc_at_schema`] (TB-4).
+///
+/// Everything before the returned offset (Schema + DictionaryBatch messages) is
+/// the template; everything after (RecordBatch + EOS) is the tail. That is only
+/// a legal cut when the dictionary contents are dataset-constant, which is why
+/// the caller gates it on [`DictHoist::Template`] — see [`build_layer_parts`].
+///
+/// The walk is exact, not heuristic: each message advances by
+/// `8 + metadata_len + bodyLength`, and arrow-rs guarantees `bodyLength` is
+/// already padded to the write alignment (`write_message` rejects an unaligned
+/// body outright), so the next message must begin exactly at that offset. Rather
+/// than assume it, every step re-checks the `0xFFFFFFFF` continuation marker and
+/// errors loudly on drift — a silently mis-cut template splices into a stream
+/// arrow-rs decodes as EMPTY, which is the one failure mode that must never be
+/// quiet.
+///
+/// A stream whose schema is followed immediately by its record batch (no
+/// dictionaries at all) returns exactly what [`split_ipc_at_schema`] returns, so
+/// the two agree wherever both are defined.
+pub(crate) fn split_ipc_after_dictionaries(ipc: &[u8]) -> Result<usize> {
+    let mut pos = split_ipc_at_schema(ipc)?;
+    loop {
+        if pos.checked_add(8).is_none_or(|end| end > ipc.len()) {
+            return Err(Error::Other(
+                "layer IPC stream ends after its schema/dictionary messages with no record \
+                 batch"
+                    .into(),
+            ));
+        }
+        if ipc[pos..pos + 4] != [0xFF, 0xFF, 0xFF, 0xFF] {
+            return Err(Error::Other(format!(
+                "layer IPC stream: the message at offset {pos} does not start with the \
+                 0xFFFFFFFF continuation marker (dictionary framing walk lost alignment)"
+            )));
+        }
+        let meta_len = i32::from_le_bytes(ipc[pos + 4..pos + 8].try_into().expect("4 bytes"));
+        if meta_len <= 0 {
+            // End-of-stream marker. Nothing but dictionaries preceded it, so
+            // the cut lands here and the tail is the bare EOS — which still
+            // begins with the continuation marker `splice_decode` demands.
+            return Ok(pos);
+        }
+        let header_end = (meta_len as usize)
+            .checked_add(8)
+            .and_then(|n| pos.checked_add(n))
+            .filter(|end| *end <= ipc.len())
+            .ok_or_else(|| Error::Other("layer IPC message metadata overruns the stream".into()))?;
+        let msg = root_as_message(&ipc[pos + 8..header_end])
+            .map_err(|e| Error::Other(format!("layer IPC message flatbuffer parse failed: {e}")))?;
+        if msg.header_type() != MessageHeader::DictionaryBatch {
+            // The first non-dictionary message (the RecordBatch) starts the tail.
+            return Ok(pos);
+        }
+        let body = usize::try_from(msg.bodyLength()).map_err(|_| {
+            Error::Other("layer IPC dictionary message declares a negative body length".into())
+        })?;
+        pos = header_end
+            .checked_add(body)
+            .filter(|next| *next <= ipc.len())
+            .ok_or_else(|| {
+                Error::Other("layer IPC dictionary message body overruns the stream".into())
+            })?;
+    }
 }
 
 /// Layer-frame row order: stable-sort rows by `start_time` at ENCODE time —
@@ -888,6 +1376,7 @@ pub(crate) fn encode_layer_v2_parts(
         vb: parts.vertex_value_buckets,
         vq: (!parts.vertex_value_quant.is_empty()).then(|| parts.vertex_value_quant.clone()),
         vt: parts.vertex_time_encoding,
+        vtf: parts.vertex_time_feature_step,
     };
     let tile_meta_json = serde_json::to_string(&tile_meta)
         .map_err(|e| Error::Other(format!("TILE_META encode failed: {e}")))?;
@@ -919,7 +1408,17 @@ pub(crate) fn encode_layer_v2_parts(
         let props_columns: Vec<ArrayRef> = parts.columns[parts.reserved_len..].to_vec();
         let props_schema = Arc::new(Schema::new(props_fields));
         let props_ipc = write_ipc_stream(props_schema, props_columns)?;
-        let boundary = split_ipc_at_schema(&props_ipc)?;
+        // TB-4: when every dictionary in this stream was built against a pinned
+        // dataset-global list, the DictionaryBatch messages are byte-identical
+        // in every tile — so the cut moves past them and the category list
+        // becomes template-resident (stored once per realized layer shape in
+        // `manifest.schemas`) instead of re-shipped in every tile's tail. This
+        // EXTENDS the TEMPLATE/TILE_META partition in its permitted direction:
+        // a provably-constant blob moves template-side, nothing per-tile does.
+        let boundary = match parts.props_dict_hoist {
+            DictHoist::Template => split_ipc_after_dictionaries(&props_ipc)?,
+            DictHoist::Tail => split_ipc_at_schema(&props_ipc)?,
+        };
         let tail = props_ipc[boundary..].to_vec();
         let mut template = props_ipc;
         template.truncate(boundary);
@@ -931,6 +1430,7 @@ pub(crate) fn encode_layer_v2_parts(
         core_tail,
         props,
         tile_meta_json,
+        feature_anchored_vertex_times: parts.vertex_time_feature_step.is_some(),
     })
 }
 
@@ -941,7 +1441,7 @@ pub(crate) fn encode_layer_v2_parts(
 /// `ipc_len` records the exact IPC byte length (padding excluded); readers
 /// derive the pad from alignment math alone.
 pub fn encode_tile(layers: &[ColumnarLayer]) -> Result<Vec<u8>> {
-    encode_tile_cfg(layers, &EncoderConfig::from_globals())
+    encode_tile_cfg(layers, &EncoderConfig::from_globals()).map(|(bytes, _)| bytes)
 }
 
 /// [`encode_tile`] with optional fixed-point coordinate quantization applied to
@@ -956,6 +1456,7 @@ pub fn encode_tile_quantized(layers: &[ColumnarLayer], quantize_m: Option<f64>) 
             ..EncoderConfig::from_globals()
         },
     )
+    .map(|(bytes, _)| bytes)
 }
 
 /// [`encode_tile`] with a fully-explicit [`EncoderConfig`] — no process-wide
@@ -963,13 +1464,41 @@ pub fn encode_tile_quantized(layers: &[ColumnarLayer], quantize_m: Option<f64>) 
 /// dynamic per-request tile server uses so each dataset/request encodes with its
 /// own settings without touching shared state.
 pub fn encode_tile_with(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result<Vec<u8>> {
+    encode_tile_cfg(layers, cfg).map(|(bytes, _)| bytes)
+}
+
+/// What an encode DID, for the caller that has to declare it.
+///
+/// Some capability declarations cannot be derived from the config: whether the
+/// TB-11 feature-anchored vertex-time tier fires depends on the DATA (a layer's
+/// per-feature spans versus its layer-wide span), so a writer only learns it by
+/// encoding. This is that channel — deliberately a plain returned value rather
+/// than shared state on [`EncoderConfig`], which is compared for byte-equality
+/// and must stay a pure description of what to do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EncodeObservations {
+    /// Some layer used the feature-anchored vertex-time form (`TILE_META.vtf`),
+    /// obliging the manifest to declare
+    /// [`crate::pack::CAPABILITY_VERTEX_TIME_FEATURE_ANCHOR`].
+    pub feature_anchored_vertex_times: bool,
+}
+
+/// [`encode_tile_with`], plus what the encode observed. Byte-identical output —
+/// the two entry points share one implementation.
+pub fn encode_tile_observed(
+    layers: &[ColumnarLayer],
+    cfg: &EncoderConfig,
+) -> Result<(Vec<u8>, EncodeObservations)> {
     encode_tile_cfg(layers, cfg)
 }
 
 /// The single tile-encode implementation, driven entirely by an explicit
 /// [`EncoderConfig`]. Every public `encode_tile*` entry point funnels here;
 /// everything upstream (column/field build) is shared.
-fn encode_tile_cfg(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result<Vec<u8>> {
+fn encode_tile_cfg(
+    layers: &[ColumnarLayer],
+    cfg: &EncoderConfig,
+) -> Result<(Vec<u8>, EncodeObservations)> {
     if cfg.format_version != LAYER_FRAME_VERSION {
         return Err(Error::Other(format!(
             "unsupported layer-frame version {} (this writer emits {LAYER_FRAME_VERSION})",
@@ -990,7 +1519,10 @@ fn pad_to_frame_align(out: &mut Vec<u8>) {
 /// [`TemplateCollector`] configured, schemas are recorded there and frames
 /// carry 16-byte hash references (the packed-dataset mode); without one the
 /// frame is self-contained via `INLINE_SCHEMA_*` sections.
-fn encode_tile_frame_v2(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result<Vec<u8>> {
+fn encode_tile_frame_v2(
+    layers: &[ColumnarLayer],
+    cfg: &EncoderConfig,
+) -> Result<(Vec<u8>, EncodeObservations)> {
     if layers.len() > u16::MAX as usize {
         return Err(Error::Other(format!(
             "tile has {} layers, exceeds the {} frame limit",
@@ -999,6 +1531,7 @@ fn encode_tile_frame_v2(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result
         )));
     }
     let collector = cfg.template_collector.as_deref();
+    let mut observed = EncodeObservations::default();
     let mut out = Vec::new();
     out.extend_from_slice(&FRAME_V2_ESCAPE.to_le_bytes());
     out.push(FRAME_V2_VERSION);
@@ -1010,6 +1543,7 @@ fn encode_tile_frame_v2(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result
             return Err(Error::Other("layer name too long".into()));
         }
         let enc = encode_layer_v2_parts(layer, cfg)?;
+        observed.feature_anchored_vertex_times |= enc.feature_anchored_vertex_times;
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name);
 
@@ -1065,5 +1599,5 @@ fn encode_tile_frame_v2(layers: &[ColumnarLayer], cfg: &EncoderConfig) -> Result
             pad_to_frame_align(&mut out);
         }
     }
-    Ok(out)
+    Ok((out, observed))
 }

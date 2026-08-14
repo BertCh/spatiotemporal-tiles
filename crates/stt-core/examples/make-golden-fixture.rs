@@ -26,17 +26,38 @@
 //!
 //! Run: cargo run -p stt-core --example make-golden-fixture
 //!
-//! `--v2` emits the SAME source data as a version-coherent packed-v2 build
-//! (`formatVersion: 2` manifests + v2 frames) into sibling `*-v2/` dirs,
-//! leaving the committed v1 fixture bytes untouched — for future fixture
-//! needs; nothing consumes the v2 output yet, so it is not committed.
+//! The generator accepts no version switch: packed v1 is withdrawn, and both
+//! the manifest and every frame use the sole supported format version.
+//!
+//! # TWO PASSES, per dataset
+//!
+//! Mechanism M2 resolves the numeric affine and the dictionary-vs-`Utf8` verdict
+//! from the DATASET domain (`EncoderConfig::global_pins`), not from whichever
+//! rows a tile caught. A generator that built at `..EncoderConfig::default()`
+//! would leave that field `None` and emit on the INCUMBENT per-tile path — the
+//! cross-impl fixtures would then be blind to every byte the pinned path moves,
+//! and re-running this generator would re-bless unpinned bytes while pinning
+//! nothing new. So each dataset below is built the way the builder builds:
+//! [`layer_for`] first, [`derive_pins`] over that dataset's own features, then
+//! encode. The two datasets get SEPARATE pins, because a pin is a property of a
+//! dataset; the paged and single grid builds share one pin set, because they are
+//! one dataset in two container shapes and their packs must stay byte-identical.
+//!
+//! `kind`'s categories are long strings and each tile uses a different pair of
+//! them ([`KINDS`]): that is what makes the dictionary the smaller form at
+//! dataset scale while still losing the per-tile comparison, so the pin flips
+//! the column's Arrow type and every tile ships the full dataset list against
+//! its own strict subset of keys. `assert_pins_bite` fails the generator rather
+//! than let it emit a fixture the pinned path cannot be seen in.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use stt_core::arrow_tile::{
-    encode_tile_with, ColumnarLayer, EncoderConfig, GeometryColumn, PropertyColumn,
+    dataset_dictionary_is_smaller, encode_tile_with, AttrPinned, ColumnarLayer, EncoderConfig,
+    GeometryColumn, GlobalColumnPins, GlobalDictVerdict, PropertyColumn,
 };
 use stt_core::metadata::Metadata;
-use stt_core::pack::PACKED_FORMAT_VERSION;
 use stt_core::{BlobOrdering, PackWriter, TileId};
 
 /// Frame-version-coherent encoder config: frames follow the writer's
@@ -47,11 +68,141 @@ use stt_core::{BlobOrdering, PackWriter, TileId};
 /// paged + single grid builds below use two writers, and inline schema
 /// sections keep their payload bytes byte-shareable without shared-collector
 /// plumbing.
-fn encoder_config(format_version: u32) -> EncoderConfig {
+///
+/// `global_pins` is passed explicitly and is the load-bearing argument:
+/// `..EncoderConfig::default()` leaves it `None`, which is the incumbent
+/// per-tile path and would make these fixtures invisible to mechanism M2 (see
+/// the module header).
+fn encoder_config(format_version: u32, pins: &Arc<GlobalColumnPins>) -> EncoderConfig {
     EncoderConfig {
         format_version,
+        global_pins: Some(Arc::clone(pins)),
         ..EncoderConfig::default()
     }
+}
+
+// ----------------------------------------------------------------------------
+// Pass 1 — the dataset-global pins
+// ----------------------------------------------------------------------------
+
+/// Category-count ceiling for a hoistable dictionary — mirrors
+/// `stt_build::dataset_stats::MAX_HOISTED_CATEGORIES`.
+const MAX_HOISTED_CATEGORIES: usize = 1024;
+/// Category-UTF-8-byte ceiling — mirrors
+/// `stt_build::dataset_stats::MAX_HOISTED_CATEGORY_BYTES`.
+const MAX_HOISTED_CATEGORY_BYTES: u64 = 4096;
+
+/// Resolve one dataset's global pins from its own features.
+///
+/// MIRRORS `stt_build::dataset_stats::DatasetStats::to_pins_with` for the same
+/// reason [`required_capabilities`] mirrors `EncoderSettings::required_capabilities`:
+/// the dependency runs `stt-build` → `stt-core`, so this crate cannot call the
+/// builder. The mirror is kept thin — the verdicts themselves are the shared
+/// `stt-core` functions the builder calls ([`AttrPinned::derive_auto`],
+/// [`dataset_dictionary_is_smaller`]); only the categorical rule's ORDER and the
+/// two hoist caps are transcribed. The distinct-set overflow branch
+/// (`MAX_CATEGORIES = 65_536`) is not reproduced: it resolves to the same
+/// `Utf8` verdict the size tests already emit, and needs a 65 K-category corpus
+/// to reach.
+///
+/// `layers` must be iterated in WRITE order — the dictionary pin records
+/// first-seen order, which is part of the output.
+fn derive_pins<'a>(layers: impl IntoIterator<Item = &'a ColumnarLayer>) -> GlobalColumnPins {
+    let mut numeric: BTreeMap<&str, (f64, f64, f64, bool, u64)> = BTreeMap::new();
+    let mut categorical: BTreeMap<&str, (Vec<String>, u64, u64)> = BTreeMap::new();
+    for layer in layers {
+        for (name, column) in &layer.properties {
+            match column {
+                PropertyColumn::Numeric(values) => {
+                    let st = numeric.entry(name.as_str()).or_insert((
+                        f64::INFINITY,
+                        f64::NEG_INFINITY,
+                        0.0,
+                        true,
+                        0,
+                    ));
+                    for v in values.iter().flatten().copied().filter(|v| v.is_finite()) {
+                        st.0 = st.0.min(v);
+                        st.1 = st.1.max(v);
+                        st.2 = st.2.max(v.abs());
+                        st.3 &= v.fract() == 0.0;
+                        st.4 += 1;
+                    }
+                }
+                PropertyColumn::Categorical(values) => {
+                    let st = categorical
+                        .entry(name.as_str())
+                        .or_insert((Vec::new(), 0, 0));
+                    for v in values.iter().flatten() {
+                        // `Vec` + linear scan, never a `HashSet`: first-seen
+                        // order is part of the emitted pin.
+                        if !st.0.iter().any(|c| c == v) {
+                            st.0.push(v.clone());
+                        }
+                        st.1 += 1;
+                        st.2 += v.len() as u64;
+                    }
+                }
+                // Vector groups carry no scalar affine and no dictionary
+                // verdict, so `GlobalColumnPins` has no key for them. Explicit
+                // so adding one is a compile error rather than a silent gap.
+                PropertyColumn::Vector { .. } => {}
+            }
+        }
+    }
+
+    let mut attr = BTreeMap::new();
+    for (name, (min, max, max_abs, all_integer, finite)) in numeric {
+        attr.insert(
+            name.to_string(),
+            AttrPinned::derive_auto(min, max, max_abs, all_integer, finite),
+        );
+    }
+    let mut dict = BTreeMap::new();
+    for (name, (categories, values, total_value_bytes)) in categorical {
+        let category_bytes: u64 = categories.iter().map(|c| c.len() as u64).sum();
+        let k = categories.len();
+        // The builder's order: the dataset-scale wire test first, then the
+        // reader's resident-memory caps.
+        let verdict =
+            if !dataset_dictionary_is_smaller(total_value_bytes, values, category_bytes, k as u64)
+                || k > MAX_HOISTED_CATEGORIES
+                || category_bytes > MAX_HOISTED_CATEGORY_BYTES
+            {
+                GlobalDictVerdict::Utf8
+            } else {
+                GlobalDictVerdict::Dictionary(Arc::new(categories))
+            };
+        dict.insert(name.to_string(), verdict);
+    }
+    GlobalColumnPins { attr, dict }
+}
+
+/// Refuse to emit a fixture whose pins decided nothing.
+///
+/// A `Utf8` verdict for `kind` is what a corpus below the dataset-scale
+/// crossover resolves to — legal, and byte-identical to what the per-tile rule
+/// already picks for tiles this small. That is the blind fixture this whole
+/// two-pass shape exists to prevent, so it stops the generator here rather than
+/// leaving it to be discovered when the pin fails to catch something.
+fn assert_pins_bite(dataset: &str, pins: &GlobalColumnPins) {
+    assert!(
+        pins.attr.contains_key("speed"),
+        "[{dataset}] `speed` must resolve a dataset-global affine"
+    );
+    let categories = match pins.dict.get("kind") {
+        Some(GlobalDictVerdict::Dictionary(c)) => c.len(),
+        other => panic!(
+            "[{dataset}] `kind` must pin a Dictionary, got {other:?} — the corpus \
+             has fallen below the dataset-scale crossover and this fixture would \
+             pin nothing new (see KINDS)"
+        ),
+    };
+    assert_eq!(
+        categories,
+        KINDS.len(),
+        "[{dataset}] the pinned list must be the whole dataset domain"
+    );
 }
 
 /// The `manifest.capabilities` entries an [`EncoderConfig`] IMPLIES —
@@ -93,48 +244,74 @@ fn required_capabilities(cfg: &EncoderConfig) -> Vec<String> {
     caps
 }
 
-/// Build the deterministic payload for tile index `k`. `id_seed` lets the
-/// deduped tiles (k=4, k=9) reuse k=0's identity bytes.
-fn payload_for(id_seed: u64, cfg: &EncoderConfig) -> Vec<u8> {
+/// The dataset-global category list for `kind`, in the order the corpus first
+/// presents them (tile seed 0 mints the first pair, seed 1 the second).
+///
+/// Long on purpose, and split into per-tile PAIRS on purpose. The categorical
+/// verdict is a measurement — `dataset_dictionary_is_smaller` — and with
+/// three-letter categories over this many cells the dictionary genuinely loses
+/// to plain `Utf8`, which would leave these fixtures pinning a verdict that
+/// changes nothing. At these lengths the dictionary wins at DATASET scale while
+/// still losing the PER-TILE comparison, so the pin flips the Arrow type in
+/// every tile; and because each tile uses two of the four, every tile ships the
+/// full dataset list against a strict subset of keys — the all-or-nothing hoist
+/// contract, made visible in the cross-impl bytes.
+const KINDS: [&str; 4] = [
+    "articulated-electric-transit-bus",
+    "low-floor-light-rail-tram-vehicle",
+    "harbour-passenger-ferry-vessel",
+    "dockless-shared-electric-scooter",
+];
+
+/// Build the deterministic LAYER for tile index `k`. `id_seed` lets the deduped
+/// tiles (k=4, k=9) reuse k=0's identity bytes.
+///
+/// Split from the encode so pass 1 can scan the dataset's features before any
+/// config exists — the pins are an input to the encode, not an output of it.
+fn layer_for(id_seed: u64) -> ColumnarLayer {
     let ids: Vec<u64> = (0..3).map(|i| 100 * id_seed + i).collect();
     let n = ids.len();
-    encode_tile_with(
-        &[ColumnarLayer {
-            polygon_parts: None,
-            name: "default".to_string(),
-            feature_ids: ids,
-            start_times: vec![1000 * id_seed as i64; n],
-            end_times: vec![1000 * id_seed as i64 + 100; n],
-            geometry: GeometryColumn::Point(vec![[-122.4 + 0.01 * id_seed as f64, 37.7]; n]),
-            vertex_times: None,
-            vertex_values: None,
-            triangles: None,
-            vertex_value_matrix: None,
-            // A numeric and a categorical column, each carrying a null, so the
-            // cross-impl readers exercise BOTH property kinds (and their null
-            // sentinels) against real writer output.
-            properties: vec![
-                (
-                    "speed".to_string(),
-                    PropertyColumn::Numeric(vec![
-                        Some(10.0 + id_seed as f64),
-                        None,
-                        Some(30.0 + id_seed as f64),
-                    ]),
-                ),
-                (
-                    "kind".to_string(),
-                    PropertyColumn::Categorical(vec![
-                        Some("car".to_string()),
-                        Some("bus".to_string()),
-                        None,
-                    ]),
-                ),
-            ],
-        }],
-        cfg,
-    )
-    .unwrap()
+    // Two of the four categories per tile, alternating by seed parity, so the
+    // first two seeds between them mint the whole list in declaration order.
+    let pair = (2 * id_seed as usize) % KINDS.len();
+    ColumnarLayer {
+        polygon_parts: None,
+        name: "default".to_string(),
+        feature_ids: ids,
+        start_times: vec![1000 * id_seed as i64; n],
+        end_times: vec![1000 * id_seed as i64 + 100; n],
+        geometry: GeometryColumn::Point(vec![[-122.4 + 0.01 * id_seed as f64, 37.7]; n]),
+        vertex_times: None,
+        vertex_values: None,
+        triangles: None,
+        vertex_value_matrix: None,
+        // A numeric and a categorical column, each carrying a null, so the
+        // cross-impl readers exercise BOTH property kinds (and their null
+        // sentinels) against real writer output.
+        properties: vec![
+            (
+                "speed".to_string(),
+                PropertyColumn::Numeric(vec![
+                    Some(10.0 + id_seed as f64),
+                    None,
+                    Some(30.0 + id_seed as f64),
+                ]),
+            ),
+            (
+                "kind".to_string(),
+                PropertyColumn::Categorical(vec![
+                    Some(KINDS[pair].to_string()),
+                    Some(KINDS[pair + 1].to_string()),
+                    None,
+                ]),
+            ),
+        ],
+    }
+}
+
+/// Encode one layer under the (pinned) config.
+fn payload_for(layer: &ColumnarLayer, cfg: &EncoderConfig) -> Vec<u8> {
+    encode_tile_with(std::slice::from_ref(layer), cfg).unwrap()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -144,9 +321,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(other) = std::env::args().nth(1) {
         return Err(format!("unknown argument {other:?} (this example takes none)").into());
     }
-    let format_version = PACKED_FORMAT_VERSION;
+    let format_version = stt_core::arrow_tile::LAYER_FRAME_VERSION;
     let suffix = "";
-    let cfg = encoder_config(format_version);
+
+    // --- Pass 1 (packed-golden) ------------------------------------------
+    // The dataset is the 12 tiles as WRITTEN, so the deduped k=4/k=9 present
+    // seed 0's features three times — the same stream the builder's pass 1
+    // would scan. Order is write order, which is what makes the dictionary's
+    // first-seen ordering well defined.
+    let n_tiles = 12u64;
+    let seed_of = |k: u64| if k == 4 || k == 9 { 0 } else { k };
+    let layers: Vec<ColumnarLayer> = (0..n_tiles).map(|k| layer_for(seed_of(k))).collect();
+    let pins = Arc::new(derive_pins(layers.iter()));
+    assert_pins_bite("packed-golden", &pins);
+    // --- Pass 2 -----------------------------------------------------------
+    let cfg = encoder_config(format_version, &pins);
 
     // <crate>/../../packages/core/test/fixtures/packed-golden
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -167,6 +356,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SpatialMajor keeps the order deterministic + independent of the Auto
     // heuristic, so the content hashes are stable across builds.
+    //
+    // ⚠ The explicit ordering is LOAD-BEARING and must stay explicit: the
+    // `stt-build` CLI defaults to `--blob-ordering measured`, so a fixture that
+    // inherited a default would let a change to the ordering picker silently
+    // move the golden pins. Golden pins move once, deliberately, under review.
     let mut w = PackWriter::create(&out_dir, BlobOrdering::SpatialMajor, 4 * 1024)?
         // Declared from `cfg`, the very config the payloads below are encoded
         // with — a fixture that used a re-typing without declaring it would
@@ -178,14 +372,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dedup cases — only the clone is byte-identical, which is what the writer's
     // blake3 dedup keys on. (This also makes the committed content hashes stable
     // across regenerations of the fixture.)
-    let n_tiles = 12u64;
     let mut distinct: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
     for k in 0..n_tiles {
         // k=4 and k=9 reuse k=0's identity → byte-identical blobs → dedup.
-        let id_seed = if k == 4 || k == 9 { 0 } else { k };
+        let id_seed = seed_of(k);
         let payload = distinct
             .entry(id_seed)
-            .or_insert_with(|| payload_for(id_seed, &cfg))
+            .or_insert_with(|| payload_for(&layers[k as usize], &cfg))
             .clone();
         let t = 1000 * k as i64;
         // Distinct spatial cell per tile so all 12 directory entries survive.
@@ -236,7 +429,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("core")
         .join("test")
         .join("fixtures");
-    let grid = build_grid_tiles(&cfg);
+    // The grid is a DIFFERENT dataset, so it gets its OWN pins — a pin is a
+    // property of a dataset domain, and reusing packed-golden's would encode a
+    // claim about a corpus these features are not part of (and would error out
+    // if a category here were absent from that one). The paged and single
+    // builds below share this single pin set, because they ARE one dataset in
+    // two container shapes and their packs must stay byte-identical.
+    let grid_layers = build_grid_layers();
+    let grid_pins = Arc::new(derive_pins(grid_layers.iter().map(|(_, _, _, l)| l)));
+    assert_pins_bite("paged-golden", &grid_pins);
+    let grid_cfg = encoder_config(format_version, &grid_pins);
+    let grid: Vec<(TileId, i64, i64, Vec<u8>)> = grid_layers
+        .iter()
+        .map(|(id, ts, te, layer)| (*id, *ts, *te, payload_for(layer, &grid_cfg)))
+        .collect();
     let grid_meta = Metadata::new("paged-golden")
         .with_description("Deterministic STT paged-directory cross-impl fixture")
         .with_zoom_levels(10, 12)
@@ -252,7 +458,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         // SpatialMajor → deterministic order + stable content hashes; identical
         // shared payload bytes → the two builds' packs are byte-identical and
-        // only the directory container differs.
+        // only the directory container differs. Explicit on purpose — see the
+        // pin note above; never let this follow the CLI's `measured` default.
         let mut gw = PackWriter::create(&dir, BlobOrdering::SpatialMajor, 8 * 1024)?
             .with_capabilities(required_capabilities(&cfg))
             .with_paging(paging);
@@ -279,10 +486,90 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// A spread-out grid of tiles across two zooms and three time buckets, with
-/// deterministic per-tile payloads built once (so paged + single builds share
-/// byte-identical blobs). ~250 entries → several leaf pages at page size 8.
-fn build_grid_tiles(cfg: &EncoderConfig) -> Vec<(TileId, i64, i64, Vec<u8>)> {
+/// Both cross-impl datasets resolve a BITING pin set — checkable without
+/// running the generator, which would overwrite the committed fixtures.
+///
+/// `main`'s `assert_pins_bite` calls are the backstop for whoever regenerates
+/// (TB-14); this is the same claim available ahead of time:
+///
+///   cargo test -p stt-core --examples
+///
+/// Not part of the default `cargo test -p stt-core` run — example tests never
+/// are — so it is a tool for the regenerator, not a gate. The gate for the same
+/// property on the WRITER-side corpus is
+/// `tests/v2_golden.rs::golden_fixture_exercises_the_pinned_path`, which does
+/// run by default.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_cross_impl_datasets_pin_a_dictionary() {
+        let seed_of = |k: u64| if k == 4 || k == 9 { 0 } else { k };
+        let packed: Vec<ColumnarLayer> = (0..12u64).map(|k| layer_for(seed_of(k))).collect();
+        let packed_pins = derive_pins(packed.iter());
+        assert_pins_bite("packed-golden", &packed_pins);
+
+        let grid = build_grid_layers();
+        let grid_pins = derive_pins(grid.iter().map(|(_, _, _, l)| l));
+        assert_pins_bite("paged-golden", &grid_pins);
+
+        // Every tile holds a STRICT subset of the pinned list, so "ship the
+        // whole list in every tile" is a claim the cross-impl bytes can
+        // disagree with.
+        let GlobalDictVerdict::Dictionary(categories) = packed_pins.dict.get("kind").unwrap()
+        else {
+            unreachable!("asserted above")
+        };
+        for layer in &packed {
+            let Some((_, PropertyColumn::Categorical(values))) =
+                layer.properties.iter().find(|(n, _)| n == "kind")
+            else {
+                continue;
+            };
+            let mut distinct: Vec<&str> = Vec::new();
+            for v in values.iter().flatten() {
+                if !distinct.contains(&v.as_str()) {
+                    distinct.push(v.as_str());
+                }
+            }
+            assert!(
+                !distinct.is_empty() && distinct.len() < categories.len(),
+                "each tile must hold a non-empty PROPER subset of the pinned list"
+            );
+        }
+    }
+
+    /// The pins actually move bytes: each dataset's first tile encodes
+    /// differently with them than without. Two configs differing ONLY in
+    /// `global_pins`.
+    #[test]
+    fn the_pins_change_the_encoded_bytes() {
+        let format_version = stt_core::arrow_tile::LAYER_FRAME_VERSION;
+        let packed: Vec<ColumnarLayer> = (0..12u64)
+            .map(|k| layer_for(if k == 4 || k == 9 { 0 } else { k }))
+            .collect();
+        let pins = Arc::new(derive_pins(packed.iter()));
+        let pinned = encoder_config(format_version, &pins);
+        let unpinned = EncoderConfig {
+            format_version,
+            ..EncoderConfig::default()
+        };
+        for layer in &packed {
+            assert_ne!(
+                payload_for(layer, &unpinned),
+                payload_for(layer, &pinned),
+                "this tile is invisible to the dataset-global pins"
+            );
+        }
+    }
+}
+
+/// A spread-out grid of tiles across two zooms and three time buckets, as
+/// LAYERS — pass 1 scans these, pass 2 encodes each exactly once (so the paged
+/// and single builds share byte-identical blobs). ~250 entries → several leaf
+/// pages at page size 8.
+fn build_grid_layers() -> Vec<(TileId, i64, i64, ColumnarLayer)> {
     let mut out = Vec::new();
     let mut seed = 1_000u64;
     let bucket = 3_600_000i64;
@@ -296,7 +583,7 @@ fn build_grid_tiles(cfg: &EncoderConfig) -> Vec<(TileId, i64, i64, Vec<u8>)> {
                 TileId::new(10, x, y, t.max(0) as u64),
                 t,
                 t + bucket - 1,
-                payload_for(seed, cfg),
+                layer_for(seed),
             ));
             seed += 1;
         }
@@ -311,7 +598,7 @@ fn build_grid_tiles(cfg: &EncoderConfig) -> Vec<(TileId, i64, i64, Vec<u8>)> {
                 TileId::new(12, x, y, t.max(0) as u64),
                 t,
                 t + bucket - 1,
-                payload_for(seed, cfg),
+                layer_for(seed),
             ));
             seed += 1;
         }

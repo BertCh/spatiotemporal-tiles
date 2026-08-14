@@ -1,12 +1,21 @@
 //! Temporal shaping advisor (`--temporal-lod`, `--adaptive-temporal`): tier
 //! and window suggestions from the temporal distribution and bucket count.
 //!
-//! `--temporal-lod` is additive (coarser aggregate tiers on top of the base
+//! `--temporal-lod` is additive (lossless coarse-bucket replicas on top of the base
 //! buckets) and `--adaptive-temporal` rebuckets windows without dropping
 //! features, so both are `lossy: false` — the LOD tradeoff (extra tiers grow
 //! the archive) is called out in `why` instead. `--vertex-time-precision` is
 //! deliberately NOT advised here: source features carry no per-vertex times,
 //! so that lever belongs to the packed-side doctor.
+//!
+//! Neither lever is a sample-encode measurement — both read the temporal
+//! distribution and the density model — and neither maps onto an encoder knob a
+//! [`MeasureSettings`](crate::measure::MeasureSettings) point can carry. So
+//! [`crate::advisors::run_iterative`] re-prices nothing here: these advisories
+//! pass through every round verbatim, which is why this module has no composed
+//! entry point. (What a coarser bucket costs in BYTES is a rebuild-shaped
+//! question — it changes the tiling, not the encoding of a fixed sample — and
+//! belongs to the two-pass build, not to a sample oracle.)
 
 use anyhow::Result;
 
@@ -16,9 +25,43 @@ use crate::analysis::temporal::TemporalDistribution;
 use crate::analysis::AnalysisResult;
 use crate::loader::LoadedData;
 
-/// Base-bucket count above which a coarse `--temporal-lod` pyramid pays off:
-/// past this, zoomed-out full-range playback touches thousands of buckets.
-const LOD_BUCKET_THRESHOLD: u64 = 5_000;
+/// Frames one watchable playback loop shows: `TARGET_PLAYBACK_SECONDS` (45) ×
+/// `PLAYBACK_FPS` (30) in [`crate::analysis::temporal`], where the recommended
+/// bucket width is derived from exactly this model. Mirrored here because those
+/// two constants are private to the analyzer; if they move, move this.
+const PLAYBACK_LOOP_FRAMES: u64 = 45 * 30;
+
+/// Base-bucket count above which a coarse `--temporal-lod` pyramid pays for its
+/// bytes: past this, a client scanning the whole timeline at one zoom is
+/// fetching more buckets than half a watchable playback loop can even display
+/// as distinct frames, so zoomed-out and scrubbing views over-fetch by
+/// construction.
+///
+/// # ⚠️ Calibration — this constant was unreachable (F7)
+///
+/// It was `5_000`, and **nothing could ever clear it.**
+/// `analysis::temporal::recommend_bucket_size` caps its own target bucket count
+/// at `45 s × 30 fps × 1.5 = 2025` (the 1.5 is the Bursty frame factor; Uniform
+/// and Periodic get 1350, Sparse 675) and then returns the FINEST standard
+/// bucket whose count is `<= target`. So the recommended base bucket count is
+/// `<= 2025` on every dataset except one that falls through to the 30-day
+/// fallback, which needs a span of over 411 years to reach 5000 buckets. The
+/// trigger — and, through the mirror this constant now feeds, the byte-budget
+/// solver's whole temporal-LOD lever — was dead code.
+///
+/// The value is therefore calibrated against the distribution of the quantity
+/// it actually tests, not against a guess about request counts: any threshold
+/// at or above 1350 is unreachable for every non-Bursty dataset, so the largest
+/// figure in the recommender's own playback model that its output can clear is
+/// `PLAYBACK_LOOP_FRAMES / 2` — which is also the bucket-count target the
+/// recommender itself uses for Sparse data. Measured over the repo's local
+/// corpus it fires on the long-timeline datasets (osm-nyc-changesets 1068
+/// buckets, goes-glm-lightning 864, cmorph-2h 729) and stays quiet on the
+/// short-timeline ones (wpc-fronts 18, storm4d-isolines 56, hrrr 285,
+/// bixi-points 287, cpc-rainfall 364).
+///
+/// Rollback is a one-line re-pin to `5_000`, which restores "never fires".
+pub const LOD_BUCKET_THRESHOLD: u64 = PLAYBACK_LOOP_FRAMES / 2;
 
 /// Minimum factor between the base bucket and the first tier (and between
 /// successive tiers): a tier that only doubles the bucket size doesn't buy
@@ -92,8 +135,9 @@ fn advise_temporal_lod(result: &AnalysisResult) -> Option<Advice> {
         value: Some(value.clone()),
         why: format!(
             "{} span at the recommended {} bucket = {} time buckets; zoomed-out full-range \
-             playback would touch thousands of buckets, so coarser aggregate tier(s) {} cap \
-             that. Tradeoff: tiers are ADDITIVE — extra coarse tiles grow the archive.",
+             playback would touch thousands of buckets, so lossless coarse-bucket tier(s) {} cap \
+             request count. Every feature is preserved. Tradeoff: tiers are ADDITIVE — extra \
+             coarse tiles grow the archive.",
             t.duration_human, t.recommended_bucket_human, bucket_count, value
         ),
         projected: Some(format!(
@@ -370,17 +414,104 @@ mod tests {
 
     #[test]
     fn uniform_short_dataset_emits_nothing() {
-        // 30 days at 30m = 1,440 buckets: under the LOD threshold, not bursty.
+        // 30 days at 2h = 360 buckets: under the LOD threshold, not bursty.
+        // (This fixture used to be 30 days at 30m = 1,440 buckets, which was
+        // "under the threshold" only because the threshold could never fire at
+        // all — see LOD_BUCKET_THRESHOLD's calibration note.)
         let result = synthetic_result(
             30 * DAY_MS,
-            30 * 60_000,
+            2 * HOUR_MS,
             TemporalDistribution::Uniform,
             uniform_events(),
             10,
             vec![zoom_density(10, 100, 300)],
         );
+        let buckets = result.temporal.duration_ms / result.temporal.recommended_bucket_ms;
+        assert!(
+            buckets < LOD_BUCKET_THRESHOLD,
+            "fixture guard: {buckets} buckets must sit under the trigger"
+        );
         let advice = advise(&result, &empty_data()).unwrap();
         assert!(advice.is_empty(), "expected no advice: {advice:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // F7: the trigger has to be REACHABLE from the bucket recommender
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_lod_threshold_sits_under_the_bucket_recommenders_own_ceiling() {
+        // `recommend_bucket_size` returns the finest standard bucket whose
+        // count is <= its target, and that target is at most
+        // PLAYBACK_LOOP_FRAMES × 1.5 (Bursty) and exactly PLAYBACK_LOOP_FRAMES
+        // for Uniform/Periodic. A threshold at or above the latter is therefore
+        // unreachable for every non-Bursty dataset, and the old 5_000 was
+        // unreachable for everything short of a 411-year span.
+        let (trigger, uniform_target) = (LOD_BUCKET_THRESHOLD, PLAYBACK_LOOP_FRAMES);
+        assert!(
+            trigger < uniform_target,
+            "a `--temporal-lod` trigger above the recommender's own bucket-count \
+             target ({uniform_target}) can only ever fire on Bursty data: {trigger}"
+        );
+        assert_eq!(uniform_target, 1_350, "45 s x 30 fps");
+    }
+
+    #[test]
+    fn a_real_long_timeline_dataset_clears_the_threshold_end_to_end() {
+        use crate::loader::{AnalyzableFeature, GeometryType};
+        use stt_core::types::BoundingBox;
+
+        // Three years of evenly-spaced events, 12k features — the shape of the
+        // repo's own osm-nyc-changesets (20 years, 380k features, 1068 weekly
+        // buckets). Driven through the REAL temporal analyzer, not a synthetic
+        // `TemporalAnalysis`, because the defect being pinned is precisely that
+        // the analyzer's output could never reach the advisor's trigger.
+        const N: u64 = 12_000;
+        const SPAN_MS: u64 = 3 * 365 * DAY_MS;
+        let step = SPAN_MS / N;
+        let features: Vec<AnalyzableFeature> = (0..N)
+            .map(|i| AnalyzableFeature {
+                lon: -74.0 + (i % 97) as f64 * 0.01,
+                lat: 40.0 + (i % 89) as f64 * 0.01,
+                timestamp: 1_400_000_000_000 + i * step,
+                geometry_type: GeometryType::Point,
+                vertex_count: 1,
+                estimated_size: 100,
+                property_count: 1,
+            })
+            .collect();
+        let data = LoadedData {
+            features,
+            bounds: BoundingBox::new(-74.0, 40.0, -73.0, 41.0),
+            time_range: TimeRange::new(1_400_000_000_000, 1_400_000_000_000 + SPAN_MS),
+            sample: Vec::new(),
+        };
+
+        let temporal = crate::analysis::temporal::analyze(&data).unwrap();
+        let buckets = temporal.duration_ms / temporal.recommended_bucket_ms.max(1);
+        assert!(
+            buckets > LOD_BUCKET_THRESHOLD,
+            "the recommender produced {buckets} buckets at {} ms, which does not \
+             clear the {LOD_BUCKET_THRESHOLD}-bucket trigger — the lever is dead again",
+            temporal.recommended_bucket_ms
+        );
+
+        let mut result = synthetic_result(
+            temporal.duration_ms,
+            temporal.recommended_bucket_ms,
+            TemporalDistribution::Uniform,
+            uniform_events(),
+            10,
+            vec![zoom_density(10, 100, 300)],
+        );
+        result.temporal = temporal;
+        let advice = advise(&result, &data).unwrap();
+        let lod = advice
+            .iter()
+            .find(|a| a.flag == "--temporal-lod")
+            .unwrap_or_else(|| panic!("the tier advisor must fire here: {advice:?}"));
+        assert!(!lod.lossy, "a coarse tier is additive, never lossy");
+        assert!(lod.value.as_deref().is_some_and(|v| !v.is_empty()));
     }
 
     #[test]

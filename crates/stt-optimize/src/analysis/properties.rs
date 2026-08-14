@@ -17,6 +17,71 @@ pub const STYLE_HINTS_VERSION: u32 = 1;
 /// dropped rather than emitted (the manifest schema pins this enum).
 const LAYER_HINTS: [&str; 4] = ["points", "paths", "trips", "polygons"];
 
+/// Target implied DATA frame rate (buckets rendered per second of playback) the
+/// refit playback duration aims for.
+///
+/// The legacy `sqrt(bucket_count)` duration has no frame-rate meaning: a
+/// 10-bucket archive clamped up to 20 s plays one frame per 2 s (a slideshow),
+/// while a 100 000-bucket archive clamped down to 90 s implies ~1 100 data-fps
+/// (a blur). Fitting the duration to a frame rate puts both in the range a human
+/// reads as motion.
+pub const F_TARGET_FPS: f64 = 20.0;
+
+/// Hard floor / ceiling on the refit playback duration, in seconds. Below the
+/// floor a loop is too short to read; above the ceiling it stops feeling like a
+/// loop at all. These bound the frame-rate fit, so very small and very large
+/// archives leave the `[K/30, K/12]` band by design.
+pub const PLAYBACK_SECONDS_FLOOR: f64 = 5.0;
+/// See [`PLAYBACK_SECONDS_FLOOR`].
+pub const PLAYBACK_SECONDS_CEILING: f64 = 300.0;
+
+/// Reference client memory budget for RESIDENT tile payload, in bytes, used to
+/// derive [`StyleHints::suggested_time_window_ms`].
+///
+/// ⚠️ **Knowingly a constant where a function could be.** The honest form is a
+/// per-session budget the client measures (`navigator.deviceMemory`, the
+/// observed cache high-water mark, or a governor-reported ceiling) and feeds
+/// back; the build has no access to any of that, so the archive publishes a
+/// window fitted to ONE reference device and the reader overrides it whenever it
+/// knows better. 256 MiB is derived once, from the device budget the eviction
+/// tiering is sized against — the low end of the phones the showcase targets,
+/// leaving headroom for the renderer's own buffers.
+///
+/// **Revival trigger:** when the client reports a measured resident-byte budget
+/// through the telemetry surface, this constant becomes that reading's default
+/// and the derivation moves reader-side. Until then a re-fit means changing this
+/// number and rebuilding — which is exactly why the value it produces is
+/// recorded in the manifest rather than recomputed at read time.
+pub const M_REF: u64 = 256 * 1024 * 1024;
+
+/// Cap on the suggested window, in temporal buckets. A window wider than ~a day
+/// of buckets stops being a window and starts being "the whole archive", which
+/// is not a playback default under any memory budget.
+pub const MAX_WINDOW_BUCKETS: u64 = 24;
+
+/// Inputs for the derived playback parameters (BH-10), separated from the
+/// profiler's own inputs because they come from a different stage of the build:
+/// the payload total is only known after tiling.
+///
+/// [`Default`] is the LEGACY behaviour — `refit` off, no byte total — so
+/// `profile_properties` and every existing caller keep emitting exactly the
+/// bytes they emit today.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlaybackDerivation {
+    /// Total UNCOMPRESSED tile-payload bytes the build produced, or `None` when
+    /// the pipeline could not total them (streaming builds, re-profilers). Drives
+    /// `suggested_time_window_ms`; `None` omits that field.
+    pub total_payload_bytes: Option<u64>,
+    /// Use the frame-rate refit for `suggested_playback_seconds` instead of the
+    /// legacy `sqrt(bucket_count)` formula.
+    ///
+    /// OFF by default and gated at the CLI (`--derived-playback-params`): turning
+    /// it on CHANGES the emitted hint value for every rebuilt archive, which is
+    /// a fleet-wide change to how demos pace. It rides the next rebuild window
+    /// rather than drifting in one archive at a time.
+    pub refit: bool,
+}
+
 /// Collected values for one property, as gathered by the caller.
 ///
 /// * `Numeric` — samples widened to `f64` (any numeric source type).
@@ -51,6 +116,29 @@ pub fn profile_properties(
     temporal_bucket_ms: u64,
     layer_kind_hint: Option<&str>,
 ) -> StyleHints {
+    profile_properties_with(
+        props,
+        time_range_ms,
+        temporal_bucket_ms,
+        layer_kind_hint,
+        PlaybackDerivation::default(),
+    )
+}
+
+/// [`profile_properties`] with the derived playback parameters (BH-10).
+///
+/// `derivation` carries what the profiler cannot know on its own: the build's
+/// total payload bytes, and whether to use the frame-rate refit for the playback
+/// duration. [`PlaybackDerivation::default()`] reproduces `profile_properties`
+/// byte-for-byte, so this is purely additive — the incumbent formula stays the
+/// documented fallback rather than being deleted.
+pub fn profile_properties_with(
+    props: &[(String, PropertyValues)],
+    time_range_ms: u64,
+    temporal_bucket_ms: u64,
+    layer_kind_hint: Option<&str>,
+    derivation: PlaybackDerivation,
+) -> StyleHints {
     let properties = props
         .iter()
         .filter_map(|(name, values)| match values {
@@ -66,7 +154,14 @@ pub fn profile_properties(
     StyleHints {
         version: STYLE_HINTS_VERSION,
         properties,
-        suggested_playback_seconds: suggested_playback_seconds(time_range_ms, temporal_bucket_ms),
+        suggested_playback_seconds: if derivation.refit {
+            refit_playback_seconds(time_range_ms, temporal_bucket_ms)
+        } else {
+            suggested_playback_seconds(time_range_ms, temporal_bucket_ms)
+        },
+        suggested_time_window_ms: derivation
+            .total_payload_bytes
+            .and_then(|bytes| suggested_time_window_ms(time_range_ms, temporal_bucket_ms, bytes)),
         layer_hint: layer_kind_hint
             .filter(|h| LAYER_HINTS.contains(h))
             .map(str::to_string),
@@ -142,6 +237,60 @@ fn suggested_playback_seconds(time_range_ms: u64, temporal_bucket_ms: u64) -> Op
     }
     let buckets = time_range_ms as f64 / temporal_bucket_ms as f64;
     Some((buckets.sqrt().round() as u64).clamp(20, 90) as u32)
+}
+
+/// The frame-rate refit (BH-10): `P = clamp(K / F_TARGET_FPS, K/30, K/12)`
+/// further clamped to `[5, 300]` s, with `K` = bucket count.
+///
+/// The inner band is what makes this a FIT rather than a division: whatever
+/// [`F_TARGET_FPS`] is re-fitted to, the implied data frame rate stays inside
+/// `[12, 30]` — the range that reads as motion rather than a slideshow or a
+/// blur. The outer clamp is the human bound on loop length and deliberately wins
+/// over the band at both extremes (a 10-bucket archive gets 5 s / 2 data-fps
+/// because a 0.5 s loop is unusable, not because 2 fps is good).
+///
+/// `None` when the bucket size is unknown (0) — same guard as the legacy
+/// formula, same reason: no bucket count, no defensible duration.
+fn refit_playback_seconds(time_range_ms: u64, temporal_bucket_ms: u64) -> Option<u32> {
+    if temporal_bucket_ms == 0 {
+        return None;
+    }
+    let k = time_range_ms as f64 / temporal_bucket_ms as f64;
+    // k >= 0 always, so k/30 <= k/12 and the clamp cannot invert.
+    let banded = (k / F_TARGET_FPS).clamp(k / 30.0, k / 12.0);
+    let seconds = banded.clamp(PLAYBACK_SECONDS_FLOOR, PLAYBACK_SECONDS_CEILING);
+    Some(seconds.round() as u32)
+}
+
+/// The byte-feasible playback window (BH-10):
+/// `min(argmax{W : β̄·W ≤ M_REF}, MAX_WINDOW_BUCKETS·Δ)`, floored at one bucket.
+///
+/// `β̄` = `total_payload_bytes / time_range_ms` is the archive's mean payload
+/// bytes per millisecond of span, so `argmax{W : β̄·W ≤ M_REF}` is
+/// `M_REF · span / bytes` — computed in `u128` integer arithmetic so the answer
+/// is exactly reproducible and cannot overflow on a 300 GiB archive.
+///
+/// The floor at one bucket is a correctness bound, not a taste one: a window
+/// narrower than `Δ` can address no complete temporal bucket, so it would
+/// display nothing. A dense archive therefore gets `Δ` and pays the memory —
+/// the alternative would be a hint that renders an empty map.
+///
+/// `None` when any input makes the ratio meaningless (no bucket, no span, no
+/// bytes); the reader then keeps its own bucket-multiple default.
+fn suggested_time_window_ms(
+    time_range_ms: u64,
+    temporal_bucket_ms: u64,
+    total_payload_bytes: u64,
+) -> Option<u64> {
+    if temporal_bucket_ms == 0 || time_range_ms == 0 || total_payload_bytes == 0 {
+        return None;
+    }
+    let feasible =
+        (u128::from(M_REF) * u128::from(time_range_ms)) / u128::from(total_payload_bytes);
+    let capped = feasible.min(u128::from(
+        temporal_bucket_ms.saturating_mul(MAX_WINDOW_BUCKETS),
+    ));
+    Some((capped as u64).max(temporal_bucket_ms))
 }
 
 #[cfg(test)]
@@ -270,6 +419,158 @@ mod tests {
             profile_properties(&[], hour, 0, None).suggested_playback_seconds,
             None
         );
+    }
+
+    /// BH-10 band math. The refit holds the implied data frame rate inside
+    /// `[12, 30]` wherever the `[5, 300]` s human bound leaves room, and hands
+    /// the extremes to that bound rather than to the band.
+    #[test]
+    fn refit_playback_seconds_holds_the_frame_rate_band_between_its_clamps() {
+        let hour = 3_600_000u64;
+        let refit = PlaybackDerivation {
+            refit: true,
+            ..Default::default()
+        };
+        let p = |buckets: u64| {
+            profile_properties_with(&[], buckets * hour, hour, None, refit)
+                .suggested_playback_seconds
+                .expect("a known bucket size always yields a duration")
+        };
+
+        // Mid-range: the fit binds and the data-fps lands on the target.
+        for buckets in [200u64, 1_000, 2_025, 4_000] {
+            let seconds = p(buckets);
+            let fps = buckets as f64 / f64::from(seconds);
+            assert!(
+                (12.0..=30.0).contains(&fps),
+                "{buckets} buckets → {seconds}s → {fps} data-fps, outside [12, 30]"
+            );
+            assert!((5..=300).contains(&seconds));
+        }
+
+        // K = 10: K/20 = 0.5 s, so the 5 s FLOOR wins. Outside the band by
+        // design — a half-second loop is unusable — but a huge improvement on
+        // the legacy 20 s (which played one frame per 2 s).
+        assert_eq!(p(10), 5);
+        assert!(
+            profile_properties(&[], 10 * hour, hour, None).suggested_playback_seconds == Some(20),
+            "legacy formula must be untouched by the refit"
+        );
+
+        // K = 100_000: K/20 = 5_000 s, so the 300 s CEILING wins (legacy: 90 s).
+        assert_eq!(p(100_000), 300);
+
+        // Unknown bucket size: absent under both formulas.
+        assert_eq!(
+            profile_properties_with(&[], hour, 0, None, refit).suggested_playback_seconds,
+            None
+        );
+    }
+
+    /// The refit is OFF unless asked for: the default derivation must reproduce
+    /// the legacy value exactly, or every rebuilt archive's pacing moves by
+    /// accident.
+    #[test]
+    fn the_default_derivation_is_byte_for_byte_the_legacy_hint() {
+        let hour = 3_600_000u64;
+        for buckets in [0u64, 1, 4, 400, 2_025, 100_000] {
+            let legacy = profile_properties(&[], buckets * hour, hour, Some("points"));
+            let defaulted = profile_properties_with(
+                &[],
+                buckets * hour,
+                hour,
+                Some("points"),
+                PlaybackDerivation::default(),
+            );
+            assert_eq!(legacy, defaulted, "{buckets} buckets");
+            assert_eq!(
+                defaulted.suggested_time_window_ms, None,
+                "no byte total ⇒ no window hint"
+            );
+        }
+    }
+
+    /// BH-10 window derivation: the byte-feasible width, capped at 24 buckets
+    /// and floored at one.
+    #[test]
+    fn suggested_time_window_is_the_byte_feasible_width_capped_and_floored() {
+        let hour = 3_600_000u64;
+        let span = 1_000 * hour;
+        let window = |bytes: u64| {
+            profile_properties_with(
+                &[],
+                span,
+                hour,
+                None,
+                PlaybackDerivation {
+                    total_payload_bytes: Some(bytes),
+                    refit: true,
+                },
+            )
+            .suggested_time_window_ms
+        };
+
+        // Sparse archive: the 24-bucket CAP binds, not the memory budget.
+        assert_eq!(window(1024), Some(24 * hour));
+
+        // Mid-density: β̄ = bytes/span, so W = M_REF·span/bytes. Pick bytes so
+        // the answer is exactly 8 buckets.
+        let bytes =
+            u64::try_from(u128::from(M_REF) * u128::from(span) / u128::from(8 * hour)).unwrap();
+        assert_eq!(window(bytes), Some(8 * hour));
+
+        // Dense archive: the feasible width collapses below one bucket, and the
+        // floor takes over — a narrower window could address no whole bucket.
+        assert_eq!(window(u64::from(u32::MAX) * 1024), Some(hour));
+
+        // Missing inputs ⇒ absent, never a guess.
+        assert_eq!(window(0), None);
+        assert_eq!(
+            profile_properties_with(
+                &[],
+                0,
+                hour,
+                None,
+                PlaybackDerivation {
+                    total_payload_bytes: Some(1_000_000),
+                    refit: true
+                }
+            )
+            .suggested_time_window_ms,
+            None
+        );
+        assert_eq!(
+            profile_properties_with(
+                &[],
+                span,
+                0,
+                None,
+                PlaybackDerivation {
+                    total_payload_bytes: Some(1_000_000),
+                    refit: true
+                }
+            )
+            .suggested_time_window_ms,
+            None
+        );
+    }
+
+    /// Determinism: both derived parameters are pure integer/IEEE functions of
+    /// their inputs, so repeated calls agree exactly.
+    #[test]
+    fn derived_playback_params_are_deterministic() {
+        let hour = 3_600_000u64;
+        let d = PlaybackDerivation {
+            total_payload_bytes: Some(987_654_321),
+            refit: true,
+        };
+        let first = profile_properties_with(&[], 4_321 * hour, hour, Some("trips"), d);
+        for _ in 0..16 {
+            assert_eq!(
+                profile_properties_with(&[], 4_321 * hour, hour, Some("trips"), d),
+                first
+            );
+        }
     }
 
     #[test]

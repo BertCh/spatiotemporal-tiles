@@ -15,6 +15,7 @@ fn point(lon: f64, lat: f64, ts: u64, mag: f64) -> ParsedFeature {
         .cloned()
         .and_then(stt_build::props::FeatureProperties::from_map);
     ParsedFeature {
+        home_zoom: None,
         geojson: Feature {
             bbox: None,
             geometry: Some(Geometry::new(GeomValue::Point(vec![lon, lat]))),
@@ -58,11 +59,11 @@ fn raw_plus_summary_tier_roundtrips_through_archive() {
     let dir = tempfile::tempdir().unwrap();
     let mut writer = PackWriter::create(dir.path(), BlobOrdering::Auto, 64 * 1024 * 1024).unwrap();
 
-    // Raw tier across zooms 8..=10 — coarse enough to keep the test fast but
-    // wide enough that "raw" is unambiguously distinct from "summary".
+    // Raw and summary deliberately overlap at every zoom. Before directory v6
+    // this silently overwrote one tier at identical z/x/y/t addresses.
     let raw_config = TileConfig {
-        min_zoom: 8,
-        max_zoom: 10,
+        min_zoom: 0,
+        max_zoom: 2,
         layer_name: "default".to_string(),
         temporal_bucket_ms: 3_600_000,
         clip_trajectories: false,
@@ -85,7 +86,7 @@ fn raw_plus_summary_tier_roundtrips_through_archive() {
     assert!(n_summary > 0, "summary tier produced no tiles");
 
     let metadata = Metadata::new("summary-test")
-        .with_zoom_levels(0, 10)
+        .with_zoom_levels(0, 2)
         .with_temporal_bucket_ms(3_600_000)
         .with_summary_tier(summary_config.to_tier());
     writer.finalize(&metadata).unwrap();
@@ -100,6 +101,7 @@ fn raw_plus_summary_tier_roundtrips_through_archive() {
     assert_eq!(tier.min_zoom, 0);
     assert_eq!(tier.max_zoom, 2);
     assert_eq!(tier.layer_name, "summary");
+    assert_eq!(tier.variant_id, stt_core::tile::SUMMARY_VARIANT_ID);
     assert_eq!(tier.cell_resolution_per_zoom.len(), 3);
 
     // Group archive entries by zoom and confirm both tiers are present.
@@ -107,11 +109,17 @@ fn raw_plus_summary_tier_roundtrips_through_archive() {
     let mut zooms_with_raw = 0usize;
     let mut summary_feature_total = 0u64;
     let mut raw_feature_total = 0u64;
+    let mut addresses = std::collections::HashMap::<(u8, u32, u32, i64), Vec<u32>>::new();
     for entry in reader.entries() {
+        addresses
+            .entry((entry.zoom, entry.x, entry.y, entry.time_start))
+            .or_default()
+            .push(entry.variant_id);
         // Read each tile so we can distinguish summary vs raw by layer name.
         let layers = reader.read_layers(entry).unwrap();
         let is_summary = layers.iter().any(|l| l.name == "summary");
         if is_summary {
+            assert_eq!(entry.variant_id, stt_core::tile::SUMMARY_VARIANT_ID);
             zooms_with_summary += 1;
             summary_feature_total += entry.feature_count as u64;
             // Summary layers carry the implicit `count` column.
@@ -142,6 +150,7 @@ fn raw_plus_summary_tier_roundtrips_through_archive() {
             }
             assert!(cell_count_total > 0.0);
         } else {
+            assert_eq!(entry.variant_id, stt_core::tile::RAW_VARIANT_ID);
             zooms_with_raw += 1;
             raw_feature_total += entry.feature_count as u64;
         }
@@ -149,6 +158,13 @@ fn raw_plus_summary_tier_roundtrips_through_archive() {
 
     assert!(zooms_with_summary > 0, "no summary tiles in archive");
     assert!(zooms_with_raw > 0, "no raw tiles in archive");
+    assert!(
+        addresses.values().any(|variants| {
+            variants.contains(&stt_core::tile::RAW_VARIANT_ID)
+                && variants.contains(&stt_core::tile::SUMMARY_VARIANT_ID)
+        }),
+        "fixture must contain an exact z/x/y/t raw+summary overlap"
+    );
     // 25 features total — every raw tile keeps each feature, but the
     // streaming writer may emit them across multiple tiles, so the sum of
     // raw feature_counts equals at least the input size at every zoom.

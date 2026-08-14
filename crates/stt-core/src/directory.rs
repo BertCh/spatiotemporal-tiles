@@ -1,4 +1,4 @@
-//! The STT tile directory at directory-codec version 5 (`DIRECTORY_VERSION`) —
+//! The STT tile directory at directory-codec version 6 (`DIRECTORY_VERSION`) —
 //! a compact, range-request-friendly tile index. Every bare vN below names a
 //! version on THAT axis, not the manifest's `formatVersion`.
 //!
@@ -6,14 +6,15 @@
 //! index: fixed-width columns + IPC framing), inspired by PMTiles v3:
 //!
 //! - **Columnar + delta + zig-zag varints.** Entries are sorted by
-//!   `(zoom, hilbert, time_start)`, so each column (zoom, hilbert, x, y,
-//!   time_start) is near-monotonic and delta-codes to ~1 byte per entry.
+//!   `(zoom, hilbert, time_start, variant_id)`, so each column (zoom,
+//!   hilbert, x, y, time_start) is near-monotonic and delta-codes to ~1 byte
+//!   per entry. `variant_id` is an unsigned varint key.
 //! - **Blob-run RLE.** Consecutive entries that point at the *same physical
 //!   blob* (a spatial cell whose content is identical across consecutive time
 //!   buckets — the temporal analogue of PMTiles' ocean tiles) collapse into one
 //!   run. The heavy per-blob columns (offset/length/uncompressed/crc) are then
 //!   stored once per *run* instead of once per *entry*.
-//! - **Per-run pack id (v5).** Each run carries a `pack_id` (which packed-format
+//! - **Per-run pack id.** Each run carries a `pack_id` (which packed-format
 //!   object holds the blob), delta+zig-zag coded against the previous run's
 //!   pack id — packs are near-monotonic in directory order, so ~1 byte/run. A
 //!   single-file archive has `pack_id == 0` on every run.
@@ -32,7 +33,14 @@
 //! `&[TileEntry] ⇆ Vec<u8>`. The archive writer/reader own where the buffer
 //! lives in the file (single-file v4) or object (packed `index/<hash>.sttd`).
 //!
-//! ## v5 wire format (per-run columns, in order)
+//! ## v6 wire format
+//!
+//! The per-entry key columns are `zoom`, `hilbert`, `x`, `y`, `time_start`,
+//! `time_end`, `feature_count`, `temporal_bucket_ms`, then `variant_id`.
+//! The variant column is new in v6 and makes raw/summary payload identity
+//! unambiguous even when every other address component is equal.
+//!
+//! Per-run columns, in order:
 //!
 //! Each run, in directory order, writes:
 //! 1. `run_len`         — uvarint
@@ -44,9 +52,7 @@
 //! 5. `uncompressed`    — uvarint
 //! 6. `crc32c`          — 4 raw little-endian bytes
 //!
-//! The `Δpack_id` column is **new in v5** and sits immediately after `run_len`,
-//! before the offset sentinel. Per-entry key columns and the trailing
-//! `COVER_SECTION_TMIN` section are byte-identical to v4.
+//! The trailing optional `COVER_SECTION_TMIN` section follows the runs.
 
 use crate::error::{Error, Result};
 use crate::tile::TileId;
@@ -64,6 +70,9 @@ pub struct TileEntry {
     pub time_start: i64,
     /// Inclusive temporal end (Unix ms).
     pub time_end: i64,
+    /// Logical payload variant. This is part of the address, so raw and
+    /// summary tiles may safely share `(z, x, y, time_start)`.
+    pub variant_id: u32,
     /// Index of the pack object holding this tile's blob (packed format).
     ///
     /// This selects `manifest.packs[pack_id]` and [`offset`](Self::offset) is
@@ -102,6 +111,7 @@ impl TileEntry {
     /// The tile's identity.
     pub fn tile_id(&self) -> TileId {
         TileId::new(self.zoom, self.x, self.y, self.time_start.max(0) as u64)
+            .with_variant(self.variant_id)
     }
 }
 
@@ -111,9 +121,28 @@ impl TileEntry {
 /// layer-frame version, so the directory codec can evolve without churning
 /// either.
 ///
-/// v5 adds the per-run `pack_id` column and makes the offset contiguity sentinel
-/// pack-relative (reset on every pack change). See the module docs.
-pub const DIRECTORY_VERSION: u8 = 5;
+/// v6 makes `variant_id` a first-class per-entry key.
+///
+/// The WRITER emits v6 only. The DECODER additionally reads
+/// [`MIN_DIRECTORY_VERSION`] upward, because a shipped archive is a durable
+/// artifact: several published datasets have no reproducible source (no
+/// generator, or a login-gated one), so a read-side cutover would not migrate
+/// them — it would strand them permanently.
+pub const DIRECTORY_VERSION: u8 = 6;
+
+/// Oldest directory codec the decoder accepts: v5, the codec every packed v2
+/// archive carries. A v5 buffer has no `variant_id` column, so every entry
+/// reads back as [`crate::tile::RAW_VARIANT_ID`] — exactly what those archives
+/// meant, since the variant axis did not exist and all payloads were raw.
+///
+/// NOT 4. v4 is the retired SINGLE-FILE directory, which the TypeScript reader
+/// never read; claiming it here would put the two reference readers on
+/// different floors, and a format the cross-language conformance tests cannot
+/// hold to account is worse than one nobody accepts.
+///
+/// Read-only: nothing ever WRITES below [`DIRECTORY_VERSION`], so no new
+/// pre-v6 bytes can enter the world through this crate.
+pub const MIN_DIRECTORY_VERSION: u8 = 5;
 
 /// Tag for the optional trailing **covering** section: one signed varint per
 /// entry (in directory order) giving `cover_t_min - time_start`, the tight
@@ -194,23 +223,24 @@ fn get_ivarint(buf: &[u8], pos: &mut usize) -> Result<i64> {
 // Encode
 // ----------------------------------------------------------------------------
 
-/// Encode tile entries into the v5 directory buffer.
+/// Encode tile entries into the v6 directory buffer.
 ///
-/// Entries are sorted into directory order `(zoom, hilbert, time_start)` first,
+/// Entries are sorted into directory order
+/// `(zoom, hilbert, time_start, variant_id)` first,
 /// so the caller need not pre-sort. Two entries are considered to share a blob
 /// (and so RLE-collapse) when their `(pack_id, offset, length,
 /// uncompressed_size, crc32c)` all match — which is exactly what the
 /// dedup-on-write path produces for byte-identical tiles within one pack. The
-/// `pack_id` is part of the run identity (v5): two entries collapse only when
+/// `pack_id` is part of the run identity: two entries collapse only when
 /// they live in the same pack *and* point at the same blob.
 pub fn encode_directory(entries: &[TileEntry]) -> Vec<u8> {
     let mut sorted: Vec<&TileEntry> = entries.iter().collect();
-    sorted.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start));
+    sorted.sort_by_key(|e| (e.zoom, e.hilbert, e.time_start, e.variant_id));
     let n = sorted.len();
 
     // Compute blob runs up front so we can write the run count into the header.
     // A run is a maximal stretch of consecutive entries pointing at one blob in
-    // one pack (pack_id is part of the run identity in v5).
+    // one pack (pack_id is part of the run identity).
     let mut runs: Vec<(usize, u32, u64, u32, u32, u32)> = Vec::new();
     let mut i = 0;
     while i < n {
@@ -276,6 +306,7 @@ pub fn encode_directory(entries: &[TileEntry]) -> Vec<u8> {
             }
             None => put_uvarint(&mut buf, 0),
         }
+        put_uvarint(&mut buf, e.variant_id as u64);
     }
 
     // Per-run blob columns: run_len, Δpack_id, offset (pack-relative
@@ -332,19 +363,7 @@ pub fn encode_directory(entries: &[TileEntry]) -> Vec<u8> {
 // Decode
 // ----------------------------------------------------------------------------
 
-/// Lowest directory version this decoder accepts. v4 (single-file archives) has
-/// no per-run `pack_id` column and whole-file offsets — decoded as `pack_id = 0`
-/// with no pack-relative reset. v5 adds the `pack_id` column. The encoder always
-/// writes [`DIRECTORY_VERSION`] (v5); v4 read support keeps the v4 single-file
-/// `ArchiveReader` working as the transcode input.
-const MIN_DIRECTORY_VERSION: u8 = 4;
-
-/// Decode a v4/v5 directory buffer back into tile entries (in directory order).
-///
-/// Both versions share the per-entry key columns and the trailing cover section.
-/// v5 prepends a `Δpack_id` (zig-zag) varint to each run's columns and resets
-/// the offset contiguity expectation on every pack change; v4 omits the column
-/// and never resets (one implicit pack, `pack_id = 0`).
+/// Decode a v6 directory buffer back into tile entries (in directory order).
 pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
     let mut pos = 0usize;
     let version = *bytes
@@ -353,10 +372,13 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
     pos += 1;
     if !(MIN_DIRECTORY_VERSION..=DIRECTORY_VERSION).contains(&version) {
         return Err(Error::InvalidArchive(format!(
-            "directory: unsupported version {version} (expected {MIN_DIRECTORY_VERSION}..={DIRECTORY_VERSION})"
+            "directory: unsupported version {version} \
+             (expected {MIN_DIRECTORY_VERSION}..={DIRECTORY_VERSION})"
         )));
     }
-    let has_pack_id = version >= 5;
+    // The `variant_id` column exists only from v6. A v5 buffer stops after
+    // `temporal_bucket_ms` and means "raw".
+    let has_variant_column = version >= 6;
     let n = get_uvarint(bytes, &mut pos)? as usize;
     let run_count = get_uvarint(bytes, &mut pos)? as usize;
     // Adversarial-input guard: every entry costs ≥ 8 wire bytes (8 one-byte-
@@ -390,6 +412,7 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
         time_end: i64,
         feature_count: u32,
         temporal_bucket_ms: Option<u64>,
+        variant_id: u32,
     }
     let mut keys: Vec<Key> = Vec::with_capacity(n);
     let mut prev_zoom = 0i64;
@@ -409,6 +432,11 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
             None
         } else {
             Some(get_uvarint(bytes, &mut pos)?)
+        };
+        let variant_id_raw = if has_variant_column {
+            get_uvarint(bytes, &mut pos)?
+        } else {
+            u64::from(crate::tile::RAW_VARIANT_ID)
         };
         // Validate the spatial / feature columns fit their target widths, so a
         // corrupt (or foreign mis-encoded) directory errors loudly instead of
@@ -433,6 +461,11 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
                 "directory: feature_count {feature_count_raw} out of u32 range"
             )));
         }
+        if variant_id_raw > u32::MAX as u64 {
+            return Err(Error::InvalidArchive(format!(
+                "directory: variant_id {variant_id_raw} out of u32 range"
+            )));
+        }
         keys.push(Key {
             zoom: prev_zoom as u8,
             hilbert: prev_hilbert as u64,
@@ -442,6 +475,7 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
             time_end: prev_t.wrapping_add(duration),
             feature_count: feature_count_raw as u32,
             temporal_bucket_ms,
+            variant_id: variant_id_raw as u32,
         });
     }
 
@@ -455,14 +489,7 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
     let mut prev_pack_id = 0i64;
     for _ in 0..run_count {
         let run_len = get_uvarint(bytes, &mut pos)? as usize;
-        // v5 carries a Δpack_id column (zig-zag) and resets the offset
-        // contiguity expectation on every pack change. v4 has neither: one
-        // implicit pack (pack_id = 0), whole-file-contiguous offsets.
-        let pid = if has_pack_id {
-            prev_pack_id.wrapping_add(get_ivarint(bytes, &mut pos)?)
-        } else {
-            0
-        };
+        let pid = prev_pack_id.wrapping_add(get_ivarint(bytes, &mut pos)?);
         if pid != prev_pack_id {
             expected_offset = 0;
         }
@@ -505,6 +532,7 @@ pub fn decode_directory(bytes: &[u8]) -> Result<Vec<TileEntry>> {
                 y: k.y,
                 time_start: k.time_start,
                 time_end: k.time_end,
+                variant_id: k.variant_id,
                 pack_id,
                 offset,
                 length,
@@ -566,6 +594,7 @@ mod tests {
             y,
             time_start: ts,
             time_end: te,
+            variant_id: crate::tile::RAW_VARIANT_ID,
             pack_id: 0,
             offset,
             length,

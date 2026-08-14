@@ -148,7 +148,11 @@ pub fn build_and_write(
             }
         }
     }
-    println!("   ✓ routed {} / {} OD pairs onto the flow graph", routed, od.len());
+    println!(
+        "   ✓ routed {} / {} OD pairs onto the flow graph",
+        routed,
+        od.len()
+    );
 
     if dir_counts.is_empty() {
         let cols = vec![
@@ -257,14 +261,41 @@ fn delaunay_graph(
     // Triangulate in an isotropic metric space (lon scaled by cos-lat).
     let pts: Vec<Point> = hubs
         .iter()
-        .map(|h| Point { x: h[0] * lon_scale, y: h[1] })
+        .map(|h| Point {
+            x: h[0] * lon_scale,
+            y: h[1],
+        })
         .collect();
     let tri = triangulate(&pts);
 
     for t in tri.triangles.chunks_exact(3) {
-        add_hub_edge(&mut adj, &mut edge_len, hubs, lon_scale, max_edge_m, t[0], t[1]);
-        add_hub_edge(&mut adj, &mut edge_len, hubs, lon_scale, max_edge_m, t[1], t[2]);
-        add_hub_edge(&mut adj, &mut edge_len, hubs, lon_scale, max_edge_m, t[2], t[0]);
+        add_hub_edge(
+            &mut adj,
+            &mut edge_len,
+            hubs,
+            lon_scale,
+            max_edge_m,
+            t[0],
+            t[1],
+        );
+        add_hub_edge(
+            &mut adj,
+            &mut edge_len,
+            hubs,
+            lon_scale,
+            max_edge_m,
+            t[1],
+            t[2],
+        );
+        add_hub_edge(
+            &mut adj,
+            &mut edge_len,
+            hubs,
+            lon_scale,
+            max_edge_m,
+            t[2],
+            t[0],
+        );
     }
 
     // Degenerate input (all hubs collinear ⇒ no triangles): fall back to a path
@@ -278,7 +309,15 @@ fn delaunay_graph(
                 .then(hubs[a][1].total_cmp(&hubs[b][1]))
         });
         for w in order.windows(2) {
-            add_hub_edge(&mut adj, &mut edge_len, hubs, lon_scale, max_edge_m, w[0], w[1]);
+            add_hub_edge(
+                &mut adj,
+                &mut edge_len,
+                hubs,
+                lon_scale,
+                max_edge_m,
+                w[0],
+                w[1],
+            );
         }
     }
 
@@ -329,7 +368,9 @@ impl Ord for HeapItem {
     fn cmp(&self, o: &Self) -> Ordering {
         // BinaryHeap is a max-heap; invert so the SMALLEST cost pops first, with a
         // deterministic node tie-break (smaller node first).
-        o.cost.total_cmp(&self.cost).then_with(|| o.node.cmp(&self.node))
+        o.cost
+            .total_cmp(&self.cost)
+            .then_with(|| o.node.cmp(&self.node))
     }
 }
 impl PartialOrd for HeapItem {
@@ -351,7 +392,10 @@ fn dijkstra_path(
     let mut prev: HashMap<usize, usize> = HashMap::new();
     let mut heap = BinaryHeap::new();
     dist.insert(src, 0.0);
-    heap.push(HeapItem { cost: 0.0, node: src });
+    heap.push(HeapItem {
+        cost: 0.0,
+        node: src,
+    });
     while let Some(HeapItem { cost, node }) = heap.pop() {
         if node == dst {
             break;
@@ -448,7 +492,11 @@ fn write_flow_network(
                 let seg_counts: Vec<u32> = dedges
                     .iter()
                     .map(|e| {
-                        let c = dir_counts.get(e).and_then(|m| m.get(&bin)).copied().unwrap_or(0);
+                        let c = dir_counts
+                            .get(e)
+                            .and_then(|m| m.get(&bin))
+                            .copied()
+                            .unwrap_or(0);
                         overall_max = overall_max.max(c);
                         c
                     })
@@ -474,7 +522,10 @@ fn write_flow_network(
             let mut properties = Map::new();
             properties.insert("max_count".to_string(), json!(overall_max));
             properties.insert("total_count".to_string(), json!(peak_seg_total));
-            properties.insert("min_zoom".to_string(), json!(stroke_min_zoom(peak_seg_total)));
+            properties.insert(
+                "min_zoom".to_string(),
+                json!(stroke_min_zoom(peak_seg_total)),
+            );
 
             writer.write_linestring(&LineStringRecord {
                 coordinates: coords,
@@ -519,13 +570,25 @@ fn offset_polyline_right(coords: &mut [[f64; 2]], offset_m: f64, lon_scale: f64)
     };
     let mut normals = vec![[0.0f64; 2]; n];
     for (i, slot) in normals.iter_mut().enumerate() {
-        let prev = if i > 0 { Some(seg_normal(mm[i - 1], mm[i])) } else { None };
-        let next = if i < n - 1 { Some(seg_normal(mm[i], mm[i + 1])) } else { None };
+        let prev = if i > 0 {
+            Some(seg_normal(mm[i - 1], mm[i]))
+        } else {
+            None
+        };
+        let next = if i < n - 1 {
+            Some(seg_normal(mm[i], mm[i + 1]))
+        } else {
+            None
+        };
         *slot = match (prev, next) {
             (Some(p), Some(q)) => {
                 let (sx, sy) = (p[0] + q[0], p[1] + q[1]);
                 let l = (sx * sx + sy * sy).sqrt();
-                if l < 1e-9 { p } else { [sx / l, sy / l] }
+                if l < 1e-9 {
+                    p
+                } else {
+                    [sx / l, sy / l]
+                }
             }
             (Some(p), None) => p,
             (None, Some(q)) => q,
@@ -564,7 +627,12 @@ fn resample_spline(
         let u = step as f64 / k as f64; // parameter in [0, n-1]
         let i = (u.floor() as usize).min(n - 2);
         let t = u - i as f64;
-        let (p0, p1, p2, p3) = (at(i as isize - 1), coords[i], coords[i + 1], at(i as isize + 2));
+        let (p0, p1, p2, p3) = (
+            at(i as isize - 1),
+            coords[i],
+            coords[i + 1],
+            at(i as isize + 2),
+        );
         let (t2, t3) = (t * t, t * t * t);
         let cr = |a: f64, b: f64, c: f64, d: f64| {
             0.5 * (2.0 * b
@@ -572,7 +640,10 @@ fn resample_spline(
                 + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2
                 + (-a + 3.0 * b - 3.0 * c + d) * t3)
         };
-        out_c.push([cr(p0[0], p1[0], p2[0], p3[0]), cr(p0[1], p1[1], p2[1], p3[1])]);
+        out_c.push([
+            cr(p0[0], p1[0], p2[0], p3[0]),
+            cr(p0[1], p1[1], p2[1], p3[1]),
+        ]);
         let tf = t as f32;
         for b in 0..nb {
             let a = matrix[i * nb + b];
@@ -635,7 +706,12 @@ mod tests {
 
     #[test]
     fn delaunay_connects_a_square() {
-        let hubs = vec![[-73.60, 45.50], [-73.59, 45.50], [-73.60, 45.51], [-73.59, 45.51]];
+        let hubs = vec![
+            [-73.60, 45.50],
+            [-73.59, 45.50],
+            [-73.60, 45.51],
+            [-73.59, 45.51],
+        ];
         let (adj, edges) = delaunay_graph(&hubs, 0.70, 0.0);
         // A 4-point square triangulates into 2 triangles sharing a diagonal → 5 edges.
         assert_eq!(edges.len(), 5);
@@ -675,10 +751,16 @@ mod tests {
         let (c, m) = resample_spline(&coords, &matrix, 1, 4);
         assert_eq!(c.len(), (3 - 1) * 4 + 1, "9 points for 2 segments × 4");
         assert_eq!(m.len(), c.len(), "matrix stays 1:1 with vertices");
-        assert!((c[0][0]).abs() < 1e-9 && (c[0][1]).abs() < 1e-9, "start preserved");
+        assert!(
+            (c[0][0]).abs() < 1e-9 && (c[0][1]).abs() < 1e-9,
+            "start preserved"
+        );
         assert!((c[c.len() - 1][0] - 2.0).abs() < 1e-9, "end preserved");
         assert!((m[0] - 10.0).abs() < 1e-6 && (m[m.len() - 1] - 10.0).abs() < 1e-6);
-        assert!(m.iter().all(|&v| (9.9..=20.1).contains(&v)), "matrix stays in range");
+        assert!(
+            m.iter().all(|&v| (9.9..=20.1).contains(&v)),
+            "matrix stays in range"
+        );
     }
 
     #[test]
@@ -687,24 +769,40 @@ mod tests {
         // trunk shifts NORTH — the opposite side, so the two make twin ribbons.
         let mut fwd = vec![[-73.60, 45.50], [-73.59, 45.50]];
         offset_polyline_right(&mut fwd, 20.0, 0.70);
-        assert!(fwd[0][1] < 45.50, "east-going shifts south, got {}", fwd[0][1]);
+        assert!(
+            fwd[0][1] < 45.50,
+            "east-going shifts south, got {}",
+            fwd[0][1]
+        );
         let mut rev = vec![[-73.59, 45.50], [-73.60, 45.50]];
         offset_polyline_right(&mut rev, 20.0, 0.70);
-        assert!(rev[0][1] > 45.50, "west-going shifts north, got {}", rev[0][1]);
+        assert!(
+            rev[0][1] > 45.50,
+            "west-going shifts north, got {}",
+            rev[0][1]
+        );
     }
 
     #[test]
     fn build_and_write_produces_a_corridor() {
         // Three collinear stations; one OD pair A→C routes through B.
         let stations = vec![[-73.60, 45.50], [-73.59, 45.50], [-73.58, 45.50]];
-        let od = vec![OdPair { origin: 0, dest: 2, bins: HashMap::from([(0i64, 9u32)]) }];
-        let tmp = std::env::temp_dir().join(format!("stt_flowgraph_{}.parquet", std::process::id()));
+        let od = vec![OdPair {
+            origin: 0,
+            dest: 2,
+            bins: HashMap::from([(0i64, 9u32)]),
+        }];
+        let tmp =
+            std::env::temp_dir().join(format!("stt_flowgraph_{}.parquet", std::process::id()));
         let (features, buckets, bucket0, range_end) = build_and_write(
             &tmp,
             &stations,
             &od,
             3_600_000,
-            &FlowGraphParams { hub_radius_m: 0.0, ..Default::default() },
+            &FlowGraphParams {
+                hub_radius_m: 0.0,
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(features >= 1);

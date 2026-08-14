@@ -122,6 +122,7 @@ mod tests {
 
     fn tier(scheme: SummaryScheme, resolutions: Vec<u8>) -> SummaryTier {
         SummaryTier {
+            variant_id: stt_core::tile::SUMMARY_VARIANT_ID,
             scheme,
             min_zoom: 0,
             max_zoom: resolutions.len() as u8 - 1,

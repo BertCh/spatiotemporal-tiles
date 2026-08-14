@@ -16,7 +16,7 @@
 //! (`drifters_hourly`), which only swaps the [`Product`] knobs.
 
 use crate::common::{
-    self, LineStringRecord, PropertyColumn, SttBuildOptions, StreamingLineStringParquetWriter,
+    self, LineStringRecord, PropertyColumn, StreamingLineStringParquetWriter, SttBuildOptions,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
@@ -167,9 +167,13 @@ pub(crate) fn run_product(args: Args, product: &Product) -> Result<()> {
         let m_start = NaiveDate::from_ymd_opt(*y, *m, 1).unwrap();
         let (ny, nm) = next_month(*y, *m);
         let m_end = NaiveDate::from_ymd_opt(ny, nm, 1).unwrap().min(end);
-        let path = args.cache_dir.join((product.cache_file)(*y, *m, &bounds_tag));
+        let path = args
+            .cache_dir
+            .join((product.cache_file)(*y, *m, &bounds_tag));
 
-        if args.refresh || !path.exists() || fs::metadata(&path).map(|m| m.len() < 64).unwrap_or(true)
+        if args.refresh
+            || !path.exists()
+            || fs::metadata(&path).map(|m| m.len() < 64).unwrap_or(true)
         {
             let url = build_url(
                 product,
@@ -325,7 +329,10 @@ fn build_url(
     end: &str,
     bounds: Option<(f64, f64, f64, f64)>,
 ) -> String {
-    let columns = format!("ID,WMO,time,longitude,latitude,{},ve,vn", product.temp_column);
+    let columns = format!(
+        "ID,WMO,time,longitude,latitude,{},ve,vn",
+        product.temp_column
+    );
     let mut parts: Vec<String> = vec![
         erddap_encode(&columns),
         format!("time%3E={}", erddap_encode(start)),
@@ -422,7 +429,10 @@ fn parse_csv(
             }
         }
 
-        tracks.entry(id).or_default().push(Fix { ms, lon, lat, temp });
+        tracks
+            .entry(id)
+            .or_default()
+            .push(Fix { ms, lon, lat, temp });
         *total += 1;
     }
     Ok(())
@@ -442,7 +452,9 @@ fn parse_time_ms(s: &str) -> Option<i64> {
 }
 
 fn ms_to_dt(ms: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(ms).single().unwrap_or_else(Utc::now)
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(Utc::now)
 }
 
 /// Per-vertex SST (°C) aligned 1:1 with a segment's fixes, gap-filled so the

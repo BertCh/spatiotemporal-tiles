@@ -3256,6 +3256,7 @@ dependencies = [
  "h3o",
  "indicatif",
  "native-tls",
+ "parquet",
  "postgres-native-tls",
  "r2d2",
  "serde",

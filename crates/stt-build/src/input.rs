@@ -12,10 +12,14 @@ use arrow::datatypes::DataType;
 use geojson::{Feature, Geometry, Value as GeomValue};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::metadata::KeyValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
+use stt_core::metadata::{
+    coord_quant_step_deg, ContentFingerprint, CONTENT_FINGERPRINT_VERSION,
+    FINGERPRINT_CARDINALITY_CAP,
+};
 use stt_core::types::{BoundingBox, TimeRange};
 
 /// Shared properties map to avoid cloning per-segment. Still the payload of
@@ -26,6 +30,13 @@ pub type SharedProperties = Arc<serde_json::Map<String, serde_json::Value>>;
 /// Parsed feature with geometry and temporal information
 #[derive(Debug, Clone)]
 pub struct ParsedFeature {
+    /// DT-2: the ONE zoom this feature is stored at under additive
+    /// decomposition, when `--additive-lod` assigned one. `None` = today's
+    /// replicated placement (the feature appears at every zoom in its band).
+    ///
+    /// Read by the tiler's band mechanism ahead of `min_zoom_field`, so the
+    /// placement authority itself needs no change.
+    pub home_zoom: Option<u8>,
     pub geojson: Feature,
     /// This feature's properties — either a handle into its batch's columnar
     /// table (the GeoParquet path) or an owned map. Cloning is a refcount bump
@@ -513,6 +524,7 @@ fn parse_batch(
             foreign_members: None,
         };
         features.push(ParsedFeature {
+            home_zoom: None,
             geojson: feature,
             shared_properties,
             timestamp,
@@ -843,13 +855,739 @@ fn extract_vertex_values_from_batch(
     Ok(out)
 }
 
-/// Calculate spatial and temporal bounds from features
+/// Calculate spatial and temporal bounds from features.
+///
+/// Thin wrapper over [`profile_features`] kept for every existing caller: it
+/// returns the same pair it always did, now computed under
+/// [`DEFAULT_BOUNDS_MODE`] — which is [`BoundsMode::Vertex`] since R1, so the
+/// bbox is the honest, conservative superset rather than the centroid box.
+/// Callers that need the vertical extent, the mode actually used, or both boxes
+/// side by side want [`profile_features_with`] instead; this two-field view
+/// exists only so pre-SH-2 call sites keep compiling.
 pub fn calculate_bounds(features: &[ParsedFeature]) -> Result<(BoundingBox, TimeRange)> {
+    let profile = profile_features(features)?;
+    Ok((profile.bounds, profile.time_range))
+}
+
+// =============================================================================
+// Feature profiling — honest bounds, temporal extent, vertical extent (SH-2)
+// =============================================================================
+
+/// Which geometric quantity an archive's declared `metadata.bounds` is taken
+/// from.
+///
+/// **The defect this exists to close (backlog K11).** The historical bbox is
+/// the min/max of [`ParsedFeature::lon`]/[`ParsedFeature::lat`] — the parsed
+/// *anchor*, which for every non-point geometry is the **centroid** (see
+/// `parse_wkb_geometry`). Tiles, however, are addressed by **vertex**
+/// (`tiler::place_non_trajectory` walks `feature.geojson.geometry`). A
+/// LineString or ring whose vertices reach past its centroid is therefore not
+/// bounded by the number the manifest advertises: the declared bbox provably
+/// *under-states* the real extent. Anything that pre-intersects a query box
+/// against `metadata.bounds` (tile selection, frustum pre-culling, the
+/// showcase's opening camera) is unsound on such an archive — it can discard
+/// tiles that really do carry visible data.
+///
+/// [`BoundsMode::Vertex`] computes the honest quantity. It is a **conservative
+/// superset**: every vertex the archive can decode to lies inside it, and it is
+/// never tighter than [`BoundsMode::Centroid`] on the same features (a centroid
+/// lies in the convex hull of its own vertices, hence inside their bbox).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoundsMode {
+    /// Legacy: min/max over feature anchors (centroids). Under-states the real
+    /// extent for any geometry wider than a point. Kept as the documented
+    /// rollback (`stt-build --bounds-mode centroid`) and as the shape every
+    /// pre-R1 published manifest carries.
+    Centroid,
+    /// Honest: min/max over every geometry vertex, falling back to the anchor
+    /// for a feature carrying no (usable) geometry. **The default since R1.**
+    #[default]
+    Vertex,
+}
+
+impl BoundsMode {
+    /// The value stamped into `metadata.properties[`[`BOUNDS_MODE_PROPERTY`]`]`.
+    ///
+    /// Lower-case, stable, and compared case-insensitively by the validator —
+    /// this string is a cross-crate contract, not a display label.
+    pub const fn as_manifest_value(self) -> &'static str {
+        match self {
+            BoundsMode::Centroid => "centroid",
+            BoundsMode::Vertex => "vertex",
+        }
+    }
+}
+
+/// The `metadata.properties` key by which a writer records **which** quantity
+/// `metadata.bounds` was taken from.
+///
+/// ⚠️ **Cross-crate contract.** `stt-validate`'s check 13 reads this exact key
+/// (its own `BOUNDS_MODE_PROPERTY`) and treats the value `"vertex"` as an
+/// *attestation*: on such an archive a bbox that fails to contain the decoded
+/// vertices is an **error**, whereas on a legacy archive (key absent — the whole
+/// pre-R1 fleet) the same finding is a warning naming the rebuild. Renaming the
+/// key, or emitting a different value spelling, silently demotes every new
+/// archive back to warn-only.
+///
+/// It rides `properties` — the free-form `BTreeMap<String, String>` every
+/// manifest already carries — rather than `manifest.capabilities`, because a
+/// reader **rejects** an archive declaring a capability it does not implement,
+/// so minting one here would make every honest archive unopenable by the
+/// deployed fleet's readers. A property is inert to any reader that ignores it.
+pub const BOUNDS_MODE_PROPERTY: &str = "bounds_mode";
+
+/// The bounds mode a build uses when the caller does not choose one.
+///
+/// ⚠️ **This constant is byte-changing and it has now been flipped (R1).** A
+/// rebuilt archive's `metadata.bounds` numbers move — they *widen* — which moves
+/// the golden manifest pins under `crates/stt-core/tests/fixtures/v2-golden/`.
+/// Golden pins are re-blessed exactly once in the 2026-08 optimization program,
+/// by work item TB-14 inside rebuild window R1; if a golden test is red because
+/// of this flip, that is the expected pin move, **not** a licence to re-bless it
+/// anywhere else.
+///
+/// Why the flip is the fix and not a weakening of the check: the centroid box
+/// provably *under-states* the extent of every non-point geometry (K11), and
+/// anything that pre-intersects a query box against `metadata.bounds` — tile
+/// selection, frustum pre-culling, the showcase's opening camera — then discards
+/// tiles that really do carry visible data, with no error anywhere in the stack.
+/// The vertex box is the conservative superset those consumers need.
+///
+/// The legacy quantity is not deleted: `stt-build --bounds-mode centroid` still
+/// selects it, and [`FeatureProfile::centroid_bounds`] is computed on every
+/// build whatever the mode.
+pub const DEFAULT_BOUNDS_MODE: BoundsMode = BoundsMode::Vertex;
+
+// ===========================================================================
+// Feature-id SCOPE — the sibling attestation, for check 12's distinct count.
+// ===========================================================================
+
+/// Largest feature set this crate will attempt to PROVE pairwise-distinct ids
+/// over.
+///
+/// The proof needs the whole id multiset in memory to look for a collision, so
+/// it costs one `u64` per feature (8 B; 40 MB at the cap) plus one sort. That
+/// is a rounding error next to the `ParsedFeature` vector it rides — hundreds
+/// of bytes per row, held for the whole build — but it is not unbounded, and an
+/// unbounded allocation inside a *diagnostic* is not a trade worth making.
+///
+/// Above the cap the attestation is DECLINED rather than guessed: the archive
+/// falls back to the conservative `SourceFeatures` basis, which costs it only a
+/// note. An operator who knows their ids are distinct can still assert it with
+/// `stt-build --feature-id-scope global`.
+pub const FEATURE_ID_ATTESTATION_CAP: usize = 5_000_000;
+
+/// HOW the writer will construct the wire `id` for one source feature.
+///
+/// # Why this type exists (BLOCKER 1)
+///
+/// `--feature-id-scope auto` used to ask one question — "does every source
+/// feature carry an id?" — and **no ingest path populates
+/// `ParsedFeature.geojson.id`**: the GeoParquet reader
+/// ([`load_features_from_geoparquet`]'s `Feature { id: None, .. }`), the
+/// PostGIS reader and the DuckDB reader all leave it `None`. So the strict
+/// basis had no live producer, `auto` resolved to `local` on every archive
+/// anyone could build, and check 12's distinct-id comparison was structurally
+/// disarmed. Worse, the resulting report *described* the fleet's point archives
+/// — "the wire id is the PER-TILE ROW INDEX" — on line, polygon and trip
+/// archives where that is simply not what the writer did.
+///
+/// The writer does not need an operator's assertion, because it already knows
+/// which id-construction path it will take. This enum is that fact, and
+/// [`feature_id_report`] derives the attestation from it.
+///
+/// # The four paths, and which are dataset-wide keys
+///
+/// | construction | where | one id per source feature? |
+/// |---|---|---|
+/// | [`Source`](FeatureIdConstruction::Source) | `columnar::determine_feature_id` maps `geojson.id` verbatim (integers) or via FNV-1a-64 (strings) | **yes** |
+/// | [`AnchorHash`](FeatureIdConstruction::AnchorHash) | `determine_feature_id`'s fallback, `FNV(timestamp, lon, lat)` over the feature ANCHOR | **yes** — the tiler copies the parent anchor into every clipped piece precisely so "id-less pieces hash to the SAME synthetic feature id in every tile" (`tiler::place_polygon`) |
+/// | [`RowIndex`](FeatureIdConstruction::RowIndex) | `columnar::build_point_layer` overwrites an id-less point's id with `i as u64` | no — unique only WITHIN a tile |
+/// | [`SegmentHash`](FeatureIdConstruction::SegmentHash) | `columnar::segment_feature_id`'s fallback, `FNV(start_time, first coord of the CLIPPED segment)` | no — a fresh id per clipped segment |
+///
+/// Only the first two make `distinct_feature_count` and the decoded distinct-id
+/// count the same quantity, so only those two arm the strict comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeatureIdConstruction {
+    /// The source feature's own id, mapped by `columnar::determine_feature_id`.
+    Source,
+    /// `FNV(timestamp, anchor lon, anchor lat)` — ONE id per source feature,
+    /// copied verbatim into every tile and every zoom the feature reaches.
+    AnchorHash,
+    /// The **per-tile row index** (`columnar::build_point_layer`). Unique inside
+    /// a tile, repeated across tiles: not a key.
+    RowIndex,
+    /// A fresh hash per CLIPPED SEGMENT (`columnar::segment_feature_id`). One
+    /// source trajectory becomes many ids, and the writer cannot enumerate them
+    /// before tiling, so it cannot prove anything about them.
+    SegmentHash,
+}
+
+impl FeatureIdConstruction {
+    /// Is this construction a dataset-wide key — exactly one distinct wire id
+    /// per source feature, stable across every tile and pyramid level?
+    ///
+    /// This is the whole gate: `true` here is what lets `stt-validate` compare
+    /// `distinct_feature_count` (a count of SOURCE FEATURES) against the ids it
+    /// decodes and call a shortfall FEATURE LOSS.
+    pub const fn is_dataset_wide_key(self) -> bool {
+        matches!(
+            self,
+            FeatureIdConstruction::Source | FeatureIdConstruction::AnchorHash
+        )
+    }
+
+    /// The value stamped into
+    /// `metadata.properties[`[`FEATURE_ID_CONSTRUCTION_PROPERTY`]`]`.
+    ///
+    /// ⚠️ Cross-crate contract, compared case-insensitively by
+    /// `stt_core::metadata::distinct_id_basis`. These strings are wire values,
+    /// not display labels.
+    pub const fn as_manifest_value(self) -> &'static str {
+        use stt_core::metadata as m;
+        match self {
+            FeatureIdConstruction::Source => m::FEATURE_ID_CONSTRUCTION_SOURCE,
+            FeatureIdConstruction::AnchorHash => m::FEATURE_ID_CONSTRUCTION_ANCHOR_HASH,
+            FeatureIdConstruction::RowIndex => m::FEATURE_ID_CONSTRUCTION_ROW_INDEX,
+            FeatureIdConstruction::SegmentHash => m::FEATURE_ID_CONSTRUCTION_SEGMENT_HASH,
+        }
+    }
+}
+
+/// Build levers [`feature_id_report`] needs in order to predict the writer's
+/// own id construction.
+///
+/// Exactly one today, and it is load-bearing: trajectory clipping is what turns
+/// a duration LineString from one [`AnchorHash`](FeatureIdConstruction::AnchorHash)
+/// id into many [`SegmentHash`](FeatureIdConstruction::SegmentHash) ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeatureIdOptions {
+    /// `TileConfig::clip_trajectories` (i.e. `!stt-build --no-clip`). With it
+    /// ON, `tiler::place_feature` cuts a duration (multi)LineString into
+    /// per-tile/per-bucket segments, each of which mints its own id when the
+    /// source carries none. With it OFF the same feature is placed whole and
+    /// keeps a single anchor hash.
+    pub clip_trajectories: bool,
+}
+
+impl Default for FeatureIdOptions {
+    /// The builder's own default (`clip_trajectories: true`), which is also the
+    /// CONSERVATIVE choice: assuming clipping can only move a trajectory into
+    /// the non-key `SegmentHash` class, never out of it.
+    fn default() -> Self {
+        Self {
+            clip_trajectories: true,
+        }
+    }
+}
+
+/// Why [`feature_ids_are_globally_distinct`] did (or did not) conclude that the
+/// wire `id` column is a dataset-wide key.
+///
+/// Every non-[`Distinct`](FeatureIdAttestation::Distinct) variant carries the
+/// evidence, so a build log can say which feature stopped the proof rather than
+/// just "no".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeatureIdAttestation {
+    /// PROVEN. Every feature's wire id is a dataset-wide key — either its own
+    /// source id (mapped verbatim for integers, through the spec-fixed
+    /// FNV-1a-64 for strings) or the whole-feature ANCHOR HASH the tiler copies
+    /// into every clipped piece — and no two of them collide.
+    Distinct,
+    /// Declined at feature `index`: it is an id-less POINT, so
+    /// `columnar::build_point_layer` overwrites its id with the **per-tile row
+    /// index**, which is unique within a tile and repeats across tiles.
+    ///
+    /// This is the fleet's normal state on point archives and the whole reason
+    /// the basis exists. (It is emitted only for the row-index construction —
+    /// an id-less LINE or POLYGON keeps a stable anchor hash and is attestable.)
+    NoSourceId { index: usize },
+    /// Declined at feature `index`: it is an id-less duration (multi)LineString
+    /// under trajectory clipping, so `columnar::segment_feature_id` mints a
+    /// fresh id per CLIPPED SEGMENT. The writer cannot enumerate those ids
+    /// before tiling, so it cannot prove they are a key.
+    SegmentIds { index: usize },
+    /// Declined at feature `index`: its `Id::Number` is neither a `u64` nor an
+    /// `i64` (a JSON float), so `determine_feature_id` falls through to its
+    /// positional hash for it exactly as if it carried no id — and the feature's
+    /// geometry then puts it in a non-key construction class.
+    NonIntegerId { index: usize },
+    /// Declined: two source features map to the SAME wire id.
+    Collision {
+        value: u64,
+        first: usize,
+        second: usize,
+    },
+    /// Declined: the feature set is larger than [`FEATURE_ID_ATTESTATION_CAP`],
+    /// so the proof was not attempted.
+    AboveCap { features: usize },
+}
+
+impl FeatureIdAttestation {
+    /// Did the proof succeed?
+    pub fn is_distinct(&self) -> bool {
+        matches!(self, FeatureIdAttestation::Distinct)
+    }
+
+    /// One line of evidence for the build log.
+    pub fn reason(&self) -> String {
+        match self {
+            FeatureIdAttestation::Distinct => {
+                "every source feature maps to one distinct, dataset-wide wire id".to_string()
+            }
+            FeatureIdAttestation::NoSourceId { index } => format!(
+                "source feature #{index} is an id-less POINT, so the writer overwrites its id \
+                 with the PER-TILE ROW INDEX, which repeats across tiles"
+            ),
+            FeatureIdAttestation::SegmentIds { index } => format!(
+                "source feature #{index} is an id-less duration (multi)LineString under \
+                 trajectory clipping, so the writer mints a fresh id per CLIPPED SEGMENT — ids \
+                 the build cannot enumerate before tiling (build with --no-clip, or give the \
+                 source an id column, to make them a key)"
+            ),
+            FeatureIdAttestation::NonIntegerId { index } => format!(
+                "source feature #{index} carries a non-integer numeric id, which the writer \
+                 cannot map verbatim — it falls through to the positional hash"
+            ),
+            FeatureIdAttestation::Collision {
+                value,
+                first,
+                second,
+            } => format!(
+                "source features #{first} and #{second} both map to wire id {value}, so the id \
+                 column is not a key"
+            ),
+            FeatureIdAttestation::AboveCap { features } => format!(
+                "{features} features is above the {FEATURE_ID_ATTESTATION_CAP}-feature \
+                 attestation cap, so distinctness was not proven (assert it with \
+                 --feature-id-scope global if you know it holds)"
+            ),
+        }
+    }
+}
+
+/// FNV-1a-64 over raw bytes — **a deliberate mirror** of `columnar::fnv1a_64`.
+///
+/// ⚠️ Why a second copy instead of a call. The original is module-private to
+/// `columnar`, and this change does not own that file. The algorithm is fixed
+/// by spec (offset basis `0xcbf29ce484222325`, prime `0x100000001b3`;
+/// <http://www.isthe.com/chongo/tech/comp/fnv/>) precisely so that it can be
+/// re-implemented without drift, and
+/// `fnv1a_64_matches_the_spec_fixed_constants` pins this copy against
+/// independently computed vectors. If the two ever disagree, the attestation
+/// would claim distinctness over ids the encoder never wrote — hence the pin.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// The wire id `columnar::determine_feature_id` will emit for `feature`, but
+/// ONLY when that id is derived from the source — `None` whenever the writer
+/// would fall through to its positional hash.
+///
+/// `None` is not by itself a decline: an id-less LINE or POLYGON falls through
+/// to the ANCHOR HASH, which the tiler copies into every clipped piece and is
+/// therefore still a dataset-wide key. [`feature_id_construction`] is what
+/// decides; this function answers only "did the source supply it?".
+fn attestable_feature_id(feature: &ParsedFeature) -> Option<u64> {
+    use geojson::feature::Id;
+    match feature.geojson.id.as_ref()? {
+        Id::Number(num) => num
+            .as_u64()
+            // Same widening the writer does: a negative i64 reinterpreted as
+            // u64 is injective, and a genuine clash with a large u64 id shows
+            // up as a Collision below rather than being waved through.
+            .or_else(|| num.as_i64().map(|v| v as u64)),
+        Id::String(s) => Some(fnv1a_64(s.as_bytes())),
+    }
+}
+
+/// The whole-feature ANCHOR HASH `columnar::determine_feature_id` falls through
+/// to for an id-less feature: `FNV-1a-64(timestamp, lon.to_bits(), lat.to_bits())`
+/// over the feature's representative point.
+///
+/// ⚠️ **A deliberate mirror of `columnar::determine_feature_id`'s fallback**,
+/// for the same reason [`fnv1a_64`] is a mirror: the original is module-private
+/// to `columnar`, which this change does not own. The field order (timestamp,
+/// lon bits, lat bits) and the little-endian folding are what must not drift —
+/// `anchor_hash_mirrors_the_writers_fallback_id` pins it against independently
+/// computed vectors.
+///
+/// Why it is a key even though nothing "assigns" it: every per-tile piece the
+/// tiler derives from a feature carries the PARENT's `timestamp`/`lon`/`lat`
+/// (`tiler::place_polygon`: "Parent's representative point, so id-less pieces
+/// hash to the SAME synthetic feature id in every tile"; `place_polyline`'s
+/// timeless arm does the same), so one source feature yields exactly one wire
+/// id however many tiles and zooms it is replicated into.
+fn anchor_feature_id(feature: &ParsedFeature) -> u64 {
+    let mut bytes = [0u8; 24];
+    bytes[0..8].copy_from_slice(&feature.timestamp.to_le_bytes());
+    bytes[8..16].copy_from_slice(&feature.lon.to_bits().to_le_bytes());
+    bytes[16..24].copy_from_slice(&feature.lat.to_bits().to_le_bytes());
+    fnv1a_64(&bytes)
+}
+
+/// Which of the writer's four id-construction paths `feature` will take.
+///
+/// Mirrors the dispatch in `tiler::place_feature` → `tiler::place_non_trajectory`
+/// and `columnar::build_layers_from_features_with`, in that order:
+///
+/// * a **source id** wins outright. `segment_feature_id` reads the parent id off
+///   every clipped segment and `build_point_layer` leaves an explicit id alone,
+///   so the id is the same value everywhere regardless of geometry.
+/// * otherwise **POINT / MultiPoint / GeometryCollection-of-points** →
+///   [`RowIndex`](FeatureIdConstruction::RowIndex). (A MultiPoint's derived
+///   pieces are Points, so they land in `build_point_layer` too.)
+/// * otherwise a **duration (multi)LineString under trajectory clipping** →
+///   [`SegmentHash`](FeatureIdConstruction::SegmentHash).
+/// * otherwise → [`AnchorHash`](FeatureIdConstruction::AnchorHash): polygons,
+///   timeless lines, and duration lines built `--no-clip`.
+///
+/// Every disagreement with the real dispatch is resolved toward the NON-key
+/// class, so a misprediction can only ever cost enforcement — never manufacture
+/// it. Two deliberate over-approximations: a 1-vertex duration LineString is
+/// classed `SegmentHash` although `is_clippable_trajectory` would reject it and
+/// place it whole, and `place_polyline`'s fully-inside-one-tile fast path can
+/// hand a duration line an anchor hash at coarse zooms while clipping it at fine
+/// ones. Both decline; neither attests.
+pub fn feature_id_construction(
+    feature: &ParsedFeature,
+    options: FeatureIdOptions,
+) -> FeatureIdConstruction {
+    use geojson::Value as G;
+    if attestable_feature_id(feature).is_some() {
+        return FeatureIdConstruction::Source;
+    }
+    // No geometry at all: `determine_geometry_type` errors and the build fails
+    // before any of this matters. Classify conservatively rather than guess.
+    let Some(geometry) = feature.geojson.geometry.as_ref() else {
+        return FeatureIdConstruction::RowIndex;
+    };
+    // A GeometryCollection is routed by its FIRST member (columnar's
+    // `determine_geometry_type`), so unwrap one level before deciding.
+    let value = match &geometry.value {
+        G::GeometryCollection(members) => match members.first() {
+            Some(first) => &first.value,
+            // Empty collection: `determine_geometry_type` calls it a Polygon,
+            // but nothing can be extracted from it and the columnar builder
+            // drops it. Conservative.
+            None => return FeatureIdConstruction::RowIndex,
+        },
+        other => other,
+    };
+    match value {
+        G::Point(_) | G::MultiPoint(_) => FeatureIdConstruction::RowIndex,
+        G::LineString(_) | G::MultiLineString(_) => {
+            if options.clip_trajectories && feature.end_timestamp.is_some() {
+                FeatureIdConstruction::SegmentHash
+            } else {
+                FeatureIdConstruction::AnchorHash
+            }
+        }
+        G::Polygon(_) | G::MultiPolygon(_) => FeatureIdConstruction::AnchorHash,
+        // A nested GeometryCollection: one unwrap is all `determine_geometry_type`
+        // does, and it calls this shape a Polygon. Decline rather than model it.
+        G::GeometryCollection(_) => FeatureIdConstruction::RowIndex,
+    }
+}
+
+/// What one build's id column IS, and whether it can be attested — both derived
+/// from the writer's own construction, in a single pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeatureIdReport {
+    /// The construction the whole feature set resolves to. When the set mixes
+    /// kinds this is the FIRST non-key kind in index order, and otherwise
+    /// [`AnchorHash`](FeatureIdConstruction::AnchorHash) if any feature needed
+    /// it, else [`Source`](FeatureIdConstruction::Source) — a total,
+    /// index-order-deterministic join.
+    pub construction: FeatureIdConstruction,
+    /// Whether the ids that construction produces are provably a dataset-wide
+    /// key. [`FeatureIdAttestation::Distinct`] iff `construction`
+    /// [`is_dataset_wide_key`](FeatureIdConstruction::is_dataset_wide_key) AND
+    /// no two features collide.
+    pub attestation: FeatureIdAttestation,
+}
+
+/// Can this feature set's wire `id` column be attested as a **dataset-wide
+/// key** — one distinct id per source feature, stable across tiles and pyramid
+/// levels?
+///
+/// This is the builder half of `stt_core::metadata::DistinctIdBasis`. A `true`
+/// here is what licenses `stt-build` to stamp
+/// `metadata.properties.feature_id_scope = "global"`, which is what licenses
+/// `stt-validate` to compare `distinct_feature_count` against the decoded id
+/// count and call a shortfall FEATURE LOSS.
+///
+/// Uses [`FeatureIdOptions::default`] (clipping ON, the conservative reading);
+/// a build that knows its `--no-clip` setting should call [`feature_id_report`].
+pub fn feature_ids_are_globally_distinct(features: &[ParsedFeature]) -> bool {
+    feature_id_attestation(features).is_distinct()
+}
+
+/// [`feature_ids_are_globally_distinct`], with the evidence kept.
+pub fn feature_id_attestation(features: &[ParsedFeature]) -> FeatureIdAttestation {
+    feature_id_report(features, FeatureIdOptions::default()).attestation
+}
+
+/// The construction-aware proof: what the writer's id column IS, and whether it
+/// is provably a dataset-wide key.
+///
+/// # ⭐ Why the question is about CONSTRUCTION, not about a source id column
+///
+/// The predecessor asked "does every source feature carry an id?", and the
+/// answer is structurally NO — no ingest path in this crate populates
+/// `ParsedFeature.geojson.id`. The strict basis therefore had no live producer,
+/// and a rebuild that silently dropped half a line/polygon dataset validated
+/// clean: the per-zoom row floor is loose exactly where clipping replicates a
+/// feature across tiles, because the surviving features' extra rows cover for
+/// the missing ones.
+///
+/// [`feature_id_construction`] answers the question the writer can actually
+/// answer. Two of its four paths — a source id, and the whole-feature ANCHOR
+/// HASH the tiler copies into every clipped piece — put exactly one distinct
+/// wire id on each source feature, and those are attestable with no operator
+/// assertion anywhere.
+///
+/// # Shape of the proof
+///
+/// One pass, and it **bails on the first feature whose construction is not a
+/// key** — an id-less point (row index) or an id-less clipped trajectory
+/// (per-segment ids). That is the overwhelmingly common case on point archives
+/// and the reason a 44 M-point no-id archive costs nothing here. Only if every
+/// feature clears that gate does it pay for the pairwise-distinctness check, and
+/// only up to [`FEATURE_ID_ATTESTATION_CAP`].
+///
+/// # What "distinct" buys, precisely
+///
+/// Every source feature is placed at least once at the deepest tier that
+/// survives it, and carries the SAME id into every tile and zoom it reaches. So
+/// on a complete decode `distinct decoded ids >= surviving source features`, and
+/// — because the ids are proven pairwise distinct — a shortfall against
+/// `distinct_feature_count` means features are genuinely absent. Clipping,
+/// pyramid replication and LOD tiers cannot move that count in either direction;
+/// they only add ROWS, which is why this is tight where the row floor is loose.
+///
+/// # Determinism
+///
+/// A pure function of the feature sequence: a sort with a total tiebreak, no
+/// hashing container, no RNG, no clock. Two runs over the same input return the
+/// same answer, and so does a run over the same input in reverse (the
+/// conclusion is; the *evidence indices* name the earliest offending pair in
+/// index order).
+pub fn feature_id_report(features: &[ParsedFeature], options: FeatureIdOptions) -> FeatureIdReport {
+    // An empty set has no colliding pair, and the fingerprint declares 0 —
+    // which check 12 skips anyway. Vacuously distinct.
     if features.is_empty() {
-        return Ok((
-            BoundingBox::new(-180.0, -90.0, 180.0, 90.0),
-            TimeRange::new(0, 0),
-        ));
+        return FeatureIdReport {
+            construction: FeatureIdConstruction::Source,
+            attestation: FeatureIdAttestation::Distinct,
+        };
+    }
+
+    let mut ids: Vec<(u64, usize)> = Vec::with_capacity(features.len().min(1024));
+    // Did any feature need the anchor-hash fallback? Only used to LABEL the set
+    // when every feature is attestable; it never changes the verdict.
+    let mut any_anchor = false;
+    for (index, feature) in features.iter().enumerate() {
+        let construction = feature_id_construction(feature, options);
+        // The early bail, on the first NON-KEY construction. Checked BEFORE the
+        // cap so a common id-less point archive gets the informative reason
+        // rather than "too big", and so the walk stops at feature #0 rather
+        // than at the cap.
+        if !construction.is_dataset_wide_key() {
+            let attestation = match (construction, feature.geojson.id.is_some()) {
+                // A non-integer numeric id: the writer could not map it, so the
+                // feature fell through to a positional construction. Name the
+                // id, which is the actionable half.
+                (_, true) => FeatureIdAttestation::NonIntegerId { index },
+                (FeatureIdConstruction::SegmentHash, false) => {
+                    FeatureIdAttestation::SegmentIds { index }
+                }
+                (_, false) => FeatureIdAttestation::NoSourceId { index },
+            };
+            return FeatureIdReport {
+                construction,
+                attestation,
+            };
+        }
+        let id = match construction {
+            FeatureIdConstruction::Source => {
+                attestable_feature_id(feature).expect("Source construction implies a mapped id")
+            }
+            _ => {
+                any_anchor = true;
+                anchor_feature_id(feature)
+            }
+        };
+        if ids.len() == FEATURE_ID_ATTESTATION_CAP {
+            return FeatureIdReport {
+                construction: set_construction(any_anchor),
+                attestation: FeatureIdAttestation::AboveCap {
+                    features: features.len(),
+                },
+            };
+        }
+        ids.push((id, index));
+    }
+
+    let construction = set_construction(any_anchor);
+
+    // Pairwise distinctness. Sorting by (id, index) makes any duplicate
+    // adjacent, and the index tiebreak makes the reported pair the earliest
+    // one — a stable total order, so the evidence is reproducible.
+    ids.sort_unstable();
+    for pair in ids.windows(2) {
+        let [(a, first), (b, second)] = [pair[0], pair[1]];
+        if a == b {
+            return FeatureIdReport {
+                construction,
+                attestation: FeatureIdAttestation::Collision {
+                    value: a,
+                    first,
+                    second,
+                },
+            };
+        }
+    }
+    FeatureIdReport {
+        construction,
+        attestation: FeatureIdAttestation::Distinct,
+    }
+}
+
+/// The set-level label for a feature set whose every member is attestable: the
+/// weaker of the two key constructions wins, so a mixed source/anchor build is
+/// reported as `anchor-hash`.
+const fn set_construction(any_anchor: bool) -> FeatureIdConstruction {
+    if any_anchor {
+        FeatureIdConstruction::AnchorHash
+    } else {
+        FeatureIdConstruction::Source
+    }
+}
+
+/// Knobs for [`profile_features_with`].
+#[derive(Debug, Clone, Copy)]
+pub struct FeatureProfileOptions<'a> {
+    /// Which quantity [`FeatureProfile::bounds`] reports. Defaults to
+    /// [`DEFAULT_BOUNDS_MODE`].
+    pub bounds_mode: BoundsMode,
+    /// Opt-in property column whose finite numeric values fold into
+    /// [`FeatureProfile::z_range`] — for datasets whose altitude lives in a
+    /// property rather than in a 3-element geometry position.
+    ///
+    /// **Metadata only.** It does not touch geometry, matching the standing
+    /// preference that render-side depth comes from `elevationProperty` over a
+    /// column rather than from rewritten coordinates.
+    ///
+    /// ⚠️ **A build using `--point-elevation-column` MUST pass that same column
+    /// here.** That flag folds the column into POINT z at *encode* time (the
+    /// `elevation-fold` capability, `arrow_tile::encode`), long after this pass
+    /// runs — so the parsed geometry this profiler walks is still 2D, and the
+    /// declared `z_range` would be absent while the tiles decode to 3D. Passing
+    /// the column keeps the manifest's vertical claim a superset of what a
+    /// reader actually gets.
+    ///
+    /// ⚠️ …and only for POINT features. The encoder's fold is gated on
+    /// `GeometryColumn::Point`, so a line/polygon feature's value contributes
+    /// nothing here — see [`elevation_column_is_folded`]. Folding it anyway
+    /// would declare vertical extent for an archive whose tiles are flat.
+    pub elevation_column: Option<&'a str>,
+}
+
+impl Default for FeatureProfileOptions<'_> {
+    fn default() -> Self {
+        Self {
+            bounds_mode: DEFAULT_BOUNDS_MODE,
+            elevation_column: None,
+        }
+    }
+}
+
+/// One pass of dataset-global statistics over the ingested source features,
+/// computed **before tiling and encode**.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeatureProfile {
+    /// The bbox to declare, per [`FeatureProfileOptions::bounds_mode`].
+    pub bounds: BoundingBox,
+    /// Temporal extent across every row (including rows whose geometry failed
+    /// to parse — a bad geometry does not invalidate a good timestamp).
+    pub time_range: TimeRange,
+    /// Vertical extent `[min_z, max_z]` when any geometry position carried a
+    /// third ordinate, or when [`FeatureProfileOptions::elevation_column`]
+    /// named a column with finite numeric values. `None` for a purely 2D
+    /// dataset — which is what keeps `metadata.z_range` absent (and manifests
+    /// byte-identical) for everything that is not volumetric.
+    pub z_range: Option<[f64; 2]>,
+    /// The honest, vertex-derived bbox. Always computed, whatever the mode, so
+    /// a validator or report can compare the declared bbox against the truth
+    /// without a second pass.
+    pub vertex_bounds: BoundingBox,
+    /// The legacy, centroid-derived bbox. Always computed, so the two can be
+    /// diffed (and so the mode switch is a selection, not a recomputation).
+    pub centroid_bounds: BoundingBox,
+    /// Which of the two [`Self::bounds`] was taken from.
+    pub bounds_mode: BoundsMode,
+}
+
+/// Profile features under [`FeatureProfileOptions::default`].
+///
+/// This is the shape SH-1's fingerprint pass shares; [`calculate_bounds`] is
+/// the two-field view of the same computation.
+pub fn profile_features(features: &[ParsedFeature]) -> Result<FeatureProfile> {
+    profile_features_with(features, &FeatureProfileOptions::default())
+}
+
+/// Profile features, choosing the bounds quantity and (optionally) folding a
+/// property column into the vertical extent.
+///
+/// **Determinism.** Every statistic is an order-independent fold of `min`/`max`
+/// over the input features: no sort, no RNG, no clock, no hash iteration. The
+/// result is therefore a pure function of the feature *set*, identical across
+/// re-runs and across any permutation of the input — pinned by
+/// `bounds_are_order_independent_and_reproducible`.
+///
+/// **Antimeridian.** The longitude fold is a plain min/max, deliberately
+/// unchanged from the legacy behaviour: a dataset straddling ±180° reports a
+/// full-width `[-180, 180]`-ish bbox rather than the (narrower, correct)
+/// wrapped interval. That is *loose but sound* — the declared box still
+/// contains every vertex, which is the direction pre-intersection requires. A
+/// wrapped bbox would be tighter and would need a wrap-aware reader on the
+/// other side; the recorded antimeridian gotchas stay untouched here, and
+/// widening a bbox can never make a superset claim false.
+///
+/// **Poles.** Latitudes fold unclamped. A vertex at ±90° widens the box to
+/// ±90°; nothing is projected here, so the Mercator latitude clamp (and the
+/// polar tile-row collapse it exists for) is a tiler concern, not a bounds one.
+/// Clamping would *shrink* the declared box below the data, which is exactly
+/// the unsoundness this item removes.
+///
+/// **Non-finite coordinates** (NaN/±inf) are skipped rather than folded — one
+/// NaN would otherwise poison a comparison chain, and one `inf` would swallow
+/// the globe. A feature that contributes no finite vertex falls back to its
+/// anchor, so it is never silently dropped from the extent.
+pub fn profile_features_with(
+    features: &[ParsedFeature],
+    options: &FeatureProfileOptions<'_>,
+) -> Result<FeatureProfile> {
+    if features.is_empty() {
+        // Unchanged empty-input contract: the whole-world placeholder, NOT an
+        // inside-out box, and a zero time range.
+        let world = BoundingBox::new(-180.0, -90.0, 180.0, 90.0);
+        return Ok(FeatureProfile {
+            bounds: world,
+            time_range: TimeRange::new(0, 0),
+            z_range: None,
+            vertex_bounds: world,
+            centroid_bounds: world,
+            bounds_mode: options.bounds_mode,
+        });
     }
 
     // Time range spans every row — a row whose geometry failed to parse may
@@ -868,10 +1606,13 @@ pub fn calculate_bounds(features: &[ParsedFeature]) -> Result<(BoundingBox, Time
     // bbox to the whole globe (and make the showcase open zoomed all the way
     // out). Real data at precisely (0,0) to full f64 precision is effectively
     // never legitimate.
-    let mut min_lon = f64::MAX;
-    let mut max_lon = f64::MIN;
-    let mut min_lat = f64::MAX;
-    let mut max_lat = f64::MIN;
+    //
+    // The sentinel test stays keyed on the parsed ANCHOR for both modes: a
+    // feature whose anchor is the sentinel had its geometry coerced, so its
+    // vertices are no more trustworthy than its centroid.
+    let mut centroid = ExtentAccumulator::default();
+    let mut vertex = ExtentAccumulator::default();
+    let mut z = ZAccumulator::default();
     let mut counted = 0usize;
     let mut skipped_null_island = 0usize;
     for f in features {
@@ -879,10 +1620,9 @@ pub fn calculate_bounds(features: &[ParsedFeature]) -> Result<(BoundingBox, Time
             skipped_null_island += 1;
             continue;
         }
-        min_lon = min_lon.min(f.lon);
-        max_lon = max_lon.max(f.lon);
-        min_lat = min_lat.min(f.lat);
-        max_lat = max_lat.max(f.lat);
+        centroid.push_raw(f.lon, f.lat);
+        accumulate_feature_extent(f, &mut vertex, &mut z);
+        accumulate_elevation_column(f, options.elevation_column, &mut z);
         counted += 1;
     }
 
@@ -891,10 +1631,9 @@ pub fn calculate_bounds(features: &[ParsedFeature]) -> Result<(BoundingBox, Time
         // genuinely straddles null island, or one that is entirely malformed).
         // Fall back to the raw extent rather than return an inside-out bbox.
         for f in features {
-            min_lon = min_lon.min(f.lon);
-            max_lon = max_lon.max(f.lon);
-            min_lat = min_lat.min(f.lat);
-            max_lat = max_lat.max(f.lat);
+            centroid.push_raw(f.lon, f.lat);
+            accumulate_feature_extent(f, &mut vertex, &mut z);
+            accumulate_elevation_column(f, options.elevation_column, &mut z);
         }
     } else if skipped_null_island > 0 {
         tracing::warn!(
@@ -904,10 +1643,395 @@ pub fn calculate_bounds(features: &[ParsedFeature]) -> Result<(BoundingBox, Time
         );
     }
 
-    Ok((
-        BoundingBox::new(min_lon, min_lat, max_lon, max_lat),
-        TimeRange::new(min_time, max_time),
-    ))
+    // The centroid box is emitted verbatim — including the inside-out sentinel
+    // values a pathological all-non-finite input would leave — so the legacy
+    // mode is bit-for-bit what it always was. The vertex box, which is new
+    // surface, degrades to the whole-world placeholder instead: a superset is
+    // the only honest answer when nothing finite was seen.
+    let centroid_bounds = centroid.into_raw_bbox();
+    let vertex_bounds = vertex
+        .into_bbox()
+        .unwrap_or_else(|| BoundingBox::new(-180.0, -90.0, 180.0, 90.0));
+
+    let bounds = match options.bounds_mode {
+        BoundsMode::Centroid => centroid_bounds,
+        BoundsMode::Vertex => vertex_bounds,
+    };
+
+    Ok(FeatureProfile {
+        bounds,
+        time_range: TimeRange::new(min_time, max_time),
+        z_range: z.finish(),
+        vertex_bounds,
+        centroid_bounds,
+        bounds_mode: options.bounds_mode,
+    })
+}
+
+/// Fold one feature's vertices into the vertex extent and the vertical extent.
+///
+/// A feature with no geometry — or whose geometry holds no finite position —
+/// contributes its anchor instead, so it still widens the box rather than
+/// vanishing from it.
+fn accumulate_feature_extent(
+    f: &ParsedFeature,
+    vertex: &mut ExtentAccumulator,
+    z: &mut ZAccumulator,
+) {
+    let before = vertex.count;
+    if let Some(geom) = f.geojson.geometry.as_ref() {
+        for_each_position(geom, |p| {
+            if p.len() >= 2 {
+                vertex.push(p[0], p[1]);
+            }
+            if p.len() >= 3 {
+                z.push(p[2]);
+            }
+        });
+    }
+    if vertex.count == before {
+        vertex.push(f.lon, f.lat);
+    }
+}
+
+/// Whether the encoder will actually CONSUME `--point-elevation-column` for
+/// this feature — i.e. fold its value into the geometry's third ordinate and
+/// drop the column from the tile's property set.
+///
+/// ⚠️ **The answer is "only for points."** `arrow_tile::encode` gates the fold
+/// on `matches!(layer.geometry, GeometryColumn::Point(_))`, and the flag's own
+/// help says so ("Only affects POINT layers"). Assuming the fold always happens
+/// is not a conservative simplification, it is a double falsehood on any
+/// line/polygon build: it invents a `z_range` for an archive with no 3D
+/// geometry, AND it removes the column from `numeric_ranges` — which disables
+/// the very attribute check that catches a corrupted rebuild. Observed on a
+/// linestring build as `z_range = [5.0, 34.0]` with the `speed` column silently
+/// gone.
+///
+/// Classification goes through [`crate::columnar::determine_geometry_type`],
+/// the same function `build_layers_from_features_with` partitions on, so this
+/// predicate cannot drift from the layer the tiler actually builds. Trajectory
+/// clipping cannot change the answer either: `is_clippable_trajectory` only
+/// ever fires on a `LineString`, so a feature that classifies as `Point` here
+/// always lands in a `GeometryColumn::Point` layer.
+///
+/// A feature whose geometry cannot be classified answers **false** — the safe
+/// direction. Guessing "point" would re-create the defect above; guessing
+/// "not point" at worst declares a range for a column no tile carries, which
+/// the validator reports as a warning.
+fn elevation_column_is_folded(f: &ParsedFeature) -> bool {
+    matches!(
+        crate::columnar::determine_geometry_type(f),
+        Ok(stt_core::types::GeometryType::Point)
+    )
+}
+
+/// Fold the opt-in elevation property column into the vertical extent, for the
+/// features whose layer the encoder will actually fold it into.
+///
+/// Reads through the same `shared_properties` handle the zoom-bound fields use
+/// (`tiler::feature_zoom_bound`), so the columnar and owned-map property paths
+/// behave identically. Non-numeric and missing values are simply absent — a
+/// string that looks like a number is NOT coerced, matching `PropValue::as_f64`.
+fn accumulate_elevation_column(f: &ParsedFeature, column: Option<&str>, z: &mut ZAccumulator) {
+    let Some(column) = column else {
+        return;
+    };
+    // Non-point features keep the column as a plain property; their tiles ship
+    // 2D geometry, so folding their values into `z_range` would claim vertical
+    // extent the archive does not have.
+    if !elevation_column_is_folded(f) {
+        return;
+    }
+    if let Some(v) = f
+        .shared_properties
+        .as_ref()
+        .and_then(|p| p.get(column))
+        .and_then(|v| v.as_f64())
+    {
+        z.push(v);
+    }
+}
+
+/// Visit every coordinate position of a GeoJSON geometry, including nested
+/// `GeometryCollection` members.
+///
+/// Iterative (explicit work stack) rather than recursive: a hostile input can
+/// nest collections arbitrarily deep, and a bbox must not be a stack-overflow
+/// vector. Visit order is unspecified and irrelevant — the only consumers are
+/// order-independent min/max folds.
+///
+/// The stack stays EMPTY (and therefore unallocated) unless a
+/// `GeometryCollection` is actually met: this walk runs once per feature, and a
+/// 44 M-point archive cannot afford a heap allocation per row.
+fn for_each_position(geom: &Geometry, mut visit: impl FnMut(&[f64])) {
+    let mut stack: Vec<&Geometry> = Vec::new();
+    let mut current = geom;
+    loop {
+        match &current.value {
+            GeomValue::Point(p) => visit(p),
+            GeomValue::MultiPoint(ps) | GeomValue::LineString(ps) => {
+                for p in ps {
+                    visit(p);
+                }
+            }
+            GeomValue::MultiLineString(lines) | GeomValue::Polygon(lines) => {
+                for line in lines {
+                    for p in line {
+                        visit(p);
+                    }
+                }
+            }
+            GeomValue::MultiPolygon(polys) => {
+                for poly in polys {
+                    for ring in poly {
+                        for p in ring {
+                            visit(p);
+                        }
+                    }
+                }
+            }
+            GeomValue::GeometryCollection(members) => stack.extend(members.iter()),
+        }
+        match stack.pop() {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+}
+
+/// Order-independent min/max fold over lon/lat pairs.
+#[derive(Debug, Default)]
+struct ExtentAccumulator {
+    min_lon: f64,
+    max_lon: f64,
+    min_lat: f64,
+    max_lat: f64,
+    count: usize,
+    /// Seeded lazily so an empty accumulator is distinguishable from one that
+    /// legitimately saw `(0, 0)`.
+    seeded: bool,
+}
+
+impl ExtentAccumulator {
+    /// Fold a position, ignoring non-finite ordinates.
+    fn push(&mut self, lon: f64, lat: f64) {
+        if !lon.is_finite() || !lat.is_finite() {
+            return;
+        }
+        if !self.seeded {
+            self.min_lon = lon;
+            self.max_lon = lon;
+            self.min_lat = lat;
+            self.max_lat = lat;
+            self.seeded = true;
+        } else {
+            self.min_lon = self.min_lon.min(lon);
+            self.max_lon = self.max_lon.max(lon);
+            self.min_lat = self.min_lat.min(lat);
+            self.max_lat = self.max_lat.max(lat);
+        }
+        self.count += 1;
+    }
+
+    /// Fold a position the LEGACY way: `f64::min`/`f64::max` from the
+    /// `MAX`/`MIN` sentinels, non-finite values included. Bit-for-bit the
+    /// pre-SH-2 centroid fold, sentinel edge cases and all.
+    fn push_raw(&mut self, lon: f64, lat: f64) {
+        if !self.seeded {
+            self.min_lon = f64::MAX;
+            self.max_lon = f64::MIN;
+            self.min_lat = f64::MAX;
+            self.max_lat = f64::MIN;
+            self.seeded = true;
+        }
+        self.min_lon = self.min_lon.min(lon);
+        self.max_lon = self.max_lon.max(lon);
+        self.min_lat = self.min_lat.min(lat);
+        self.max_lat = self.max_lat.max(lat);
+        self.count += 1;
+    }
+
+    fn into_bbox(self) -> Option<BoundingBox> {
+        if self.count == 0 || !self.seeded {
+            return None;
+        }
+        Some(BoundingBox::new(
+            self.min_lon,
+            self.min_lat,
+            self.max_lon,
+            self.max_lat,
+        ))
+    }
+
+    /// The legacy view: emit whatever the fold holds, sentinels included.
+    fn into_raw_bbox(self) -> BoundingBox {
+        if !self.seeded {
+            return BoundingBox::new(f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        }
+        BoundingBox::new(self.min_lon, self.min_lat, self.max_lon, self.max_lat)
+    }
+}
+
+/// Order-independent min/max fold over elevations.
+#[derive(Debug, Default)]
+struct ZAccumulator {
+    min: f64,
+    max: f64,
+    seen: bool,
+}
+
+impl ZAccumulator {
+    fn push(&mut self, z: f64) {
+        if !z.is_finite() {
+            return;
+        }
+        if !self.seen {
+            self.min = z;
+            self.max = z;
+            self.seen = true;
+        } else {
+            self.min = self.min.min(z);
+            self.max = self.max.max(z);
+        }
+    }
+
+    fn finish(self) -> Option<[f64; 2]> {
+        self.seen.then_some([self.min, self.max])
+    }
+}
+
+// =============================================================================
+// Semantic content fingerprint — build-time emission (SH-1)
+// =============================================================================
+
+/// Knobs [`content_fingerprint`] derives its declared TOLERANCES from.
+///
+/// Every entry corresponds to a build lever that moves a decoded value away
+/// from its source value. Miss one and an honest quantized archive fails
+/// validation; declare one the archive did not earn and the validator rejects
+/// it (the tolerances are capability-gated on the reading side).
+#[derive(Debug, Clone, Default)]
+pub struct FingerprintOptions<'a> {
+    /// `--quantize-coords METERS`, or `None`/`0` when coordinates ship as
+    /// exact Float64.
+    pub quantize_coords_m: Option<f64>,
+    /// Explicit `--quantize-attr NAME=PREC` pairs. `--quantize-attrs-auto`
+    /// needs no entry here: its step is range-adaptive per tile, so no writer
+    /// could declare it up front — the validator reads that step off the
+    /// column's own `stt:qa` affine instead.
+    pub attr_precisions: BTreeMap<String, f64>,
+    /// `--point-elevation-column NAME`.
+    ///
+    /// ⚠️ **Per feature, not per build.** The encoder folds the column into
+    /// geometry `z` and removes it from the property set **only for POINT
+    /// layers** (`arrow_tile::encode` gates on `GeometryColumn::Point`; the
+    /// flag's help says "Only affects POINT layers"). So a point feature's
+    /// value is recorded in `z_range` and omitted from `numeric_ranges`, while
+    /// a line/polygon feature's value stays an ordinary property and keeps its
+    /// declared range. Folding unconditionally invents a `z_range` for a
+    /// flat archive and blinds the check on the named column — see
+    /// [`elevation_column_is_folded`].
+    pub elevation_column: Option<&'a str>,
+}
+
+/// Compute the archive's [`ContentFingerprint`] from the ingested source
+/// features, before tiling and encode.
+///
+/// # Why this is a separate walk from [`profile_features_with`]
+///
+/// `metadata.bounds` is a **presentation** quantity: it deliberately excludes
+/// null-island `(0, 0)` features so one coerced row cannot make the showcase
+/// open zoomed all the way out. The fingerprint's bbox is a **containment
+/// claim** about what the archive decodes to, and excluding data the archive
+/// will later be asked to contain would make the claim false. So this pass
+/// folds EVERY feature, sentinel rows included, and is otherwise the same
+/// order-independent min/max fold.
+///
+/// # Determinism
+///
+/// `min`/`max` over finite values, `BTreeMap`/`BTreeSet` throughout, no sort,
+/// no RNG, no clock, no sampling stride (the style-hints profiler samples;
+/// a containment claim must not). Two builds of one input emit byte-identical
+/// `content_fingerprint` JSON — pinned by
+/// `content_fingerprint_is_order_independent_and_reproducible`.
+pub fn content_fingerprint(
+    features: &[ParsedFeature],
+    options: &FingerprintOptions<'_>,
+) -> Result<ContentFingerprint> {
+    let mut vertex = ExtentAccumulator::default();
+    let mut z = ZAccumulator::default();
+    let mut numeric: BTreeMap<String, [f64; 2]> = BTreeMap::new();
+    let mut categorical: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    for f in features {
+        // Sentinel rows included — see the doc comment.
+        accumulate_feature_extent(f, &mut vertex, &mut z);
+        accumulate_elevation_column(f, options.elevation_column, &mut z);
+        // Whether THIS feature's value is consumed by the elevation fold. The
+        // encoder folds only into POINT layers, so on a line/polygon build the
+        // column survives as an ordinary property and MUST keep its declared
+        // range — dropping it would disable the attribute check on exactly the
+        // column an operator singled out.
+        let elevation_folded = options.elevation_column.is_some() && elevation_column_is_folded(f);
+
+        let Some(props) = f.shared_properties.as_ref() else {
+            continue;
+        };
+        for (name, value) in props.iter() {
+            if elevation_folded && options.elevation_column == Some(name) {
+                // Folded into geometry z by the encoder and dropped from the
+                // property set, so declaring a numeric range for it would
+                // describe a column the archive does not carry.
+                continue;
+            }
+            // Matches the profiler's kind rule exactly: `as_f64` is
+            // numbers-only, so a numeric-looking STRING stays categorical.
+            if let Some(v) = value.as_f64().filter(|v| v.is_finite()) {
+                match numeric.get_mut(name) {
+                    Some(slot) => {
+                        slot[0] = slot[0].min(v);
+                        slot[1] = slot[1].max(v);
+                    }
+                    None => {
+                        numeric.insert(name.to_string(), [v, v]);
+                    }
+                }
+            } else if let Some(s) = value.as_str() {
+                let set = categorical.entry(name.to_string()).or_default();
+                if set.len() < FINGERPRINT_CARDINALITY_CAP as usize {
+                    set.insert(s.to_string());
+                }
+            }
+        }
+    }
+
+    let bbox = vertex
+        .into_bbox()
+        // No finite vertex anywhere: claim the whole world rather than an
+        // inside-out box, so the claim stays a (vacuous) superset.
+        .unwrap_or_else(|| BoundingBox::new(-180.0, -90.0, 180.0, 90.0));
+
+    let mut column_tolerance: BTreeMap<String, f64> = BTreeMap::new();
+    for (column, precision) in &options.attr_precisions {
+        if precision.is_finite() && *precision > 0.0 {
+            column_tolerance.insert(column.clone(), *precision);
+        }
+    }
+
+    Ok(ContentFingerprint {
+        version: CONTENT_FINGERPRINT_VERSION,
+        bbox: [bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat],
+        z_range: z.finish(),
+        distinct_feature_count: features.len() as u64,
+        numeric_ranges: numeric,
+        categorical_cardinality: categorical
+            .into_iter()
+            .map(|(k, v)| (k, v.len() as u32))
+            .collect(),
+        coord_tolerance_deg: coord_quant_step_deg(options.quantize_coords_m.unwrap_or(0.0)),
+        column_tolerance,
+    })
 }
 
 // =============================================================================
@@ -1872,5 +2996,1432 @@ mod tests {
             None,
             &coords
         ));
+    }
+
+    /// SH-2 / backlog K11 — honest (vertex) manifest bounds and the additive
+    /// vertical extent.
+    ///
+    /// The whole point of these cases is DIRECTION: the declared bbox must be a
+    /// conservative SUPERSET of the data's extent. A box that is too tight
+    /// makes query-box pre-intersection unsound (it discards tiles that really
+    /// do hold visible data); a box that is too loose only costs a wasted
+    /// intersection test. Every assertion below therefore checks containment,
+    /// not just equality.
+    mod feature_profile {
+        use crate::input::{
+            calculate_bounds, profile_features, profile_features_with, BoundsMode, FeatureProfile,
+            FeatureProfileOptions, ParsedFeature, DEFAULT_BOUNDS_MODE,
+        };
+        use crate::props::FeatureProperties;
+        use geojson::{Geometry, Value as G};
+        use stt_core::types::BoundingBox;
+
+        /// A feature with an explicit anchor (`lon`/`lat` — what the parsers
+        /// fill with the geometry's CENTROID) and an optional geometry.
+        fn feature(geometry: Option<G>, lon: f64, lat: f64) -> ParsedFeature {
+            ParsedFeature {
+                home_zoom: None,
+                geojson: geojson::Feature {
+                    bbox: None,
+                    geometry: geometry.map(Geometry::new),
+                    id: None,
+                    properties: None,
+                    foreign_members: None,
+                },
+                shared_properties: None,
+                timestamp: 1_000,
+                end_timestamp: None,
+                vertex_timestamps: None,
+                vertex_values: None,
+                vertex_value_matrix: None,
+                lon,
+                lat,
+            }
+        }
+
+        fn with_props(mut f: ParsedFeature, pairs: &[(&str, serde_json::Value)]) -> ParsedFeature {
+            let mut map = serde_json::Map::new();
+            for (k, v) in pairs {
+                map.insert((*k).to_string(), v.clone());
+            }
+            f.shared_properties = FeatureProperties::from_map(map);
+            f
+        }
+
+        fn vertex_profile(features: &[ParsedFeature]) -> FeatureProfile {
+            profile_features_with(
+                features,
+                &FeatureProfileOptions {
+                    bounds_mode: BoundsMode::Vertex,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        }
+
+        fn contains(b: &BoundingBox, lon: f64, lat: f64) -> bool {
+            lon >= b.min_lon && lon <= b.max_lon && lat >= b.min_lat && lat <= b.max_lat
+        }
+
+        /// ⚠️ THE BYTE GATE, now flipped (R1). The builder's DEFAULT is the
+        /// honest vertex box; a rebuilt archive's `metadata.bounds` widens, and
+        /// the golden manifest pins under
+        /// `crates/stt-core/tests/fixtures/v2-golden/**` move exactly once for
+        /// it — at TB-14, inside rebuild window R1, and nowhere else.
+        ///
+        /// The direction is the whole point: the new default must be a
+        /// **superset** of the old one on the same features, never tighter.
+        /// A tighter box is what made query-box pre-intersection unsound.
+        #[test]
+        fn default_bounds_mode_is_vertex_since_the_r1_rebuild() {
+            assert_eq!(DEFAULT_BOUNDS_MODE, BoundsMode::Vertex);
+            // One source of truth: `FeatureProfileOptions::default()` reads the
+            // constant, and `BoundsMode::default()` must not disagree with it.
+            assert_eq!(BoundsMode::default(), DEFAULT_BOUNDS_MODE);
+            assert_eq!(
+                FeatureProfileOptions::default().bounds_mode,
+                DEFAULT_BOUNDS_MODE
+            );
+
+            let feats = vec![feature(
+                Some(G::LineString(vec![vec![-10.0, -4.0], vec![10.0, 6.0]])),
+                0.0,
+                1.0,
+            )];
+            let p = profile_features(&feats).unwrap();
+            assert_eq!(p.bounds_mode, BoundsMode::Vertex);
+            assert_eq!(p.bounds, p.vertex_bounds);
+            // The legacy quantity is still computed, and the new default
+            // contains it — a widening, not a different answer.
+            assert_eq!(p.centroid_bounds, BoundingBox::new(0.0, 1.0, 0.0, 1.0));
+            assert!(p.bounds.min_lon <= p.centroid_bounds.min_lon);
+            assert!(p.bounds.min_lat <= p.centroid_bounds.min_lat);
+            assert!(p.bounds.max_lon >= p.centroid_bounds.max_lon);
+            assert!(p.bounds.max_lat >= p.centroid_bounds.max_lat);
+
+            // The two-field entry point every legacy call site uses now answers
+            // the honest box too — this is the byte-changing edge.
+            let (bounds, _) = calculate_bounds(&feats).unwrap();
+            assert_eq!(bounds, BoundingBox::new(-10.0, -4.0, 10.0, 6.0));
+
+            // …and the documented rollback still yields the pre-R1 number
+            // verbatim, so `--bounds-mode centroid` is a real escape hatch.
+            let legacy = profile_features_with(
+                &feats,
+                &FeatureProfileOptions {
+                    bounds_mode: BoundsMode::Centroid,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(legacy.bounds, BoundingBox::new(0.0, 1.0, 0.0, 1.0));
+        }
+
+        /// The manifest stamp is a cross-crate contract with `stt-validate`'s
+        /// check 13: the key and the `vertex` spelling are what promote a
+        /// containment failure from "legacy warning" to "error".
+        #[test]
+        fn bounds_mode_manifest_stamp_matches_the_validator_contract() {
+            use crate::input::BOUNDS_MODE_PROPERTY;
+            assert_eq!(BOUNDS_MODE_PROPERTY, "bounds_mode");
+            assert_eq!(BoundsMode::Vertex.as_manifest_value(), "vertex");
+            assert_eq!(BoundsMode::Centroid.as_manifest_value(), "centroid");
+        }
+
+        /// The defect itself: a LineString reaches well past its own centroid,
+        /// so the centroid box does not bound the geometry the tiler addresses.
+        #[test]
+        fn linestring_vertices_widen_the_bbox_past_the_centroid_box() {
+            let feats = vec![feature(
+                Some(G::LineString(vec![vec![-10.0, -4.0], vec![10.0, 6.0]])),
+                0.0,
+                1.0,
+            )];
+
+            let p = vertex_profile(&feats);
+            assert_eq!(p.centroid_bounds, BoundingBox::new(0.0, 1.0, 0.0, 1.0));
+            assert_eq!(p.vertex_bounds, BoundingBox::new(-10.0, -4.0, 10.0, 6.0));
+            assert_eq!(p.bounds, p.vertex_bounds);
+            assert_eq!(p.bounds_mode, BoundsMode::Vertex);
+
+            // Strictly wider on all four edges — the centroid box under-stated
+            // the extent in every direction.
+            assert!(p.vertex_bounds.min_lon < p.centroid_bounds.min_lon);
+            assert!(p.vertex_bounds.max_lon > p.centroid_bounds.max_lon);
+            assert!(p.vertex_bounds.min_lat < p.centroid_bounds.min_lat);
+            assert!(p.vertex_bounds.max_lat > p.centroid_bounds.max_lat);
+
+            // And it really does bound every vertex.
+            for v in [(-10.0, -4.0), (10.0, 6.0)] {
+                assert!(contains(&p.vertex_bounds, v.0, v.1), "vertex {v:?} escaped");
+            }
+        }
+
+        #[test]
+        fn polygon_ring_vertices_widen_the_bbox() {
+            // A closed square ring centred on (5, 5); its centroid anchor sits
+            // 5 degrees inside every edge.
+            let ring = vec![
+                vec![0.0, 0.0],
+                vec![10.0, 0.0],
+                vec![10.0, 10.0],
+                vec![0.0, 10.0],
+                vec![0.0, 0.0],
+            ];
+            let feats = vec![feature(Some(G::Polygon(vec![ring.clone()])), 5.0, 5.0)];
+
+            let p = vertex_profile(&feats);
+            assert_eq!(p.centroid_bounds, BoundingBox::new(5.0, 5.0, 5.0, 5.0));
+            assert_eq!(p.vertex_bounds, BoundingBox::new(0.0, 0.0, 10.0, 10.0));
+            for v in &ring {
+                assert!(
+                    contains(&p.vertex_bounds, v[0], v[1]),
+                    "ring vertex escaped"
+                );
+            }
+        }
+
+        #[test]
+        fn multipolygon_and_nested_geometry_collections_are_walked() {
+            // A GeometryCollection nesting another collection: the walk is
+            // iterative, so depth costs no stack.
+            let inner = Geometry::new(G::GeometryCollection(vec![Geometry::new(G::Point(vec![
+                -30.0, 40.0,
+            ]))]));
+            let geom = G::GeometryCollection(vec![
+                Geometry::new(G::MultiPolygon(vec![vec![vec![
+                    vec![1.0, 1.0],
+                    vec![2.0, 1.0],
+                    vec![2.0, 2.0],
+                    vec![1.0, 1.0],
+                ]]])),
+                Geometry::new(G::MultiLineString(vec![vec![
+                    vec![50.0, -20.0],
+                    vec![51.0, -21.0],
+                ]])),
+                inner,
+            ]);
+            let feats = vec![feature(Some(geom), 10.0, 10.0)];
+
+            let p = vertex_profile(&feats);
+            assert_eq!(p.vertex_bounds, BoundingBox::new(-30.0, -21.0, 51.0, 40.0));
+        }
+
+        #[test]
+        fn multipoint_vertices_are_walked() {
+            let feats = vec![feature(
+                Some(G::MultiPoint(vec![vec![-3.0, -3.0], vec![7.0, 9.0]])),
+                2.0,
+                3.0,
+            )];
+            assert_eq!(
+                vertex_profile(&feats).vertex_bounds,
+                BoundingBox::new(-3.0, -3.0, 7.0, 9.0)
+            );
+        }
+
+        /// Soundness, stated as the property the whole item exists for: the
+        /// declared box is a superset of the data, and never tighter than the
+        /// legacy one it replaces.
+        #[test]
+        fn vertex_bbox_is_a_conservative_superset_of_every_vertex_and_of_the_centroid_box() {
+            let feats = vec![
+                feature(Some(G::Point(vec![12.5, -3.25])), 12.5, -3.25),
+                feature(
+                    Some(G::LineString(vec![
+                        vec![-44.0, 8.0],
+                        vec![-40.0, 12.0],
+                        vec![-48.0, 3.0],
+                    ])),
+                    -44.0,
+                    7.6,
+                ),
+                feature(
+                    Some(G::Polygon(vec![vec![
+                        vec![100.0, -60.0],
+                        vec![101.0, -60.0],
+                        vec![101.0, -59.0],
+                        vec![100.0, -60.0],
+                    ]])),
+                    100.3,
+                    -59.7,
+                ),
+                feature(None, 5.0, 5.0),
+            ];
+
+            let p = vertex_profile(&feats);
+            let all_vertices = [
+                (12.5, -3.25),
+                (-44.0, 8.0),
+                (-40.0, 12.0),
+                (-48.0, 3.0),
+                (100.0, -60.0),
+                (101.0, -60.0),
+                (101.0, -59.0),
+                (5.0, 5.0), // the geometry-less feature contributes its anchor
+            ];
+            for (lon, lat) in all_vertices {
+                assert!(
+                    contains(&p.vertex_bounds, lon, lat),
+                    "({lon}, {lat}) escaped the declared bbox — pre-intersection would be unsound"
+                );
+            }
+
+            // Never tighter than the box it replaces, on any edge.
+            let c = p.centroid_bounds;
+            let v = p.vertex_bounds;
+            assert!(v.min_lon <= c.min_lon && v.min_lat <= c.min_lat);
+            assert!(v.max_lon >= c.max_lon && v.max_lat >= c.max_lat);
+        }
+
+        /// Antimeridian: the longitude fold stays a plain min/max, so a dataset
+        /// straddling ±180° reports the LOOSE full-width box, exactly as today.
+        /// Loose is sound (it still contains every vertex); tight-but-wrapped
+        /// would need a wrap-aware consumer and is deliberately not attempted
+        /// here.
+        #[test]
+        fn antimeridian_crossing_keeps_the_loose_full_width_bbox() {
+            let feats = vec![
+                feature(Some(G::Point(vec![179.9, 10.0])), 179.9, 10.0),
+                feature(Some(G::Point(vec![-179.9, 11.0])), -179.9, 11.0),
+            ];
+            let p = vertex_profile(&feats);
+            assert_eq!(p.vertex_bounds, BoundingBox::new(-179.9, 10.0, 179.9, 11.0));
+            // The claim that matters: both vertices are inside it.
+            assert!(contains(&p.vertex_bounds, 179.9, 10.0));
+            assert!(contains(&p.vertex_bounds, -179.9, 11.0));
+            // Same convention as the legacy centroid box — no regression, no
+            // new wrapping semantics.
+            assert_eq!(p.centroid_bounds, p.vertex_bounds);
+        }
+
+        /// Poles: latitudes are NOT clamped to the Mercator limit. Clamping
+        /// would shrink the declared box below the data — the exact unsoundness
+        /// this item removes. (The projection clamp is a tiler concern.)
+        #[test]
+        fn polar_latitudes_are_not_clamped_to_the_mercator_limit() {
+            let feats = vec![feature(
+                Some(G::LineString(vec![vec![0.0, -89.9], vec![1.0, 89.9]])),
+                0.5,
+                0.0,
+            )];
+            let p = vertex_profile(&feats);
+            assert_eq!(p.vertex_bounds.min_lat, -89.9);
+            assert_eq!(p.vertex_bounds.max_lat, 89.9);
+        }
+
+        #[test]
+        fn z_range_comes_from_three_element_positions() {
+            let feats = vec![
+                feature(
+                    Some(G::LineString(vec![
+                        vec![0.0, 0.5, 120.0],
+                        vec![1.0, 1.5, -7.5],
+                    ])),
+                    0.5,
+                    1.0,
+                ),
+                feature(Some(G::Point(vec![2.0, 2.0, 4000.0])), 2.0, 2.0),
+            ];
+            let p = vertex_profile(&feats);
+            assert_eq!(p.z_range, Some([-7.5, 4000.0]));
+        }
+
+        #[test]
+        fn z_range_is_absent_for_a_purely_2d_dataset() {
+            let feats = vec![feature(Some(G::Point(vec![1.0, 2.0])), 1.0, 2.0)];
+            assert_eq!(vertex_profile(&feats).z_range, None);
+            assert_eq!(profile_features(&feats).unwrap().z_range, None);
+        }
+
+        #[test]
+        fn elevation_column_folds_into_the_z_range() {
+            let feats = vec![
+                with_props(
+                    feature(Some(G::Point(vec![1.0, 2.0])), 1.0, 2.0),
+                    &[("alt_m", serde_json::json!(35.5))],
+                ),
+                with_props(
+                    feature(Some(G::Point(vec![1.5, 2.5])), 1.5, 2.5),
+                    &[("alt_m", serde_json::json!(-12))],
+                ),
+                // No such property: contributes nothing rather than a zero.
+                feature(Some(G::Point(vec![1.7, 2.7])), 1.7, 2.7),
+                // Present but not a number: NOT coerced.
+                with_props(
+                    feature(Some(G::Point(vec![1.8, 2.8])), 1.8, 2.8),
+                    &[("alt_m", serde_json::json!("900"))],
+                ),
+            ];
+
+            let p = profile_features_with(
+                &feats,
+                &FeatureProfileOptions {
+                    bounds_mode: BoundsMode::Vertex,
+                    elevation_column: Some("alt_m"),
+                },
+            )
+            .unwrap();
+            assert_eq!(p.z_range, Some([-12.0, 35.5]));
+
+            // Opt-in: without the flag the same features stay 2D, and the
+            // geometry is untouched either way.
+            assert_eq!(vertex_profile(&feats).z_range, None);
+            assert_eq!(p.vertex_bounds, vertex_profile(&feats).vertex_bounds);
+        }
+
+        /// The same per-feature gate the fingerprint uses, on the profiler that
+        /// feeds `metadata.z_range`: a line/polygon build declares no vertical
+        /// extent from a property column the encoder never folds. Both claims
+        /// come from one predicate, so they cannot drift apart.
+        #[test]
+        fn elevation_column_does_not_fold_on_non_point_geometry() {
+            let feats = vec![
+                with_props(
+                    feature(
+                        Some(G::LineString(vec![vec![1.0, 2.0], vec![1.5, 2.5]])),
+                        1.25,
+                        2.25,
+                    ),
+                    &[("alt_m", serde_json::json!(35.5))],
+                ),
+                with_props(
+                    feature(
+                        Some(G::Polygon(vec![vec![
+                            vec![0.0, 0.0],
+                            vec![1.0, 0.0],
+                            vec![1.0, 1.0],
+                            vec![0.0, 0.0],
+                        ]])),
+                        0.5,
+                        0.5,
+                    ),
+                    &[("alt_m", serde_json::json!(-12.0))],
+                ),
+            ];
+            let p = profile_features_with(
+                &feats,
+                &FeatureProfileOptions {
+                    bounds_mode: BoundsMode::Vertex,
+                    elevation_column: Some("alt_m"),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                p.z_range, None,
+                "the encoder folds only into POINT layers, so these tiles stay flat"
+            );
+        }
+
+        #[test]
+        fn elevation_column_and_geometry_z_combine() {
+            let feats = vec![with_props(
+                feature(Some(G::Point(vec![1.0, 2.0, 10.0])), 1.0, 2.0),
+                &[("alt_m", serde_json::json!(-500.0))],
+            )];
+            let p = profile_features_with(
+                &feats,
+                &FeatureProfileOptions {
+                    bounds_mode: BoundsMode::Vertex,
+                    elevation_column: Some("alt_m"),
+                },
+            )
+            .unwrap();
+            assert_eq!(p.z_range, Some([-500.0, 10.0]));
+        }
+
+        /// Behavioural pin: the null-island sentinel policy is load-bearing —
+        /// dropping it re-opens the whole-globe-bbox failure the current code
+        /// documents. It skips the feature's WHOLE contribution, vertices
+        /// included, because a sentinel anchor means the geometry was coerced.
+        #[test]
+        fn null_island_sentinel_features_are_excluded_from_both_bboxes() {
+            let feats = vec![
+                feature(Some(G::Point(vec![10.0, 20.0])), 10.0, 20.0),
+                feature(Some(G::Point(vec![11.0, 21.0])), 11.0, 21.0),
+                // Coerced row: anchor at the sentinel, geometry equally bogus.
+                feature(Some(G::Point(vec![0.0, 0.0])), 0.0, 0.0),
+            ];
+            let p = vertex_profile(&feats);
+            assert_eq!(p.vertex_bounds, BoundingBox::new(10.0, 20.0, 11.0, 21.0));
+            assert_eq!(p.centroid_bounds, BoundingBox::new(10.0, 20.0, 11.0, 21.0));
+        }
+
+        /// The degenerate all-sentinel fallback: rather than return an
+        /// inside-out bbox, fall back to the raw extent. The centroid answer is
+        /// pinned unchanged; the vertex answer is the honest version of it.
+        #[test]
+        fn all_sentinel_input_falls_back_to_the_raw_extent() {
+            let feats = vec![
+                feature(
+                    Some(G::LineString(vec![vec![-1.0, -1.0], vec![1.0, 1.0]])),
+                    0.0,
+                    0.0,
+                ),
+                feature(Some(G::Point(vec![0.0, 0.0])), 0.0, 0.0),
+            ];
+            let p = vertex_profile(&feats);
+            assert_eq!(p.centroid_bounds, BoundingBox::new(0.0, 0.0, 0.0, 0.0));
+            assert_eq!(p.vertex_bounds, BoundingBox::new(-1.0, -1.0, 1.0, 1.0));
+
+            // The default (vertex since R1) takes the honest branch of the same
+            // fallback; the legacy branch is still reachable and unchanged.
+            let (default_bounds, _) = calculate_bounds(&feats).unwrap();
+            assert_eq!(default_bounds, BoundingBox::new(-1.0, -1.0, 1.0, 1.0));
+            assert_eq!(
+                profile_features_with(
+                    &feats,
+                    &FeatureProfileOptions {
+                        bounds_mode: BoundsMode::Centroid,
+                        ..Default::default()
+                    }
+                )
+                .unwrap()
+                .bounds,
+                BoundingBox::new(0.0, 0.0, 0.0, 0.0)
+            );
+        }
+
+        #[test]
+        fn empty_input_returns_the_world_placeholder_unchanged() {
+            let (bounds, time_range) = calculate_bounds(&[]).unwrap();
+            assert_eq!(bounds, BoundingBox::new(-180.0, -90.0, 180.0, 90.0));
+            assert_eq!(time_range.start, 0);
+            assert_eq!(time_range.end, 0);
+
+            let p = vertex_profile(&[]);
+            assert_eq!(p.bounds, BoundingBox::new(-180.0, -90.0, 180.0, 90.0));
+            assert_eq!(p.vertex_bounds, p.bounds);
+            assert_eq!(p.z_range, None);
+        }
+
+        #[test]
+        fn feature_without_geometry_contributes_its_anchor() {
+            let feats = vec![
+                feature(None, -20.0, -30.0),
+                feature(Some(G::Point(vec![1.0, 1.0])), 1.0, 1.0),
+            ];
+            let p = vertex_profile(&feats);
+            assert_eq!(p.vertex_bounds, BoundingBox::new(-20.0, -30.0, 1.0, 1.0));
+        }
+
+        /// A NaN/inf ordinate must neither poison the fold nor erase the
+        /// feature: it falls back to the anchor, which still widens the box.
+        #[test]
+        fn non_finite_vertices_fall_back_to_the_anchor() {
+            let feats = vec![
+                feature(
+                    Some(G::LineString(vec![
+                        vec![f64::NAN, 5.0],
+                        vec![f64::INFINITY, f64::NAN],
+                    ])),
+                    -7.0,
+                    -8.0,
+                ),
+                feature(Some(G::Point(vec![1.0, 1.0])), 1.0, 1.0),
+            ];
+            let p = vertex_profile(&feats);
+            assert_eq!(p.vertex_bounds, BoundingBox::new(-7.0, -8.0, 1.0, 1.0));
+            assert!(p.vertex_bounds.min_lon.is_finite());
+            assert_eq!(p.z_range, None);
+        }
+
+        /// Determinism (§13.1): the profile is a pure, order-independent fold —
+        /// identical across re-runs AND across any permutation of the input, so
+        /// two builds of the same data declare byte-identical bounds.
+        #[test]
+        fn bounds_are_order_independent_and_reproducible() {
+            let mut feats = vec![
+                feature(
+                    Some(G::LineString(vec![
+                        vec![-44.0, 8.0, 15.0],
+                        vec![-40.0, 12.0, 22.0],
+                    ])),
+                    -42.0,
+                    10.0,
+                ),
+                feature(Some(G::Point(vec![12.5, -3.25, -4.0])), 12.5, -3.25),
+                feature(
+                    Some(G::Polygon(vec![vec![
+                        vec![100.0, -60.0],
+                        vec![101.0, -60.0],
+                        vec![101.0, -59.0],
+                        vec![100.0, -60.0],
+                    ]])),
+                    100.3,
+                    -59.7,
+                ),
+                feature(None, 5.0, 5.0),
+            ];
+
+            let first = vertex_profile(&feats);
+            // Re-run: same input, same answer.
+            assert_eq!(vertex_profile(&feats), first);
+
+            // Permutation: reverse, then rotate — a deterministic shuffle that
+            // touches every position.
+            feats.reverse();
+            feats.rotate_left(1);
+            assert_eq!(vertex_profile(&feats), first);
+            feats.rotate_left(2);
+            assert_eq!(vertex_profile(&feats), first);
+
+            // The two-field view is order-independent too, and (since R1) it
+            // answers the same honest box.
+            assert_eq!(calculate_bounds(&feats).unwrap().0, first.vertex_bounds);
+        }
+    }
+
+    /// BLOCKER A — the feature-id SCOPE attestation.
+    ///
+    /// `stt-validate` may only compare `distinct_feature_count` against decoded
+    /// ids on an archive whose writer proved the id column is a dataset-wide
+    /// key. These tests pin what that proof accepts, what it declines, and that
+    /// declining is cheap.
+    mod feature_id_scope {
+        use crate::input::{
+            attestable_feature_id, feature_id_attestation, feature_ids_are_globally_distinct,
+            fnv1a_64, FeatureIdAttestation, ParsedFeature,
+        };
+        use geojson::feature::Id;
+        use geojson::{Geometry, Value as G};
+
+        fn feature(id: Option<Id>, lon: f64, lat: f64) -> ParsedFeature {
+            ParsedFeature {
+                home_zoom: None,
+                geojson: geojson::Feature {
+                    bbox: None,
+                    geometry: Some(Geometry::new(G::Point(vec![lon, lat]))),
+                    id,
+                    properties: None,
+                    foreign_members: None,
+                },
+                shared_properties: None,
+                timestamp: 1_000,
+                end_timestamp: None,
+                vertex_timestamps: None,
+                vertex_values: None,
+                vertex_value_matrix: None,
+                lon,
+                lat,
+            }
+        }
+
+        fn numeric(n: u64) -> Option<Id> {
+            Some(Id::Number(serde_json::Number::from(n)))
+        }
+
+        fn string(s: &str) -> Option<Id> {
+            Some(Id::String(s.to_string()))
+        }
+
+        /// ⚠️ The load-bearing pin. This crate carries its OWN copy of
+        /// FNV-1a-64 (the original is module-private to `columnar`, which this
+        /// change does not own). If the copy drifts, the attestation would
+        /// prove distinctness over ids the encoder never wrote.
+        ///
+        /// The expectations are the FNV-1a-64 reference vectors from the
+        /// algorithm's own specification, not values read back out of this
+        /// implementation.
+        #[test]
+        fn fnv1a_64_matches_the_spec_fixed_constants() {
+            assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+            assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+            assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+            // One more, computed off-tree from the same spec, so a
+            // single mistyped digit above cannot pass unnoticed.
+            assert_eq!(fnv1a_64(b"quake-1"), 0xb832_28a8_e922_7888);
+        }
+
+        /// The happy path: distinct explicit ids, numeric and string alike.
+        #[test]
+        fn distinct_explicit_ids_are_attested() {
+            let numeric_ids = vec![
+                feature(numeric(7), 0.0, 0.0),
+                feature(numeric(9), 1.0, 1.0),
+                feature(numeric(11), 2.0, 2.0),
+            ];
+            assert_eq!(
+                feature_id_attestation(&numeric_ids),
+                FeatureIdAttestation::Distinct
+            );
+            assert!(feature_ids_are_globally_distinct(&numeric_ids));
+
+            let string_ids = vec![
+                feature(string("quake-1"), 0.0, 0.0),
+                feature(string("quake-2"), 1.0, 1.0),
+            ];
+            assert!(feature_ids_are_globally_distinct(&string_ids));
+            // …and through the writer's mapping, not the raw string.
+            assert_eq!(
+                attestable_feature_id(&string_ids[0]),
+                Some(fnv1a_64(b"quake-1"))
+            );
+
+            // Vacuous, not an error.
+            assert!(feature_ids_are_globally_distinct(&[]));
+        }
+
+        /// ⭐ THE BUG'S SHAPE. One id-less feature is enough to decline —
+        /// and it declines AT THAT FEATURE, which is what keeps a 44 M-point
+        /// no-id archive free.
+        #[test]
+        fn one_id_less_feature_declines_the_whole_set_immediately() {
+            let feats = vec![
+                feature(None, 0.0, 0.0),
+                feature(numeric(9), 1.0, 1.0),
+                feature(numeric(11), 2.0, 2.0),
+            ];
+            assert_eq!(
+                feature_id_attestation(&feats),
+                FeatureIdAttestation::NoSourceId { index: 0 }
+            );
+            assert!(!feature_ids_are_globally_distinct(&feats));
+
+            // Mixed the other way round: the bail names the offending index.
+            let mut later = feats.clone();
+            later.swap(0, 2);
+            assert_eq!(
+                feature_id_attestation(&later),
+                FeatureIdAttestation::NoSourceId { index: 2 }
+            );
+            assert!(feature_id_attestation(&later).reason().contains("#2"));
+        }
+
+        /// A non-integer numeric id is NOT attestable: the writer's
+        /// `determine_feature_id` falls through to the positional hash for it,
+        /// exactly as if the feature carried no id.
+        #[test]
+        fn non_integer_numeric_ids_are_not_attestable() {
+            let float_id = feature(
+                Some(Id::Number(serde_json::Number::from_f64(1.5).unwrap())),
+                0.0,
+                0.0,
+            );
+            assert_eq!(attestable_feature_id(&float_id), None);
+            assert_eq!(
+                feature_id_attestation(std::slice::from_ref(&float_id)),
+                FeatureIdAttestation::NonIntegerId { index: 0 }
+            );
+
+            // A negative INTEGER id is attestable — the writer widens it the
+            // same way, and the widening is injective.
+            let negative = feature(Some(Id::Number(serde_json::Number::from(-3i64))), 0.0, 0.0);
+            assert_eq!(attestable_feature_id(&negative), Some(-3i64 as u64));
+            assert!(feature_ids_are_globally_distinct(std::slice::from_ref(
+                &negative
+            )));
+        }
+
+        /// Duplicate ids mean the id column is not a key, so it cannot be
+        /// compared against a source-feature COUNT. The evidence names the
+        /// earliest pair, deterministically.
+        #[test]
+        fn colliding_ids_decline_and_name_the_pair() {
+            let feats = vec![
+                feature(numeric(7), 0.0, 0.0),
+                feature(numeric(9), 1.0, 1.0),
+                feature(numeric(7), 2.0, 2.0),
+                feature(numeric(7), 3.0, 3.0),
+            ];
+            assert_eq!(
+                feature_id_attestation(&feats),
+                FeatureIdAttestation::Collision {
+                    value: 7,
+                    first: 0,
+                    second: 2,
+                }
+            );
+            assert!(!feature_ids_are_globally_distinct(&feats));
+
+            // Repeat runs agree — a sort with a total tiebreak, no hashing
+            // container, no iteration-order dependence.
+            for _ in 0..4 {
+                assert_eq!(
+                    feature_id_attestation(&feats),
+                    FeatureIdAttestation::Collision {
+                        value: 7,
+                        first: 0,
+                        second: 2,
+                    }
+                );
+            }
+        }
+
+        /// The trajectory shape that used to false-positive the old check:
+        /// every point of one track shares the track's id. Distinct SOURCE
+        /// FEATURES, one id — so the attestation declines and check 12 stays on
+        /// the conservative basis.
+        #[test]
+        fn one_id_per_track_is_declined_not_attested() {
+            let feats: Vec<ParsedFeature> = (0..8)
+                .map(|i| feature(string("track-A"), i as f64, i as f64))
+                .collect();
+            assert!(!feature_ids_are_globally_distinct(&feats));
+        }
+
+        // -------------------------------------------------------------------
+        // ⭐ BLOCKER 1 — the CONSTRUCTION classifier and the proof built on it.
+        // -------------------------------------------------------------------
+
+        use crate::input::{
+            anchor_feature_id, feature_id_construction, feature_id_report, FeatureIdConstruction,
+            FeatureIdOptions,
+        };
+
+        /// The same feature, with the geometry and duration swapped in — the two
+        /// axes the classifier actually reads.
+        fn shaped(
+            id: Option<Id>,
+            geometry: G,
+            end_timestamp: Option<u64>,
+            lon: f64,
+        ) -> ParsedFeature {
+            ParsedFeature {
+                home_zoom: None,
+                geojson: geojson::Feature {
+                    bbox: None,
+                    geometry: Some(Geometry::new(geometry)),
+                    id,
+                    properties: None,
+                    foreign_members: None,
+                },
+                shared_properties: None,
+                timestamp: 1_000,
+                end_timestamp,
+                vertex_timestamps: None,
+                vertex_values: None,
+                vertex_value_matrix: None,
+                lon,
+                lat: 0.0,
+            }
+        }
+
+        fn line() -> G {
+            G::LineString(vec![vec![0.0, 0.0], vec![1.0, 1.0]])
+        }
+        fn poly() -> G {
+            G::Polygon(vec![vec![
+                vec![0.0, 0.0],
+                vec![1.0, 0.0],
+                vec![1.0, 1.0],
+                vec![0.0, 0.0],
+            ]])
+        }
+
+        /// ⚠️ THE MIRROR PIN, and the sibling of
+        /// `fnv1a_64_matches_the_spec_fixed_constants`. [`anchor_feature_id`]
+        /// re-implements `columnar::determine_feature_id`'s fallback, which is
+        /// module-private to a file this change does not own. If the field order
+        /// or the folding drifts, the proof would establish distinctness over
+        /// ids the encoder never wrote — and the validator would then read a
+        /// shortfall as feature loss on a healthy archive.
+        ///
+        /// The expectation is computed here from the spec constants
+        /// independently of the implementation.
+        #[test]
+        fn anchor_hash_mirrors_the_writers_fallback_id() {
+            let f = shaped(None, poly(), None, -122.394);
+            // FNV-1a-64 over LE(timestamp) ++ LE(lon.to_bits()) ++ LE(lat.to_bits()).
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&1_000u64.to_le_bytes());
+            expected.extend_from_slice(&(-122.394f64).to_bits().to_le_bytes());
+            expected.extend_from_slice(&0.0f64.to_bits().to_le_bytes());
+            assert_eq!(anchor_feature_id(&f), fnv1a_64(&expected));
+
+            // It is a function of the ANCHOR, so two features sharing a
+            // timestamp and a representative point collide — which is exactly
+            // what the pairwise check below has to catch.
+            let twin = shaped(None, line(), None, -122.394);
+            assert_eq!(anchor_feature_id(&f), anchor_feature_id(&twin));
+        }
+
+        /// The classifier's full table. Each row is a real writer path; the two
+        /// key rows are the ones that were unreachable before.
+        #[test]
+        fn construction_classifier_covers_every_writer_path() {
+            let clipping = FeatureIdOptions {
+                clip_trajectories: true,
+            };
+            let no_clip = FeatureIdOptions {
+                clip_trajectories: false,
+            };
+            let k = |f: &ParsedFeature, o| feature_id_construction(f, o);
+
+            // A source id wins outright, whatever the geometry: `build_point_layer`
+            // leaves it alone and `segment_feature_id` reads it off every segment.
+            for geom in [G::Point(vec![0.0, 0.0]), line(), poly()] {
+                let f = shaped(numeric(7), geom, Some(2_000), 0.0);
+                assert_eq!(k(&f, clipping), FeatureIdConstruction::Source);
+            }
+
+            // Id-less points (and multipoints, whose derived pieces are points)
+            // get the per-tile ROW INDEX.
+            for geom in [
+                G::Point(vec![0.0, 0.0]),
+                G::MultiPoint(vec![vec![0.0, 0.0], vec![1.0, 1.0]]),
+            ] {
+                let f = shaped(None, geom, None, 0.0);
+                assert_eq!(k(&f, clipping), FeatureIdConstruction::RowIndex);
+            }
+
+            // ⭐ Id-less polygons and TIMELESS lines keep the whole-feature
+            // anchor hash — the class the row floor cannot police and the whole
+            // reason this change exists.
+            for geom in [
+                line(),
+                poly(),
+                G::MultiLineString(vec![vec![vec![0.0, 0.0], vec![1.0, 1.0]]]),
+            ] {
+                let f = shaped(None, geom, None, 0.0);
+                assert_eq!(k(&f, clipping), FeatureIdConstruction::AnchorHash);
+            }
+
+            // A DURATION line under clipping mints per-segment ids…
+            let trip = shaped(None, line(), Some(2_000), 0.0);
+            assert_eq!(k(&trip, clipping), FeatureIdConstruction::SegmentHash);
+            // …and the very same feature placed whole does not. The decline is a
+            // property of the CONSTRUCTION, not of the geometry kind.
+            assert_eq!(k(&trip, no_clip), FeatureIdConstruction::AnchorHash);
+
+            // Degenerate shapes resolve toward the NON-key class: a
+            // misprediction may cost enforcement, never manufacture it.
+            let no_geometry = ParsedFeature {
+                home_zoom: None,
+                geojson: geojson::Feature {
+                    bbox: None,
+                    geometry: None,
+                    id: None,
+                    properties: None,
+                    foreign_members: None,
+                },
+                ..shaped(None, poly(), None, 0.0)
+            };
+            assert_eq!(k(&no_geometry, clipping), FeatureIdConstruction::RowIndex);
+            let empty_collection = shaped(None, G::GeometryCollection(vec![]), None, 0.0);
+            assert_eq!(
+                k(&empty_collection, clipping),
+                FeatureIdConstruction::RowIndex
+            );
+            // A GeometryCollection routes by its FIRST member, like columnar's
+            // `determine_geometry_type`.
+            let gc_poly = shaped(
+                None,
+                G::GeometryCollection(vec![Geometry::new(poly())]),
+                None,
+                0.0,
+            );
+            assert_eq!(k(&gc_poly, clipping), FeatureIdConstruction::AnchorHash);
+        }
+
+        /// ⭐ THE REGRESSION ITSELF. No ingest path populates `geojson.id`, so
+        /// an id-less line/polygon set is what a real build sees — and it must
+        /// now ATTEST, where the predecessor declined every archive anyone
+        /// could build.
+        #[test]
+        fn id_less_lines_and_polygons_attest_where_points_decline() {
+            let opts = FeatureIdOptions::default();
+
+            // Distinct anchors (distinct longitudes) ⇒ distinct ids ⇒ proven.
+            for geom in [line as fn() -> G, poly as fn() -> G] {
+                let feats: Vec<ParsedFeature> = (0..16)
+                    .map(|i| shaped(None, geom(), None, i as f64))
+                    .collect();
+                let report = feature_id_report(&feats, opts);
+                assert_eq!(report.construction, FeatureIdConstruction::AnchorHash);
+                assert_eq!(report.attestation, FeatureIdAttestation::Distinct);
+            }
+
+            // The point control, unchanged: still the row index, still declined,
+            // and still declined AT feature #0 so a 44 M-point archive pays
+            // nothing for the walk.
+            let points: Vec<ParsedFeature> =
+                (0..16).map(|i| feature(None, i as f64, 0.0)).collect();
+            let report = feature_id_report(&points, opts);
+            assert_eq!(report.construction, FeatureIdConstruction::RowIndex);
+            assert_eq!(
+                report.attestation,
+                FeatureIdAttestation::NoSourceId { index: 0 }
+            );
+
+            // A clipped trip declines with its OWN evidence, naming the segment
+            // mechanism rather than the point one.
+            let trips: Vec<ParsedFeature> = (0..4)
+                .map(|i| shaped(None, line(), Some(2_000), i as f64))
+                .collect();
+            let report = feature_id_report(&trips, opts);
+            assert_eq!(report.construction, FeatureIdConstruction::SegmentHash);
+            assert_eq!(
+                report.attestation,
+                FeatureIdAttestation::SegmentIds { index: 0 }
+            );
+            assert!(report.attestation.reason().contains("CLIPPED SEGMENT"));
+            // …and `--no-clip` moves the identical features into the key class.
+            let report = feature_id_report(
+                &trips,
+                FeatureIdOptions {
+                    clip_trajectories: false,
+                },
+            );
+            assert_eq!(report.construction, FeatureIdConstruction::AnchorHash);
+            assert_eq!(report.attestation, FeatureIdAttestation::Distinct);
+        }
+
+        /// ⚠️ The soundness guard on the new arming path. The anchor hash is a
+        /// function of `(timestamp, lon, lat)`, so two features sharing all
+        /// three map to ONE wire id — and the archive would then decode fewer
+        /// distinct ids than it has features with nothing missing. The pairwise
+        /// check must catch that BEFORE the manifest claims a key.
+        #[test]
+        fn colliding_anchors_decline_so_the_new_path_cannot_false_positive() {
+            let feats = vec![
+                shaped(None, poly(), None, 10.0),
+                shaped(None, poly(), None, 11.0),
+                // Same timestamp, same anchor as #0: the two polygons are
+                // different, their wire ids are not.
+                shaped(None, line(), None, 10.0),
+            ];
+            let report = feature_id_report(&feats, FeatureIdOptions::default());
+            assert_eq!(report.construction, FeatureIdConstruction::AnchorHash);
+            assert!(
+                matches!(
+                    report.attestation,
+                    FeatureIdAttestation::Collision {
+                        first: 0,
+                        second: 2,
+                        ..
+                    }
+                ),
+                "a colliding anchor pair must decline, and name the earliest pair: {:?}",
+                report.attestation
+            );
+
+            // Deterministic: the sort carries a total tiebreak, so repeat runs
+            // and a reversed input agree on the conclusion.
+            for _ in 0..4 {
+                assert_eq!(
+                    feature_id_report(&feats, FeatureIdOptions::default()).attestation,
+                    report.attestation
+                );
+            }
+        }
+
+        /// A MIXED set is judged by its weakest member, and the label follows.
+        #[test]
+        fn a_mixed_set_is_judged_by_its_weakest_construction() {
+            let opts = FeatureIdOptions::default();
+
+            // One id-less point among polygons ⇒ the whole set declines, at
+            // that feature.
+            let mixed = vec![
+                shaped(None, poly(), None, 1.0),
+                shaped(None, poly(), None, 2.0),
+                feature(None, 3.0, 0.0),
+                shaped(None, poly(), None, 4.0),
+            ];
+            let report = feature_id_report(&mixed, opts);
+            assert_eq!(report.construction, FeatureIdConstruction::RowIndex);
+            assert_eq!(
+                report.attestation,
+                FeatureIdAttestation::NoSourceId { index: 2 }
+            );
+
+            // Source ids everywhere ⇒ labelled `source`; one anchor among them
+            // ⇒ labelled `anchor-hash` (the weaker of the two key kinds), and
+            // both still attest.
+            let sourced = vec![
+                feature(numeric(1), 0.0, 0.0),
+                shaped(numeric(2), poly(), None, 1.0),
+            ];
+            let report = feature_id_report(&sourced, opts);
+            assert_eq!(report.construction, FeatureIdConstruction::Source);
+            assert_eq!(report.attestation, FeatureIdAttestation::Distinct);
+
+            let blended = vec![
+                feature(numeric(1), 0.0, 0.0),
+                shaped(None, poly(), None, 1.0),
+            ];
+            let report = feature_id_report(&blended, opts);
+            assert_eq!(report.construction, FeatureIdConstruction::AnchorHash);
+            assert_eq!(report.attestation, FeatureIdAttestation::Distinct);
+        }
+    }
+
+    /// SH-1 — the build-time semantic content fingerprint.
+    ///
+    /// Its bbox is a CONTAINMENT CLAIM, not a camera hint, which is the one
+    /// place it deliberately diverges from `metadata.bounds`: it folds every
+    /// feature, null-island rows included, because excluding data the archive
+    /// will later be asked to contain would make the claim false.
+    mod content_fingerprint {
+        use crate::input::{content_fingerprint, FingerprintOptions, ParsedFeature};
+        use crate::props::FeatureProperties;
+        use geojson::{Geometry, Value as G};
+        use std::collections::BTreeMap;
+
+        fn feature(geometry: Option<G>, lon: f64, lat: f64) -> ParsedFeature {
+            ParsedFeature {
+                home_zoom: None,
+                geojson: geojson::Feature {
+                    bbox: None,
+                    geometry: geometry.map(Geometry::new),
+                    id: None,
+                    properties: None,
+                    foreign_members: None,
+                },
+                shared_properties: None,
+                timestamp: 1_000,
+                end_timestamp: None,
+                vertex_timestamps: None,
+                vertex_values: None,
+                vertex_value_matrix: None,
+                lon,
+                lat,
+            }
+        }
+
+        fn with_props(mut f: ParsedFeature, pairs: &[(&str, serde_json::Value)]) -> ParsedFeature {
+            let mut map = serde_json::Map::new();
+            for (k, v) in pairs {
+                map.insert((*k).to_string(), v.clone());
+            }
+            f.shared_properties = FeatureProperties::from_map(map);
+            f
+        }
+
+        fn fingerprint(features: &[ParsedFeature]) -> stt_core::metadata::ContentFingerprint {
+            content_fingerprint(features, &FingerprintOptions::default()).unwrap()
+        }
+
+        /// The bbox is taken from VERTICES (the quantity tiles are addressed
+        /// by), not from the centroid anchor — otherwise every line and polygon
+        /// archive would fail its own containment check on the first decode.
+        #[test]
+        fn bbox_is_taken_from_vertices_not_the_centroid() {
+            let feats = vec![feature(
+                Some(G::LineString(vec![vec![-10.0, -4.0], vec![10.0, 6.0]])),
+                0.0,
+                1.0,
+            )];
+            let fp = fingerprint(&feats);
+            assert_eq!(fp.bbox, [-10.0, -4.0, 10.0, 6.0]);
+            assert_eq!(fp.version, stt_core::metadata::CONTENT_FINGERPRINT_VERSION);
+            assert_eq!(fp.distinct_feature_count, 1);
+        }
+
+        /// ⚠️ THE DIVERGENCE FROM `metadata.bounds`. A null-island feature is
+        /// EXCLUDED from the declared camera bbox (one coerced row must not
+        /// zoom the showcase out to the whole globe) but INCLUDED here: if the
+        /// archive decodes a vertex at (0, 0), the containment claim has to
+        /// cover it or the validator reports a defect that is not there.
+        #[test]
+        fn null_island_features_are_included_in_the_containment_claim() {
+            let feats = vec![
+                feature(Some(G::Point(vec![10.0, 10.0])), 10.0, 10.0),
+                feature(Some(G::Point(vec![0.0, 0.0])), 0.0, 0.0),
+            ];
+            let fp = fingerprint(&feats);
+            assert_eq!(
+                fp.bbox,
+                [0.0, 0.0, 10.0, 10.0],
+                "the sentinel must be covered"
+            );
+
+            // ...whereas the camera bbox still excludes it, unchanged.
+            let profile = super::super::profile_features_with(
+                &feats,
+                &crate::input::FeatureProfileOptions {
+                    bounds_mode: crate::input::BoundsMode::Vertex,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(profile.vertex_bounds.min_lon, 10.0);
+        }
+
+        /// A 3-element position contributes altitude; a 2-element one leaves
+        /// `z_range` absent, which is what keeps 2D fingerprints small.
+        #[test]
+        fn z_comes_from_three_element_positions() {
+            let flat = vec![feature(Some(G::Point(vec![1.0, 2.0])), 1.0, 2.0)];
+            assert_eq!(fingerprint(&flat).z_range, None);
+
+            let volumetric = vec![
+                feature(Some(G::Point(vec![1.0, 2.0, 5.0])), 1.0, 2.0),
+                feature(Some(G::Point(vec![1.5, 2.5, -3.0])), 1.5, 2.5),
+            ];
+            assert_eq!(fingerprint(&volumetric).z_range, Some([-3.0, 5.0]));
+        }
+
+        /// Property columns split by KIND exactly the way the style-hints
+        /// profiler splits them: `as_f64` is numbers-only, so a numeric-looking
+        /// string stays categorical.
+        #[test]
+        fn property_ranges_and_cardinality() {
+            let feats = vec![
+                with_props(
+                    feature(Some(G::Point(vec![0.0, 0.0])), 0.0, 0.0),
+                    &[
+                        ("speed", serde_json::json!(2.0)),
+                        ("kind", serde_json::json!("car")),
+                        ("code", serde_json::json!("42")),
+                    ],
+                ),
+                with_props(
+                    feature(Some(G::Point(vec![1.0, 1.0])), 1.0, 1.0),
+                    &[
+                        ("speed", serde_json::json!(30.0)),
+                        ("kind", serde_json::json!("bus")),
+                        ("code", serde_json::json!("42")),
+                    ],
+                ),
+            ];
+            let fp = fingerprint(&feats);
+            assert_eq!(fp.numeric_ranges.get("speed"), Some(&[2.0, 30.0]));
+            assert_eq!(fp.categorical_cardinality.get("kind"), Some(&2));
+            assert_eq!(
+                fp.categorical_cardinality.get("code"),
+                Some(&1),
+                "a numeric-LOOKING string stays categorical, like the profiler"
+            );
+            assert!(!fp.numeric_ranges.contains_key("code"));
+        }
+
+        /// Tolerances come from the levers that actually move decoded values,
+        /// and only from those: no quantization ⇒ an exact claim.
+        #[test]
+        fn tolerances_track_the_quantization_levers() {
+            let feats = vec![with_props(
+                feature(Some(G::Point(vec![1.0, 2.0])), 1.0, 2.0),
+                &[("z", serde_json::json!(7.5))],
+            )];
+
+            let exact = fingerprint(&feats);
+            assert_eq!(exact.coord_tolerance_deg, 0.0);
+            assert!(exact.column_tolerance.is_empty());
+
+            let quantized = content_fingerprint(
+                &feats,
+                &FingerprintOptions {
+                    quantize_coords_m: Some(1.0),
+                    attr_precisions: BTreeMap::from([("z".to_string(), 0.05)]),
+                    elevation_column: None,
+                },
+            )
+            .unwrap();
+            assert!(
+                (quantized.coord_tolerance_deg - 1.0 / 111_320.0).abs() < 1e-15,
+                "got {}",
+                quantized.coord_tolerance_deg
+            );
+            assert_eq!(quantized.column_tolerance.get("z"), Some(&0.05));
+        }
+
+        /// `--point-elevation-column` moves a column OUT of the property set and
+        /// into geometry z, so the fingerprint must follow it — declaring a
+        /// numeric range for a column the archive no longer carries would fire a
+        /// finding on every honest volumetric build.
+        #[test]
+        fn elevation_column_folds_into_z_and_leaves_the_property_set() {
+            let feats = vec![
+                with_props(
+                    feature(Some(G::Point(vec![1.0, 2.0])), 1.0, 2.0),
+                    &[("alt", serde_json::json!(3.0))],
+                ),
+                with_props(
+                    feature(Some(G::Point(vec![1.5, 2.5])), 1.5, 2.5),
+                    &[("alt", serde_json::json!(9.0))],
+                ),
+            ];
+            let fp = content_fingerprint(
+                &feats,
+                &FingerprintOptions {
+                    elevation_column: Some("alt"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(fp.z_range, Some([3.0, 9.0]));
+            assert!(
+                !fp.numeric_ranges.contains_key("alt"),
+                "the folded column must not be declared twice"
+            );
+        }
+
+        /// ⭐ …and the SAME flag on a NON-point layer must do neither.
+        ///
+        /// `--point-elevation-column` is a shipped flag combination on a
+        /// linestring build, and the fold never happens there — `encode` gates
+        /// on `GeometryColumn::Point` and the flag's help says "Only affects
+        /// POINT layers". Assuming it happened baked a fingerprint that was
+        /// wrong twice over: a `z_range` invented for an archive with no 3D
+        /// geometry, and the named column dropped from `numeric_ranges`, which
+        /// switched OFF the attribute check that catches a corrupted rebuild.
+        /// A wrong fingerprint is worse than none, because it certifies.
+        #[test]
+        fn elevation_column_is_not_folded_on_a_non_point_layer() {
+            let line = |lo: f64, hi: f64, alt: f64| {
+                with_props(
+                    feature(
+                        Some(G::LineString(vec![vec![lo, lo], vec![hi, hi]])),
+                        (lo + hi) / 2.0,
+                        (lo + hi) / 2.0,
+                    ),
+                    &[("alt", serde_json::json!(alt))],
+                )
+            };
+            let feats = vec![line(1.0, 2.0, 5.0), line(2.0, 3.0, 34.0)];
+            let fp = content_fingerprint(
+                &feats,
+                &FingerprintOptions {
+                    elevation_column: Some("alt"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                fp.z_range, None,
+                "a linestring build has no 3D geometry, so it may claim no vertical extent"
+            );
+            assert_eq!(
+                fp.numeric_ranges.get("alt"),
+                Some(&[5.0, 34.0]),
+                "the column is still a property on a non-point layer and MUST stay checkable"
+            );
+
+            // Polygons behave the same way — the gate is "is it a point", not
+            // "is it not a line".
+            let poly = with_props(
+                feature(
+                    Some(G::Polygon(vec![vec![
+                        vec![0.0, 0.0],
+                        vec![1.0, 0.0],
+                        vec![1.0, 1.0],
+                        vec![0.0, 0.0],
+                    ]])),
+                    0.5,
+                    0.5,
+                ),
+                &[("alt", serde_json::json!(12.0))],
+            );
+            let fp = content_fingerprint(
+                std::slice::from_ref(&poly),
+                &FingerprintOptions {
+                    elevation_column: Some("alt"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(fp.z_range, None);
+            assert_eq!(fp.numeric_ranges.get("alt"), Some(&[12.0, 12.0]));
+        }
+
+        /// A MIXED build splits the claim exactly where the encoder splits it:
+        /// the point layer's values move into `z_range`, the line layer's stay
+        /// in `numeric_ranges`. Neither statistic may absorb the other's
+        /// values — over-declaring either one is a finding on an honest
+        /// archive under a full decode.
+        #[test]
+        fn mixed_geometry_splits_the_elevation_claim_by_layer() {
+            let feats = vec![
+                with_props(
+                    feature(Some(G::Point(vec![1.0, 2.0])), 1.0, 2.0),
+                    &[("alt", serde_json::json!(3.0))],
+                ),
+                with_props(
+                    feature(
+                        Some(G::LineString(vec![vec![1.0, 1.0], vec![2.0, 2.0]])),
+                        1.5,
+                        1.5,
+                    ),
+                    &[("alt", serde_json::json!(900.0))],
+                ),
+            ];
+            let fp = content_fingerprint(
+                &feats,
+                &FingerprintOptions {
+                    elevation_column: Some("alt"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                fp.z_range,
+                Some([3.0, 3.0]),
+                "only the POINT feature's altitude reaches geometry z"
+            );
+            assert_eq!(
+                fp.numeric_ranges.get("alt"),
+                Some(&[900.0, 900.0]),
+                "only the LINE feature's altitude survives as a property"
+            );
+        }
+
+        /// DETERMINISM. Two runs over the same feature set — in any order —
+        /// serialise to BYTE-IDENTICAL `content_fingerprint` JSON. This is the
+        /// build-reproducibility pin: min/max folds, BTreeMaps, no sampling
+        /// stride, no clock, no hash iteration order.
+        #[test]
+        fn content_fingerprint_is_order_independent_and_reproducible() {
+            let mut feats = vec![
+                with_props(
+                    feature(Some(G::Point(vec![-3.0, 4.0])), -3.0, 4.0),
+                    &[
+                        ("speed", serde_json::json!(1.5)),
+                        ("kind", serde_json::json!("a")),
+                    ],
+                ),
+                with_props(
+                    feature(
+                        Some(G::LineString(vec![vec![10.0, -8.0], vec![12.0, -6.0]])),
+                        11.0,
+                        -7.0,
+                    ),
+                    &[
+                        ("speed", serde_json::json!(9.5)),
+                        ("kind", serde_json::json!("b")),
+                    ],
+                ),
+                with_props(
+                    feature(Some(G::Point(vec![0.5, 0.5, 2.0])), 0.5, 0.5),
+                    &[
+                        ("speed", serde_json::json!(4.0)),
+                        ("kind", serde_json::json!("a")),
+                    ],
+                ),
+            ];
+
+            let bytes = |f: &[ParsedFeature]| serde_json::to_vec(&fingerprint(f)).unwrap();
+            let first = bytes(&feats);
+            assert_eq!(bytes(&feats), first, "a re-run must be byte-identical");
+
+            feats.reverse();
+            assert_eq!(bytes(&feats), first, "input order must not leak");
+            feats.rotate_left(1);
+            assert_eq!(bytes(&feats), first, "nor must a rotation");
+
+            // ...and the bytes really do describe the data.
+            let fp = fingerprint(&feats);
+            assert_eq!(fp.bbox, [-3.0, -8.0, 12.0, 4.0]);
+            assert_eq!(fp.z_range, Some([2.0, 2.0]));
+            assert_eq!(fp.numeric_ranges.get("speed"), Some(&[1.5, 9.5]));
+            assert_eq!(fp.categorical_cardinality.get("kind"), Some(&2));
+        }
+
+        /// Non-finite ordinates are skipped rather than folded (one NaN would
+        /// poison the chain, one inf would swallow the globe), and an entirely
+        /// unusable input degrades to a vacuous whole-world superset instead of
+        /// an inside-out box.
+        #[test]
+        fn non_finite_and_empty_inputs_degrade_to_a_superset() {
+            let feats = vec![feature(
+                Some(G::Point(vec![f64::NAN, f64::NAN])),
+                f64::NAN,
+                f64::NAN,
+            )];
+            assert_eq!(fingerprint(&feats).bbox, [-180.0, -90.0, 180.0, 90.0]);
+            assert_eq!(fingerprint(&[]).bbox, [-180.0, -90.0, 180.0, 90.0]);
+            assert_eq!(fingerprint(&[]).distinct_feature_count, 0);
+        }
     }
 }

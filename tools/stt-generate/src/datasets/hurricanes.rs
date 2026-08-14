@@ -90,7 +90,7 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     let use_parquet = common::is_parquet_output(&intermediate_path);
-    
+
     if use_parquet {
         println!("📄 Using streaming GeoParquet output (efficient)");
     }
@@ -216,7 +216,10 @@ fn process_hurricane_data(path: &PathBuf, args: &Args) -> Result<Vec<Feature>> {
             properties.insert("name".to_string(), json!(start_record.name));
             properties.insert("wind_speed".to_string(), json!(wind_speed));
             properties.insert("category".to_string(), json!(category_num));
-            properties.insert("status".to_string(), json!(get_status(category_num, nature)));
+            properties.insert(
+                "status".to_string(),
+                json!(get_status(category_num, nature)),
+            );
             properties.insert("nature".to_string(), json!(nature));
             properties.insert("value".to_string(), json!(wind_speed));
 
@@ -371,7 +374,10 @@ fn process_hurricane_data_parquet(path: &PathBuf, output: &PathBuf, args: &Args)
             properties.insert("name".to_string(), json!(start_record.name));
             properties.insert("wind_speed".to_string(), json!(wind_speed));
             properties.insert("category".to_string(), json!(category_num));
-            properties.insert("status".to_string(), json!(get_status(category_num, nature)));
+            properties.insert(
+                "status".to_string(),
+                json!(get_status(category_num, nature)),
+            );
             properties.insert("nature".to_string(), json!(nature));
             properties.insert("value".to_string(), json!(wind_speed));
 
@@ -380,12 +386,7 @@ fn process_hurricane_data_parquet(path: &PathBuf, output: &PathBuf, args: &Args)
                 [end_record.lon, end_record.lat],
             ];
 
-            let record = LineStringRecord::new(
-                coordinates,
-                start_time,
-                Some(end_time),
-                properties,
-            );
+            let record = LineStringRecord::new(coordinates, start_time, Some(end_time), properties);
 
             writer.write_linestring(&record)?;
         }
@@ -398,5 +399,3 @@ fn process_hurricane_data_parquet(path: &PathBuf, output: &PathBuf, args: &Args)
 
     writer.finish()
 }
-
-

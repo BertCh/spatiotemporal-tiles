@@ -16,6 +16,11 @@ use std::fmt;
 /// well inside `u64`.
 pub const MAX_ZOOM: u8 = 22;
 
+/// Canonical raw-detail variant. Every ordinary tile uses this id.
+pub const RAW_VARIANT_ID: u32 = 0;
+/// Canonical pre-aggregated summary variant.
+pub const SUMMARY_VARIANT_ID: u32 = 1;
+
 /// Unique identifier for a spatiotemporal tile
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileId {
@@ -27,12 +32,27 @@ pub struct TileId {
     pub y: u32,
     /// Timestamp (Unix milliseconds)
     pub t: u64,
+    /// Logical payload variant (raw, summary, or a future independently
+    /// addressable representation). Variant is part of tile identity.
+    pub variant_id: u32,
 }
 
 impl TileId {
-    /// Create a new tile ID
+    /// Create a raw-variant tile ID.
     pub fn new(z: u8, x: u32, y: u32, t: u64) -> Self {
-        Self { z, x, y, t }
+        Self {
+            z,
+            x,
+            y,
+            t,
+            variant_id: RAW_VARIANT_ID,
+        }
+    }
+
+    /// Select an independently addressable payload variant.
+    pub fn with_variant(mut self, variant_id: u32) -> Self {
+        self.variant_id = variant_id;
+        self
     }
 
     /// Validate tile coordinates
@@ -79,6 +99,7 @@ impl TileId {
             x: self.x / 2,
             y: self.y / 2,
             t: self.t,
+            variant_id: self.variant_id,
         })
     }
 
@@ -88,18 +109,26 @@ impl TileId {
             return vec![];
         }
         vec![
-            TileId::new(self.z + 1, self.x * 2, self.y * 2, self.t),
-            TileId::new(self.z + 1, self.x * 2 + 1, self.y * 2, self.t),
-            TileId::new(self.z + 1, self.x * 2, self.y * 2 + 1, self.t),
-            TileId::new(self.z + 1, self.x * 2 + 1, self.y * 2 + 1, self.t),
+            TileId::new(self.z + 1, self.x * 2, self.y * 2, self.t).with_variant(self.variant_id),
+            TileId::new(self.z + 1, self.x * 2 + 1, self.y * 2, self.t)
+                .with_variant(self.variant_id),
+            TileId::new(self.z + 1, self.x * 2, self.y * 2 + 1, self.t)
+                .with_variant(self.variant_id),
+            TileId::new(self.z + 1, self.x * 2 + 1, self.y * 2 + 1, self.t)
+                .with_variant(self.variant_id),
         ]
     }
 }
 
-/// Canonical textual tile address: `z/x/y/t`.
+/// Canonical textual tile address: `z/x/y/t` for raw, `z/x/y/t#variant` for
+/// every other independently addressable representation.
 impl fmt::Display for TileId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}/{}/{}", self.z, self.x, self.y, self.t)
+        write!(f, "{}/{}/{}/{}", self.z, self.x, self.y, self.t)?;
+        if self.variant_id != RAW_VARIANT_ID {
+            write!(f, "#{}", self.variant_id)?;
+        }
+        Ok(())
     }
 }
 
@@ -121,6 +150,7 @@ impl Ord for TileId {
             .cmp(&other.z)
             .then(self.hilbert_index().cmp(&other.hilbert_index()))
             .then(self.t.cmp(&other.t))
+            .then(self.variant_id.cmp(&other.variant_id))
     }
 }
 

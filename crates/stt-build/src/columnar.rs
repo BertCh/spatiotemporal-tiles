@@ -9,12 +9,12 @@
 
 use crate::clip::ClippedSegment;
 use crate::input::ParsedFeature;
-use crate::props::FeatureProperties;
+use crate::props::{FeatureProperties, PropValue};
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use stt_core::arrow_tile::{
-    tessellate_polygon, ColumnarLayer, Coord, GeometryColumn, PropertyColumn,
+    tessellate_polygon, ColumnarLayer, Coord, FeatureIdOrigin, GeometryColumn, PropertyColumn,
 };
 use stt_core::projection::haversine_distance;
 use stt_core::types::GeometryType;
@@ -76,7 +76,10 @@ pub type PropertyTypes = BTreeMap<String, PropertyKind>;
 
 /// Per-tile build options that influence the columnar layout (independent of
 /// the tile-level partitioning logic the tiler owns).
-#[derive(Debug, Clone, Default)]
+///
+/// ⚠️ [`Default`] is hand-written rather than derived because
+/// [`Self::synthetic_point_row_ids`] defaults to **true** — see its docs.
+#[derive(Debug, Clone)]
 pub struct ColumnarOptions {
     /// When true, polygon layers will carry pre-baked earcut triangle indices
     /// in a `triangles` sidecar column — letting the renderer skip its own
@@ -93,6 +96,71 @@ pub struct ColumnarOptions {
     /// tiles. Keys not listed keep the sniffing behaviour, which schema-less
     /// producers rely on.
     pub property_types: Arc<PropertyTypes>,
+    /// **Ids-after-sort** (TB-5 half 1). When true — the default — a point
+    /// layer whose every id `build_point_layer` had to synthesise is sorted
+    /// into the encoder's stored order FIRST and numbered `0..n` SECOND, so the
+    /// stored `id` column is strictly increasing by one instead of a shuffled
+    /// permutation of `0..n`.
+    ///
+    /// The incumbent numbers first and lets the encoder's start-time sort
+    /// shuffle the result; a shuffled dense column delta-codes no better than
+    /// noise, which throws away most of the win the row-index substitution was
+    /// introduced for. Numbering after the sort is byte-equivalent to
+    /// re-densifying inside the encoder (proved in
+    /// `stt_core::arrow_tile::layer`'s
+    /// `apply_synthetic_row_ids_equals_densifying_after_the_encoder_sort`) and
+    /// needs no encoder change.
+    ///
+    /// **Only ever fires on a layer whose ids are ALL synthetic.** A point
+    /// layer mixing explicit source ids with synthetic row indices classifies
+    /// [`FeatureIdOrigin::Keyed`] and is left untouched — see
+    /// [`FeatureIdOrigin::from_synthetic_count`].
+    ///
+    /// BYTE-CHANGING when true. Set false for the documented `--single-pass`
+    /// rollback: the id column reverts to the incumbent shuffled-dense shape,
+    /// byte-for-byte.
+    pub synthetic_point_row_ids: bool,
+    /// **TB-12 per-feature triangle emission.** When true — the default — a
+    /// polygon layer bakes triangle indices only for the features a renderer's
+    /// own single-boundary earcut cannot reproduce (holes, multi-part) and
+    /// leaves every other list EMPTY for the decoder to backfill.
+    ///
+    /// BYTE-CHANGING when true. Set false for the rollback: the triangle column
+    /// reverts to the incumbent all-or-nothing shape, byte-for-byte, and no
+    /// capability is owed.
+    ///
+    /// `stt-serve` sets it false by DEFAULT and gates it behind an explicit
+    /// flag, for the same reason it keeps `--compact-times` opt-in: a packed
+    /// archive lets an old reader refuse at open, but a served tile gives it no
+    /// such chance, so a re-typing default there would silently drop geometry
+    /// instead of failing loudly.
+    pub partial_triangles: bool,
+    /// TB-12 OBSERVATION CHANNEL (out-parameter, not a setting). Set to `true`
+    /// by [`build_polygon_layer`] the first time a layer actually MIXES empty
+    /// and baked triangle lists, which is the condition that obliges the
+    /// manifest to declare [`stt_core::pack::CAPABILITY_TRIANGLES_PARTIAL`].
+    ///
+    /// Shared across the tiler's rayon workers, so it is an atomic. The value
+    /// is a monotone OR over every layer built — order-independent, hence
+    /// deterministic regardless of worker scheduling. `Relaxed` is sufficient:
+    /// nothing is published through this flag, and it is read only after the
+    /// tiling pool has joined.
+    pub partial_triangles_observed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for ColumnarOptions {
+    fn default() -> Self {
+        Self {
+            pre_tessellate: false,
+            attribute_filter: AttributeFilter::default(),
+            property_types: Arc::default(),
+            // The R1 default: on. See the field's docs for the rollback.
+            synthetic_point_row_ids: true,
+            // The R1 default: on. See the field's docs for the rollback.
+            partial_triangles: true,
+            partial_triangles_observed: Arc::default(),
+        }
+    }
 }
 
 /// Build layers from a set of features sharing a tile. Features are grouped by
@@ -126,7 +194,9 @@ pub fn build_layers_from_features_with(
             Ok(GeometryType::Point) => points.push(f),
             Ok(GeometryType::LineString) => lines.push(f),
             Ok(GeometryType::Polygon) => polygons.push(f),
-            Err(e) => tracing::warn!("skipping feature with no geometry: {e}"),
+            Err(error) => {
+                anyhow::bail!("layer {layer_name:?}: cannot classify feature geometry: {error}")
+            }
         }
     }
 
@@ -148,29 +218,11 @@ pub fn build_layers_from_features_with(
     if !points.is_empty() {
         layers.push(build_point_layer(&points, name_for("points"), &opts)?);
     }
-    // A geometry kind whose features are ALL unusable must not take the other
-    // kinds down with it: the line/polygon builders fail only when every one of
-    // their features had geometry that could not be read (see
-    // `extract_or_drop`), which says nothing about the points sharing the tile.
-    // Log the loss and keep going — the tiler applies the same rule one level
-    // up, and an empty layer list simply collapses the tile.
     if !lines.is_empty() {
-        match build_line_layer(&lines, name_for("lines"), &opts) {
-            Ok(layer) => layers.push(layer),
-            Err(e) => tracing::warn!(
-                "layer {layer_name:?}: dropping {} line feature(s); {e}",
-                lines.len()
-            ),
-        }
+        layers.push(build_line_layer(&lines, name_for("lines"), &opts)?);
     }
     if !polygons.is_empty() {
-        match build_polygon_layer(&polygons, name_for("polygons"), &opts) {
-            Ok(layer) => layers.push(layer),
-            Err(e) => tracing::warn!(
-                "layer {layer_name:?}: dropping {} polygon feature(s); {e}",
-                polygons.len()
-            ),
-        }
+        layers.push(build_polygon_layer(&polygons, name_for("polygons"), &opts)?);
     }
     Ok(layers)
 }
@@ -292,13 +344,34 @@ fn build_point_layer(
     // index: still unique within the tile (picking stays correct) but monotonic,
     // so the column compresses to a few bits per point. Explicit source ids
     // (e.g. earthquake/storm-cell ids a consumer may surface) are preserved.
+    let mut synthetic = 0usize;
     for (i, f) in features.iter().enumerate() {
         if f.geojson.id.is_none() {
             ids[i] = i as u64;
+            synthetic += 1;
+        }
+    }
+    // THE GUARD. `SyntheticRowIndex` is a claim about EVERY id in the layer,
+    // and it is the claim that licenses re-densifying the whole column. This
+    // loop only overwrote the ids of features that carried none, so a layer
+    // where `synthetic < features.len()` MIXES minted row indices with explicit
+    // source ids and must stay `Keyed` — re-densifying it would renumber the
+    // explicit ids, which are identity and which a consumer may be joining on.
+    let origin = FeatureIdOrigin::from_synthetic_count(synthetic, features.len());
+    // A mixed layer is also the one place today's point ids can collide inside
+    // a single tile — explicit source id `5` against minted row index `5` — and
+    // that collision predates any of this. It is not silently repaired here
+    // (the repair would be to renumber, which is exactly what the guard above
+    // forbids), but it is no longer silent: two rows sharing an id break the
+    // picking join, so a build that produces one should say so.
+    if origin == FeatureIdOrigin::Keyed && synthetic > 0 {
+        let collisions = mixed_point_id_collisions(features, &ids);
+        if !collisions.is_empty() {
+            warn_mixed_point_id_collision(&name, &collisions);
         }
     }
     let geometry: Vec<Coord> = features.iter().map(|f| [f.lon, f.lat]).collect();
-    Ok(ColumnarLayer {
+    let mut layer = ColumnarLayer {
         polygon_parts: None,
         name,
         feature_ids: ids,
@@ -310,7 +383,74 @@ fn build_point_layer(
         triangles: None,
         vertex_value_matrix: None,
         properties: props,
-    })
+    };
+    // Ids-after-sort (TB-5 half 1). Sorting into the encoder's stored order
+    // here and numbering second makes the STORED id column `0, 1, .., n-1`
+    // rather than a shuffled permutation of it. Gated on `origin`, so this is a
+    // no-op on every layer the guard above classified `Keyed`, and gated again
+    // on the option, which is the `--single-pass` rollback. The encoder's own
+    // start-time sort then finds nothing to do and borrows the layer unchanged.
+    if opts.synthetic_point_row_ids {
+        layer.apply_synthetic_row_ids_for(origin);
+    }
+    Ok(layer)
+}
+
+/// The ids a MIXED point layer minted as row indices that collide with an
+/// explicit source id in the same layer — the picking hazard
+/// [`ColumnarLayer::feature_ids_are_unique`] detects, localized to its one real
+/// cause so a build can name it.
+///
+/// `features` and `ids` are row-aligned, and `ids[i]` is the *post-substitution*
+/// id: a row whose feature carried no source id holds `i`. Ascending and
+/// deduplicated, so any message built from it is deterministic.
+///
+/// Costs one `Vec<bool>` of the layer's length and a linear scan, and the caller
+/// only runs it on a mixed layer — the rare shape — so the common all-synthetic
+/// and all-keyed layers pay nothing.
+fn mixed_point_id_collisions(features: &[&ParsedFeature], ids: &[u64]) -> Vec<u64> {
+    let n = ids.len();
+    let mut minted = vec![false; n];
+    for (i, f) in features.iter().enumerate() {
+        if f.geojson.id.is_none() {
+            minted[i] = true;
+        }
+    }
+    let mut hits: Vec<u64> = Vec::new();
+    for (i, f) in features.iter().enumerate() {
+        if f.geojson.id.is_some() {
+            let id = ids[i];
+            // An explicit id only collides if it lands inside `0..n` AND that
+            // row index was actually minted for some other row.
+            if let Ok(slot) = usize::try_from(id) {
+                if minted.get(slot).copied().unwrap_or(false) {
+                    hits.push(id);
+                }
+            }
+        }
+    }
+    hits.sort_unstable();
+    hits.dedup();
+    hits
+}
+
+/// Warn once per process about the mixed-point-layer id collision. Once,
+/// because the shape is a property of the SOURCE, so every tile of an affected
+/// dataset would otherwise repeat it — and a warning nobody can read is a
+/// warning nobody acts on. Log volume only; nothing here reaches a tile byte.
+fn warn_mixed_point_id_collision(layer: &str, collisions: &[u64]) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "point layer {layer:?}: {} feature id(s) minted as row indices collide with an \
+             explicit source id in the same tile (first: {}). Two rows sharing one id break the \
+             picking join, and the collision is NOT repaired here — renumbering across it would \
+             overwrite the explicit ids. Give every feature an explicit id, or none. (Further \
+             collisions in this build are silent.)",
+            collisions.len(),
+            collisions[0],
+        );
+    });
 }
 
 fn build_line_layer(
@@ -450,28 +590,51 @@ fn build_polygon_layer(
     // MANDATORY for these layers, not just a perf win. Layers whose every
     // feature is a single ring stay lean (no sidecar).
     //
-    // ALL-OR-NOTHING PER LAYER, deliberately. The triangle column is 40-45% of
-    // the wire bytes of a polygon-heavy tile (measured on storm-field and
-    // storm4d-cloudtop), and most of that is spent on single-ring features that
-    // every renderer could earcut itself — so it is tempting to emit an EMPTY
-    // list for those and keep the baked indices only for the features that need
-    // them. That is NOT safe against the current readers, all three of which
-    // branch on whether the LAYER has a triangle column and then trust each
-    // feature's slice verbatim, with no per-feature fallback:
-    //   - packages/layers/.../animated-polygon-layer.ts binds `binary.triangles`
-    //     as ONE whole-layer index buffer, so a feature missing from it is
-    //     simply never drawn;
-    //   - packages/core/src/render/geometry.ts `tessellateFeature` returns the
-    //     empty slice (maplibre draws nothing for that feature);
-    //   - packages/three/src/layers/polygon-buffers.ts takes its `hasPreBaked`
-    //     branch per LAYER and pushes no cap triangles for an empty range.
-    // Mixing empty and non-empty lists therefore makes single-ring polygons
-    // vanish. Unlocking the saving needs a reader-side change first (the
-    // cheapest is a backfill in the decoder: earcut a feature's single ring when
-    // its baked list is empty, in packages/core/src/tile.ts) — until then every
-    // feature in a triangle-bearing layer gets a real triangulation.
+    // PER-FEATURE since TB-12. The triangle column is 40-45% of the wire bytes
+    // of a polygon-heavy tile (measured on storm-field and storm4d-cloudtop),
+    // and most of that is spent on single-ring features every renderer can
+    // earcut itself — so we emit an EMPTY list for those and keep baked indices
+    // only for the features that genuinely need them.
+    //
+    // This was UNSAFE before the reader change that now precedes it. All three
+    // readers used to branch on whether the LAYER had a triangle column and then
+    // trust each feature's slice verbatim, so an empty list meant "draw
+    // nothing" and every single-ring polygon vanished. The decoder in
+    // packages/core/src/tile.ts now BACKFILLS an empty run by earcutting the
+    // feature's single ring, which completes the buffer before any of the three
+    // sees it — deck's whole-layer `indices` handoff and three's layer-global
+    // `hasPreBaked` switch keep working unchanged.
+    //
+    // Readers that predate that backfill must not open these archives at all,
+    // hence CAPABILITY_TRIANGLES_PARTIAL below: a loud refusal at open instead
+    // of silently missing geometry.
+    //
+    // `--pre-tessellate` keeps the old bake-everything behaviour, for clients
+    // that would rather spend the bytes than the decode-time CPU.
     let needs_triangles = opts.pre_tessellate || parts.iter().any(PolygonParts::needs_triangles);
-    let triangles = needs_triangles.then(|| parts.iter().map(tessellate_parts).collect::<Vec<_>>());
+    // Only the features a renderer's own earcut cannot reproduce get baked. A
+    // layer where EVERY feature needs baking mixes nothing and so stays
+    // byte-identical to the incumbent — and declares no capability.
+    let partial = needs_triangles
+        && opts.partial_triangles
+        && !opts.pre_tessellate
+        && parts.iter().any(|p| !p.needs_triangles());
+    if partial {
+        opts.partial_triangles_observed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let triangles = needs_triangles.then(|| {
+        parts
+            .iter()
+            .map(|p| {
+                if partial && !p.needs_triangles() {
+                    Vec::new()
+                } else {
+                    tessellate_parts(p)
+                }
+            })
+            .collect::<Vec<_>>()
+    });
 
     // The PART boundaries the geometry column is about to erase. `geoarrow.
     // polygon` is one flat ring list per feature, so once the parts are
@@ -583,6 +746,94 @@ fn value_as_f64(v: &serde_json::Value) -> Option<f64> {
         serde_json::Value::Number(_) => v.as_f64(),
         serde_json::Value::String(s) => s.trim().parse::<f64>().ok().filter(|f| f.is_finite()),
         _ => None,
+    }
+}
+
+/// The numeric coercion a NUMERIC property column applies to one cell — on a
+/// BORROWED [`PropValue`], allocating nothing.
+///
+/// Exactly `value_as_f64(&value.to_json())`, with the transient
+/// `serde_json::Value` elided. It has to be exactly that: this is the same
+/// function [`PropertyAccumulator::push_row`] materialises tile columns with
+/// AND the one the dataset-global statistics pass
+/// ([`crate::dataset_stats`]) accumulates over. A pin derived from a domain
+/// the encoder disagrees with is worse than no pin at all, so the two share one
+/// definition rather than two that agree today.
+///
+/// `to_json` is not free — for a string cell it clones the string, and for a
+/// `Json` cell it deep-clones — and pass 1 runs it once per (row × column) over
+/// the whole resident feature vector. That is the per-row allocation the
+/// columnar-property rewrite exists to have removed.
+///
+/// The non-obvious branches, all inherited rather than invented:
+/// * a non-finite float has no JSON number spelling, so `to_json` yields
+///   `Value::Null` and the cell is absent — hence the `is_finite` filter;
+/// * a numeric-looking STRING coerces (that is `value_as_f64`'s whole point),
+///   while a boolean does not.
+pub(crate) fn prop_value_as_f64(value: PropValue<'_>) -> Option<f64> {
+    match value {
+        // `json!(f64)` maps NaN/±inf to `Value::Null`, which `value_as_f64`
+        // then rejects.
+        PropValue::F64(x) => x.is_finite().then_some(x),
+        PropValue::I64(x) => Some(x as f64),
+        PropValue::U64(x) => Some(x as f64),
+        PropValue::Bool(_) => None,
+        PropValue::Str(s) => s.trim().parse::<f64>().ok().filter(|f| f.is_finite()),
+        PropValue::Json(v) => value_as_f64(v),
+    }
+}
+
+/// The stringification a CATEGORICAL property column applies to one cell,
+/// borrowing where it can and formatting into a caller-owned `scratch` buffer
+/// otherwise. `None` for a cell that produces no category (a null, a non-finite
+/// float, a nested array/object).
+///
+/// Mirrors [`PropertyAccumulator::push_row`]'s categorical arm — and, like
+/// [`prop_value_as_f64`], is shared with it so the dataset-global scan and the
+/// tile encoder can never disagree about what a category IS.
+///
+/// The callback shape (rather than returning `Cow<'_, str>`) is what keeps the
+/// scan allocation-free: a string cell hands back a borrow of the feature's own
+/// bytes, and a number/bool cell reuses one buffer across every row instead of
+/// minting a `String` per row. The caller only allocates when a category is
+/// genuinely new — which is the capped, dataset-sized cost, not a per-row one.
+pub(crate) fn with_category<R>(
+    value: PropValue<'_>,
+    scratch: &mut String,
+    f: impl FnOnce(&str) -> R,
+) -> Option<R> {
+    use std::fmt::Write as _;
+    match value {
+        PropValue::Str(s) => Some(f(s)),
+        PropValue::Bool(b) => Some(f(if b { "true" } else { "false" })),
+        PropValue::I64(x) => {
+            scratch.clear();
+            let _ = write!(scratch, "{x}");
+            Some(f(scratch))
+        }
+        PropValue::U64(x) => {
+            scratch.clear();
+            let _ = write!(scratch, "{x}");
+            Some(f(scratch))
+        }
+        // A non-finite float has no JSON number spelling: `to_json` yields
+        // `Value::Null`, so the categorical arm sees no value at all.
+        PropValue::F64(x) => {
+            let n = serde_json::Number::from_f64(x)?;
+            scratch.clear();
+            let _ = write!(scratch, "{n}");
+            Some(f(scratch))
+        }
+        PropValue::Json(v) => match v {
+            serde_json::Value::String(s) => Some(f(s)),
+            serde_json::Value::Bool(b) => Some(f(if *b { "true" } else { "false" })),
+            serde_json::Value::Number(n) => {
+                scratch.clear();
+                let _ = write!(scratch, "{n}");
+                Some(f(scratch))
+            }
+            _ => None,
+        },
     }
 }
 
@@ -760,25 +1011,23 @@ impl PropertyAccumulator {
         if !self.sealed {
             self.seal();
         }
+        // One reusable formatting buffer for the categorical arm's number/bool
+        // cells, so a numeric-backed categorical column costs one allocation
+        // per row (the retained `String`) rather than three.
+        let mut scratch = String::new();
         for (key, col) in self.numeric.iter_mut() {
-            // Routed through the same `value_as_f64` as before, on a value
-            // rebuilt from the columnar cell — so numeric-looking strings still
-            // coerce and the number widths still round-trip. The rebuilt
-            // `Value` is transient; nothing retains it.
-            let v = props
-                .and_then(|p| p.get(key))
-                .and_then(|v| value_as_f64(&v.to_json()));
+            // Routed through the shared `prop_value_as_f64` — the SAME coercion
+            // the dataset-global statistics pass accumulates over, so a pinned
+            // affine can never be derived from a domain the encoder disagrees
+            // with. Numeric-looking strings still coerce and the number widths
+            // still round-trip.
+            let v = props.and_then(|p| p.get(key)).and_then(prop_value_as_f64);
             col.push(v);
         }
         for (key, col) in self.categorical.iter_mut() {
             let v = props
                 .and_then(|p| p.get(key))
-                .and_then(|v| match v.to_json() {
-                    serde_json::Value::String(s) => Some(s),
-                    serde_json::Value::Bool(b) => Some(b.to_string()),
-                    serde_json::Value::Number(n) => Some(n.to_string()),
-                    _ => None,
-                });
+                .and_then(|v| with_category(v, &mut scratch, |s| s.to_string()));
             col.push(v);
         }
     }
@@ -1191,6 +1440,97 @@ mod tests {
     use geojson::{Feature, Geometry, Value as GeomValue};
     use serde_json::json;
 
+    /// Every `PropValue` shape a property cell can take, as the borrowed value
+    /// AND as the owning JSON the pre-M2 code path rebuilt per row. The two
+    /// spellings have to agree cell for cell — see the two tests below.
+    fn coercion_corpus() -> Vec<serde_json::Value> {
+        vec![
+            json!(1.5),
+            json!(-0.0),
+            json!(0),
+            json!(-7),
+            json!(9_007_199_254_740_993i64),
+            json!(18_446_744_073_709_551_615u64),
+            json!(true),
+            json!(false),
+            json!("alpha"),
+            json!("1000.0"),
+            json!("  42  "),
+            json!("1e309"), // parses to +inf → NOT numeric
+            json!("NaN"),   // parses to NaN → NOT numeric
+            json!(""),
+            json!([1, 2]),
+            json!({ "nested": 1 }),
+            json!(null),
+        ]
+    }
+
+    /// `prop_value_as_f64` is EXACTLY `value_as_f64(&value.to_json())`.
+    ///
+    /// The borrowed coercion exists so the dataset-global statistics pass does
+    /// not allocate a `serde_json::Value` per (row × column) — the cost the
+    /// columnar-property rewrite was written to remove. But a statistics pass
+    /// that coerces differently from the encoder derives a pinned affine over
+    /// the wrong domain, which is a silent wrong-values bug rather than a
+    /// crash. So the elision is pinned against the literal expression it
+    /// replaced, over every value shape a cell can hold.
+    #[test]
+    fn borrowed_numeric_coercion_matches_the_json_round_trip() {
+        for value in coercion_corpus() {
+            let Some(borrowed) = PropValue::from_json(&value) else {
+                assert!(value.is_null(), "only null yields no PropValue: {value}");
+                continue;
+            };
+            let via_json = value_as_f64(&borrowed.to_json());
+            let direct = prop_value_as_f64(borrowed);
+            assert_eq!(
+                direct.map(f64::to_bits),
+                via_json.map(f64::to_bits),
+                "numeric coercion diverged for {value}"
+            );
+        }
+    }
+
+    /// `with_category` is EXACTLY the `to_json`-based categorical arm.
+    ///
+    /// Same argument as above, plus one of its own: the category STRING is the
+    /// dictionary key, so a divergence here would put a value in the global
+    /// category list that no tile ever emits (or vice versa) — and under the
+    /// global-dictionary hoist a category missing from the pin is a hard build
+    /// error, not a degradation.
+    #[test]
+    fn borrowed_category_stringification_matches_the_json_round_trip() {
+        let mut scratch = String::new();
+        for value in coercion_corpus() {
+            let Some(borrowed) = PropValue::from_json(&value) else {
+                continue;
+            };
+            let via_json = match borrowed.to_json() {
+                serde_json::Value::String(s) => Some(s),
+                serde_json::Value::Bool(b) => Some(b.to_string()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            };
+            let direct = with_category(borrowed, &mut scratch, |s| s.to_string());
+            assert_eq!(
+                direct, via_json,
+                "categorical spelling diverged for {value}"
+            );
+        }
+        // A non-finite float has no JSON number spelling, so it is no category.
+        assert_eq!(
+            with_category(PropValue::F64(f64::NAN), &mut scratch, |s| s.to_string()),
+            None
+        );
+        assert_eq!(
+            with_category(PropValue::F64(f64::INFINITY), &mut scratch, |s| s
+                .to_string()),
+            None
+        );
+        // ...and it is no numeric value either.
+        assert_eq!(prop_value_as_f64(PropValue::F64(f64::NAN)), None);
+    }
+
     /// The schema stays authoritative for the columns it types; only the gaps
     /// are filled. A `Utf8` column whose values all look numeric must NOT be
     /// re-typed numeric by the inference pass.
@@ -1329,6 +1669,7 @@ mod tests {
 
     fn point_feature(lon: f64, lat: f64, props: serde_json::Value) -> ParsedFeature {
         ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::Point(vec![lon, lat]))),
@@ -1354,6 +1695,7 @@ mod tests {
     fn line_feature(coords: Vec<[f64; 2]>, start: u64, end: Option<u64>) -> ParsedFeature {
         let pts: Vec<Vec<f64>> = coords.iter().map(|c| vec![c[0], c[1]]).collect();
         ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::LineString(pts))),
@@ -1771,6 +2113,7 @@ mod tests {
             vec![x, y], // closing vertex
         ];
         ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::Polygon(vec![ring]))),
@@ -1807,6 +2150,7 @@ mod tests {
             vec![1.0, 1.0],
         ];
         ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::Polygon(vec![exterior, hole]))),
@@ -1839,8 +2183,13 @@ mod tests {
         // A hole-bearing polygon CANNOT render through deck.gl's binary earcut
         // path (it bridges the exterior and hole rings with spanning
         // triangles). The builder must bake the hole-aware index sidecar even
-        // when --pre-tessellate is OFF. A single-ring feature sharing the layer
-        // is tessellated too (consistent per-tile index buffer).
+        // when --pre-tessellate is OFF.
+        //
+        // TB-12 CHANGED THE OTHER HALF of this test: the single-ring feature
+        // sharing the layer used to be tessellated too, for a uniform per-tile
+        // index buffer. It now gets an EMPTY list, because the decoder earcuts
+        // it on arrival. The holed feature's assertions below are unchanged —
+        // that is the half that must never regress.
         let holed = polygon_feature_with_hole();
         let simple = polygon_feature([10.0, 10.0], 1.0);
         let refs = vec![&holed, &simple];
@@ -1858,8 +2207,83 @@ mod tests {
         for &i in &tri[0] {
             assert!((i as usize) < 10, "triangle index escapes the feature");
         }
-        // The simple square still earcuts to two triangles.
-        assert_eq!(tri[1].len(), 6);
+        // The simple square is left to the decoder's backfill.
+        assert!(
+            tri[1].is_empty(),
+            "TB-12: a single-ring feature must not be baked"
+        );
+    }
+
+    /// TB-12 — `--pre-tessellate` is the documented way back to bake-everything,
+    /// for clients that would rather spend bytes than decode CPU. It must bake
+    /// the single-ring feature the default now skips, and declare NO capability
+    /// (nothing is mixed, so every reader can still open the archive).
+    #[test]
+    fn pre_tessellate_still_bakes_every_feature_and_declares_nothing() {
+        let holed = polygon_feature_with_hole();
+        let simple = polygon_feature([10.0, 10.0], 1.0);
+        let refs = vec![&holed, &simple];
+        let opts = ColumnarOptions {
+            pre_tessellate: true,
+            ..ColumnarOptions::default()
+        };
+        let layers = build_layers_from_features_with(&refs, "default", opts.clone()).unwrap();
+        let tri = layers[0].triangles.as_ref().expect("pre-tessellate bakes");
+        assert!(!tri[0].is_empty());
+        assert_eq!(
+            tri[1].len(),
+            6,
+            "--pre-tessellate must bake the simple ring"
+        );
+        assert!(
+            !opts
+                .partial_triangles_observed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "nothing was mixed, so no capability is owed"
+        );
+    }
+
+    /// TB-12 — the capability is owed only when a layer actually MIXES. A layer
+    /// whose every feature needs baking emits the incumbent bytes, so locking
+    /// older readers out of it would be gratuitous.
+    #[test]
+    fn the_capability_is_observed_only_when_a_layer_actually_mixes() {
+        // Two holed features: everything is baked, nothing is empty.
+        let a = polygon_feature_with_hole();
+        let b = polygon_feature_with_hole();
+        let refs = vec![&a, &b];
+        let all_baked = ColumnarOptions::default();
+        let layers = build_layers_from_features_with(&refs, "default", all_baked.clone()).unwrap();
+        let tri = layers[0].triangles.as_ref().unwrap();
+        assert!(tri.iter().all(|t| !t.is_empty()));
+        assert!(
+            !all_baked
+                .partial_triangles_observed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "a uniformly-baked layer mixes nothing and owes no capability"
+        );
+
+        // Add a single-ring feature and the layer mixes.
+        let simple = polygon_feature([10.0, 10.0], 1.0);
+        let refs = vec![&a, &simple];
+        let mixed = ColumnarOptions::default();
+        let layers = build_layers_from_features_with(&refs, "default", mixed.clone()).unwrap();
+        let tri = layers[0].triangles.as_ref().unwrap();
+        assert!(!tri[0].is_empty() && tri[1].is_empty());
+        assert!(
+            mixed
+                .partial_triangles_observed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "a mixed layer MUST be observed — an undeclared one vanishes geometry"
+        );
+
+        // And a layer with no polygons at all observes nothing.
+        let untouched = ColumnarOptions::default();
+        let p = point_feature(0.0, 0.0, json!({}));
+        build_layers_from_features_with(&[&p], "default", untouched.clone()).unwrap();
+        assert!(!untouched
+            .partial_triangles_observed
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     /// Synthetic ids MUST come from the documented FNV-1a 64 (never
@@ -1918,6 +2342,7 @@ mod tests {
             .collect();
         let first = parts[0][0][0];
         ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::MultiPolygon(value))),
@@ -2059,35 +2484,50 @@ mod tests {
         );
     }
 
-    /// Contract pin for the triangle sidecar: it is ALL-OR-NOTHING per layer.
-    /// Every reader branches on whether the LAYER carries triangles and then
-    /// trusts each feature's slice verbatim — deck binds one whole-layer index
-    /// buffer, `tessellateFeature` returns the empty slice, three's polygon
-    /// buffers push no cap triangles — so a per-feature EMPTY list makes that
-    /// polygon disappear. A layer that bakes triangles must bake them for every
-    /// feature, single-ring ones included.
+    /// Contract pin for the triangle sidecar, TB-12 edition: emission is
+    /// PER-FEATURE, and the boundary is exactly "can a renderer's own
+    /// single-boundary earcut reproduce this?".
+    ///
+    /// The pin that matters is the negative one. A hole or an extra part left
+    /// unbaked would be earcut as one flat loop by the decoder's backfill,
+    /// bridging disjoint rings and filling holes — the storm-radar isoband
+    /// streaks, back as a SILENT wrong render. So multi-part and holed features
+    /// must always carry real indices; only genuinely single-ring features may
+    /// be left to the reader.
     #[test]
-    fn every_feature_in_a_triangle_bearing_layer_gets_indices() {
+    fn only_features_needing_baked_indices_get_them() {
         let multipart = multipolygon_feature(vec![
             vec![square_ring([0.0, 0.0], 1.0)],
             vec![square_ring([5.0, 5.0], 1.0)],
         ]);
         let holed = polygon_feature_with_hole();
         let simple = polygon_feature([20.0, 20.0], 1.0);
-        let layers = build_layers_from_features(&[&multipart, &holed, &simple], "default").unwrap();
+        let opts = ColumnarOptions::default();
+        let layers = build_layers_from_features_with(
+            &[&multipart, &holed, &simple],
+            "default",
+            opts.clone(),
+        )
+        .unwrap();
         let tri = layers[0]
             .triangles
             .as_ref()
             .expect("a layer with a multi-part / holed feature bakes triangles");
         assert_eq!(tri.len(), 3, "one list per feature");
-        for (i, t) in tri.iter().enumerate() {
+        // Multi-part and holed: baked, and a real triangulation.
+        for i in [0usize, 1] {
             assert!(
-                !t.is_empty() && t.len() % 3 == 0,
-                "feature {i} must carry a real triangulation, got {t:?}"
+                !tri[i].is_empty() && tri[i].len() % 3 == 0,
+                "feature {i} is not reproducible by a flat earcut and MUST be baked, got {:?}",
+                tri[i]
             );
         }
-        // The single-ring feature is tessellated too, not left empty.
-        assert_eq!(tri[2].len(), 6);
+        // Single ring: left to the decoder's backfill.
+        assert!(tri[2].is_empty(), "a single ring must not be baked");
+        // ...and because this layer mixes, the capability is owed.
+        assert!(opts
+            .partial_triangles_observed
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     /// An unreadable polygon is DROPPED, never replaced by a one-vertex ring at
@@ -2139,9 +2579,12 @@ mod tests {
             other => panic!("expected a polygon layer, got {other:?}"),
         }
 
-        // When NOTHING survives the layer is skipped, not filled with phantoms.
-        let empty = build_layers_from_features(&[&broken], "default").unwrap();
-        assert!(empty.is_empty(), "no layer is emitted for {empty:?}");
+        // When NOTHING survives, fail closed instead of making the source loss
+        // look like an ordinary empty tile.
+        let error = build_layers_from_features(&[&broken], "default")
+            .err()
+            .expect("fully unusable polygon layer must fail");
+        assert!(error.to_string().contains("all 1 polygon feature"));
     }
 
     /// Same for lines: an empty LineString is dropped, never turned into a
@@ -2162,21 +2605,23 @@ mod tests {
             other => panic!("expected a line layer, got {other:?}"),
         }
 
-        let empty = build_layers_from_features(&[&broken], "default").unwrap();
-        assert!(empty.is_empty());
+        let error = build_layers_from_features(&[&broken], "default")
+            .err()
+            .expect("fully unusable line layer must fail");
+        assert!(error.to_string().contains("all 1 line feature"));
     }
 
-    /// One kind's total failure must not take the other kinds down with it —
-    /// the points sharing the tile are perfectly good data.
+    /// One kind's total failure aborts the combined layer build: otherwise the
+    /// archive would silently omit that kind while appearing successful.
     #[test]
-    fn a_fully_unusable_kind_does_not_drop_the_other_layers() {
+    fn a_fully_unusable_kind_fails_the_mixed_layer_build() {
         let pt = point_feature(0.0, 0.0, json!({ "ok": 1 }));
         let mut broken = line_feature(vec![[0.0, 0.0], [1.0, 1.0]], 1000, None);
         broken.geojson.geometry = Some(Geometry::new(GeomValue::LineString(vec![])));
-        let layers = build_layers_from_features(&[&pt, &broken], "default").unwrap();
-        let names: Vec<&str> = layers.iter().map(|l| l.name.as_str()).collect();
-        assert_eq!(names, vec!["default_points"], "the point layer survives");
-        assert_eq!(layers[0].feature_count(), 1);
+        let error = build_layers_from_features(&[&pt, &broken], "default")
+            .err()
+            .expect("mixed build must not hide a failed geometry kind");
+        assert!(error.to_string().contains("all 1 line feature"));
     }
 
     /// A part whose EXTERIOR ring is unusable is dropped whole — its holes must
@@ -2273,6 +2718,280 @@ mod tests {
         assert!(
             layers[0].polygon_parts.is_none(),
             "a single-part layer must not pay for the column"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Ids-after-sort and its guard (TB-5 half 1)
+    // ------------------------------------------------------------------
+    //
+    // The two claims under test are the ones a naive wiring breaks:
+    //   * an ALL-synthetic point layer gets a dense, MONOTONE stored id column;
+    //   * a MIXED point layer — one explicit source id among the minted row
+    //     indices — is not touched at all, because renumbering it would
+    //     overwrite identity a consumer may be joining on.
+
+    /// A point feature at `lon`, timestamped, with an optional explicit id.
+    fn timed_point(lon: f64, timestamp: u64, id: Option<u64>) -> ParsedFeature {
+        let mut f = point_feature(lon, 37.0, json!({ "speed": lon }));
+        f.timestamp = timestamp;
+        f.geojson.id = id.map(|v| geojson::feature::Id::Number(v.into()));
+        f
+    }
+
+    /// The headline: rows leave sorted by `start_time` and the id column is
+    /// `0, 1, .., n-1` IN THAT ORDER — strictly increasing by one, which is the
+    /// cheapest column an integer codec can be handed. The incumbent produced
+    /// a dense but SHUFFLED permutation, which delta-codes like noise.
+    #[test]
+    fn all_synthetic_point_layer_gets_dense_monotone_ids_in_stored_order() {
+        let feats: Vec<ParsedFeature> = [500u64, 100, 400, 200, 300]
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| timed_point(i as f64, t, None))
+            .collect();
+        let refs: Vec<&ParsedFeature> = feats.iter().collect();
+
+        let layers = build_layers_from_features(&refs, "default").unwrap();
+        assert_eq!(layers.len(), 1);
+        let layer = &layers[0];
+        assert_eq!(layer.feature_ids, vec![0, 1, 2, 3, 4]);
+        assert!(layer.feature_ids_are_dense_row_order());
+        assert_eq!(layer.start_times, vec![100, 200, 300, 400, 500]);
+        // Every column travelled with its row: `speed` mirrors the source's
+        // lon, and the source order was 500,100,400,200,300.
+        match &layer
+            .properties
+            .iter()
+            .find(|(n, _)| n == "speed")
+            .unwrap()
+            .1
+        {
+            PropertyColumn::Numeric(v) => assert_eq!(
+                v,
+                &vec![Some(1.0), Some(3.0), Some(4.0), Some(2.0), Some(0.0)]
+            ),
+            other => panic!("speed should be numeric, got {other:?}"),
+        }
+        // And it survives the encoder, which is where the incumbent's sort used
+        // to shuffle the ids back apart.
+        let encoded = stt_core::arrow_tile::encode_tile(&layers).unwrap();
+        let decoded = stt_core::arrow_tile::decode_tile(&encoded).unwrap();
+        let ids = decoded[0].batch.column_by_name("id").unwrap();
+        let ids = ids
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(ids.values().to_vec(), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// The incumbent, for contrast — and the rollback. With the lever off the
+    /// column is the dense-but-shuffled shape, byte-for-byte as before.
+    #[test]
+    fn synthetic_point_row_ids_off_restores_the_incumbent_shuffled_column() {
+        let feats: Vec<ParsedFeature> = [500u64, 100, 400, 200, 300]
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| timed_point(i as f64, t, None))
+            .collect();
+        let refs: Vec<&ParsedFeature> = feats.iter().collect();
+
+        let layers = build_layers_from_features_with(
+            &refs,
+            "default",
+            ColumnarOptions {
+                synthetic_point_row_ids: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Numbered in SOURCE order, un-sorted — what the encoder then shuffles.
+        assert_eq!(layers[0].feature_ids, vec![0, 1, 2, 3, 4]);
+        assert_eq!(layers[0].start_times, vec![500, 100, 400, 200, 300]);
+
+        let encoded = stt_core::arrow_tile::encode_tile(&layers).unwrap();
+        let decoded = stt_core::arrow_tile::decode_tile(&encoded).unwrap();
+        let ids = decoded[0].batch.column_by_name("id").unwrap();
+        let ids = ids
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(
+            ids.values().to_vec(),
+            vec![1, 3, 4, 2, 0],
+            "the incumbent stores a SHUFFLED dense column — the defect, kept \
+             reachable as the documented rollback"
+        );
+    }
+
+    /// **The guard.** One explicit source id among the minted row indices makes
+    /// the layer `Keyed`, and a `Keyed` layer is not renumbered and not even
+    /// re-sorted — the ids stay exactly what they were, explicit ones included.
+    #[test]
+    fn mixed_point_layer_is_keyed_and_keeps_every_explicit_id() {
+        // Row 0 carries explicit id 900; rows 1..3 carry none.
+        let feats = vec![
+            timed_point(0.0, 400, Some(900)),
+            timed_point(1.0, 100, None),
+            timed_point(2.0, 300, None),
+            timed_point(3.0, 200, None),
+        ];
+        let refs: Vec<&ParsedFeature> = feats.iter().collect();
+        let layers = build_layers_from_features(&refs, "default").unwrap();
+        let layer = &layers[0];
+
+        assert_eq!(
+            layer.feature_ids,
+            vec![900, 1, 2, 3],
+            "the explicit id must survive and the minted ones must stay put"
+        );
+        assert_eq!(
+            layer.start_times,
+            vec![400, 100, 300, 200],
+            "a Keyed layer's rows must not be re-ordered either"
+        );
+
+        // All-keyed is the same answer, arrived at the other way.
+        let all_keyed: Vec<ParsedFeature> = [(0.0, 400u64, 7u64), (1.0, 100, 8), (2.0, 300, 9)]
+            .into_iter()
+            .map(|(lon, t, id)| timed_point(lon, t, Some(id)))
+            .collect();
+        let refs: Vec<&ParsedFeature> = all_keyed.iter().collect();
+        let layers = build_layers_from_features(&refs, "default").unwrap();
+        assert_eq!(layers[0].feature_ids, vec![7, 8, 9]);
+    }
+
+    /// The pre-existing collision the guard is protecting: explicit source id
+    /// `1` against the row index `1` minted for its neighbour. Detected and
+    /// named — and NOT renumbered across, because doing so would move both
+    /// rows onto new ids and break the picking join for good.
+    #[test]
+    fn mixed_point_layer_collision_is_detected_and_never_renumbered_across() {
+        let feats = vec![
+            timed_point(0.0, 300, Some(1)), // explicit 1
+            timed_point(1.0, 100, None),    // minted row index 1  ← collision
+            timed_point(2.0, 200, None),    // minted row index 2
+        ];
+        let refs: Vec<&ParsedFeature> = feats.iter().collect();
+        let layers = build_layers_from_features(&refs, "default").unwrap();
+        let layer = &layers[0];
+
+        assert_eq!(layer.feature_ids, vec![1, 1, 2]);
+        assert!(!layer.feature_ids_are_unique());
+        assert_eq!(layer.duplicate_feature_ids(), vec![1]);
+        // Unchanged rows: the guard held.
+        assert_eq!(layer.start_times, vec![300, 100, 200]);
+
+        // The detector, directly.
+        assert_eq!(
+            mixed_point_id_collisions(&refs, &layer.feature_ids),
+            vec![1]
+        );
+    }
+
+    /// The detector is exact in both directions: an explicit id outside `0..n`,
+    /// or one that lands on a row that was NOT minted, is not a collision.
+    #[test]
+    fn mixed_point_id_collisions_is_exact() {
+        // Explicit ids 0 and 2; minted row index 1 only. Neither explicit id
+        // collides: 0 and 2 are not minted slots.
+        let feats = vec![
+            timed_point(0.0, 100, Some(0)),
+            timed_point(1.0, 200, None),
+            timed_point(2.0, 300, Some(2)),
+        ];
+        let refs: Vec<&ParsedFeature> = feats.iter().collect();
+        assert!(mixed_point_id_collisions(&refs, &[0, 1, 2]).is_empty());
+
+        // A huge explicit id cannot collide with any row index.
+        let feats = vec![
+            timed_point(0.0, 100, Some(u64::MAX)),
+            timed_point(1.0, 200, None),
+        ];
+        let refs: Vec<&ParsedFeature> = feats.iter().collect();
+        assert!(mixed_point_id_collisions(&refs, &[u64::MAX, 1]).is_empty());
+
+        // Explicit id 1 lands on row index 1, which is NOT a minted slot here
+        // (row 1 carries an explicit id), so it is not a collision — the
+        // detector tests membership of the MINTED set, not merely `id < n`.
+        // Explicit id 2 does land on a minted slot, twice, and dedups to one.
+        let feats = vec![
+            timed_point(0.0, 100, Some(2)),
+            timed_point(1.0, 200, Some(1)),
+            timed_point(2.0, 300, None), // mints row index 2
+            timed_point(3.0, 400, None), // mints row index 3
+            timed_point(4.0, 500, Some(2)),
+        ];
+        let refs: Vec<&ParsedFeature> = feats.iter().collect();
+        assert_eq!(mixed_point_id_collisions(&refs, &[2, 1, 2, 3, 2]), vec![2]);
+
+        // Now make slot 1 minted too, and BOTH explicit ids collide: sorted,
+        // deduplicated.
+        let feats = vec![
+            timed_point(0.0, 100, Some(2)),
+            timed_point(1.0, 200, None), // mints row index 1
+            timed_point(2.0, 300, None), // mints row index 2
+            timed_point(3.0, 400, Some(1)),
+        ];
+        let refs: Vec<&ParsedFeature> = feats.iter().collect();
+        assert_eq!(mixed_point_id_collisions(&refs, &[2, 1, 2, 1]), vec![1, 2]);
+    }
+
+    /// Lines and polygons are untouched by any of this: their ids must survive
+    /// a tile cut, so they are never synthetic and the lever must not reach
+    /// them. Two layers of one tile, only the point one is renumbered.
+    #[test]
+    fn the_lever_reaches_points_only() {
+        let p = timed_point(0.0, 500, None);
+        let l = line_feature(vec![[0.0, 0.0], [1.0, 1.0]], 100, Some(200));
+        let layers = build_layers_from_features(&[&p, &l], "default").unwrap();
+        assert_eq!(layers.len(), 2);
+        let points = layers
+            .iter()
+            .find(|layer| layer.name.ends_with("_points"))
+            .expect("a point layer");
+        let lines = layers
+            .iter()
+            .find(|layer| layer.name.ends_with("_lines"))
+            .expect("a line layer");
+        assert_eq!(points.feature_ids, vec![0]);
+        // The line's id is still the builder's spec-fixed FNV hash, untouched.
+        assert_eq!(lines.feature_ids, vec![determine_feature_id(&l)]);
+        assert_ne!(lines.feature_ids[0], 0);
+    }
+
+    /// Determinism: the same features build the same layer twice, and the
+    /// input order the features arrive in is the only order that reaches the
+    /// output (ties in `start_time` keep the caller's order).
+    #[test]
+    fn ids_after_sort_is_deterministic_and_stable_on_ties() {
+        let feats: Vec<ParsedFeature> = [5u64, 5, 5, 5]
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| timed_point(i as f64, t, None))
+            .collect();
+        let refs: Vec<&ParsedFeature> = feats.iter().collect();
+        let a = build_layers_from_features(&refs, "default").unwrap();
+        let b = build_layers_from_features(&refs, "default").unwrap();
+        assert_eq!(a[0].feature_ids, b[0].feature_ids);
+        assert_eq!(a[0].feature_ids, vec![0, 1, 2, 3]);
+        // Ties kept the caller's order, so `speed` (which mirrors lon) is
+        // still in source order.
+        match &a[0]
+            .properties
+            .iter()
+            .find(|(n, _)| n == "speed")
+            .unwrap()
+            .1
+        {
+            PropertyColumn::Numeric(v) => {
+                assert_eq!(v, &vec![Some(0.0), Some(1.0), Some(2.0), Some(3.0)])
+            }
+            other => panic!("speed should be numeric, got {other:?}"),
+        }
+        assert_eq!(
+            stt_core::arrow_tile::encode_tile(&a).unwrap(),
+            stt_core::arrow_tile::encode_tile(&b).unwrap()
         );
     }
 }

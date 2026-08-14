@@ -7,6 +7,14 @@
 //! sides; per-column numbers inherit whatever sampling the two inspections
 //! ran with ([`DiffReport::decode_sampled`] flags this), so treat them as
 //! attribution shifts, not absolute wire accounting.
+//!
+//! ⚠️ The `--fail-on-growth` gate metric is [`DiffReport::compressed_bytes`],
+//! which comes from the DIRECTORY on both sides and is exact. Nothing on the
+//! sampled per-column path feeds it, and nothing here may change that. The
+//! per-column rows are decision support: they gained a graded
+//! [`ColumnDiff::significant`] annotation (is this share move bigger than the
+//! two sides' decode noise?) which sits BESIDE the binary
+//! [`DiffReport::decode_sampled`] caveat rather than replacing it.
 
 use std::collections::BTreeSet;
 
@@ -100,10 +108,36 @@ pub struct ColumnDiff {
     pub name: String,
     /// Set when the column exists in only one report.
     pub only_in: Option<Side>,
-    /// Standalone re-encode bytes (IPC + zstd) over the decoded tiles.
+    /// Attributed bytes (IPC + zstd) over the decoded tiles, under whichever
+    /// attribution design each side ran — check `decode.attribution` on the
+    /// two inspect reports before reading a delta across a design change.
     pub compressed_bytes: Delta,
-    /// Standalone re-encode bytes per feature row.
+    /// Attributed bytes per feature row.
     pub bytes_per_feature: DeltaF,
+    /// Share of the per-column total on each side, and its delta.
+    #[serde(default = "zero_delta_f")]
+    pub share: DeltaF,
+    /// Is the share move bigger than the two sides' decode noise?
+    ///
+    /// `Some(|Δshare| > 2·(stderr_before + stderr_after))` when the column
+    /// exists on BOTH sides — a graded companion to the binary
+    /// [`DiffReport::decode_sampled`] caveat, which stays for compatibility.
+    /// `None` for a one-sided row, where the change is a presence change and a
+    /// share delta is not the question being asked.
+    ///
+    /// Both stderrs are finite even when both sides decoded exhaustively (no
+    /// finite-population correction — see
+    /// [`crate::analysis::inspect::ColumnCost::share_stderr`]), so this stays a
+    /// conservative test in every mode: it asks whether the move exceeds
+    /// ordinary tile-to-tile dispersion.
+    #[serde(default)]
+    pub significant: Option<bool>,
+}
+
+/// serde default for [`ColumnDiff::share`]: diffs written before the field
+/// existed carry no share information.
+fn zero_delta_f() -> DeltaF {
+    DeltaF::new(0.0, 0.0)
 }
 
 /// Full comparison of two inspected tilesets.
@@ -178,6 +212,17 @@ pub fn diff(before: &InspectReport, after: &InspectReport) -> DiffReport {
         .map(|name| {
             let b = before.per_column.iter().find(|c| c.name == name);
             let a = after.per_column.iter().find(|c| c.name == name);
+            let share = DeltaF::new(b.map_or(0.0, |c| c.share), a.map_or(0.0, |c| c.share));
+            // Two-sided rows only: for a column that appears on one side the
+            // interesting fact is the appearance, not a share delta measured
+            // against a fabricated zero.
+            let significant = match (b, a) {
+                (Some(b), Some(a)) => {
+                    let noise = 2.0 * (b.share_stderr + a.share_stderr);
+                    Some(share.delta.abs() > noise)
+                }
+                _ => None,
+            };
             ColumnDiff {
                 name: name.to_string(),
                 only_in: only_in(b.is_some(), a.is_some()),
@@ -189,6 +234,8 @@ pub fn diff(before: &InspectReport, after: &InspectReport) -> DiffReport {
                     b.map_or(0.0, |c| c.bytes_per_feature),
                     a.map_or(0.0, |c| c.bytes_per_feature),
                 ),
+                share,
+                significant,
             }
         })
         .collect();
@@ -235,6 +282,19 @@ fn one_sided_note(only_in: Option<Side>) -> &'static str {
         Some(Side::Before) => "before only",
         Some(Side::After) => "after only",
         None => "",
+    }
+}
+
+/// Note for a per-column row: the one-sided flag if any, else the graded
+/// significance verdict.
+fn column_note(c: &ColumnDiff) -> &'static str {
+    match c.only_in {
+        Some(_) => one_sided_note(c.only_in),
+        None => match c.significant {
+            Some(true) => "significant",
+            Some(false) => "within noise",
+            None => "",
+        },
     }
 }
 
@@ -322,12 +382,12 @@ pub fn format_text(report: &DiffReport) -> String {
             }
         ));
         out.push_str(&format!(
-            "  {:<22} {:>11} {:>11} {:>11} {:>8}  {:>7} -> {:<7}  note\n",
-            "column", "before KB", "after KB", "delta KB", "pct", "B/feat", "B/feat"
+            "  {:<22} {:>11} {:>11} {:>11} {:>8}  {:>7} -> {:<7}  {:>9}  note\n",
+            "column", "before KB", "after KB", "delta KB", "pct", "B/feat", "B/feat", "Δshare"
         ));
         for c in &report.per_column {
             out.push_str(&format!(
-                "  {:<22} {:>11.1} {:>11.1} {:>+11.1} {:>8}  {:>7.2} -> {:<7.2}  {}\n",
+                "  {:<22} {:>11.1} {:>11.1} {:>+11.1} {:>8}  {:>7.2} -> {:<7.2}  {:>+8.2}%  {}\n",
                 c.name,
                 c.compressed_bytes.before as f64 / 1e3,
                 c.compressed_bytes.after as f64 / 1e3,
@@ -335,7 +395,8 @@ pub fn format_text(report: &DiffReport) -> String {
                 fmt_pct(c.compressed_bytes.pct),
                 c.bytes_per_feature.before,
                 c.bytes_per_feature.after,
-                one_sided_note(c.only_in)
+                100.0 * c.share.delta,
+                column_note(c)
             ));
         }
     }
@@ -368,6 +429,23 @@ mod tests {
             compressed_bytes,
             share: 0.5,
             bytes_per_feature,
+            marginal_bytes: compressed_bytes,
+            share_stderr: 0.0,
+            encoding_note: String::new(),
+        }
+    }
+
+    /// A column with an explicit share + dispersion — what the `significant`
+    /// annotation is computed from.
+    fn column_share(name: &str, share: f64, share_stderr: f64) -> ColumnCost {
+        ColumnCost {
+            name: name.to_string(),
+            dtype: "Float64".to_string(),
+            compressed_bytes: (share * 1_000_000.0) as u64,
+            share,
+            bytes_per_feature: 1.0,
+            marginal_bytes: (share * 1_000_000.0) as u64,
+            share_stderr,
             encoding_note: String::new(),
         }
     }
@@ -406,6 +484,12 @@ mod tests {
                 sampled,
                 features_decoded: tile_count * 10,
                 distinct_layer_schemas: 1,
+                design: crate::analysis::inspect::SampleDesign::default()
+                    .as_str()
+                    .to_string(),
+                attribution: crate::measure::AttributionDesign::default()
+                    .as_str()
+                    .to_string(),
             },
             per_column,
         }
@@ -515,5 +599,149 @@ mod tests {
         assert!(d.per_zoom.iter().all(|z| z.only_in.is_none()));
         assert!(d.per_column.iter().all(|c| c.only_in.is_none()));
         assert!(!format_text(&d).contains("only"));
+        // A report diffed against itself moved by exactly zero, which no
+        // amount of decode noise can make significant.
+        assert_eq!(d.per_column[0].significant, Some(false));
+        assert_eq!(d.per_column[0].share.delta, 0.0);
+    }
+
+    // ------------------------------------------------------------------
+    // MO-2: graded significance beside the binary sampling caveat
+    // ------------------------------------------------------------------
+
+    /// Diff two one-column reports whose shares and stderrs are given.
+    fn significance(
+        before: (f64, f64),
+        after: (f64, f64),
+        sampled: (bool, bool),
+    ) -> (Option<bool>, DiffReport) {
+        let b = report(
+            "b",
+            1_000,
+            vec![zoom(5, 1, 1_000)],
+            vec![column_share("geometry", before.0, before.1)],
+            sampled.0,
+        );
+        let a = report(
+            "a",
+            1_000,
+            vec![zoom(5, 1, 1_000)],
+            vec![column_share("geometry", after.0, after.1)],
+            sampled.1,
+        );
+        let d = diff(&b, &a);
+        (d.per_column[0].significant, d)
+    }
+
+    #[test]
+    fn column_significance_flips_at_the_two_sigma_boundary() {
+        // Every constant below is an exact binary fraction, so the boundary is
+        // walked in real arithmetic rather than in rounding noise:
+        //   σ = 2⁻⁵ = 0.03125 on each side ⇒ noise budget 2·(σ+σ) = 0.125,
+        //   and the deltas sit one 2⁻⁸ step either side of it.
+        const SIGMA: f64 = 0.03125;
+        const BUDGET: f64 = 0.125;
+        const STEP: f64 = 0.00390625;
+        const BASE: f64 = 0.25;
+
+        let (below, _) = significance((BASE, SIGMA), (BASE + BUDGET - STEP, SIGMA), (true, true));
+        assert_eq!(below, Some(false), "just under 2σ is within noise");
+        let (above, _) = significance((BASE, SIGMA), (BASE + BUDGET + STEP, SIGMA), (true, true));
+        assert_eq!(above, Some(true), "just over 2σ clears the noise floor");
+        // Exactly at the boundary the strict `>` keeps it insignificant — the
+        // conservative side of the test.
+        let (at, _) = significance((BASE, SIGMA), (BASE + BUDGET, SIGMA), (true, true));
+        assert_eq!(at, Some(false), "|Δ| == 2σ must NOT be called significant");
+        // Sign-symmetric: a shrink of the same size reads the same.
+        let (down, _) = significance((BASE + BUDGET + STEP, SIGMA), (BASE, SIGMA), (true, true));
+        assert_eq!(down, Some(true));
+
+        // A noisier side widens the budget, so the SAME delta stops being
+        // significant. This is what makes tiny archives stop crying wolf.
+        let (noisy, _) = significance(
+            (BASE, SIGMA),
+            (BASE + BUDGET + STEP, 3.0 * SIGMA),
+            (true, true),
+        );
+        assert_eq!(noisy, Some(false));
+
+        // Exhaustive decodes on both sides still publish finite stderr, so the
+        // test still applies (and stays conservative) rather than degenerating.
+        let (exhaustive, report_ex) =
+            significance((BASE, SIGMA), (BASE + 0.25, SIGMA), (false, false));
+        assert_eq!(exhaustive, Some(true));
+        assert!(
+            !report_ex.decode_sampled,
+            "the binary caveat stays independent of the graded one"
+        );
+    }
+
+    #[test]
+    fn one_sided_columns_get_no_significance_verdict() {
+        let before = report(
+            "old",
+            1_000,
+            vec![zoom(5, 1, 1_000)],
+            vec![column_share("geometry", 0.6, 0.01)],
+            true,
+        );
+        let after = report(
+            "new",
+            1_000,
+            vec![zoom(5, 1, 1_000)],
+            vec![column_share("payload", 0.6, 0.01)],
+            true,
+        );
+        let d = diff(&before, &after);
+        assert!(
+            d.per_column.iter().all(|c| c.significant.is_none()),
+            "one-sided rows must not fabricate a share delta: {:?}",
+            d.per_column
+        );
+        // …and the one-sided note still wins the note column.
+        let text = format_text(&d);
+        assert!(text.contains("before only"));
+        assert!(text.contains("after only"));
+        assert!(!text.contains("within noise"));
+    }
+
+    #[test]
+    fn the_gate_metric_is_untouched_by_the_graded_annotation() {
+        // `compressed_bytes` is the `--fail-on-growth` gate metric and comes
+        // from the DIRECTORY on both sides. It must be identical whether or not
+        // the per-column rows were annotated, and whether or not either decode
+        // was sampled.
+        let cols_quiet = vec![column_share("geometry", 0.50, 0.20)];
+        let cols_loud = vec![column_share("geometry", 0.50, 0.00)];
+        let mk = |cols: Vec<crate::analysis::inspect::ColumnCost>, sampled: bool| {
+            report("x", 4_242_424, vec![zoom(5, 10, 4_242_424)], cols, sampled)
+        };
+        let a = diff(&mk(cols_quiet.clone(), true), &mk(cols_quiet, true));
+        let b = diff(&mk(cols_loud.clone(), false), &mk(cols_loud, false));
+        assert_eq!(a.compressed_bytes.before, 4_242_424);
+        assert_eq!(a.compressed_bytes.delta, 0);
+        assert_eq!(
+            serde_json::to_string(&a.compressed_bytes).unwrap(),
+            serde_json::to_string(&b.compressed_bytes).unwrap(),
+            "the gate metric must not vary with decode noise or sampling"
+        );
+    }
+
+    #[test]
+    fn pre_mo2_diff_json_still_deserializes() {
+        let (_, d) = significance((0.30, 0.01), (0.40, 0.01), (true, true));
+        let mut value = serde_json::to_value(&d).unwrap();
+        for row in value["per_column"].as_array_mut().unwrap() {
+            let obj = row.as_object_mut().unwrap();
+            obj.remove("share").unwrap();
+            obj.remove("significant").unwrap();
+        }
+        let back: DiffReport = serde_json::from_value(value).unwrap();
+        assert_eq!(back.per_column[0].significant, None);
+        assert_eq!(back.per_column[0].share.delta, 0.0);
+        assert_eq!(
+            back.compressed_bytes.delta, d.compressed_bytes.delta,
+            "the gate metric survives the round trip"
+        );
     }
 }

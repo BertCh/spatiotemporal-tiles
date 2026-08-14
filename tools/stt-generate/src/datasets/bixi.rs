@@ -45,7 +45,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use crate::common::{
-    self, LineStringRecord, PropertyColumn, SttBuildOptions, StreamingLineStringParquetWriter,
+    self, LineStringRecord, PropertyColumn, StreamingLineStringParquetWriter, SttBuildOptions,
 };
 use crate::datasets::nyc_rideshare_flows::parse_bin_ms;
 use crate::edge_bundle::{self, BundleParams};
@@ -55,7 +55,11 @@ use crate::edge_bundle::{self, BundleParams};
 pub struct Args {
     /// Output packed `.stt` directory (or `*.parquet` to stop at the
     /// intermediate). Default targets the showcase data dir.
-    #[arg(short, long, default_value = "examples/showcase/public/data/bixi-flowmap")]
+    #[arg(
+        short,
+        long,
+        default_value = "examples/showcase/public/data/bixi-flowmap"
+    )]
     pub output: PathBuf,
 
     /// BIXI open-data input: the downloaded `.zip`, an extracted `.csv`, or a
@@ -279,7 +283,11 @@ pub fn run(args: Args) -> Result<()> {
     let to_ms = args.to.as_deref().map(parse_date_utc_ms).transpose()?;
     if let (Some(f), Some(t)) = (from_ms, to_ms) {
         if t <= f {
-            return Err(anyhow!("--to ({}) must be after --from ({})", args.to.as_deref().unwrap_or(""), args.from.as_deref().unwrap_or("")));
+            return Err(anyhow!(
+                "--to ({}) must be after --from ({})",
+                args.to.as_deref().unwrap_or(""),
+                args.from.as_deref().unwrap_or("")
+            ));
         }
     }
 
@@ -348,7 +356,11 @@ pub fn run(args: Args) -> Result<()> {
     println!("   Input:     {}", args.input.display());
     println!("   Output:    {}", args.output.display());
     println!("   Bin:       {} ({} ms)", args.bin, bin_ms);
-    println!("   Span:      {} → {}", args.from.as_deref().unwrap_or("(start)"), args.to.as_deref().unwrap_or("(end)"));
+    println!(
+        "   Span:      {} → {}",
+        args.from.as_deref().unwrap_or("(start)"),
+        args.to.as_deref().unwrap_or("(end)")
+    );
     println!("   Min trips: {}", args.min_trips);
     println!("   Zoom:      {}-{}", args.min_zoom, args.max_zoom);
     if args.no_cluster {
@@ -418,7 +430,11 @@ pub fn run(args: Args) -> Result<()> {
 
     let (intermediate_path, output_is_intermediate) = resolve_intermediate(&args.output);
 
-    let cluster_radius = if args.no_cluster { None } else { Some(args.cluster_radius) };
+    let cluster_radius = if args.no_cluster {
+        None
+    } else {
+        Some(args.cluster_radius)
+    };
     let (features, num_buckets, bucket0, range_end) = agg.write_parquet(
         &intermediate_path,
         args.min_trips,
@@ -433,7 +449,10 @@ pub fn run(args: Args) -> Result<()> {
     println!("       end   = {range_end}");
 
     if args.skip_build || output_is_intermediate {
-        println!("\n📦 Skipping stt-build (intermediate written to {})", intermediate_path.display());
+        println!(
+            "\n📦 Skipping stt-build (intermediate written to {})",
+            intermediate_path.display()
+        );
         return Ok(());
     }
 
@@ -474,7 +493,7 @@ pub fn run(args: Args) -> Result<()> {
         // (relaxed `--min-trips`) network stays affordable on the wire.
         quantize_coords: bundle.as_ref().map(|_| 1.0),
         quantize_attrs: Vec::new(),
-            blob_ordering: None,
+        blob_ordering: None,
     })?;
 
     println!("\n✅ BIXI flowmap built: {}", args.output.display());
@@ -496,9 +515,14 @@ fn parse_date_utc_ms(s: &str) -> Result<i64> {
 /// intermediate written to a sibling `.parquet`. Shared with the other
 /// path-style generators (e.g. [`super::gtfs`]).
 pub(crate) fn resolve_intermediate(output: &Path) -> (PathBuf, bool) {
-    let ext = output.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
-    let is_intermediate =
-        matches!(ext.as_deref(), Some("parquet") | Some("geoparquet") | Some("geojson"));
+    let ext = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    let is_intermediate = matches!(
+        ext.as_deref(),
+        Some("parquet") | Some("geoparquet") | Some("geojson")
+    );
     let path = if is_intermediate {
         output.to_path_buf()
     } else {
@@ -567,7 +591,11 @@ fn generate_paths(args: &Args, from_ms: Option<i64>, to_ms: Option<i64>) -> Resu
     println!("   Output:    {}", args.output.display());
     println!("   Mode:      per-trip OSRM paths (moving head-dots)");
     println!("   Routing:   {} (bicycle)", args.osrm_url);
-    println!("   Span:      {} → {}", args.from.as_deref().unwrap_or("(start)"), args.to.as_deref().unwrap_or("(end)"));
+    println!(
+        "   Span:      {} → {}",
+        args.from.as_deref().unwrap_or("(start)"),
+        args.to.as_deref().unwrap_or("(end)")
+    );
     if let Some(max) = args.max_trips {
         println!("   Max trips: {max}");
     }
@@ -651,7 +679,10 @@ fn generate_paths(args: &Args, from_ms: Option<i64>, to_ms: Option<i64>) -> Resu
         if max > 0 && trips.len() > max {
             let n = trips.len();
             let sampled: Vec<PathTrip> = (0..max).map(|i| trips[i * n / max]).collect();
-            println!("   📊 Subsampled {n} → {} trips (even temporal stride)", sampled.len());
+            println!(
+                "   📊 Subsampled {n} → {} trips (even temporal stride)",
+                sampled.len()
+            );
             trips = sampled;
         }
     }
@@ -684,7 +715,11 @@ fn generate_paths(args: &Args, from_ms: Option<i64>, to_ms: Option<i64>) -> Resu
             }
         })
         .collect();
-    println!("   ✓ routed {} / {} unique pairs", routed.len(), unique_pairs.len());
+    println!(
+        "   ✓ routed {} / {} unique pairs",
+        routed.len(),
+        unique_pairs.len()
+    );
     if routed.is_empty() {
         return Err(anyhow!(
             "No OD pairs routed — is the OSRM bicycle server at {} loaded with the \
@@ -807,7 +842,10 @@ fn generate_streets(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Result<()
     // Fail fast if the routing server isn't up before loading a large network.
     check_osrm_connectivity(&args.osrm_url)?;
 
-    println!("🗺  Loading OSM bicycle network from {} …", osm_pbf.display());
+    println!(
+        "🗺  Loading OSM bicycle network from {} …",
+        osm_pbf.display()
+    );
     let network = OsmNetwork::from_pbf_with_mode(osm_pbf, NetworkMode::Bike)?;
 
     // Unique OD pairs above the legibility threshold, with endpoints + per-bin
@@ -835,19 +873,19 @@ fn generate_streets(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Result<()
     // straight line would smear counts onto edges no rider used.
     let routed: Vec<(Vec<[f64; 2]>, &HashMap<i64, u32>)> = pairs
         .par_iter()
-        .filter_map(|(op, dp, bins)| match get_osrm_route_pooled(
-            &args.osrm_url,
-            op[0],
-            op[1],
-            dp[0],
-            dp[1],
-        ) {
-            Ok(Some(route)) => {
-                let coords: Vec<[f64; 2]> =
-                    route.geometry.coordinates.iter().map(|c| [c[0], c[1]]).collect();
-                (coords.len() >= 2).then_some((coords, *bins))
+        .filter_map(|(op, dp, bins)| {
+            match get_osrm_route_pooled(&args.osrm_url, op[0], op[1], dp[0], dp[1]) {
+                Ok(Some(route)) => {
+                    let coords: Vec<[f64; 2]> = route
+                        .geometry
+                        .coordinates
+                        .iter()
+                        .map(|c| [c[0], c[1]])
+                        .collect();
+                    (coords.len() >= 2).then_some((coords, *bins))
+                }
+                _ => None,
             }
-            _ => None,
         })
         .collect();
 
@@ -929,7 +967,7 @@ fn generate_streets(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Result<()
         no_clip: false,
         quantize_coords: None,
         quantize_attrs: Vec::new(),
-            blob_ordering: None,
+        blob_ordering: None,
     })?;
 
     println!("\n✅ BIXI street network built: {}", args.output.display());
@@ -970,7 +1008,10 @@ fn generate_merged_paths(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Resu
 
     check_osrm_connectivity(&args.osrm_url)?;
 
-    println!("🗺  Loading OSM bicycle network from {} …", osm_pbf.display());
+    println!(
+        "🗺  Loading OSM bicycle network from {} …",
+        osm_pbf.display()
+    );
     let network = OsmNetwork::from_pbf_with_mode(osm_pbf, NetworkMode::Bike)?;
 
     // Unique OD pairs above the legibility threshold (route once per pair).
@@ -995,19 +1036,19 @@ fn generate_merged_paths(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Resu
     // line would smear counts onto streets no rider used).
     let routed: Vec<(Vec<[f64; 2]>, &HashMap<i64, u32>)> = pairs
         .par_iter()
-        .filter_map(|(op, dp, bins)| match get_osrm_route_pooled(
-            &args.osrm_url,
-            op[0],
-            op[1],
-            dp[0],
-            dp[1],
-        ) {
-            Ok(Some(route)) => {
-                let coords: Vec<[f64; 2]> =
-                    route.geometry.coordinates.iter().map(|c| [c[0], c[1]]).collect();
-                (coords.len() >= 2).then_some((coords, *bins))
+        .filter_map(|(op, dp, bins)| {
+            match get_osrm_route_pooled(&args.osrm_url, op[0], op[1], dp[0], dp[1]) {
+                Ok(Some(route)) => {
+                    let coords: Vec<[f64; 2]> = route
+                        .geometry
+                        .coordinates
+                        .iter()
+                        .map(|c| [c[0], c[1]])
+                        .collect();
+                    (coords.len() >= 2).then_some((coords, *bins))
+                }
+                _ => None,
             }
-            _ => None,
         })
         .collect();
 
@@ -1109,10 +1150,13 @@ fn generate_merged_paths(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Resu
         no_clip: false,
         quantize_coords: Some(1.0),
         quantize_attrs: Vec::new(),
-            blob_ordering: None,
+        blob_ordering: None,
     })?;
 
-    println!("\n✅ BIXI merged corridors built: {}", args.output.display());
+    println!(
+        "\n✅ BIXI merged corridors built: {}",
+        args.output.display()
+    );
     println!("   Set datasets.ts timeRange to {{ start: {bucket0}, end: {range_end} }}");
     Ok(())
 }
@@ -1146,19 +1190,33 @@ fn generate_flow_network(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Resu
             station_coords.push(dp);
             station_coords.len() - 1
         });
-        let bins_out =
-            if args.typical_day { fold_bins_to_day(bins, buckets_per_day) } else { bins.clone() };
-        od.push(OdPair { origin: oi, dest: di, bins: bins_out });
+        let bins_out = if args.typical_day {
+            fold_bins_to_day(bins, buckets_per_day)
+        } else {
+            bins.clone()
+        };
+        od.push(OdPair {
+            origin: oi,
+            dest: di,
+            bins: bins_out,
+        });
     }
     println!(
         "🌐 Flow network: {} stations · {} OD pairs (≥{} trips){}",
         station_coords.len(),
         od.len(),
         args.min_trips,
-        if args.typical_day { " · typical day" } else { "" }
+        if args.typical_day {
+            " · typical day"
+        } else {
+            ""
+        }
     );
     if od.is_empty() {
-        return Err(anyhow!("No OD pairs ≥ --min-trips {} to bundle", args.min_trips));
+        return Err(anyhow!(
+            "No OD pairs ≥ --min-trips {} to bundle",
+            args.min_trips
+        ));
     }
 
     let params = FlowGraphParams {
@@ -1211,7 +1269,7 @@ fn generate_flow_network(args: &Args, agg: &BixiAggregator, bin_ms: i64) -> Resu
         no_clip: false,
         quantize_coords: Some(1.0),
         quantize_attrs: Vec::new(),
-            blob_ordering: None,
+        blob_ordering: None,
     })?;
 
     println!("\n✅ BIXI flow network built: {}", args.output.display());
@@ -1296,8 +1354,12 @@ impl BixiAggregator {
         if t.origin_key == t.dest_key {
             return;
         }
-        self.station_pos.entry(t.origin_key.clone()).or_insert(t.origin_pos);
-        self.station_pos.entry(t.dest_key.clone()).or_insert(t.dest_pos);
+        self.station_pos
+            .entry(t.origin_key.clone())
+            .or_insert(t.origin_pos);
+        self.station_pos
+            .entry(t.dest_key.clone())
+            .or_insert(t.dest_pos);
 
         let bin = t.start_ms.div_euclid(self.bin_ms);
         *self
@@ -1505,8 +1567,14 @@ impl BixiAggregator {
             // Collect this zoom's KEPT hub-pair corridors (those clearing
             // min_trips) — the complete edge set the bundler relaxes against.
             #[allow(clippy::type_complexity)]
-            let mut kept: Vec<([f64; 2], [f64; 2], &HashMap<i64, u32>, u32, String, String)> =
-                Vec::new();
+            let mut kept: Vec<(
+                [f64; 2],
+                [f64; 2],
+                &HashMap<i64, u32>,
+                u32,
+                String,
+                String,
+            )> = Vec::new();
             for pair in pairs {
                 let bins = &hub_counts[pair];
                 let total: u32 = bins.values().copied().sum();
@@ -1814,7 +1882,10 @@ struct TripSchema {
 
 /// Normalize a header cell for tolerant matching: lowercase, alphanumeric only.
 fn norm(s: &str) -> String {
-    s.chars().filter(|c| c.is_ascii_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
 }
 
 impl TripSchema {
@@ -1829,9 +1900,8 @@ impl TripSchema {
         let start_name = find(&|c| c.contains("start") && c.contains("name"));
         let end_name = find(&|c| c.contains("end") && c.contains("name"));
         // Station codes: `start_station_code` / `emplacement_pk_start`.
-        let start_code = find(&|c| {
-            (c.contains("start") && c.contains("code")) || c == "emplacementpkstart"
-        });
+        let start_code =
+            find(&|c| (c.contains("start") && c.contains("code")) || c == "emplacementpkstart");
         let end_code =
             find(&|c| (c.contains("end") && c.contains("code")) || c == "emplacementpkend");
         // Start time: prefer an explicit start-time/date column that isn't a
@@ -1859,7 +1929,8 @@ impl TripSchema {
         });
 
         // Need a station identity AND a position source on both ends.
-        let has_pos = start_lat.is_some() && start_lon.is_some() && end_lat.is_some() && end_lon.is_some();
+        let has_pos =
+            start_lat.is_some() && start_lon.is_some() && end_lat.is_some() && end_lon.is_some();
         let has_code = start_code.is_some() && end_code.is_some();
         if !has_pos && !has_code {
             return None;
@@ -1886,7 +1957,13 @@ impl TripSchema {
         let start_ms = parse_time_ms(rec.get(self.start_time)?)?;
 
         // Position: embedded coords win; else resolve a code via the stations map.
-        let origin_pos = self.position(rec, self.start_lat, self.start_lon, self.start_code, stations)?;
+        let origin_pos = self.position(
+            rec,
+            self.start_lat,
+            self.start_lon,
+            self.start_code,
+            stations,
+        )?;
         let dest_pos = self.position(rec, self.end_lat, self.end_lon, self.end_code, stations)?;
 
         // Identity: name if present, else code, else a coordinate hash.
@@ -1900,7 +1977,14 @@ impl TripSchema {
             .and_then(|i| rec.get(i))
             .and_then(parse_time_ms);
 
-        Some(ParsedTrip { origin_key, dest_key, origin_pos, dest_pos, start_ms, end_ms })
+        Some(ParsedTrip {
+            origin_key,
+            dest_key,
+            origin_pos,
+            dest_pos,
+            start_ms,
+            end_ms,
+        })
     }
 
     fn position(
@@ -2009,11 +2093,15 @@ fn collect_csvs(path: &Path, out: &mut Vec<NamedCsv>) -> Result<()> {
         }
         return Ok(());
     }
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match ext.as_str() {
         "zip" => {
-            let file = File::open(path)
-                .with_context(|| format!("opening zip {}", path.display()))?;
+            let file =
+                File::open(path).with_context(|| format!("opening zip {}", path.display()))?;
             let mut zip = zip::ZipArchive::new(file)?;
             // Names first (immutable borrow), then extract each to a temp file —
             // zip entries aren't seekable/clonable, and trip CSVs are huge, so we
@@ -2075,12 +2163,18 @@ fn stations_from_input(input: &Path) -> Option<HashMap<String, [f64; 2]>> {
     }
     let mut map = HashMap::new();
     for content in files {
-        let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(content.as_bytes());
+        let mut rdr = csv::ReaderBuilder::new()
+            .flexible(true)
+            .from_reader(content.as_bytes());
         let headers = rdr.headers().ok()?.clone();
         let cols: Vec<String> = headers.iter().map(norm).collect();
-        let code = cols.iter().position(|c| c == "code" || c.contains("pk") || c.contains("shortname"))?;
+        let code = cols
+            .iter()
+            .position(|c| c == "code" || c.contains("pk") || c.contains("shortname"))?;
         let lat = cols.iter().position(|c| c.contains("lat"))?;
-        let lon = cols.iter().position(|c| c.contains("lon") || c.contains("lng"))?;
+        let lon = cols
+            .iter()
+            .position(|c| c.contains("lon") || c.contains("lng"))?;
         for rec in rdr.records().flatten() {
             if let (Some(c), Some(la), Some(lo)) = (rec.get(code), rec.get(lat), rec.get(lon)) {
                 if let (Ok(la), Ok(lo)) = (la.trim().parse::<f64>(), lo.trim().parse::<f64>()) {
@@ -2101,7 +2195,11 @@ fn gather_station_files(path: &Path, out: &mut Vec<String>) {
         }
         return;
     }
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if ext == "csv" && is_stations_name(name) {
         if let Ok(s) = std::fs::read_to_string(path) {
@@ -2160,8 +2258,16 @@ mod tests {
         assert_eq!(s.end_time, Some(9));
 
         let row = rec(&[
-            "A", "Ville-Marie", "45.5", "-73.5", "B", "Ville-Marie", "45.6", "-73.6",
-            "1704230756167", "1704231106232",
+            "A",
+            "Ville-Marie",
+            "45.5",
+            "-73.5",
+            "B",
+            "Ville-Marie",
+            "45.6",
+            "-73.6",
+            "1704230756167",
+            "1704231106232",
         ]);
         let t = s.parse_row(&row, &HashMap::new()).expect("trip");
         assert_eq!(t.origin_key, "A");
@@ -2191,14 +2297,33 @@ mod tests {
         let mut stations = HashMap::new();
         stations.insert("6001".to_string(), [-73.57, 45.49]);
         stations.insert("6002".to_string(), [-73.54, 45.53]);
-        let row = rec(&["2019-04-15 08:23:00", "6001", "2019-04-15 08:31:00", "6002", "480", "1"]);
+        let row = rec(&[
+            "2019-04-15 08:23:00",
+            "6001",
+            "2019-04-15 08:31:00",
+            "6002",
+            "480",
+            "1",
+        ]);
         let t = s.parse_row(&row, &stations).expect("trip");
         assert_eq!(t.origin_key, "6001");
         assert_eq!(t.origin_pos, [-73.57, 45.49]);
-        assert_eq!(t.start_ms, NaiveDate::from_ymd_opt(2019, 4, 15).unwrap()
-            .and_hms_opt(8, 23, 0).unwrap().and_utc().timestamp_millis());
-        assert_eq!(t.end_ms, NaiveDate::from_ymd_opt(2019, 4, 15).unwrap()
-            .and_hms_opt(8, 31, 0).map(|d| d.and_utc().timestamp_millis()));
+        assert_eq!(
+            t.start_ms,
+            NaiveDate::from_ymd_opt(2019, 4, 15)
+                .unwrap()
+                .and_hms_opt(8, 23, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        );
+        assert_eq!(
+            t.end_ms,
+            NaiveDate::from_ymd_opt(2019, 4, 15)
+                .unwrap()
+                .and_hms_opt(8, 31, 0)
+                .map(|d| d.and_utc().timestamp_millis())
+        );
     }
 
     #[test]
@@ -2227,8 +2352,19 @@ mod tests {
         assert_eq!(s.end_lon, Some(11));
 
         let row = rec(&[
-            "abc", "classic_bike", "2024-08-15 08:00:00", "2024-08-15 08:12:00",
-            "A", "1", "B", "2", "45.50", "-73.57", "45.53", "-73.54", "member",
+            "abc",
+            "classic_bike",
+            "2024-08-15 08:00:00",
+            "2024-08-15 08:12:00",
+            "A",
+            "1",
+            "B",
+            "2",
+            "45.50",
+            "-73.57",
+            "45.53",
+            "-73.54",
+            "member",
         ]);
         let t = s.parse_row(&row, &HashMap::new()).expect("trip");
         assert_eq!(t.origin_pos, [-73.57, 45.50]);
@@ -2300,11 +2436,27 @@ mod tests {
     fn min_trips_threshold_drops_sparse_pairs() {
         let h = 3_600_000i64;
         let mut agg = BixiAggregator::new(h, None, None);
-        let busy = ParsedTrip { origin_key: "A".into(), dest_key: "B".into(), origin_pos: [0.0, 0.0], dest_pos: [1.0, 1.0], start_ms: 0, end_ms: None };
+        let busy = ParsedTrip {
+            origin_key: "A".into(),
+            dest_key: "B".into(),
+            origin_pos: [0.0, 0.0],
+            dest_pos: [1.0, 1.0],
+            start_ms: 0,
+            end_ms: None,
+        };
         for _ in 0..5 {
-            agg.add_trip(ParsedTrip { ..clone_trip(&busy) });
+            agg.add_trip(ParsedTrip {
+                ..clone_trip(&busy)
+            });
         }
-        agg.add_trip(ParsedTrip { origin_key: "C".into(), dest_key: "D".into(), origin_pos: [0.0, 0.0], dest_pos: [2.0, 2.0], start_ms: 0, end_ms: None });
+        agg.add_trip(ParsedTrip {
+            origin_key: "C".into(),
+            dest_key: "D".into(),
+            origin_pos: [0.0, 0.0],
+            dest_pos: [2.0, 2.0],
+            start_ms: 0,
+            end_ms: None,
+        });
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("bixi-test-thresh.parquet");
         let (features, _, _, _) = agg.write_parquet(&dir, 3, None, 10, 13, None).unwrap();
@@ -2328,7 +2480,14 @@ mod tests {
         assert_eq!(parse_time_ms("1704230756"), Some(1704230756000));
         assert_eq!(
             parse_time_ms("2019-04-15 08:23:00"),
-            Some(NaiveDate::from_ymd_opt(2019, 4, 15).unwrap().and_hms_opt(8, 23, 0).unwrap().and_utc().timestamp_millis())
+            Some(
+                NaiveDate::from_ymd_opt(2019, 4, 15)
+                    .unwrap()
+                    .and_hms_opt(8, 23, 0)
+                    .unwrap()
+                    .and_utc()
+                    .timestamp_millis()
+            )
         );
         assert_eq!(parse_time_ms("not a time"), None);
     }
@@ -2349,8 +2508,22 @@ mod tests {
         let s1 = [-73.561, 45.508];
         let s2 = [-73.566, 45.512];
         let s3 = [-73.500, 45.560];
-        agg.add_trip(ParsedTrip { origin_key: "S1".into(), dest_key: "S3".into(), origin_pos: s1, dest_pos: s3, start_ms: 0, end_ms: None });
-        agg.add_trip(ParsedTrip { origin_key: "S2".into(), dest_key: "S3".into(), origin_pos: s2, dest_pos: s3, start_ms: 0, end_ms: None });
+        agg.add_trip(ParsedTrip {
+            origin_key: "S1".into(),
+            dest_key: "S3".into(),
+            origin_pos: s1,
+            dest_pos: s3,
+            start_ms: 0,
+            end_ms: None,
+        });
+        agg.add_trip(ParsedTrip {
+            origin_key: "S2".into(),
+            dest_key: "S3".into(),
+            origin_pos: s2,
+            dest_pos: s3,
+            start_ms: 0,
+            end_ms: None,
+        });
         agg
     }
 
@@ -2368,7 +2541,10 @@ mod tests {
         // The two downtown docks collapse into one hub at low zoom; S3 stays.
         let coarse = hier.clusters(10);
         assert_eq!(coarse.len(), 2);
-        let merged = coarse.iter().find(|c| c.members.len() == 2).expect("a 2-member hub");
+        let merged = coarse
+            .iter()
+            .find(|c| c.members.len() == 2)
+            .expect("a 2-member hub");
         // Tie weights → smallest key seeds the hub name.
         assert_eq!(hier.rep_key(merged), "S1");
     }
@@ -2378,8 +2554,9 @@ mod tests {
         let h = 3_600_000i64;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("bixi-test-cluster.parquet");
-        let (features, buckets, bucket0, range_end) =
-            downtown_agg().write_parquet(&dir, 1, Some(40.0), 10, 13, None).unwrap();
+        let (features, buckets, bucket0, range_end) = downtown_agg()
+            .write_parquet(&dir, 1, Some(40.0), 10, 13, None)
+            .unwrap();
         // z13+z12 keep both corridors (2+2); z11+z10 aggregate the two docks
         // into one merged→S3 corridor (1+1) → 6 banded features total.
         assert_eq!(features, 6);
@@ -2395,9 +2572,13 @@ mod tests {
         // unbundled clustered write above.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("bixi-test-baked.parquet");
-        let bp = BundleParams { points: 12, ..Default::default() };
-        let (features, buckets, _, _) =
-            downtown_agg().write_parquet(&dir, 1, Some(40.0), 10, 13, Some(&bp)).unwrap();
+        let bp = BundleParams {
+            points: 12,
+            ..Default::default()
+        };
+        let (features, buckets, _, _) = downtown_agg()
+            .write_parquet(&dir, 1, Some(40.0), 10, 13, Some(&bp))
+            .unwrap();
         assert_eq!(features, 6, "baking preserves per-zoom feature banding");
         assert_eq!(buckets, 1);
     }

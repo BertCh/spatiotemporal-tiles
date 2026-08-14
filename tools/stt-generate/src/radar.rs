@@ -221,7 +221,11 @@ pub fn contour_bands(
                     rings.push(ring);
                 }
             }
-            out.push(BandPolygon { dbz_lo, dbz_hi, rings });
+            out.push(BandPolygon {
+                dbz_lo,
+                dbz_hi,
+                rings,
+            });
         }
     }
     out
@@ -310,7 +314,11 @@ pub fn detect_cells(grid: &MosaicGrid, cell_dbz: f64, min_cell_km2: f64) -> Vec<
         a.lon
             .partial_cmp(&b.lon)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.lat.partial_cmp(&b.lat).unwrap_or(std::cmp::Ordering::Equal))
+            .then(
+                a.lat
+                    .partial_cmp(&b.lat)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
     });
     cells
 }
@@ -370,7 +378,8 @@ pub fn track_cells(mut frames: Vec<(i64, Vec<Cell>)>, max_speed_m_s: f64) -> Vec
                         continue;
                     }
                     let last = &tracks[ti].points[tracks[ti].points.len() - 1];
-                    let d = crate::common::haversine_distance(last.lat, last.lon, cell.lat, cell.lon);
+                    let d =
+                        crate::common::haversine_distance(last.lat, last.lon, cell.lat, cell.lon);
                     if d <= max_dist && best.map(|(_, bd)| d < bd).unwrap_or(true) {
                         best = Some((ti, d));
                     }
@@ -412,7 +421,13 @@ mod tests {
     /// `iy = 0` at min_lat).
     fn grid_with(nx: usize, ny: usize, fill: &[(usize, usize, f32)]) -> MosaicGrid {
         // 1 km cells near 42°N over a small bbox.
-        let mut g = MosaicGrid::new(42.0, -93.0, 42.0 + ny as f64 * 0.01, -93.0 + nx as f64 * 0.02, 1.0);
+        let mut g = MosaicGrid::new(
+            42.0,
+            -93.0,
+            42.0 + ny as f64 * 0.01,
+            -93.0 + nx as f64 * 0.02,
+            1.0,
+        );
         // Force exact dimensions for deterministic tests.
         g.nx = nx;
         g.ny = ny;
@@ -429,12 +444,7 @@ mod tests {
         let g = grid_with(
             6,
             6,
-            &[
-                (2, 2, 55.0),
-                (3, 2, 56.0),
-                (2, 3, 54.0),
-                (3, 3, 58.0),
-            ],
+            &[(2, 2, 55.0), (3, 2, 56.0), (2, 3, 54.0), (3, 3, 58.0)],
         );
         let cells = detect_cells(&g, 50.0, 0.0);
         assert_eq!(cells.len(), 1);
@@ -486,9 +496,25 @@ mod tests {
     #[test]
     fn track_links_moving_cell() {
         let frames = vec![
-            (0i64, vec![Cell { lon: -93.0, lat: 42.0, max_dbz: 55.0, area_km2: 20.0 }]),
+            (
+                0i64,
+                vec![Cell {
+                    lon: -93.0,
+                    lat: 42.0,
+                    max_dbz: 55.0,
+                    area_km2: 20.0,
+                }],
+            ),
             // ~1.5 km east after 300 s → ~5 m/s, within a 40 m/s gate.
-            (300_000i64, vec![Cell { lon: -92.982, lat: 42.0, max_dbz: 57.0, area_km2: 22.0 }]),
+            (
+                300_000i64,
+                vec![Cell {
+                    lon: -92.982,
+                    lat: 42.0,
+                    max_dbz: 57.0,
+                    area_km2: 22.0,
+                }],
+            ),
         ];
         let tracks = track_cells(frames, 40.0);
         assert_eq!(tracks.len(), 1);
@@ -498,9 +524,25 @@ mod tests {
     #[test]
     fn track_splits_when_too_fast() {
         let frames = vec![
-            (0i64, vec![Cell { lon: -93.0, lat: 42.0, max_dbz: 55.0, area_km2: 20.0 }]),
+            (
+                0i64,
+                vec![Cell {
+                    lon: -93.0,
+                    lat: 42.0,
+                    max_dbz: 55.0,
+                    area_km2: 20.0,
+                }],
+            ),
             // ~80 km east after 60 s → way past any plausible storm speed.
-            (60_000i64, vec![Cell { lon: -92.0, lat: 42.0, max_dbz: 57.0, area_km2: 22.0 }]),
+            (
+                60_000i64,
+                vec![Cell {
+                    lon: -92.0,
+                    lat: 42.0,
+                    max_dbz: 57.0,
+                    area_km2: 22.0,
+                }],
+            ),
         ];
         let tracks = track_cells(frames, 40.0);
         // Both cells are too-short singletons → dropped, leaving no 2+ track.

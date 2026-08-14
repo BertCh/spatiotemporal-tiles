@@ -67,6 +67,7 @@ impl SummaryConfig {
             });
         }
         SummaryTier {
+            variant_id: stt_core::tile::SUMMARY_VARIANT_ID,
             scheme: self.scheme,
             min_zoom: self.min_zoom,
             max_zoom: self.max_zoom,
@@ -331,7 +332,8 @@ pub fn build_summary_tier<W: TileWriter>(
                 .min()
                 .unwrap_or(bucket_start as i64);
             let tile = GeneratedTile {
-                id: TileId::new(zoom, tx, ty, bucket_start),
+                id: TileId::new(zoom, tx, ty, bucket_start)
+                    .with_variant(stt_core::tile::SUMMARY_VARIANT_ID),
                 time_start: bucket_start as i64,
                 time_end,
                 cover_t_min,
@@ -557,6 +559,7 @@ mod tests {
             .cloned()
             .and_then(crate::props::FeatureProperties::from_map);
         ParsedFeature {
+            home_zoom: None,
             geojson: Feature {
                 bbox: None,
                 geometry: Some(Geometry::new(GeomValue::Point(vec![lon, lat]))),

@@ -69,8 +69,10 @@ use crate::datasets::bixi::resolve_intermediate;
 use crate::datasets::nyc_rideshare_flows::parse_bin_ms;
 
 #[derive(Parser, Debug)]
-#[command(about = "Generate a country-scale transit dataset from a static GTFS feed \
-                   (every trip scheduled on one service date as a timestamped trajectory)")]
+#[command(
+    about = "Generate a country-scale transit dataset from a static GTFS feed \
+                   (every trip scheduled on one service date as a timestamped trajectory)"
+)]
 pub struct Args {
     /// Extracted GTFS feed directory (needs trips.txt, stop_times.txt,
     /// routes.txt, calendar_dates.txt and/or calendar.txt; shapes.txt and
@@ -85,7 +87,12 @@ pub struct Args {
 
     /// Output packed `.stt` directory (or `*.parquet` to stop at the
     /// intermediate). `--out` is accepted as an alias.
-    #[arg(short, long, alias = "out", default_value = "examples/showcase/public/data/gtfs-transit")]
+    #[arg(
+        short,
+        long,
+        alias = "out",
+        default_value = "examples/showcase/public/data/gtfs-transit"
+    )]
     pub output: PathBuf,
 
     /// Temporal bucket for the output archive's tile chunking (e.g. `1h`, `30m`).
@@ -123,7 +130,11 @@ pub fn run(args: Args) -> Result<()> {
     // Validate the temporal bucket early (same helper the other generators use).
     parse_bin_ms(&args.bin)?;
     if args.min_zoom > args.max_zoom {
-        return Err(anyhow!("--min-zoom ({}) must be ≤ --max-zoom ({})", args.min_zoom, args.max_zoom));
+        return Err(anyhow!(
+            "--min-zoom ({}) must be ≤ --max-zoom ({})",
+            args.min_zoom,
+            args.max_zoom
+        ));
     }
 
     println!("📋 Configuration:");
@@ -154,7 +165,9 @@ pub fn run(args: Args) -> Result<()> {
     let stats = expand_feed(
         &args.feed,
         &args.date,
-        &ExpandOptions { max_trips: args.max_trips },
+        &ExpandOptions {
+            max_trips: args.max_trips,
+        },
         &mut |f: TripFeature| {
             let (Some(start_dt), Some(end_dt)) = (
                 DateTime::<Utc>::from_timestamp_millis(f.start_ms),
@@ -389,7 +402,10 @@ pub(crate) fn expand_feed(
         .with_context(|| format!("invalid --date '{date}' (expected YYYYMMDD)"))?;
     let tz = feed_timezone(feed);
     let midnight_ms = service_midnight_ms(date, tz)?;
-    println!("🕛 Service date {date} anchored at local midnight ({})", tz.name());
+    println!(
+        "🕛 Service date {date} anchored at local midnight ({})",
+        tz.name()
+    );
 
     let mut stats = ExpandStats::default();
 
@@ -445,9 +461,16 @@ pub(crate) fn expand_feed(
                 }),
                 _ => None,
             };
-            let headsign = i_headsign.map(|i| field(&rec, i).to_string()).unwrap_or_default();
+            let headsign = i_headsign
+                .map(|i| field(&rec, i).to_string())
+                .unwrap_or_default();
             trip_index.insert(trip_id.to_string(), trips.len() as u32);
-            trips.push(TripMeta { trip_id: trip_id.to_string(), route, shape, headsign });
+            trips.push(TripMeta {
+                trip_id: trip_id.to_string(),
+                route,
+                shape,
+                headsign,
+            });
         }
     }
     stats.trips_scheduled = trips.len();
@@ -556,14 +579,20 @@ pub(crate) fn expand_feed(
         order.push((evs.first().map(|e| e.departure_ms).unwrap_or(0), ti as u32));
     }
     order.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| trips[a.1 as usize].trip_id.cmp(&trips[b.1 as usize].trip_id))
+        a.0.cmp(&b.0).then_with(|| {
+            trips[a.1 as usize]
+                .trip_id
+                .cmp(&trips[b.1 as usize].trip_id)
+        })
     });
     if let Some(max) = opts.max_trips {
         if max > 0 && order.len() > max {
             let n = order.len();
             let sampled: Vec<(i64, u32)> = (0..max).map(|i| order[i * n / max]).collect();
-            println!("   📊 Subsampled {n} → {} trips (even temporal stride)", sampled.len());
+            println!(
+                "   📊 Subsampled {n} → {} trips (even temporal stride)",
+                sampled.len()
+            );
             order = sampled;
         }
     }
@@ -822,7 +851,11 @@ fn pos_at(pts: &[[f64; 2]], axis: &[f64], s: f64) -> [f64; 2] {
     let hi = axis.partition_point(|&d| d < s);
     let lo = hi - 1;
     let span = axis[hi] - axis[lo];
-    let f = if span > 0.0 { (s - axis[lo]) / span } else { 0.0 };
+    let f = if span > 0.0 {
+        (s - axis[lo]) / span
+    } else {
+        0.0
+    };
     let a = pts[lo];
     let b = pts[hi];
     [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f]
@@ -845,7 +878,11 @@ fn project_onto(pts: &[[f64; 2]], cum: &[f64], p: [f64; 2], from_seg: usize) -> 
         let dx = (b[0] - a[0]) * kx;
         let dy = (b[1] - a[1]) * ky;
         let len2 = dx * dx + dy * dy;
-        let t = if len2 > 0.0 { (-(ax * dx + ay * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        let t = if len2 > 0.0 {
+            (-(ax * dx + ay * dy) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let px = ax + dx * t;
         let py = ay + dy * t;
         let d2 = px * px + py * py;
@@ -885,7 +922,11 @@ fn open_csv(path: &Path) -> Result<csv::Reader<BufReader<File>>> {
 fn col(headers: &csv::ByteRecord, name: &str) -> Option<usize> {
     headers.iter().position(|h| {
         std::str::from_utf8(h)
-            .map(|s| s.trim_start_matches('\u{feff}').trim().eq_ignore_ascii_case(name))
+            .map(|s| {
+                s.trim_start_matches('\u{feff}')
+                    .trim()
+                    .eq_ignore_ascii_case(name)
+            })
             .unwrap_or(false)
     })
 }
@@ -895,7 +936,9 @@ fn req_col(headers: &csv::ByteRecord, name: &str, file: &str) -> Result<usize> {
 }
 
 fn field<'a>(rec: &'a csv::ByteRecord, i: usize) -> &'a str {
-    std::str::from_utf8(rec.get(i).unwrap_or(b"")).unwrap_or("").trim()
+    std::str::from_utf8(rec.get(i).unwrap_or(b""))
+        .unwrap_or("")
+        .trim()
 }
 
 /// Parse a GTFS `HH:MM:SS` clock time into seconds since local midnight.
@@ -948,7 +991,10 @@ fn feed_timezone(feed: &Path) -> Tz {
         return fallback;
     };
     let Some(i_tz) = col(&h, "agency_timezone") else {
-        println!("   ⚠ agency.txt has no agency_timezone — assuming {}", fallback.name());
+        println!(
+            "   ⚠ agency.txt has no agency_timezone — assuming {}",
+            fallback.name()
+        );
         return fallback;
     };
     let mut rec = csv::ByteRecord::new();
@@ -960,7 +1006,10 @@ fn feed_timezone(feed: &Path) -> Tz {
         match raw.parse::<Tz>() {
             Ok(tz) => return tz,
             Err(_) => {
-                println!("   ⚠ unrecognized agency_timezone '{raw}' — assuming {}", fallback.name());
+                println!(
+                    "   ⚠ unrecognized agency_timezone '{raw}' — assuming {}",
+                    fallback.name()
+                );
                 return fallback;
             }
         }
@@ -1072,8 +1121,12 @@ fn load_routes(feed: &Path) -> Result<(HashMap<String, u32>, Vec<RouteMeta>)> {
         index.insert(id.to_string(), routes.len() as u32);
         routes.push(RouteMeta {
             label: route_type_label(field(&rec, i_type)),
-            short_name: i_short.map(|i| field(&rec, i).to_string()).unwrap_or_default(),
-            agency_id: i_agency.map(|i| field(&rec, i).to_string()).unwrap_or_default(),
+            short_name: i_short
+                .map(|i| field(&rec, i).to_string())
+                .unwrap_or_default(),
+            agency_id: i_agency
+                .map(|i| field(&rec, i).to_string())
+                .unwrap_or_default(),
         });
     }
     println!("   ✓ {} routes", routes.len());
@@ -1207,7 +1260,11 @@ fn load_shapes(feed: &Path, needed: &HashMap<String, u32>) -> Result<Vec<Option<
             let file_dist = file_dist
                 .filter(|l| l.last().copied().unwrap_or(0.0) > l.first().copied().unwrap_or(0.0));
             loaded += 1;
-            Some(Shape { pts, cum, file_dist })
+            Some(Shape {
+                pts,
+                cum,
+                file_dist,
+            })
         })
         .collect();
     println!("   ✓ {loaded} / {n} referenced shapes loaded");
@@ -1415,7 +1472,10 @@ mod tests {
         assert_eq!(f.route_type, "rail");
         // 25:30:00 = 01:30 the NEXT morning, local.
         assert_eq!(f.start_ms, MID_MS + 91_800_000);
-        assert_eq!(f.times_ms, vec![t(25, 30), t(25, 35), t(25, 40), t(25, 45), t(25, 50)]);
+        assert_eq!(
+            f.times_ms,
+            vec![t(25, 30), t(25, 35), t(25, 40), t(25, 45), t(25, 50)]
+        );
         assert_eq!(f.end_ms, t(25, 50));
     }
 
@@ -1447,9 +1507,17 @@ mod tests {
         // lon spacing at one latitude = equal segment lengths, so vertex 1 is
         // half-way through 11:00 → 11:10 (float axis → ±2 ms slack).
         assert_eq!(f.times_ms[0], t(11, 0));
-        assert!((f.times_ms[1] - t(11, 5)).abs() <= 2, "got {}", f.times_ms[1]);
+        assert!(
+            (f.times_ms[1] - t(11, 5)).abs() <= 2,
+            "got {}",
+            f.times_ms[1]
+        );
         assert_eq!(f.times_ms[2], t(11, 10));
-        assert!((f.times_ms[3] - t(11, 15)).abs() <= 2, "got {}", f.times_ms[3]);
+        assert!(
+            (f.times_ms[3] - t(11, 15)).abs() <= 2,
+            "got {}",
+            f.times_ms[3]
+        );
         assert_eq!(f.times_ms[4], t(11, 20));
     }
 
@@ -1488,7 +1556,10 @@ mod tests {
         // so the dropped T_BAD (12:00, index 3) leaves a hole before T_LATE.
         let ids: Vec<&str> = a.iter().map(|f| f.gtfs_trip_id.as_str()).collect();
         assert_eq!(ids, vec!["T_NORMAL", "T_NOSHAPE", "T_PROJ", "T_LATE"]);
-        assert_eq!(a.iter().map(|f| f.seq).collect::<Vec<_>>(), vec![0, 1, 2, 4]);
+        assert_eq!(
+            a.iter().map(|f| f.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2, 4]
+        );
         // Vertex timestamps are non-decreasing and match the feature window.
         for f in &a {
             assert!(f.times_ms.windows(2).all(|w| w[1] >= w[0]));

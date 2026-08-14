@@ -117,7 +117,7 @@ fn build_points(dir: &Path, cfg_of: impl Fn(&PackWriter) -> EncoderConfig) -> Pa
 
 fn v2_config(w: &PackWriter) -> EncoderConfig {
     EncoderConfig {
-        format_version: w.format_version(),
+        format_version: stt_core::arrow_tile::LAYER_FRAME_VERSION,
         template_collector: Some(w.template_collector()),
         ..EncoderConfig::default()
     }
@@ -460,7 +460,7 @@ fn quantized_coordinates_are_reconstructed() {
     let archive = build_points(dir.path(), |w| EncoderConfig {
         quantize_coords_m: Some(1.0),
         quantize_attrs: HashMap::from([("speed".to_string(), 0.01)]),
-        format_version: w.format_version(),
+        format_version: stt_core::arrow_tile::LAYER_FRAME_VERSION,
         template_collector: Some(w.template_collector()),
         ..EncoderConfig::default()
     });

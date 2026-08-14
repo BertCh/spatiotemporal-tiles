@@ -7,24 +7,33 @@
 //! Arrow decode + per-column re-encode is optionally restricted to a
 //! deterministic sample (mirroring `stt-validate --sample` semantics).
 //!
-//! Per-column attribution re-encodes each decoded column alone (Arrow IPC +
-//! zstd-19) to get a fair compressed-byte share. The per-column sum exceeds the
-//! whole-tile size (lost cross-column sharing + per-column IPC framing), so it
-//! is used for *shares*, not absolute wire accounting. The technique is
-//! geometry-agnostic: every column — point/line/polygon geometry included — is
-//! a plain Arrow array that a single-column `RecordBatch` can carry.
+//! Per-column attribution is LEAVE-ONE-OUT (the shared
+//! [`crate::measure::attribution`] module): the decoded batch is re-encoded
+//! whole (Arrow IPC + zstd-19) and then once per column with that column
+//! removed, and the column is charged the difference. That is the post-zstd
+//! bytes the tile actually sheds if the column vanishes, so the per-column sum
+//! fits inside the whole-tile size and duplicated columns are no longer
+//! double-charged — the failure of the old singleton proxy, which re-encoded
+//! each column ALONE and therefore over-spent the tile budget. The proxy stays
+//! reachable as [`AttributionDesign::SingletonV1`] for one release. The
+//! technique is geometry-agnostic: every column — point/line/polygon geometry
+//! included — is a plain Arrow array.
+//!
+//! Every published share carries a `share_stderr` beside it: the tile-to-tile
+//! dispersion of that share across the decoded tiles, so threshold consumers
+//! (the doctor's rules, `diff`'s significance annotation) can tell a real
+//! difference from decode noise. It is finite even for an exhaustive decode —
+//! see [`ShareDispersion`] for the interpretation.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arrow::array::RecordBatch;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::writer::StreamWriter;
+use arrow::datatypes::{DataType, Field};
 use serde::{Deserialize, Serialize};
 use stt_core::arrow_tile::{DecodedLayer, STT_QUANT_ATTR_META_KEY, STT_QUANT_META_KEY};
-use stt_core::compression::compress_zstd_with_dict_level;
+use stt_core::TileEntry;
 
+use crate::measure::attribution::{attribute_columns, AttributionDesign, ShareDispersion};
 use crate::packed::PackedTileset;
 
 /// zstd level for the standalone per-column re-encode. Fixed at the publish
@@ -80,6 +89,33 @@ pub struct DecodeStats {
     /// Distinct layer-schema signatures across decoded tiles. `> 1` means
     /// producer drift (tiles disagree on columns or types).
     pub distinct_layer_schemas: u64,
+    /// Which sampling design selected the decoded tiles — `"stride-v1"` (the
+    /// legacy flat systematic stride) or `"stratified-v2"` (the default:
+    /// byte-proportional strata over `(zoom, time_start)`). Reports written
+    /// before the discriminator existed deserialize as `"stride-v1"`, which is
+    /// what they in fact used.
+    #[serde(default = "legacy_sample_design")]
+    pub design: String,
+    /// Which per-column attribution design produced `per_column` —
+    /// `"loo-v2"` (the default: leave-one-out marginals) or `"singleton-v1"`
+    /// (the rollback: each column re-encoded alone). The two are NOT
+    /// numerically comparable, so a consumer comparing two reports must check
+    /// this first. Reports written before the discriminator existed
+    /// deserialize as `"singleton-v1"`, which is what they in fact used.
+    #[serde(default = "legacy_attribution_design")]
+    pub attribution: String,
+}
+
+/// serde default for [`DecodeStats::design`]: reports predating the field were
+/// all produced by the flat stride.
+fn legacy_sample_design() -> String {
+    SampleDesign::StrideV1.as_str().to_string()
+}
+
+/// serde default for [`DecodeStats::attribution`]: reports predating the field
+/// were all produced by the singleton proxy.
+fn legacy_attribution_design() -> String {
+    AttributionDesign::SingletonV1.as_str().to_string()
 }
 
 /// Compressed-byte attribution for one column (merged by name across layers
@@ -90,12 +126,37 @@ pub struct ColumnCost {
     pub name: String,
     /// Arrow data type, `Debug`-formatted.
     pub dtype: String,
-    /// Standalone re-encode size (IPC + zstd-19) summed over decoded tiles.
+    /// Bytes charged to this column, summed over the decoded tiles, under the
+    /// attribution design [`DecodeStats::attribution`] names.
+    ///
+    /// Default (`loo-v2`): the leave-one-out marginal — what the tiles shed if
+    /// the column vanished. Rollback (`singleton-v1`): the old standalone
+    /// re-encode size (IPC + zstd-19), which over-charges shared information.
     pub compressed_bytes: u64,
     /// `compressed_bytes / Σ all columns' compressed_bytes` — the fair share.
+    /// Under `loo-v2` these are normalised marginals: they sum to 1 AND their
+    /// byte sum fits inside the whole-tile size.
     pub share: f64,
     /// `compressed_bytes / rows` over the batches that carry this column.
     pub bytes_per_feature: f64,
+    /// Leave-one-out marginal bytes over the decoded tiles: the honest unit
+    /// for "how much would dropping this column actually save". Equals
+    /// `compressed_bytes` under `loo-v2`; `0` under the `singleton-v1`
+    /// rollback, which performs no leave-one-out encode.
+    #[serde(default)]
+    pub marginal_bytes: u64,
+    /// Standard error of [`Self::share`] across the decoded tiles (the
+    /// ratio-estimator form — see [`ShareDispersion`]).
+    ///
+    /// Under a sampled decode this is the share's sampling error. Under an
+    /// EXHAUSTIVE decode (`sample: None`) it is deliberately still finite and
+    /// non-zero: no finite-population correction is applied, so what it
+    /// publishes is the tile-to-tile dispersion of the share — how far the
+    /// number would move on comparable tiles from the same producer — which is
+    /// what a threshold consumer needs. `0.0` when fewer than two tiles were
+    /// decoded (no dispersion evidence exists).
+    #[serde(default)]
+    pub share_stderr: f64,
     /// Encoding flag the doctor keys off: `dictionary-encoded`, `quantized
     /// attr (stt:qa)`, `quantized coords (stt:quant)`, `u16 vertex-time
     /// deltas`, `plain f64 (unquantized)` — empty when nothing notable.
@@ -148,6 +209,206 @@ pub struct InspectReport {
 /// randomness. Callers guard `n == 0` (decode nothing).
 fn sample_stride(total: usize, n: usize) -> usize {
     total.div_ceil(n).max(1)
+}
+
+// ----------------------------------------------------------------------------
+// Decode-sampling designs
+// ----------------------------------------------------------------------------
+
+/// Which design picks the tiles the decode pass reads.
+///
+/// Sampling is CONTRACTUAL: every design here is a pure function of the
+/// directory — no RNG, no wall clock, no arrival-order or hash-iteration
+/// dependence — so two runs over the same archive read the same tiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SampleDesign {
+    /// Flat systematic stride over the curve-ordered directory: every
+    /// `ceil(total/n)`-th entry. Kept as the documented fallback for one
+    /// release — it aliases badly when the stride lands near the temporal
+    /// bucket count (it can then sample a single bucket phase).
+    StrideV1,
+    /// Byte-proportional stratified sampling: entries are grouped into
+    /// `(zoom, time_start)` strata, each stratum gets a quota proportional to
+    /// its share of compressed blob bytes (largest-remainder rounding, ties
+    /// broken by ascending `(zoom, time_start)`), and the quota is spread
+    /// evenly inside the stratum from its first entry.
+    #[default]
+    StratifiedV2,
+}
+
+impl SampleDesign {
+    /// Stable discriminator string published on [`DecodeStats::design`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SampleDesign::StrideV1 => "stride-v1",
+            SampleDesign::StratifiedV2 => "stratified-v2",
+        }
+    }
+}
+
+/// v1: the flat systematic stride, as directory indices.
+///
+/// Retained as the rollback path behind [`SampleDesign::StrideV1`]; the
+/// anti-aliasing unit test uses it as the cheap guard for the rejected design.
+pub fn stride_sample_indices(entries: &[TileEntry], n: usize) -> Vec<usize> {
+    if n == 0 || entries.is_empty() {
+        return Vec::new();
+    }
+    let stride = sample_stride(entries.len(), n);
+    (0..entries.len()).step_by(stride).collect()
+}
+
+/// Largest-remainder allocation of `n` units over weighted, capacity-bounded
+/// buckets.
+///
+/// Contract: returns exactly `n` units in total whenever `n <= Σ caps` (and
+/// `Σ caps` otherwise), never exceeds a bucket's cap, and is a pure function of
+/// its inputs — the ordering of `weights`/`caps` IS the tiebreak, so callers
+/// must pass buckets in their canonical (ascending-key) order.
+///
+/// When `n >= caps.len()` every non-empty bucket is first reserved one unit, so
+/// a stratum can never be missed entirely just because it is byte-light; the
+/// remainder is what gets distributed proportionally.
+fn largest_remainder_alloc(weights: &[u128], caps: &[usize], n: usize) -> Vec<usize> {
+    let k = weights.len();
+    debug_assert_eq!(k, caps.len());
+    let mut alloc = vec![0usize; k];
+    if k == 0 || n == 0 {
+        return alloc;
+    }
+    let total_cap: usize = caps.iter().sum();
+    if n >= total_cap {
+        return caps.to_vec();
+    }
+
+    // Coverage floor: with at least one unit per bucket available, spend it
+    // there first (guarantees "n >= strata count touches every stratum").
+    let mut remaining = n;
+    if n >= k {
+        for (i, a) in alloc.iter_mut().enumerate() {
+            if caps[i] > 0 {
+                *a = 1;
+                remaining -= 1;
+            }
+        }
+    }
+
+    // Degenerate weights (an all-zero-length directory) fall back to uniform so
+    // the allocation is still defined and still deterministic.
+    let w_sum: u128 = weights.iter().sum();
+    let (w, w_sum): (Vec<u128>, u128) = if w_sum == 0 {
+        (vec![1u128; k], k as u128)
+    } else {
+        (weights.to_vec(), w_sum)
+    };
+
+    // Integer proportional base + exact remainder — no floats, so the
+    // tie-break is exact rather than epsilon-dependent.
+    let mut rems: Vec<(u128, usize)> = Vec::with_capacity(k);
+    let mut placed = 0usize;
+    for i in 0..k {
+        let num = remaining as u128 * w[i];
+        let base = (num / w_sum) as usize;
+        let room = caps[i] - alloc[i];
+        let add = base.min(room);
+        alloc[i] += add;
+        placed += add;
+        rems.push((num % w_sum, i));
+    }
+    let mut left = remaining - placed;
+
+    // Largest remainder first, ascending bucket index on ties.
+    rems.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    for &(_, i) in &rems {
+        if left == 0 {
+            break;
+        }
+        if alloc[i] < caps[i] {
+            alloc[i] += 1;
+            left -= 1;
+        }
+    }
+    // Capacity clamping can leave units unplaced; sweep in ascending index
+    // order until they are all spent (Σ caps > n guarantees termination).
+    while left > 0 {
+        let mut progressed = false;
+        for i in 0..k {
+            if left == 0 {
+                break;
+            }
+            if alloc[i] < caps[i] {
+                alloc[i] += 1;
+                left -= 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    alloc
+}
+
+/// v2: byte-proportional stratified sample of at most `n` directory indices,
+/// returned ascending.
+///
+/// Strata are `(zoom, time_start)` — both already on every entry, exactly the
+/// stats the directory pass computes for free. A stratum's quota is
+/// proportional to its share of compressed blob BYTES (not its entry count):
+/// the decode pass exists to attribute bytes, so byte mass is the right
+/// allocation currency. Rounding is largest-remainder with an ascending
+/// `(zoom, time_start)` tiebreak, so the returned set is a pure function of the
+/// directory. Inside a stratum the quota is spread evenly from its first entry
+/// (`pos_j = j·len/quota`), which yields exactly `quota` distinct positions.
+///
+/// This is what replaces the flat stride: a stride near the bucket count could
+/// land on one bucket phase and miss every other bucket, which is the aliasing
+/// failure §12.1 names.
+pub fn stratified_sample_indices(entries: &[TileEntry], n: usize) -> Vec<usize> {
+    if n == 0 || entries.is_empty() {
+        return Vec::new();
+    }
+    if n >= entries.len() {
+        return (0..entries.len()).collect();
+    }
+
+    // BTreeMap: canonical ascending (zoom, time_start) order, and the pushed
+    // index lists inherit ascending directory order. No HashMap anywhere on
+    // this path — iteration order is part of the contract.
+    let mut strata: BTreeMap<(u8, i64), Vec<usize>> = BTreeMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        strata.entry((e.zoom, e.time_start)).or_default().push(i);
+    }
+
+    let weights: Vec<u128> = strata
+        .values()
+        .map(|ix| ix.iter().map(|&i| entries[i].length as u128).sum())
+        .collect();
+    let caps: Vec<usize> = strata.values().map(|ix| ix.len()).collect();
+    let alloc = largest_remainder_alloc(&weights, &caps, n);
+
+    let mut out: Vec<usize> = Vec::with_capacity(n);
+    for (h, ix) in strata.values().enumerate() {
+        let quota = alloc[h];
+        if quota == 0 {
+            continue;
+        }
+        let len = ix.len();
+        for j in 0..quota {
+            out.push(ix[(j * len) / quota]);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Directory indices the decode pass reads for `n` sampled tiles under
+/// `design`.
+fn sample_indices(entries: &[TileEntry], n: usize, design: SampleDesign) -> Vec<usize> {
+    match design {
+        SampleDesign::StrideV1 => stride_sample_indices(entries, n),
+        SampleDesign::StratifiedV2 => stratified_sample_indices(entries, n),
+    }
 }
 
 /// Schema signature for producer-drift detection: layer name + every field's
@@ -227,28 +488,44 @@ fn encoding_note(field: &Field) -> String {
     String::new()
 }
 
-/// Re-encode a batch standalone (Arrow IPC stream + zstd-19) and return the
-/// compressed length — the fair-share cost unit for column attribution.
-fn ipc_zstd_len(batch: &RecordBatch) -> Result<u64> {
-    let mut buf = Vec::new();
-    {
-        let mut w =
-            StreamWriter::try_new(&mut buf, &batch.schema()).context("column IPC writer init")?;
-        w.write(batch).context("column IPC write")?;
-        w.finish().context("column IPC finish")?;
-    }
-    Ok(compress_zstd_with_dict_level(&buf, None, COLUMN_ZSTD_LEVEL)?.len() as u64)
-}
-
-/// Inspect a packed tileset.
+/// Inspect a packed tileset with the default decode-sampling
+/// ([`SampleDesign::StratifiedV2`]) and attribution
+/// ([`AttributionDesign::LeaveOneOutV2`]) designs.
 ///
-/// `sample`: `None` decodes every tile; `Some(n)` decodes a deterministic,
-/// evenly-spread sample of at most `n` tiles (every `ceil(total/n)`-th
-/// directory entry, starting at 0 — `stt-validate --sample` semantics);
-/// `Some(0)` skips the decode pass entirely. Directory-derived stats
+/// `sample`: `None` decodes every tile; `Some(n)` decodes a deterministic
+/// sample of at most `n` tiles; `Some(0)` skips the decode pass entirely (the
+/// directory-only fast mode — a recorded contract). Directory-derived stats
 /// (`per_zoom`, `dedup`, the wire totals) are ALWAYS computed over all
 /// entries — only the decode-based stats (`decode`, `per_column`) sample.
 pub fn inspect(tileset: &PackedTileset, sample: Option<usize>) -> Result<InspectReport> {
+    inspect_with_design(tileset, sample, SampleDesign::default())
+}
+
+/// Inspect a packed tileset, choosing the decode-sampling design explicitly.
+///
+/// [`inspect`] is this with [`SampleDesign::StratifiedV2`];
+/// [`SampleDesign::StrideV1`] reproduces the pre-stratified behaviour and is
+/// the documented rollback. Attribution stays on its own default — use
+/// [`inspect_with_designs`] to move that one.
+pub fn inspect_with_design(
+    tileset: &PackedTileset,
+    sample: Option<usize>,
+    design: SampleDesign,
+) -> Result<InspectReport> {
+    inspect_with_designs(tileset, sample, design, AttributionDesign::default())
+}
+
+/// Inspect a packed tileset, choosing BOTH the decode-sampling design and the
+/// per-column attribution design.
+///
+/// The two are independent rollback levers: `design` picks WHICH tiles are
+/// decoded, `attribution` picks how their columns are priced.
+pub fn inspect_with_designs(
+    tileset: &PackedTileset,
+    sample: Option<usize>,
+    design: SampleDesign,
+    attribution: AttributionDesign,
+) -> Result<InspectReport> {
     let entries = tileset.entries();
     let meta = tileset.metadata();
 
@@ -302,28 +579,29 @@ pub fn inspect(tileset: &PackedTileset, sample: Option<usize>) -> Result<Inspect
         dtype: String,
         note: String,
         compressed: u64,
+        marginal: u64,
         rows: u64,
     }
     let mut cols: BTreeMap<String, ColAcc> = BTreeMap::new();
+    // Per-tile share observations for the published `share_stderr`. `BTreeMap`
+    // accumulators only — no HashMap iteration order may reach a number.
+    let mut dispersion = ShareDispersion::default();
     let mut schemas: BTreeSet<String> = BTreeSet::new();
     let mut tiles_decoded = 0u64;
     let mut features_decoded = 0u64;
-    let stride = sample.map(|n| {
-        if n == 0 {
-            usize::MAX
-        } else {
-            sample_stride(entries.len(), n)
-        }
-    });
-    for (idx, e) in entries.iter().enumerate() {
-        let decode_this = match stride {
-            None => true,
-            Some(usize::MAX) => false,
-            Some(s) => idx % s == 0,
+    // `None` = exhaustive (no index list materialised); `Some(ix)` = the
+    // sampled plan, already ascending. `Some(0)` yields an empty plan, which
+    // is the directory-only fast mode.
+    let plan: Option<Vec<usize>> = sample.map(|n| sample_indices(entries, n, design));
+    let decode_count = match &plan {
+        None => entries.len(),
+        Some(ix) => ix.len(),
+    };
+    for k in 0..decode_count {
+        let e = match &plan {
+            None => &entries[k],
+            Some(ix) => &entries[ix[k]],
         };
-        if !decode_this {
-            continue;
-        }
         let layers = tileset.read_layers(e).with_context(|| {
             format!(
                 "decoding tile z{}/{}/{} t{}",
@@ -332,44 +610,58 @@ pub fn inspect(tileset: &PackedTileset, sample: Option<usize>) -> Result<Inspect
         })?;
         tiles_decoded += 1;
         schemas.insert(schema_signature(&layers));
+        // Bytes this ONE tile attributes per column, merged over its layers —
+        // the observation unit `share_stderr` is estimated from.
+        let mut per_tile: BTreeMap<String, u64> = BTreeMap::new();
         for layer in &layers {
             let batch = &layer.batch;
             let rows = batch.num_rows() as u64;
             features_decoded += rows;
+            // Attribution strips field AND schema metadata before every IPC
+            // write (Arrow serializes those HashMaps in nondeterministic order,
+            // so keeping them would make repeated inspections disagree by a few
+            // bytes) and returns costs in SCHEMA ORDER, index-aligned with the
+            // fields walked below. The encoding note is derived from the
+            // ORIGINAL field, so the metadata still reaches the report.
+            let attributed = attribute_columns(batch, COLUMN_ZSTD_LEVEL, attribution)?;
             let schema = batch.schema();
             for (i, field) in schema.fields().iter().enumerate() {
-                // Strip field metadata from the standalone re-encode: Arrow IPC
-                // serializes the metadata HashMap in nondeterministic order, so
-                // keeping it would make repeated inspections disagree by a few
-                // bytes. The metadata is negligible for shares; the encoding
-                // note (derived from the ORIGINAL field below) preserves it.
-                let clean = field.as_ref().clone().with_metadata(Default::default());
-                let one = RecordBatch::try_new(
-                    Arc::new(Schema::new(vec![clean])),
-                    vec![batch.column(i).clone()],
-                )
-                .context("single-column batch")?;
+                let a = &attributed[i];
+                debug_assert_eq!(&a.name, field.name(), "attribution must be in schema order");
                 let c = cols.entry(field.name().clone()).or_default();
-                c.compressed += ipc_zstd_len(&one)?;
+                c.compressed += a.bytes;
+                c.marginal += a.marginal_bytes;
                 c.rows += rows;
                 c.dtype = format!("{:?}", field.data_type());
                 c.note = encoding_note(field);
+                *per_tile.entry(field.name().clone()).or_insert(0) += a.bytes;
             }
         }
+        dispersion.observe_tile(&per_tile);
     }
     let col_total: u64 = cols.values().map(|c| c.compressed).sum();
     let mut per_column: Vec<ColumnCost> = cols
         .into_iter()
         .map(|(name, c)| ColumnCost {
-            name,
             dtype: c.dtype,
             compressed_bytes: c.compressed,
             share: c.compressed as f64 / col_total.max(1) as f64,
             bytes_per_feature: c.compressed as f64 / c.rows.max(1) as f64,
+            marginal_bytes: c.marginal,
+            share_stderr: dispersion.stderr(&name),
             encoding_note: c.note,
+            name,
         })
         .collect();
-    per_column.sort_by(|a, b| b.compressed_bytes.cmp(&a.compressed_bytes));
+    // Descending bytes, ascending name on ties. Leave-one-out attribution
+    // produces far more ties than the singleton proxy did (a fully redundant
+    // column marginals to zero), so the tiebreak is spelled out rather than
+    // left to the stable sort's input order.
+    per_column.sort_by(|a, b| {
+        b.compressed_bytes
+            .cmp(&a.compressed_bytes)
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
     let time_range = tileset.time_range();
     Ok(InspectReport {
@@ -391,9 +683,11 @@ pub fn inspect(tileset: &PackedTileset, sample: Option<usize>) -> Result<Inspect
         decode: DecodeStats {
             tiles_decoded,
             tiles_total: entries.len() as u64,
-            sampled: stride.is_some(),
+            sampled: plan.is_some(),
             features_decoded,
             distinct_layer_schemas: schemas.len() as u64,
+            design: design.as_str().to_string(),
+            attribution: attribution.as_str().to_string(),
         },
         per_column,
     })
@@ -455,9 +749,9 @@ pub fn format_text(report: &InspectReport) -> String {
         report.decode.tiles_decoded,
         report.decode.tiles_total,
         if report.decode.sampled {
-            ", sampled"
+            format!(", sampled [{}]", report.decode.design)
         } else {
-            ""
+            String::new()
         }
     ));
     out.push_str(&format!(
@@ -466,10 +760,17 @@ pub fn format_text(report: &InspectReport) -> String {
     ));
 
     if !report.per_column.is_empty() {
-        out.push_str("💾 Per-column cost (standalone IPC+zstd-19; shares, not absolute wire)\n");
         out.push_str(&format!(
-            "  {:<22} {:<28} {:>10} {:>9} {:>7}  note\n",
-            "column", "dtype", "comp KB", "B/feat", "share%"
+            "💾 Per-column cost ({}, IPC+zstd-19; shares ±1 stderr, not absolute wire)\n",
+            if report.decode.attribution == AttributionDesign::SingletonV1.as_str() {
+                "standalone re-encode"
+            } else {
+                "leave-one-out marginals"
+            }
+        ));
+        out.push_str(&format!(
+            "  {:<22} {:<28} {:>10} {:>9} {:>7} {:>7}  note\n",
+            "column", "dtype", "comp KB", "B/feat", "share%", "±"
         ));
         for c in &report.per_column {
             let dt = if c.dtype.len() > 27 {
@@ -478,12 +779,13 @@ pub fn format_text(report: &InspectReport) -> String {
                 c.dtype.clone()
             };
             out.push_str(&format!(
-                "  {:<22} {:<28} {:>10.1} {:>9.2} {:>6.1}%  {}\n",
+                "  {:<22} {:<28} {:>10.1} {:>9.2} {:>6.1}% {:>6.2}%  {}\n",
                 c.name,
                 dt,
                 c.compressed_bytes as f64 / 1e3,
                 c.bytes_per_feature,
                 100.0 * c.share,
+                100.0 * c.share_stderr,
                 c.encoding_note
             ));
         }
@@ -559,7 +861,7 @@ mod tests {
     fn build_fixture(out: &std::path::Path) {
         let mut w = PackWriter::create(out, BlobOrdering::Auto, 64 * 1024).unwrap();
         let cfg = EncoderConfig {
-            format_version: w.format_version(),
+            format_version: stt_core::arrow_tile::LAYER_FRAME_VERSION,
             template_collector: Some(w.template_collector()),
             ..EncoderConfig::default()
         };
@@ -737,6 +1039,377 @@ mod tests {
         let all = inspect(&ts, Some(100)).unwrap();
         assert_eq!(all.decode.tiles_decoded, 4);
         assert!(all.decode.sampled);
+    }
+
+    // ------------------------------------------------------------------
+    // MO-1: stratified deterministic decode sampling
+    // ------------------------------------------------------------------
+
+    /// A directory entry with just the fields sampling reads: the stratum key
+    /// `(zoom, time_start)` and the byte weight `length`.
+    fn entry(zoom: u8, time_start: i64, length: u32) -> TileEntry {
+        TileEntry {
+            zoom,
+            x: 0,
+            y: 0,
+            time_start,
+            time_end: time_start + 1,
+            variant_id: 0,
+            pack_id: 0,
+            offset: 0,
+            length,
+            uncompressed_size: length * 3,
+            feature_count: 1,
+            hilbert: 0,
+            crc32c: 0,
+            temporal_bucket_ms: None,
+            cover_t_min: None,
+        }
+    }
+
+    /// Which stratum each sampled index belongs to.
+    fn strata_hit(entries: &[TileEntry], picks: &[usize]) -> BTreeMap<(u8, i64), usize> {
+        let mut hits: BTreeMap<(u8, i64), usize> = BTreeMap::new();
+        for &i in picks {
+            *hits
+                .entry((entries[i].zoom, entries[i].time_start))
+                .or_insert(0) += 1;
+        }
+        hits
+    }
+
+    #[test]
+    fn stratified_allocation_sums_to_n_and_tracks_stratum_bytes() {
+        // Three zooms, one time bucket each, byte mass skewed 80/16/4 —
+        // deliberately NOT the entry-count split (71/14/14), so an allocation
+        // that quietly counted entries instead of bytes would fail here.
+        let mut entries = Vec::new();
+        for _ in 0..200 {
+            entries.push(entry(3, 0, 40));
+        }
+        for _ in 0..40 {
+            entries.push(entry(4, 0, 40));
+        }
+        for _ in 0..40 {
+            entries.push(entry(5, 0, 10));
+        }
+        // bytes: z3 = 8000, z4 = 1600, z5 = 400 → 10_000 total.
+
+        let picks = stratified_sample_indices(&entries, 100);
+        assert_eq!(picks.len(), 100, "allocation must sum to exactly n");
+        assert!(
+            picks.windows(2).all(|w| w[0] < w[1]),
+            "indices must be ascending and distinct"
+        );
+
+        let hits = strata_hit(&entries, &picks);
+        // Ideal byte shares are 80 / 16 / 4; the one-per-stratum coverage
+        // reserve shifts each by at most a unit or two.
+        assert!(
+            (hits[&(3, 0)] as i64 - 80).abs() <= 2,
+            "z3 got {}",
+            hits[&(3, 0)]
+        );
+        assert!(
+            (hits[&(4, 0)] as i64 - 16).abs() <= 2,
+            "z4 got {}",
+            hits[&(4, 0)]
+        );
+        assert!(
+            (hits[&(5, 0)] as i64 - 4).abs() <= 2,
+            "z5 got {}",
+            hits[&(5, 0)]
+        );
+        assert_eq!(hits.values().sum::<usize>(), 100);
+
+        // Pure function of the directory: byte-identical on a re-run.
+        assert_eq!(picks, stratified_sample_indices(&entries, 100));
+    }
+
+    #[test]
+    fn stratified_beats_the_stride_aliasing_trap() {
+        // The exact failure mode of stride-v1: entry order interleaves k = 4
+        // temporal buckets and the requested sample makes the stride land on
+        // k, so every pick shares one bucket phase.
+        let mut entries = Vec::new();
+        for i in 0..40 {
+            entries.push(entry(6, (i % 4) as i64 * 3_600_000, 100));
+        }
+
+        let strided = stride_sample_indices(&entries, 10);
+        let strided_hits = strata_hit(&entries, &strided);
+        assert_eq!(
+            strided_hits.len(),
+            1,
+            "guard for the REJECTED design: stride-v1 must alias to one bucket here \
+             (hits {strided_hits:?}) — if it stops doing so this test no longer guards anything"
+        );
+
+        let stratified = stratified_sample_indices(&entries, 10);
+        assert_eq!(stratified.len(), 10);
+        let hits = strata_hit(&entries, &stratified);
+        assert_eq!(hits.len(), 4, "every bucket must be sampled: {hits:?}");
+        assert!(hits.values().all(|&c| c >= 2), "hits {hits:?}");
+    }
+
+    #[test]
+    fn stratified_touches_every_stratum_when_n_reaches_strata_count() {
+        // Byte-light strata must not be starved out by proportional rounding:
+        // one stratum carries 100x the bytes of the other nine.
+        let mut entries = Vec::new();
+        for _ in 0..10 {
+            entries.push(entry(7, 0, 100_000));
+        }
+        for b in 1..10i64 {
+            for _ in 0..10 {
+                entries.push(entry(7, b * 1_000, 10));
+            }
+        }
+        let picks = stratified_sample_indices(&entries, 10);
+        assert_eq!(picks.len(), 10);
+        let hits = strata_hit(&entries, &picks);
+        assert_eq!(hits.len(), 10, "n == strata count → one each: {hits:?}");
+        assert!(hits.values().all(|&c| c == 1));
+    }
+
+    #[test]
+    fn stratified_returns_exactly_n_on_thousands_of_singleton_strata() {
+        // Fragmented directory: every entry is its own stratum, so the
+        // proportional quota n_h < 1 everywhere and ONLY largest-remainder
+        // rounding gets the count right.
+        let entries: Vec<TileEntry> = (0..2000i64).map(|t| entry(9, t, 500)).collect();
+        for n in [1usize, 7, 63, 999] {
+            let picks = stratified_sample_indices(&entries, n);
+            assert_eq!(picks.len(), n, "n = {n}");
+            assert!(picks.windows(2).all(|w| w[0] < w[1]), "n = {n}");
+            assert_eq!(picks, stratified_sample_indices(&entries, n), "n = {n}");
+        }
+        // Equal weights + equal remainders → the ascending (zoom, time_start)
+        // tiebreak decides, so the first n strata win.
+        assert_eq!(stratified_sample_indices(&entries, 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn stratified_degenerate_inputs() {
+        let entries: Vec<TileEntry> = (0..8i64).map(|t| entry(4, t, 0)).collect();
+        // n == 0 decodes nothing; n >= total decodes everything.
+        assert!(stratified_sample_indices(&entries, 0).is_empty());
+        assert_eq!(stratified_sample_indices(&entries, 8).len(), 8);
+        assert_eq!(stratified_sample_indices(&entries, 99).len(), 8);
+        // All-zero byte weights still allocate (uniform fallback), still exact.
+        assert_eq!(stratified_sample_indices(&entries, 3).len(), 3);
+        assert!(stratified_sample_indices(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn inspect_publishes_the_sampling_design_and_honours_the_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        build_fixture(&out);
+        let ts = PackedTileset::open(&out).unwrap();
+
+        let v2 = inspect(&ts, Some(2)).unwrap();
+        assert_eq!(v2.decode.design, "stratified-v2");
+        assert!(format_text(&v2).contains("sampled [stratified-v2]"));
+
+        // The v1 stride stays reachable as the documented rollback.
+        let v1 = inspect_with_design(&ts, Some(2), SampleDesign::StrideV1).unwrap();
+        assert_eq!(v1.decode.design, "stride-v1");
+        assert_eq!(v1.decode.tiles_decoded, 2);
+
+        // --sample 0 keeps its directory-only fast-mode semantics under BOTH
+        // designs: nothing decoded, directory stats still total.
+        for design in [SampleDesign::StratifiedV2, SampleDesign::StrideV1] {
+            let none = inspect_with_design(&ts, Some(0), design).unwrap();
+            assert_eq!(none.decode.tiles_decoded, 0);
+            assert!(none.per_column.is_empty());
+            assert_eq!(none.dedup.entries, 4);
+            assert_eq!(none.tile_count, 4);
+        }
+
+        // Old reports (no `design` key) still deserialize, as stride-v1.
+        let mut value = serde_json::to_value(&v2).unwrap();
+        value["decode"]
+            .as_object_mut()
+            .unwrap()
+            .remove("design")
+            .unwrap();
+        let legacy: InspectReport = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.decode.design, "stride-v1");
+    }
+
+    #[test]
+    fn sampled_inspect_is_byte_identical_across_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        build_fixture(&out);
+        let ts = PackedTileset::open(&out).unwrap();
+
+        let a = serde_json::to_string(&inspect(&ts, Some(2)).unwrap()).unwrap();
+        let b = serde_json::to_string(&inspect(&ts, Some(2)).unwrap()).unwrap();
+        assert_eq!(a, b, "sampled inspect JSON must be byte-identical");
+
+        let full_a = serde_json::to_string(&inspect(&ts, None).unwrap()).unwrap();
+        let full_b = serde_json::to_string(&inspect(&ts, None).unwrap()).unwrap();
+        assert_eq!(
+            full_a, full_b,
+            "exhaustive inspect JSON must be byte-identical"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // MO-3: leave-one-out attribution / MO-2: dispersion
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn per_column_costs_are_leave_one_out_marginals() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        build_fixture(&out);
+        let ts = PackedTileset::open(&out).unwrap();
+
+        let loo = inspect(&ts, None).unwrap();
+        assert_eq!(loo.decode.attribution, "loo-v2", "loo-v2 is the default");
+        for c in &loo.per_column {
+            assert_eq!(
+                c.marginal_bytes, c.compressed_bytes,
+                "column {}: loo-v2 charges the marginal",
+                c.name
+            );
+        }
+        let share_sum: f64 = loo.per_column.iter().map(|c| c.share).sum();
+        assert!((share_sum - 1.0).abs() < 1e-9, "shares sum to {share_sum}");
+
+        // Efficiency: the attributed bytes fit inside the wire bytes of the
+        // decoded tiles. The singleton proxy could not say that — it is the
+        // documented reason it was replaced. (The decode covers every entry,
+        // and shared blobs are read once per entry, so `compressed_bytes` is
+        // the right budget to compare against.)
+        let attributed: u64 = loo.per_column.iter().map(|c| c.compressed_bytes).sum();
+        assert!(
+            attributed <= loo.compressed_bytes,
+            "Σ marginals {attributed} must fit in {} wire bytes",
+            loo.compressed_bytes
+        );
+
+        // The singleton rollback stays reachable, publishes its own
+        // discriminator, and remains the inefficient proxy.
+        let singleton = inspect_with_designs(
+            &ts,
+            None,
+            SampleDesign::StratifiedV2,
+            AttributionDesign::SingletonV1,
+        )
+        .unwrap();
+        assert_eq!(singleton.decode.attribution, "singleton-v1");
+        assert!(singleton.per_column.iter().all(|c| c.marginal_bytes == 0));
+        let singleton_total: u64 = singleton
+            .per_column
+            .iter()
+            .map(|c| c.compressed_bytes)
+            .sum();
+        assert!(
+            singleton_total > loo.compressed_bytes,
+            "guard for the REJECTED proxy: singleton sum {singleton_total} must exceed the \
+             archive's {} wire bytes",
+            loo.compressed_bytes
+        );
+        // Directory-derived numbers are attribution-independent — the diff
+        // gate's exact metric can never move because of an attribution change.
+        assert_eq!(singleton.compressed_bytes, loo.compressed_bytes);
+        assert_eq!(singleton.tile_count, loo.tile_count);
+        assert_eq!(singleton.dedup.distinct_blobs, loo.dedup.distinct_blobs);
+        assert!(format_text(&singleton).contains("standalone re-encode"));
+        assert!(format_text(&loo).contains("leave-one-out marginals"));
+    }
+
+    #[test]
+    fn exhaustive_decode_publishes_finite_nonzero_dispersion() {
+        // The interpretation MO-2 documents: with `sample: None` every tile was
+        // decoded, so there is no sampling error left — and the published
+        // stderr is deliberately NOT zero. What it reports is the tile-to-tile
+        // dispersion of the share (no finite-population correction), i.e. how
+        // far the number would move on comparable tiles from this producer.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        build_fixture(&out);
+        let ts = PackedTileset::open(&out).unwrap();
+
+        let report = inspect(&ts, None).unwrap();
+        assert!(!report.decode.sampled);
+        assert_eq!(report.decode.tiles_decoded, 4);
+        for c in &report.per_column {
+            assert!(
+                c.share_stderr.is_finite() && c.share_stderr >= 0.0,
+                "column {} stderr {}",
+                c.name,
+                c.share_stderr
+            );
+        }
+        assert!(
+            report.per_column.iter().any(|c| c.share_stderr > 0.0),
+            "the fixture's tiles differ, so SOME column must show dispersion: {:?}",
+            report.per_column
+        );
+        // The rendered table carries the spread beside the share.
+        assert!(format_text(&report).contains("±"));
+
+        // A single decoded tile has no dispersion evidence at all → 0.0, which
+        // makes every consumer's `share − 2·stderr` gate behave as it did
+        // before MO-2 rather than silently suppressing findings.
+        let one = inspect(&ts, Some(1)).unwrap();
+        assert_eq!(one.decode.tiles_decoded, 1);
+        assert!(one.per_column.iter().all(|c| c.share_stderr == 0.0));
+    }
+
+    #[test]
+    fn attribution_and_dispersion_are_byte_identical_across_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        build_fixture(&out);
+        let ts = PackedTileset::open(&out).unwrap();
+
+        for design in [
+            AttributionDesign::LeaveOneOutV2,
+            AttributionDesign::SingletonV1,
+        ] {
+            for sample in [None, Some(2)] {
+                let a =
+                    inspect_with_designs(&ts, sample, SampleDesign::StratifiedV2, design).unwrap();
+                let b =
+                    inspect_with_designs(&ts, sample, SampleDesign::StratifiedV2, design).unwrap();
+                assert_eq!(
+                    serde_json::to_string(&a).unwrap(),
+                    serde_json::to_string(&b).unwrap(),
+                    "design {design:?} sample {sample:?} must serialize identically"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pre_mo2_reports_deserialize_with_singleton_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        build_fixture(&out);
+        let ts = PackedTileset::open(&out).unwrap();
+        let report = inspect(&ts, None).unwrap();
+
+        let mut value = serde_json::to_value(&report).unwrap();
+        value["decode"]
+            .as_object_mut()
+            .unwrap()
+            .remove("attribution")
+            .unwrap();
+        for row in value["per_column"].as_array_mut().unwrap() {
+            let obj = row.as_object_mut().unwrap();
+            obj.remove("marginal_bytes").unwrap();
+            obj.remove("share_stderr").unwrap();
+        }
+        let legacy: InspectReport = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.decode.attribution, "singleton-v1");
+        assert!(legacy.per_column.iter().all(|c| c.marginal_bytes == 0));
+        assert!(legacy.per_column.iter().all(|c| c.share_stderr == 0.0));
     }
 
     #[test]

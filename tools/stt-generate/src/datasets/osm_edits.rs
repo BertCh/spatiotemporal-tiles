@@ -106,7 +106,12 @@ pub fn run(args: Args) -> Result<()> {
     println!("   © OpenStreetMap contributors (ODbL)\n");
 
     let (min_lat, min_lon, max_lat, max_lon) = common::parse_bounds(&args.bounds)?;
-    let bbox = Bbox { min_lon, min_lat, max_lon, max_lat };
+    let bbox = Bbox {
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+    };
     let start_ms = date_to_ms(&args.start_date, false)?;
     let end_ms = match &args.end_date {
         Some(d) => date_to_ms(d, true)?,
@@ -114,7 +119,8 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     // .stt output → write an intermediate parquet, then shell out to stt-build.
-    let build_stt = args.output.extension().map(|e| e == "stt").unwrap_or(false) && !args.skip_build;
+    let build_stt =
+        args.output.extension().map(|e| e == "stt").unwrap_or(false) && !args.skip_build;
     let intermediate = if build_stt {
         args.output.with_extension("parquet")
     } else {
@@ -123,7 +129,9 @@ pub fn run(args: Args) -> Result<()> {
 
     match args.source {
         Source::Nodes => run_nodes(&args, &bbox, start_ms, end_ms, &intermediate, build_stt),
-        Source::Changesets => run_changesets(&args, &bbox, start_ms, end_ms, &intermediate, build_stt),
+        Source::Changesets => {
+            run_changesets(&args, &bbox, start_ms, end_ms, &intermediate, build_stt)
+        }
     }
 }
 
@@ -239,7 +247,10 @@ fn run_nodes(
         "\n📊 Scanned {} nodes; kept {} creations in bbox/time window ({} rows written)",
         scanned, kept, total
     );
-    anyhow::ensure!(total > 0, "No node creations matched the bbox/time filters.");
+    anyhow::ensure!(
+        total > 0,
+        "No node creations matched the bbox/time filters."
+    );
 
     if build_stt {
         let summary = if args.summary_tier {
@@ -370,7 +381,9 @@ fn categorize_key(k: &str) -> &'static str {
         return "building";
     }
     match k {
-        "highway" | "railway" | "crossing" | "traffic_calming" | "barrier" | "aeroway" => "transport",
+        "highway" | "railway" | "crossing" | "traffic_calming" | "barrier" | "aeroway" => {
+            "transport"
+        }
         "amenity" | "shop" | "tourism" | "leisure" | "office" | "craft" | "healthcare" => "poi",
         "natural" | "waterway" | "water" | "landuse" | "place" | "boundary" => "land",
         "power" | "man_made" | "emergency" | "historic" => "infra",
@@ -407,7 +420,10 @@ fn run_changesets(
     println!("📡 Streaming changesets from {}", args.input.display());
     println!("   bbox: {:?}", bbox);
     if args.max_bbox_deg > 0.0 {
-        println!("   dropping changesets wider than {}° (imports/bots)", args.max_bbox_deg);
+        println!(
+            "   dropping changesets wider than {}° (imports/bots)",
+            args.max_bbox_deg
+        );
     }
 
     let typed_columns = vec![
@@ -421,8 +437,8 @@ fn run_changesets(
 
     // bz2 → buffered text → streaming XML. MultiBzDecoder handles both single-
     // and multi-stream bz2 (the planet dump is large; never fully in RAM).
-    let file = File::open(&args.input)
-        .with_context(|| format!("opening {}", args.input.display()))?;
+    let file =
+        File::open(&args.input).with_context(|| format!("opening {}", args.input.display()))?;
     let decoder = bzip2::read::MultiBzDecoder::new(BufReader::with_capacity(1 << 20, file));
     let mut xml = Reader::from_reader(BufReader::with_capacity(1 << 20, decoder));
 
@@ -440,7 +456,14 @@ fn run_changesets(
                 scanned += 1;
                 if let Some(meta) = parse_changeset_attrs(&e)? {
                     maybe_emit_changeset(
-                        &mut writer, &meta, "other", bbox, start_ms, end_ms, args.max_bbox_deg, &mut kept,
+                        &mut writer,
+                        &meta,
+                        "other",
+                        bbox,
+                        start_ms,
+                        end_ms,
+                        args.max_bbox_deg,
+                        &mut kept,
                     )?;
                 }
             }
@@ -474,14 +497,25 @@ fn run_changesets(
                 }
                 if let Some(meta) = meta {
                     maybe_emit_changeset(
-                        &mut writer, &meta, &editor, bbox, start_ms, end_ms, args.max_bbox_deg, &mut kept,
+                        &mut writer,
+                        &meta,
+                        &editor,
+                        bbox,
+                        start_ms,
+                        end_ms,
+                        args.max_bbox_deg,
+                        &mut kept,
                     )?;
                 }
             }
             _ => {}
         }
         if scanned % 5_000_000 == 0 && scanned > 0 {
-            println!("   …scanned {}M changesets, kept {}", scanned / 1_000_000, kept);
+            println!(
+                "   …scanned {}M changesets, kept {}",
+                scanned / 1_000_000,
+                kept
+            );
         }
     }
 
@@ -653,7 +687,11 @@ fn normalize_editor(created_by: &str) -> &'static str {
         "Maps.me"
     } else if s.starts_with("organicmaps") || s.starts_with("organic maps") {
         "Organic Maps"
-    } else if s.contains("bot") || s.contains("import") || s.starts_with("bulk_upload") || s.starts_with("osmsync") {
+    } else if s.contains("bot")
+        || s.contains("import")
+        || s.starts_with("bulk_upload")
+        || s.starts_with("osmsync")
+    {
         "bot/import"
     } else {
         "other"
@@ -707,15 +745,29 @@ mod tests {
             (false, "vertex"),
             "housekeeping-only tags don't make a feature"
         );
-        assert_eq!(classify_tags([("building", "yes")].into_iter()), (true, "building"));
-        assert_eq!(classify_tags([("amenity", "cafe")].into_iter()), (true, "poi"));
-        assert_eq!(classify_tags([("natural", "tree")].into_iter()), (true, "land"));
+        assert_eq!(
+            classify_tags([("building", "yes")].into_iter()),
+            (true, "building")
+        );
+        assert_eq!(
+            classify_tags([("amenity", "cafe")].into_iter()),
+            (true, "poi")
+        );
+        assert_eq!(
+            classify_tags([("natural", "tree")].into_iter()),
+            (true, "land")
+        );
         assert_eq!(classify_tags([("ref", "A1")].into_iter()), (true, "other"));
     }
 
     #[test]
     fn bbox_contains() {
-        let b = Bbox { min_lon: -74.27, min_lat: 40.49, max_lon: -73.68, max_lat: 40.92 };
+        let b = Bbox {
+            min_lon: -74.27,
+            min_lat: 40.49,
+            max_lon: -73.68,
+            max_lat: 40.92,
+        };
         assert!(b.contains(-73.98, 40.75)); // Manhattan
         assert!(!b.contains(0.0, 0.0)); // Null Island
     }

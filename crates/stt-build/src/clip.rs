@@ -53,8 +53,25 @@ pub struct ClippedSegment {
 pub struct ClipConfig {
     /// Minimum number of vertices to bother clipping
     pub min_vertices: usize,
-    /// Buffer in degrees to add around tile bounds (prevents gaps at boundaries)
+    /// Buffer in degrees to add around tile bounds (prevents gaps at boundaries).
+    ///
+    /// ⚠️ Read this through [`ClipConfig::line_buffer_degrees`], not directly:
+    /// under the default [`LineBuffer::TileRelativePx`] mode the effective
+    /// buffer is a function of zoom and this field is only the legacy fallback.
     pub buffer_degrees: f64,
+    /// How the LINE clip buffer is sized (TB-7, §1.2).
+    ///
+    /// A single degree constant is wrong at both ends of the pyramid: 0.001°
+    /// is ~4.5 % of tile width at z14 and *exceeds* a whole tile by z18 (so
+    /// deep zooms duplicate a seam strip into every neighbour), while at low
+    /// zooms it is far *below* a wide stroke's ground half-width (so wide
+    /// strokes seam). A tile-relative buffer is the closed form: `b(z) ≥ σ/2 ·
+    /// W(z)/E`, i.e. a constant fraction of tile width at every zoom — the
+    /// same shape as tippecanoe's `--buffer`.
+    ///
+    /// The POLYGON buffer is NOT configurable and stays 0 — see
+    /// [`ClipConfig::polygon_buffer_degrees`].
+    pub line_buffer: LineBuffer,
     /// Buffer for POLYGON coverage clipping — 0 (exact tile rect), unlike the
     /// trajectory `buffer_degrees` above. Lines need the overlap for stroke
     /// joins at cut points; fills must NOT overlap: adjacent tiles clipping
@@ -84,12 +101,51 @@ pub struct ClipConfig {
     pub simplify_metric: bool,
 }
 
+/// How the LINE clip buffer is sized (TB-7, §1.2).
+///
+/// Polygons are unaffected in both modes: their buffer is pinned at 0 by the
+/// watertight bit-identical-seam construction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineBuffer {
+    /// Tile-relative: `px` pixels of a 256-px tile, resolved per zoom. The
+    /// default (8 px) covers a 16-px stroke's half-width at every zoom.
+    TileRelativePx(f64),
+    /// Legacy fixed degrees — the documented rollback (`--clip-buffer-degrees`).
+    FixedDegrees(f64),
+}
+
+/// Tile size the tile-relative buffer is expressed against.
+const CLIP_TILE_PX: f64 = 256.0;
+/// Default line buffer: 8 px of a 256-px tile = 3.125 % of tile width at every
+/// zoom, which covers a 16-px stroke's half-width.
+pub const DEFAULT_CLIP_BUFFER_PX: f64 = 8.0;
+/// The pre-TB-7 constant, kept as the rollback value.
+pub const LEGACY_CLIP_BUFFER_DEGREES: f64 = 0.001;
+
+impl ClipConfig {
+    /// The LINE clip buffer in degrees at `zoom`.
+    ///
+    /// Tile-relative mode is the closed form `px/256 × 360/2^z`; fixed mode
+    /// ignores zoom and reproduces the legacy constant exactly.
+    pub fn line_buffer_degrees(&self, zoom: u8) -> f64 {
+        match self.line_buffer {
+            LineBuffer::TileRelativePx(px) => {
+                let tile_width_deg = 360.0 / f64::from(1u32 << zoom.min(31));
+                px / CLIP_TILE_PX * tile_width_deg
+            }
+            LineBuffer::FixedDegrees(d) => d,
+        }
+    }
+}
+
 impl Default for ClipConfig {
     fn default() -> Self {
         Self {
             min_vertices: 2,
-            // Small buffer (~100m at equator) to ensure visual continuity
-            buffer_degrees: 0.001,
+            // Legacy fallback; the live value comes from `line_buffer` via
+            // `line_buffer_degrees(zoom)`.
+            buffer_degrees: LEGACY_CLIP_BUFFER_DEGREES,
+            line_buffer: LineBuffer::TileRelativePx(DEFAULT_CLIP_BUFFER_PX),
             // Fills are clipped exact — see the field doc.
             polygon_buffer_degrees: 0.0,
             // No temporal slicing by default
@@ -875,7 +931,7 @@ pub fn clip_trajectory(
         // `touched` is already deduplicated; iterate it directly.
         for (tile_x, tile_y) in touched {
             let tile_bounds = TileBounds::from_tile(tile_x, tile_y, zoom);
-            let buffered_bounds = tile_bounds.with_buffer(config.buffer_degrees);
+            let buffered_bounds = tile_bounds.with_buffer(config.line_buffer_degrees(zoom));
 
             // Quick rejection: check if feature bbox intersects tile
             if !buffered_bounds.intersects(min_lon, min_lat, max_lon, max_lat) {
@@ -2167,5 +2223,93 @@ mod tests {
             bounds.min_lat,
             bounds.max_lat
         );
+    }
+
+    // ------------------------------------------------------------------
+    // TB-7 — tile-relative line clip buffer b(z) ∝ 2⁻ᶻ (§1.2)
+    // ------------------------------------------------------------------
+
+    /// The closed form, per zoom: `px/256 × 360/2^z`.
+    #[test]
+    fn line_buffer_degrees_is_a_constant_fraction_of_tile_width() {
+        let cfg = ClipConfig::default();
+        for zoom in 0u8..=18 {
+            let tile_width = 360.0 / f64::from(1u32 << zoom);
+            let got = cfg.line_buffer_degrees(zoom);
+            let want = DEFAULT_CLIP_BUFFER_PX / 256.0 * tile_width;
+            assert!((got - want).abs() < 1e-15, "z{zoom}: {got} != {want}");
+            // The point of the item: a CONSTANT fraction at every zoom.
+            assert!(
+                ((got / tile_width) - (DEFAULT_CLIP_BUFFER_PX / 256.0)).abs() < 1e-15,
+                "z{zoom}: fraction drifted"
+            );
+        }
+    }
+
+    /// The documented rollback reproduces the pre-TB-7 constant exactly, at
+    /// every zoom.
+    #[test]
+    fn fixed_degrees_mode_reproduces_the_legacy_constant() {
+        let cfg = ClipConfig {
+            line_buffer: LineBuffer::FixedDegrees(LEGACY_CLIP_BUFFER_DEGREES),
+            ..ClipConfig::default()
+        };
+        for zoom in 0u8..=18 {
+            assert_eq!(cfg.line_buffer_degrees(zoom), 0.001, "z{zoom}");
+        }
+    }
+
+    /// **Guard — the pinned optimum.** The polygon buffer is 0 in every line
+    /// mode and is not reachable from `line_buffer`. Fills must not overlap:
+    /// adjacent tiles clipping the same ring emit bit-identical seam vertices,
+    /// so unbuffered pieces rasterize watertight while a buffered strip
+    /// double-blends under any `opacity < 1`.
+    #[test]
+    fn polygon_buffer_stays_zero_in_every_line_mode() {
+        for lb in [
+            LineBuffer::TileRelativePx(8.0),
+            LineBuffer::TileRelativePx(64.0),
+            LineBuffer::FixedDegrees(0.001),
+            LineBuffer::FixedDegrees(10.0),
+        ] {
+            let cfg = ClipConfig {
+                line_buffer: lb,
+                ..ClipConfig::default()
+            };
+            assert_eq!(
+                cfg.polygon_buffer_degrees, 0.0,
+                "the polygon buffer is pinned optimal and must not track {lb:?}"
+            );
+        }
+    }
+
+    /// The defect being fixed, in both directions: the legacy constant is a
+    /// large fraction of a deep-zoom tile (duplicating a seam strip into every
+    /// neighbour) and a tiny fraction of a shallow one (so wide strokes seam).
+    #[test]
+    fn the_legacy_constant_is_wrong_at_both_ends_of_the_pyramid() {
+        let tile_relative = ClipConfig::default();
+        let legacy = ClipConfig {
+            line_buffer: LineBuffer::FixedDegrees(LEGACY_CLIP_BUFFER_DEGREES),
+            ..ClipConfig::default()
+        };
+
+        // Deep zoom: legacy over-buffers. At z18 a whole tile is ~0.00137°, so
+        // the legacy 0.001° buffer is most of a tile.
+        let z18_tile = 360.0 / f64::from(1u32 << 18);
+        assert!(legacy.line_buffer_degrees(18) > 0.5 * z18_tile);
+        assert!(tile_relative.line_buffer_degrees(18) < 0.05 * z18_tile);
+
+        // Shallow zoom: legacy under-buffers, far below a stroke half-width.
+        let z4_tile = 360.0 / f64::from(1u32 << 4);
+        assert!(legacy.line_buffer_degrees(4) < 0.001 * z4_tile);
+        assert!(tile_relative.line_buffer_degrees(4) > 0.03 * z4_tile);
+
+        // And the buffer shrinks monotonically with zoom.
+        for z in 0u8..18 {
+            assert!(
+                tile_relative.line_buffer_degrees(z) > tile_relative.line_buffer_degrees(z + 1)
+            );
+        }
     }
 }

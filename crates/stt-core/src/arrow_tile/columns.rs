@@ -320,6 +320,14 @@ pub(crate) struct VertexTimeColumn {
     /// fallback path, used for layers whose temporal span would need a step
     /// beyond the configured ceiling — see [`DEFAULT_VERTEX_TIME_MAX_STEP_MS`]).
     pub(crate) encoding: Option<(i64, u32)>,
+    /// `TILE_META.vtf` — the FEATURE-ANCHORED tier's step (TB-11 extension 2).
+    /// `Some(step)` means each feature's deltas are measured from **its own
+    /// `start_time`**, not from a layer-wide origin, so there is no origin to
+    /// record: the anchor already ships in CORE.
+    ///
+    /// Mutually exclusive with [`Self::encoding`]: a column is layer-anchored,
+    /// feature-anchored, or exact, never two of them.
+    pub(crate) feature_anchored_step: Option<u32>,
 }
 
 /// Build one feature-per-row `List<UInt16>` delta column
@@ -394,6 +402,7 @@ pub(crate) fn build_vertex_time_array(
     vertex_times: &Option<Vec<Vec<i64>>>,
     feature_count: usize,
     max_step_ms: u32,
+    start_times: &[i64],
 ) -> Option<VertexTimeColumn> {
     let vt = vertex_times.as_ref()?;
 
@@ -444,7 +453,28 @@ pub(crate) fn build_vertex_time_array(
                 return Some(VertexTimeColumn {
                     array,
                     encoding: Some((min, step)),
+                    feature_anchored_step: None,
                 });
+            }
+
+            // TB-11 extension 2 — the FEATURE-ANCHORED u16 tier, tried between
+            // the layer-anchored u16 and the u32 tier.
+            //
+            // A trip-shaped layer has a wide LAYER span (trips all day) and a
+            // narrow PER-FEATURE span (one trip lasts minutes). The layer-wide
+            // origin prices every feature at the layer's span, which forces the
+            // coarse step this ceiling just rejected — while each feature's own
+            // deltas would fit u16 at step 1. Anchoring per feature is free on
+            // the wire because `start_time` already ships in CORE.
+            //
+            // Only worth trying where the layer-anchored u16 failed, and only
+            // against u16: at u32 the layer anchor is already wide enough that
+            // re-anchoring buys nothing.
+            if max_delta == u16::MAX as u64 {
+                if let Some(fa) = try_feature_anchored(vt, feature_count, start_times, max_step_ms)
+                {
+                    return Some(fa);
+                }
             }
         }
         // Reached the exact-Int64 fallback because the span needs a coarser
@@ -479,6 +509,68 @@ pub(crate) fn build_vertex_time_array(
     Some(VertexTimeColumn {
         array: Arc::new(builder.finish()),
         encoding: None,
+        feature_anchored_step: None,
+    })
+}
+
+/// TB-11 extension 2 — build the feature-anchored `List<UInt16>` tier, or
+/// `None` if it does not fit within `max_step_ms`.
+///
+/// The widest PER-FEATURE span decides the step (one step for the whole column,
+/// so a reader needs no per-feature table beyond the `start_time` it already
+/// has). A feature whose vertex times reach BEFORE its own `start_time` — which
+/// a clipped or resampled trip can produce — cannot be anchored there without a
+/// signed delta, so the tier declines rather than wrapping: the exact fallback
+/// is always available and is never a correctness compromise, only a size one.
+fn try_feature_anchored(
+    vt: &[Vec<i64>],
+    feature_count: usize,
+    start_times: &[i64],
+    max_step_ms: u32,
+) -> Option<VertexTimeColumn> {
+    let mut widest = 0u64;
+    for (i, times) in vt.iter().take(feature_count).enumerate() {
+        if times.is_empty() {
+            continue;
+        }
+        let anchor = *start_times.get(i)?;
+        for &t in times {
+            if t < anchor {
+                return None; // would need a signed delta
+            }
+            widest = widest.max((t - anchor) as u64);
+        }
+    }
+    if widest == 0 {
+        // Every vertex sits exactly on its feature's start_time. The
+        // layer-anchored tiers already covered anything this degenerate, so
+        // claiming it here would only add a capability for no gain.
+        return None;
+    }
+    let step = widest.div_ceil(u16::MAX as u64).max(1);
+    if step > max_step_ms as u64 {
+        return None;
+    }
+    let step = step as u32;
+
+    let mut builder = ListBuilder::new(UInt16Builder::new());
+    for i in 0..feature_count {
+        match vt.get(i) {
+            Some(times) if !times.is_empty() => {
+                let anchor = start_times[i];
+                for &t in times {
+                    let d = ((t - anchor) as u64) / step as u64;
+                    builder.values().append_value(d as u16);
+                }
+                builder.append(true);
+            }
+            _ => builder.append(false),
+        }
+    }
+    Some(VertexTimeColumn {
+        array: Arc::new(builder.finish()),
+        encoding: None,
+        feature_anchored_step: Some(step),
     })
 }
 

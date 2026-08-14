@@ -365,16 +365,30 @@ impl FlowAggregator {
                 if self.network.node_xy(r).is_some() {
                     run.push(r);
                 } else if run.len() >= 2 {
-                    features += self.emit_run(&run, way.class.min_zoom(), bucket0, range_end,
-                        min_bin, num_buckets, &mut writer)?;
+                    features += self.emit_run(
+                        &run,
+                        way.class.min_zoom(),
+                        bucket0,
+                        range_end,
+                        min_bin,
+                        num_buckets,
+                        &mut writer,
+                    )?;
                     run.clear();
                 } else {
                     run.clear();
                 }
             }
             if run.len() >= 2 {
-                features += self.emit_run(&run, way.class.min_zoom(), bucket0, range_end,
-                    min_bin, num_buckets, &mut writer)?;
+                features += self.emit_run(
+                    &run,
+                    way.class.min_zoom(),
+                    bucket0,
+                    range_end,
+                    min_bin,
+                    num_buckets,
+                    &mut writer,
+                )?;
             }
         }
         writer.finish()?;
@@ -461,8 +475,12 @@ impl FlowAggregator {
                     let seg_counts: Vec<u32> = dedges
                         .iter()
                         .map(|e| {
-                            let c =
-                                self.dir_counts.get(e).and_then(|m| m.get(&bin)).copied().unwrap_or(0);
+                            let c = self
+                                .dir_counts
+                                .get(e)
+                                .and_then(|m| m.get(&bin))
+                                .copied()
+                                .unwrap_or(0);
                             overall_max = overall_max.max(c);
                             c
                         })
@@ -479,7 +497,10 @@ impl FlowAggregator {
                 let mut properties = Map::new();
                 properties.insert("max_count".to_string(), json!(overall_max));
                 properties.insert("total_count".to_string(), json!(peak_seg_total));
-                properties.insert("min_zoom".to_string(), json!(stroke_min_zoom(peak_seg_total)));
+                properties.insert(
+                    "min_zoom".to_string(),
+                    json!(stroke_min_zoom(peak_seg_total)),
+                );
 
                 writer.write_linestring(&LineStringRecord {
                     coordinates: coords,
@@ -535,7 +556,12 @@ impl FlowAggregator {
                 let seg_counts: Vec<u32> = edges
                     .iter()
                     .map(|e| {
-                        let c = self.counts.get(e).and_then(|m| m.get(&bin)).copied().unwrap_or(0);
+                        let c = self
+                            .counts
+                            .get(e)
+                            .and_then(|m| m.get(&bin))
+                            .copied()
+                            .unwrap_or(0);
                         overall_max = overall_max.max(c);
                         c
                     })
@@ -580,8 +606,12 @@ impl FlowAggregator {
                         .map(|w| {
                             let e = edge_key(w[0], w[1]);
                             let along = if w[0] <= w[1] { 1 } else { -1 };
-                            let net =
-                                self.signed.get(&e).and_then(|m| m.get(&bin)).copied().unwrap_or(0);
+                            let net = self
+                                .signed
+                                .get(&e)
+                                .and_then(|m| m.get(&bin))
+                                .copied()
+                                .unwrap_or(0);
                             along * net
                         })
                         .collect();
@@ -727,7 +757,11 @@ pub struct StrokeParams {
 
 impl Default for StrokeParams {
     fn default() -> Self {
-        Self { angle_threshold_deg: 50.0, flow_similarity_ratio: 0.35, min_stroke_trips: 1 }
+        Self {
+            angle_threshold_deg: 50.0,
+            flow_similarity_ratio: 0.35,
+            min_stroke_trips: 1,
+        }
     }
 }
 
@@ -820,7 +854,9 @@ pub(crate) fn synthesize_strokes<F: Fn(i64) -> (f64, f64)>(
             {
                 continue;
             }
-            if best.map_or(true, |(ba, bx)| ang < ba - 1e-9 || (ang <= ba + 1e-9 && x < bx)) {
+            if best.map_or(true, |(ba, bx)| {
+                ang < ba - 1e-9 || (ang <= ba + 1e-9 && x < bx)
+            }) {
                 best = Some((ang, x));
             }
         }
@@ -842,7 +878,9 @@ pub(crate) fn synthesize_strokes<F: Fn(i64) -> (f64, f64)>(
             {
                 continue;
             }
-            if best.map_or(true, |(ba, bz)| ang < ba - 1e-9 || (ang <= ba + 1e-9 && z < bz)) {
+            if best.map_or(true, |(ba, bz)| {
+                ang < ba - 1e-9 || (ang <= ba + 1e-9 && z < bz)
+            }) {
                 best = Some((ang, z));
             }
         }
@@ -987,7 +1025,10 @@ fn decode_wkb_linestring(wkb: &[u8]) -> Option<Vec<[f64; 2]>> {
     let mut coords = Vec::with_capacity(n);
     for i in 0..n {
         let off = 9 + i * 16;
-        coords.push([read_f64(&wkb[off..off + 8]), read_f64(&wkb[off + 8..off + 16])]);
+        coords.push([
+            read_f64(&wkb[off..off + 8]),
+            read_f64(&wkb[off + 8..off + 16]),
+        ]);
     }
     Some(coords)
 }
@@ -1004,7 +1045,13 @@ mod tests {
         node_coords.insert(2, (-73.999, 40.000));
         node_coords.insert(3, (-73.998, 40.000));
         let mut ways = HashMap::new();
-        ways.insert(10, WayRec { refs: vec![1, 2, 3], class: RoadClass::Primary });
+        ways.insert(
+            10,
+            WayRec {
+                refs: vec![1, 2, 3],
+                class: RoadClass::Primary,
+            },
+        );
         OsmNetwork::build_indices(node_coords, ways)
     }
 
@@ -1025,7 +1072,12 @@ mod tests {
         let coords = [[-74.000, 40.000], [-73.999, 40.000], [-73.998, 40.000]];
         agg.add_trip(&coords, Some(&[0, 10_000, 20_000]), 0, 20_000);
         agg.add_trip(&coords, Some(&[30_000, 40_000, 50_000]), 30_000, 50_000);
-        agg.add_trip(&coords, Some(&[1_000_000, 1_010_000, 1_020_000]), 1_000_000, 1_020_000);
+        agg.add_trip(
+            &coords,
+            Some(&[1_000_000, 1_010_000, 1_020_000]),
+            1_000_000,
+            1_020_000,
+        );
 
         let (added, skipped, exact, fallback, miss) = agg.stats();
         assert_eq!((added, skipped, miss), (3, 0, 0));
@@ -1090,8 +1142,14 @@ mod tests {
     fn segment_orientation_signs_by_travel() {
         let n = net();
         // Edge (1,2) canonical points node 1 (-74.000) → node 2 (-73.999) = +lon.
-        assert_eq!(segment_orientation(&n, [-74.000, 40.0], [-73.999, 40.0], (1, 2)), 1);
-        assert_eq!(segment_orientation(&n, [-73.999, 40.0], [-74.000, 40.0], (1, 2)), -1);
+        assert_eq!(
+            segment_orientation(&n, [-74.000, 40.0], [-73.999, 40.0], (1, 2)),
+            1
+        );
+        assert_eq!(
+            segment_orientation(&n, [-73.999, 40.0], [-74.000, 40.0], (1, 2)),
+            -1
+        );
     }
 
     #[test]
@@ -1173,9 +1231,21 @@ mod tests {
             .to_vec();
         // Vertex-major [v * nb + b], nb = 3. Vertex 0: bucket 0 (forward) vs
         // bucket 2 (reverse) must carry OPPOSITE signs, same magnitude (volume).
-        assert!(m[0] > 0.0, "bucket 0 flows along winding → positive, got {}", m[0]);
-        assert!(m[2] < 0.0, "bucket 2 flows against winding → negative, got {}", m[2]);
-        assert_eq!(m[0].abs(), m[2].abs(), "|value| is the volume, sign is direction");
+        assert!(
+            m[0] > 0.0,
+            "bucket 0 flows along winding → positive, got {}",
+            m[0]
+        );
+        assert!(
+            m[2] < 0.0,
+            "bucket 2 flows against winding → negative, got {}",
+            m[2]
+        );
+        assert_eq!(
+            m[0].abs(),
+            m[2].abs(),
+            "|value| is the volume, sign is direction"
+        );
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -1185,9 +1255,15 @@ mod tests {
         let mut signed = HashMap::new();
         signed.insert((1, 2), HashMap::from([(0i64, 5i64)]));
         // Forward winding [1,2,3]: net reads +5.
-        assert_eq!(chunk_net_along_winding(&signed, &[1, 2, 3], &[(1, 2), (2, 3)]), 5);
+        assert_eq!(
+            chunk_net_along_winding(&signed, &[1, 2, 3], &[(1, 2), (2, 3)]),
+            5
+        );
         // Reversed winding [3,2,1]: the same edge is traversed high→low → -5.
-        assert_eq!(chunk_net_along_winding(&signed, &[3, 2, 1], &[(2, 3), (1, 2)]), -5);
+        assert_eq!(
+            chunk_net_along_winding(&signed, &[3, 2, 1], &[(2, 3), (1, 2)]),
+            -5
+        );
     }
 
     #[test]
@@ -1230,8 +1306,20 @@ mod tests {
         nc.insert(4, (-73.570, 45.500));
         nc.insert(5, (-73.580, 45.510));
         let mut ways = HashMap::new();
-        ways.insert(10, WayRec { refs: vec![1, 2, 3, 4], class: RoadClass::Residential });
-        ways.insert(20, WayRec { refs: vec![3, 5], class: RoadClass::Residential });
+        ways.insert(
+            10,
+            WayRec {
+                refs: vec![1, 2, 3, 4],
+                class: RoadClass::Residential,
+            },
+        );
+        ways.insert(
+            20,
+            WayRec {
+                refs: vec![3, 5],
+                class: RoadClass::Residential,
+            },
+        );
         OsmNetwork::build_indices(nc, ways)
     }
 
@@ -1244,7 +1332,9 @@ mod tests {
     }
 
     fn totals(dc: &HashMap<(i64, i64), HashMap<i64, u32>>) -> HashMap<(i64, i64), u32> {
-        dc.iter().map(|(e, b)| (*e, b.values().copied().sum::<u32>())).collect()
+        dc.iter()
+            .map(|(e, b)| (*e, b.values().copied().sum::<u32>()))
+            .collect()
     }
 
     #[test]
@@ -1267,14 +1357,23 @@ mod tests {
         let straight = deflection_angle((-73.60, 45.50), (-73.59, 45.50), (-73.58, 45.50), 0.70);
         assert!(straight < 1.0, "collinear → ~0°, got {straight}");
         let turn = deflection_angle((-73.60, 45.50), (-73.59, 45.50), (-73.59, 45.51), 0.70);
-        assert!((80.0..100.0).contains(&turn), "north turn → ~90°, got {turn}");
+        assert!(
+            (80.0..100.0).contains(&turn),
+            "north turn → ~90°, got {turn}"
+        );
     }
 
     #[test]
     fn stroke_contracts_degree2_chain() {
         let net = line_net();
         let dc = dir(&[((1, 2), 10), ((2, 3), 10), ((3, 4), 10)]);
-        let strokes = synthesize_strokes(&dc, &totals(&dc), |id| net.node_xy(id).unwrap(), net.lon_scale(), &StrokeParams::default());
+        let strokes = synthesize_strokes(
+            &dc,
+            &totals(&dc),
+            |id| net.node_xy(id).unwrap(),
+            net.lon_scale(),
+            &StrokeParams::default(),
+        );
         assert_eq!(strokes, vec![vec![1, 2, 3, 4]]);
     }
 
@@ -1283,7 +1382,13 @@ mod tests {
         let net = line_net();
         // 1→2→3 heavy (100), 3→4 light (5): ratio 0.05 < 0.35 → split at node 3.
         let dc = dir(&[((1, 2), 100), ((2, 3), 100), ((3, 4), 5)]);
-        let strokes = synthesize_strokes(&dc, &totals(&dc), |id| net.node_xy(id).unwrap(), net.lon_scale(), &StrokeParams::default());
+        let strokes = synthesize_strokes(
+            &dc,
+            &totals(&dc),
+            |id| net.node_xy(id).unwrap(),
+            net.lon_scale(),
+            &StrokeParams::default(),
+        );
         assert_eq!(strokes.len(), 2);
         assert!(strokes.contains(&vec![1, 2, 3]));
         assert!(strokes.contains(&vec![3, 4]));
@@ -1294,7 +1399,13 @@ mod tests {
         let net = line_net();
         // Equal flow, but the 90° turn 3→5 exceeds the 50° default cap.
         let dc = dir(&[((1, 2), 10), ((2, 3), 10), ((3, 5), 10)]);
-        let strokes = synthesize_strokes(&dc, &totals(&dc), |id| net.node_xy(id).unwrap(), net.lon_scale(), &StrokeParams::default());
+        let strokes = synthesize_strokes(
+            &dc,
+            &totals(&dc),
+            |id| net.node_xy(id).unwrap(),
+            net.lon_scale(),
+            &StrokeParams::default(),
+        );
         assert!(strokes.contains(&vec![1, 2, 3]));
         assert!(strokes.contains(&vec![3, 5]));
     }
@@ -1303,8 +1414,20 @@ mod tests {
     fn strokes_are_deterministic() {
         let net = line_net();
         let dc = dir(&[((1, 2), 10), ((2, 3), 10), ((3, 4), 10), ((3, 5), 10)]);
-        let a = synthesize_strokes(&dc, &totals(&dc), |id| net.node_xy(id).unwrap(), net.lon_scale(), &StrokeParams::default());
-        let b = synthesize_strokes(&dc, &totals(&dc), |id| net.node_xy(id).unwrap(), net.lon_scale(), &StrokeParams::default());
+        let a = synthesize_strokes(
+            &dc,
+            &totals(&dc),
+            |id| net.node_xy(id).unwrap(),
+            net.lon_scale(),
+            &StrokeParams::default(),
+        );
+        let b = synthesize_strokes(
+            &dc,
+            &totals(&dc),
+            |id| net.node_xy(id).unwrap(),
+            net.lon_scale(),
+            &StrokeParams::default(),
+        );
         assert_eq!(a, b);
     }
 
@@ -1321,7 +1444,13 @@ mod tests {
         agg.add_route_bins_directed(&coords, &HashMap::from([(0i64, 8u32)]));
         let tmp = std::env::temp_dir().join(format!("stt_strokes_{}.parquet", std::process::id()));
         let (features, buckets) = agg
-            .write_parquet_strokes(&tmp, &StrokeParams { min_stroke_trips: 1, ..Default::default() })
+            .write_parquet_strokes(
+                &tmp,
+                &StrokeParams {
+                    min_stroke_trips: 1,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!((features, buckets), (1, 1)); // one corridor, one bucket
         let _ = std::fs::remove_file(&tmp);

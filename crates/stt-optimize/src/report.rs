@@ -418,4 +418,75 @@ mod tests {
         assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
     }
+
+    // ------------------------------------------------------------------
+    // Report-schema serialization: the per-column cost surface (MO-2/MO-3)
+    // ------------------------------------------------------------------
+
+    /// The `measured` block of a JSON report is `MeasuredEncoding` verbatim
+    /// (`report.rs`'s `generate_json` embeds `result.measured`), so its schema
+    /// IS the report schema. Every field MO-2/MO-3 added must be append-only:
+    /// a report written before they existed has to keep deserializing.
+    #[test]
+    fn measured_block_schema_is_append_only() {
+        use crate::measure::MeasuredEncoding;
+
+        // A pre-MO-2/MO-3/MO-4 report: no `tiles`, no `marginal_bytes`, no
+        // `share_stderr`.
+        let legacy = r#"{
+            "features": 5000,
+            "geometry_kind": "point",
+            "bytes_total": 120000,
+            "bytes_per_feature": 24.0,
+            "zstd_ratio": 3.1,
+            "per_column": [
+                {"name": "geometry", "compressed_bytes": 70000, "share": 0.58},
+                {"name": "magnitude", "compressed_bytes": 50000, "share": 0.42}
+            ]
+        }"#;
+        let back: MeasuredEncoding = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.tiles, 1, "pre-layout reports were all single-tile");
+        assert_eq!(back.per_column.len(), 2);
+        for c in &back.per_column {
+            assert_eq!(
+                c.marginal_bytes, 0,
+                "no leave-one-out encode existed when {} was written",
+                c.name
+            );
+            assert_eq!(c.share_stderr, 0.0, "no dispersion was published either");
+        }
+
+        // Round-tripping a current report preserves every field exactly, and
+        // serializes byte-identically twice (the determinism contract the
+        // solver-side consumers depend on).
+        let current = serde_json::to_string(&back).unwrap();
+        assert!(current.contains("\"marginal_bytes\":0"));
+        assert!(current.contains("\"share_stderr\":0.0"));
+        let again: MeasuredEncoding = serde_json::from_str(&current).unwrap();
+        assert_eq!(serde_json::to_string(&again).unwrap(), current);
+    }
+
+    /// The inspect report is the other half of the per-column surface and is
+    /// serialized wholesale by `stt-optimize inspect --format json`.
+    #[test]
+    fn inspect_column_cost_schema_is_append_only() {
+        use crate::analysis::inspect::ColumnCost;
+
+        let legacy = r#"{
+            "name": "magnitude",
+            "dtype": "Float64",
+            "compressed_bytes": 50000,
+            "share": 0.42,
+            "bytes_per_feature": 2.5,
+            "encoding_note": "plain f64 (unquantized)"
+        }"#;
+        let back: ColumnCost = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.marginal_bytes, 0);
+        assert_eq!(back.share_stderr, 0.0);
+        assert_eq!(back.compressed_bytes, 50_000);
+
+        let json = serde_json::to_string(&back).unwrap();
+        let again: ColumnCost = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&again).unwrap(), json);
+    }
 }

@@ -80,7 +80,7 @@ impl SttArchive {
         })
     }
 
-    /// The manifest's `formatVersion` (1 | 2).
+    /// The manifest's packed `formatVersion` (3).
     #[wasm_bindgen(js_name = formatVersion)]
     pub fn format_version(&self) -> u32 {
         self.inner.format_version()

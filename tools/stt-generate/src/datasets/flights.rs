@@ -39,8 +39,8 @@ pub struct Args {
     #[arg(long, default_value = "25,-125,50,-65")]
     pub bounds: String,
 
-    /// Sampling interval in seconds
-    #[arg(long, default_value = "60")]
+    /// Explicit sampling interval in seconds (0 preserves every usable row)
+    #[arg(long, default_value = "0", value_parser = parse_nonnegative_i64)]
     pub sample_seconds: i64,
 
     /// Keep downloaded files after processing
@@ -72,6 +72,29 @@ pub struct Args {
     pub max_gap_seconds: i64,
 }
 
+fn parse_nonnegative_i64(value: &str) -> std::result::Result<i64, String> {
+    let parsed = value
+        .parse::<i64>()
+        .map_err(|_| format!("expected a non-negative integer, got {value:?}"))?;
+    if parsed < 0 {
+        return Err(format!("expected a non-negative integer, got {parsed}"));
+    }
+    Ok(parsed)
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn sampling_is_lossless_by_default_and_negative_values_are_rejected() {
+        let args = Args::try_parse_from(["flights"]).unwrap();
+        assert_eq!(args.sample_seconds, 0);
+        assert!(Args::try_parse_from(["flights", "--sample-seconds=-1"]).is_err());
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct StateRecord {
     time: i64,
@@ -96,14 +119,20 @@ pub fn run(args: Args) -> Result<()> {
         .with_context(|| format!("Invalid date format: {}. Use YYYY-MM-DD", args.date))?;
 
     if parsed_date.weekday() != chrono::Weekday::Mon {
-        println!("⚠️  Warning: {} is not a Monday. OpenSky data is only available for Mondays.", args.date);
+        println!(
+            "⚠️  Warning: {} is not a Monday. OpenSky data is only available for Mondays.",
+            args.date
+        );
     }
 
     let (start_hour, end_hour) = parse_hours_range(&args.hours)?;
     let total_hours = end_hour - start_hour + 1;
 
     println!("📅 Date: {}", args.date);
-    println!("⏰ Hours: {:02}:00 - {:02}:59 UTC ({} hours)", start_hour, end_hour, total_hours);
+    println!(
+        "⏰ Hours: {:02}:00 - {:02}:59 UTC ({} hours)",
+        start_hour, end_hour, total_hours
+    );
     println!("📍 Bounds: {}", args.bounds);
     if args.paths {
         println!("🛤️  Mode: Flight paths (LineStrings)");
@@ -192,7 +221,10 @@ pub fn run(args: Args) -> Result<()> {
             if csv_path.exists() {
                 downloaded_files.push(csv_path);
             } else {
-                eprintln!("Warning: CSV file not found after extraction: {}", csv_path.display());
+                eprintln!(
+                    "Warning: CSV file not found after extraction: {}",
+                    csv_path.display()
+                );
             }
 
             pb.inc(1);
@@ -206,14 +238,28 @@ pub fn run(args: Args) -> Result<()> {
 
         // Combine CSV files
         println!("\n📦 Combining {} CSV files...", downloaded_files.len());
-        let combined_path = args.download_dir.join(format!("combined-{}.csv", args.date));
+        let combined_path = args
+            .download_dir
+            .join(format!("combined-{}.csv", args.date));
         combine_csv_files(&downloaded_files, &combined_path)?;
 
         // Process combined file
         if args.paths {
-            process_csv_paths(&combined_path, &intermediate_path, Some(&args.bounds), args.sample_seconds, args.min_points, args.max_gap_seconds)?;
+            process_csv_paths(
+                &combined_path,
+                &intermediate_path,
+                Some(&args.bounds),
+                args.sample_seconds,
+                args.min_points,
+                args.max_gap_seconds,
+            )?;
         } else {
-            process_csv(&combined_path, &intermediate_path, Some(&args.bounds), args.sample_seconds)?;
+            process_csv(
+                &combined_path,
+                &intermediate_path,
+                Some(&args.bounds),
+                args.sample_seconds,
+            )?;
         }
 
         // Cleanup if requested
@@ -235,48 +281,66 @@ pub fn run(args: Args) -> Result<()> {
         }
     } else {
         // Process existing files
-        let combined_path = args.download_dir.join(format!("combined-{}.csv", args.date));
-        
+        let combined_path = args
+            .download_dir
+            .join(format!("combined-{}.csv", args.date));
+
         if !combined_path.exists() {
             // Try to find and combine individual CSV files
             let (start_hour, end_hour) = parse_hours_range(&args.hours)?;
             let mut csv_files: Vec<PathBuf> = Vec::new();
-            
+
             for hour in start_hour..=end_hour {
                 let hour_str = format!("{:02}", hour);
-                let csv_path = args.download_dir.join(format!("states_{}-{}.csv", args.date, hour_str));
-                let gz_path = args.download_dir.join(format!("states_{}-{}.csv.gz", args.date, hour_str));
-                
+                let csv_path = args
+                    .download_dir
+                    .join(format!("states_{}-{}.csv", args.date, hour_str));
+                let gz_path = args
+                    .download_dir
+                    .join(format!("states_{}-{}.csv.gz", args.date, hour_str));
+
                 // If only .gz exists, decompress it
                 if gz_path.exists() && !csv_path.exists() {
                     println!("   Decompressing {}...", gz_path.display());
-                    let status = Command::new("gunzip")
-                        .arg("-k")
-                        .arg(&gz_path)
-                        .status();
+                    let status = Command::new("gunzip").arg("-k").arg(&gz_path).status();
                     if let Err(e) = status {
                         eprintln!("Warning: Failed to decompress {}: {}", gz_path.display(), e);
                     }
                 }
-                
+
                 if csv_path.exists() {
                     csv_files.push(csv_path);
                 }
             }
-            
+
             if csv_files.is_empty() {
-                anyhow::bail!("No CSV files found in {}. Run without --skip-download first.", args.download_dir.display());
+                anyhow::bail!(
+                    "No CSV files found in {}. Run without --skip-download first.",
+                    args.download_dir.display()
+                );
             }
-            
+
             // Combine CSV files
             println!("📦 Combining {} CSV files...", csv_files.len());
             combine_csv_files(&csv_files, &combined_path)?;
         }
-        
+
         if args.paths {
-            process_csv_paths(&combined_path, &intermediate_path, Some(&args.bounds), args.sample_seconds, args.min_points, args.max_gap_seconds)?;
+            process_csv_paths(
+                &combined_path,
+                &intermediate_path,
+                Some(&args.bounds),
+                args.sample_seconds,
+                args.min_points,
+                args.max_gap_seconds,
+            )?;
         } else {
-            process_csv(&combined_path, &intermediate_path, Some(&args.bounds), args.sample_seconds)?;
+            process_csv(
+                &combined_path,
+                &intermediate_path,
+                Some(&args.bounds),
+                args.sample_seconds,
+            )?;
         }
     }
 
@@ -293,14 +357,7 @@ pub fn run(args: Args) -> Result<()> {
                 "zstd",
             )?;
         } else {
-            common::run_stt_build(
-                &intermediate_path,
-                &args.output,
-                "timestamp",
-                0,
-                10,
-                "zstd",
-            )?;
+            common::run_stt_build(&intermediate_path, &args.output, "timestamp", 0, 10, "zstd")?;
         }
 
         // Clean up intermediate file
@@ -317,11 +374,13 @@ fn download_file(url: &str, output_path: &PathBuf) -> Result<()> {
     // reqwest tends to timeout on these large files
     let status = Command::new("curl")
         .args([
-            "-L",           // Follow redirects
-            "-f",           // Fail silently on server errors
-            "-S",           // Show error messages
-            "--connect-timeout", "30",
-            "--max-time", "600",  // 10 minute max for large files
+            "-L", // Follow redirects
+            "-f", // Fail silently on server errors
+            "-S", // Show error messages
+            "--connect-timeout",
+            "30",
+            "--max-time",
+            "600", // 10 minute max for large files
             "-o",
         ])
         .arg(output_path)
@@ -346,7 +405,7 @@ fn combine_csv_files(files: &[PathBuf], output: &PathBuf) -> Result<()> {
         let file = File::open(csv_path)?;
         let reader = BufReader::new(file);
         let mut first_line = true;
-        
+
         for line in std::io::BufRead::lines(reader) {
             let line = line?;
             if first_line {
@@ -402,7 +461,9 @@ fn process_csv(
     };
 
     let buf_reader = BufReader::new(reader);
-    let mut csv_reader = ReaderBuilder::new().has_headers(true).from_reader(buf_reader);
+    let mut csv_reader = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(buf_reader);
 
     let mut aircraft_last_time: HashMap<String, i64> = HashMap::new();
     let mut total_records = 0;
@@ -433,7 +494,9 @@ fn process_csv(
         if total_records % 500000 == 0 {
             println!(
                 "   Processed {} records, {} written, {} aircraft...",
-                total_records, writer.row_count(), unique_aircraft.len()
+                total_records,
+                writer.row_count(),
+                unique_aircraft.len()
             );
         }
 
@@ -459,12 +522,14 @@ fn process_csv(
             }
         }
 
-        if let Some(&last_time) = aircraft_last_time.get(&record.icao24) {
-            if record.time - last_time < sample_seconds {
-                continue;
+        if sample_seconds > 0 {
+            if let Some(&last_time) = aircraft_last_time.get(&record.icao24) {
+                if record.time - last_time < sample_seconds {
+                    continue;
+                }
             }
+            aircraft_last_time.insert(record.icao24.clone(), record.time);
         }
-        aircraft_last_time.insert(record.icao24.clone(), record.time);
         unique_aircraft.insert(record.icao24.clone());
 
         // Skip (don't fabricate now()) on an out-of-range epoch — a corrupt
@@ -498,7 +563,10 @@ fn process_csv(
         }
 
         if let Some(vertrate) = record.vertrate {
-            properties.insert("vertical_rate".to_string(), json!((vertrate * 196.85) as i32));
+            properties.insert(
+                "vertical_rate".to_string(),
+                json!((vertrate * 196.85) as i32),
+            );
         }
 
         if let Some(ref squawk) = record.squawk {
@@ -556,7 +624,9 @@ fn process_csv_paths(
     };
 
     let buf_reader = BufReader::new(reader);
-    let mut csv_reader = ReaderBuilder::new().has_headers(true).from_reader(buf_reader);
+    let mut csv_reader = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(buf_reader);
 
     // Group positions by aircraft (icao24)
     // Use BTreeMap to maintain insertion order for reproducibility
@@ -573,7 +643,8 @@ fn process_csv_paths(
         if total_records % 500000 == 0 {
             println!(
                 "   Read {} records, {} aircraft...",
-                total_records, aircraft_positions.len()
+                total_records,
+                aircraft_positions.len()
             );
         }
 
@@ -605,17 +676,25 @@ fn process_csv_paths(
             .entry(record.icao24.clone())
             .or_insert_with(BTreeMap::new);
 
-        // Use time as key to handle duplicates - only keep one position per second
-        // Apply sampling - only keep positions at sample_seconds intervals
-        let sample_key = record.time / sample_seconds * sample_seconds;
+        // Use exact time when sampling is disabled; otherwise coalesce into
+        // the explicitly requested interval. Duplicate timestamps still
+        // collapse deterministically through the BTreeMap key.
+        let sample_key = if sample_seconds > 0 {
+            record.time / sample_seconds * sample_seconds
+        } else {
+            record.time
+        };
 
         if !positions.contains_key(&sample_key) {
-            positions.insert(sample_key, FlightPosition {
-                time: record.time,
-                lon,
-                lat,
-                callsign: record.callsign.clone(),
-            });
+            positions.insert(
+                sample_key,
+                FlightPosition {
+                    time: record.time,
+                    lon,
+                    lat,
+                    callsign: record.callsign.clone(),
+                },
+            );
         }
     }
 
@@ -666,7 +745,8 @@ fn process_csv_paths(
             };
 
             // Use the most common callsign in this segment
-            let callsign = segment.iter()
+            let callsign = segment
+                .iter()
                 .filter_map(|p| p.callsign.as_ref())
                 .filter(|s| !s.trim().is_empty())
                 .next()
@@ -681,16 +761,9 @@ fn process_csv_paths(
 
             // Create 2D coordinates (altitude is scaled for visualization)
             // Note: For proper 3D, we'd need to handle altitude separately
-            let coordinates: Vec<[f64; 2]> = segment.iter()
-                .map(|p| [p.lon, p.lat])
-                .collect();
+            let coordinates: Vec<[f64; 2]> = segment.iter().map(|p| [p.lon, p.lat]).collect();
 
-            let record = LineStringRecord::new(
-                coordinates,
-                start_time,
-                Some(end_time),
-                properties,
-            );
+            let record = LineStringRecord::new(coordinates, start_time, Some(end_time), properties);
 
             writer.write_linestring(&record)?;
             total_points += segment.len();
@@ -742,5 +815,3 @@ fn split_into_segments(
 
     segments
 }
-
-

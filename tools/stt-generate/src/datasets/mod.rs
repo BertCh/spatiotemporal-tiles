@@ -8,8 +8,8 @@ pub mod bixi;
 pub mod drifters;
 pub mod drifters_hourly;
 pub mod earthquakes;
-pub mod flow_graph;
 pub mod flights;
+pub mod flow_graph;
 pub mod gtfs;
 pub mod hurricanes;
 pub mod nwm;
@@ -22,4 +22,3 @@ pub mod osrm;
 pub mod satellites;
 pub mod storms;
 pub mod wildfires;
-

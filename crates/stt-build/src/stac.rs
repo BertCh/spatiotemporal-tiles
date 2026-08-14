@@ -72,8 +72,19 @@ pub fn stac_item(manifest: &stt_core::Manifest, out_dir: &std::path::Path) -> Va
     let m = &manifest.metadata;
     let b = &m.bounds;
 
-    // bbox order is STAC/GeoJSON's [west, south, east, north].
-    let bbox = json!([b.min_lon, b.min_lat, b.max_lon, b.max_lat]);
+    // bbox order is STAC/GeoJSON's [west, south, east, north] — or, for a
+    // dataset that declares a vertical extent, RFC 7946 §5's 2n-element form
+    // [west, south, z_min, east, north, z_max]. STAC inherits that rule
+    // verbatim ("the length of the array must be 2*n where n is the number of
+    // dimensions"), so a volumetric archive becomes discoverable AS volumetric
+    // in a plain catalog search, with no STT-specific extension. Datasets
+    // without `z_range` keep the four-element form byte-for-byte.
+    let bbox = match m.z_range {
+        Some([z_min, z_max]) => {
+            json!([b.min_lon, b.min_lat, z_min, b.max_lon, b.max_lat, z_max])
+        }
+        None => json!([b.min_lon, b.min_lat, b.max_lon, b.max_lat]),
+    };
     // Counter-clockwise exterior ring, closed (first == last) — the RFC 7946
     // winding for an exterior ring, and the shape §10.3 documents.
     let geometry = json!({
@@ -195,20 +206,33 @@ mod tests {
         metadata.temporal_bucket_ms = 86_400_000;
         stt_core::Manifest {
             format: "stt-packed".to_string(),
-            format_version: 2,
+            format_version: stt_core::pack::PACKED_FORMAT_VERSION,
             capabilities: Vec::new(),
+            adaptive_boundaries: Vec::new(),
             schemas: Vec::new(),
+            variants: vec![stt_core::pack::ManifestVariant {
+                id: stt_core::tile::RAW_VARIANT_ID,
+                kind: stt_core::pack::VariantKind::Raw,
+                layer_name: None,
+                method: None,
+                params: None,
+            }],
             compression: "zstd".to_string(),
             blob_ordering: Some("time-major".to_string()),
+            // Fixture archive: an explicitly-ordered build, so no simulation ran
+            // and no workload is co-versioned (the field's absence is the signal).
+            ordering_workload: None,
             directory: stt_core::pack::DirectoryRef {
                 key: "index/deadbeef.sttd".to_string(),
                 length: 1,
-                directory_version: 5,
+                directory_version: stt_core::directory::DIRECTORY_VERSION,
                 encoding: None,
                 layout: None,
                 root_length: None,
                 page_count: None,
                 page_entries: None,
+                root_hash: None,
+                page_hashes: None,
             },
             packs: Vec::new(),
             metadata,
@@ -271,7 +295,10 @@ mod tests {
         assert_eq!(props["stt:distinct_feature_count"], 54_321);
         assert_eq!(props["stt:min_zoom"], 0);
         assert_eq!(props["stt:max_zoom"], 4);
-        assert_eq!(props["stt:format_version"], 2);
+        assert_eq!(
+            props["stt:format_version"],
+            stt_core::pack::PACKED_FORMAT_VERSION
+        );
         assert_eq!(props["stt:layers"], json!(["default"]));
     }
 
@@ -314,6 +341,43 @@ mod tests {
             item["properties"]["end_datetime"],
             "2023-11-14T22:13:29.987Z"
         );
+    }
+
+    /// A volumetric dataset advertises its vertical extent in the Item bbox,
+    /// using RFC 7946's 2n-element form `[w, s, z_min, e, n, z_max]` — the only
+    /// place in the emitted metadata where a third dimension is legal.
+    #[test]
+    fn six_element_bbox_when_a_z_range_is_declared() {
+        let mut m = manifest();
+        m.metadata.z_range = Some([-430.0, 18_500.5]);
+        let item = stac_item(&m, std::path::Path::new("/tmp/storm"));
+
+        let bbox = item["bbox"].as_array().expect("bbox array");
+        assert_eq!(bbox.len(), 6, "2n elements for a 3-dimensional dataset");
+        assert_eq!(bbox[0], -180.0); // west
+        assert_eq!(bbox[1], -78.4); // south
+        assert_eq!(bbox[2], -430.0); // z_min
+        assert_eq!(bbox[3], 180.0); // east
+        assert_eq!(bbox[4], 81.5); // north
+        assert_eq!(bbox[5], 18_500.5); // z_max
+
+        // The footprint polygon stays 2D: it is a footprint, not a volume.
+        let ring = item["geometry"]["coordinates"][0]
+            .as_array()
+            .expect("exterior ring");
+        assert!(ring.iter().all(|p| p.as_array().unwrap().len() == 2));
+    }
+
+    /// ...and a 2D dataset keeps the four-element form byte-for-byte, so no
+    /// published Item changes shape.
+    #[test]
+    fn four_element_bbox_when_no_z_range_is_declared() {
+        let mut m = manifest();
+        m.metadata.z_range = None;
+        let item = stac_item(&m, std::path::Path::new("/tmp/drifters"));
+        let bbox = item["bbox"].as_array().expect("bbox array");
+        assert_eq!(bbox.len(), 4);
+        assert_eq!(bbox[2], 180.0, "third element is EAST, not an altitude");
     }
 
     /// The written bytes are pretty JSON that round-trips.

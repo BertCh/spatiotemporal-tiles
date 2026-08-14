@@ -3,26 +3,42 @@
 //! the synthesized native tiles, pack sizing from the estimated archive size.
 //!
 //! The zstd trial and the blob-ordering pick are both evidence-based: `--publish`
-//! re-encodes the real sample, and `--blob-ordering` runs the SAME range-read
-//! simulator the post-build `order-audit` uses ([`stt_core::ordering_sim`]) over
-//! tiles synthesized from the loaded features — so its pre-build recommendation
-//! agrees with what `order-audit measured` finds on the built archive. Only pack
-//! sizing stays a formula estimate at Low confidence. Everything here is
-//! byte-level and reversible — `lossy: false` throughout.
+//! re-encodes the real sample under the run's [`SyntheticLayout`] (baseline and
+//! trial share ONE cut — MO-4's invariant; measuring them under different cuts
+//! prices the cut, not the lever), and `--blob-ordering` runs the SAME
+//! range-read simulator the post-build `order-audit` uses
+//! ([`stt_core::ordering_sim`]) over tiles synthesized from the loaded features,
+//! under the SAME [`ordering_sim::workload_weights`] table — so its pre-build
+//! recommendation agrees with what `order-audit measured` finds on the built
+//! archive. Only pack sizing stays a formula estimate at Low confidence.
+//! Everything here is byte-level and reversible — `lossy: false` throughout.
 
 use anyhow::Result;
 
 use stt_core::curve::{self, BlobOrdering};
-use stt_core::ordering_sim::{self, SimOptions, TileSample};
+use stt_core::ordering_sim::{self, OrderingWorkloadMode, QueryWeights, SimOptions, TileSample};
 use stt_core::tile::TileId;
 
-use super::{Advice, AdviceConfidence};
+use super::{
+    composed_levers, confidence_with_noise, stderr_suffix, Advice, AdviceConfidence, Composer,
+    Repriced,
+};
 use crate::analysis::spatial::SpatialDistribution;
 use crate::analysis::AnalysisResult;
-use crate::loader::LoadedData;
-use crate::measure::{measure_sample, MeasureSettings, MeasuredEncoding};
-use crate::order_audit::playback_caveat_for;
+use crate::attribution::AttributionDesign;
+use crate::loader::{GeometryType, LoadedData};
+use crate::measure::{
+    baseline_under, measure_sample_layout_with, MeasureSettings, MeasuredEncoding, SyntheticLayout,
+};
+use crate::oracle::Candidate;
+use crate::order_audit::{playback_caveat_for, playback_caveat_weighted};
 use stt_core::projection;
+
+/// The zstd level `--publish` bundles. Also the level the composed recipe is
+/// measured at whenever the publish advisory is in it — and the fixed level
+/// every cross-dataset column cost is compared at, which is why it is a
+/// ceiling and not a starting point for a search.
+pub(crate) const PUBLISH_ZSTD_LEVEL: i32 = 19;
 
 /// Measured sample shrink at zstd 19 (vs level 3) at or above this many
 /// percent earns High confidence; a smaller measured win stays Medium.
@@ -49,9 +65,25 @@ const SUGGESTED_PACK_MIB: usize = 128;
 /// when possible), blob ordering from the access shape, and pack sizing for
 /// large archives.
 pub fn advise(result: &AnalysisResult, data: &LoadedData) -> Result<Vec<Advice>> {
+    advise_with(result, data, OrderingWorkloadMode::default())
+}
+
+/// [`advise`] with an explicit ordering workload.
+///
+/// [`OrderingWorkloadMode::Legacy`] is the ROLLBACK for the workload weighting:
+/// it ranks orderings under [`ordering_sim::LEGACY_WEIGHTS`] (scrub + pan,
+/// playback unpriced) and carries the historical prose caveat, reproducing the
+/// pick this advisor made before the weight table was wired in. It is the same
+/// escape `stt-build --ordering-workload legacy` selects for the writer, so a
+/// user reproducing an old build can reproduce the advice that produced it.
+pub fn advise_with(
+    result: &AnalysisResult,
+    data: &LoadedData,
+    workload: OrderingWorkloadMode,
+) -> Result<Vec<Advice>> {
     let mut advice = Vec::new();
     advice.push(publish_advice(result, data)?);
-    advice.extend(blob_ordering_advice(result, data));
+    advice.extend(blob_ordering_advice(result, data, workload));
     advice.extend(pack_size_advice(result));
     Ok(advice)
 }
@@ -60,45 +92,43 @@ pub fn advise(result: &AnalysisResult, data: &LoadedData) -> Result<Vec<Advice>>
 /// trial-encode the sample at level 19 against the level-3 baseline. Falls
 /// back to typical-range guidance at Low confidence when the sample can't be
 /// measured.
+///
+/// Both arms are measured under the run's own layout
+/// (`SyntheticLayout::from_density(&result.density)`): the level-19 trial is a
+/// one-lever move off the same cut the baseline was taken on, so the reported
+/// shrink is the compressor's and nothing else's.
 fn publish_advice(result: &AnalysisResult, data: &LoadedData) -> Result<Advice> {
+    let layout = SyntheticLayout::from_density(&result.density);
     let publish_settings = MeasureSettings {
-        zstd_level: 19,
+        zstd_level: PUBLISH_ZSTD_LEVEL,
         ..MeasureSettings::default()
     };
-    let at_19 = measure_sample(&data.sample, &publish_settings)?;
+    // Trials read only `bytes_total`, which is attribution-independent, so they
+    // take the cheap singleton pass (the same cost choice the trial oracle
+    // documents). The baseline keeps the default leave-one-out design.
+    let at_19 = measure_sample_layout_with(
+        &data.sample,
+        &publish_settings,
+        &layout,
+        AttributionDesign::SingletonV1,
+    )?;
     // Baseline at the build default (level 3): reuse the analysis measurement
-    // when present, otherwise measure it here with identical settings.
-    let at_3: Option<MeasuredEncoding> = match &result.measured {
-        Some(m) => Some(m.clone()),
-        None => measure_sample(&data.sample, &MeasureSettings::default())?,
-    };
+    // when it was cut the same way, otherwise measure it here under this layout.
+    let at_3: Option<MeasuredEncoding> =
+        baseline_under(result.measured.as_ref(), &data.sample, &layout)?;
 
     if let (Some(base), Some(hi)) = (&at_3, &at_19) {
         if base.bytes_total > 0 {
             let shrink_pct =
                 (base.bytes_total as f64 - hi.bytes_total as f64) / base.bytes_total as f64 * 100.0;
-            let confidence = if shrink_pct >= ZSTD_HIGH_CONFIDENCE_SHRINK_PCT {
-                AdviceConfidence::High
-            } else {
-                AdviceConfidence::Medium
-            };
-            return Ok(Advice {
-                flag: "--publish".to_string(),
-                value: None,
-                why: format!(
-                    "zstd 19 encodes the {}-feature sample to {} B vs {} B at the \
-                     default level 3; decode-free wire savings for deployment \
-                     builds; dev builds can stay at 3 for speed",
-                    hi.features, hi.bytes_total, base.bytes_total
-                ),
-                projected: Some(format!(
-                    "{:+.1}% sample encode (measured, zstd 3 vs 19)",
-                    -shrink_pct
-                )),
-                lossy: false,
-                suggestion_only: false,
-                confidence,
-            });
+            return Ok(publish_advisory(
+                hi.features,
+                hi.bytes_total,
+                base.bytes_total,
+                shrink_pct,
+                None,
+                publish_confidence(shrink_pct),
+            ));
         }
     }
 
@@ -121,6 +151,104 @@ fn publish_advice(result: &AnalysisResult, data: &LoadedData) -> Result<Advice> 
     })
 }
 
+/// Assemble the measured `--publish` advisory. `note` is the composed-recipe
+/// clause an iterated re-price adds; round 0 passes `None` and gets the
+/// original string byte for byte.
+fn publish_advisory(
+    features: usize,
+    hi_bytes: usize,
+    base_bytes: usize,
+    shrink_pct: f64,
+    note: Option<&str>,
+    confidence: AdviceConfidence,
+) -> Advice {
+    let mut why = format!(
+        "zstd {PUBLISH_ZSTD_LEVEL} encodes the {features}-feature sample to {hi_bytes} B vs \
+         {base_bytes} B at the default level 3; decode-free wire savings for deployment \
+         builds; dev builds can stay at 3 for speed"
+    );
+    if let Some(note) = note {
+        why.push_str("; ");
+        why.push_str(note);
+    }
+    Advice {
+        flag: "--publish".to_string(),
+        value: None,
+        why,
+        projected: Some(format!(
+            "{:+.1}% sample encode (measured, zstd 3 vs {PUBLISH_ZSTD_LEVEL})",
+            -shrink_pct
+        )),
+        lossy: false,
+        suggestion_only: false,
+        confidence,
+    }
+}
+
+fn publish_confidence(shrink_pct: f64) -> AdviceConfidence {
+    if shrink_pct >= ZSTD_HIGH_CONFIDENCE_SHRINK_PCT {
+        AdviceConfidence::High
+    } else {
+        AdviceConfidence::Medium
+    }
+}
+
+/// Re-price publish-grade zstd against the composed incumbent.
+///
+/// The other half of the §12.2 interaction: the zstd win the single pass
+/// measures on build-default data is re-measured with the rest of the recipe
+/// already applied. The comparison holds every other composed lever FIXED and
+/// moves only this one — baseline θ at the default level, trial θ at
+/// [`PUBLISH_ZSTD_LEVEL`] — so a θ that already carries `--publish` is priced
+/// against itself-without-it, not against a no-op.
+///
+/// [`Repriced::Unmeasured`] leaves round 0's advisory (including its unmeasured
+/// `Low`-confidence fallback) exactly as it was.
+pub(super) fn reprice_publish(
+    theta: &MeasureSettings,
+    composer: &mut Composer<'_>,
+) -> Result<Repriced> {
+    let mut at_default = theta.clone();
+    at_default.zstd_level = MeasureSettings::default().zstd_level;
+    if at_default.zstd_level == PUBLISH_ZSTD_LEVEL {
+        // Nothing to compare against; the build default IS publish grade.
+        return Ok(Repriced::Unmeasured);
+    }
+
+    let priced = composer.price(&at_default, &[Candidate::ZstdLevel(PUBLISH_ZSTD_LEVEL)])?;
+    let Some(trial) = priced.first() else {
+        return Ok(Repriced::Unmeasured);
+    };
+    let Some(base) = composer.measure(&at_default)? else {
+        return Ok(Repriced::Unmeasured);
+    };
+    if base.bytes_total == 0 {
+        return Ok(Repriced::Unmeasured);
+    }
+
+    let shrink_pct = -trial.delta_frac * 100.0;
+    // The note names the arm this lever was moved OFF, not the level it was
+    // moved to — "measured on the composed recipe (zstd 3)" would read as if
+    // the trial itself ran at 3.
+    let note = format!(
+        "re-priced against the composed recipe at the default level{}{}",
+        composed_levers(&at_default),
+        stderr_suffix(trial.stderr)
+    );
+    Ok(Repriced::Measured(Some(publish_advisory(
+        base.features,
+        trial.bytes_total,
+        base.bytes_total,
+        shrink_pct,
+        Some(&note),
+        confidence_with_noise(
+            publish_confidence(shrink_pct),
+            -trial.delta_frac,
+            trial.stderr,
+        ),
+    ))))
+}
+
 /// Fewest synthesized native tiles worth trusting the range-read simulation on.
 /// Below this the occupied grid is too small to discriminate orderings, so we
 /// fall back to the access-shape heuristic.
@@ -134,15 +262,31 @@ const MIN_TILES_TO_SIMULATE: usize = 8;
 /// `spatial` on a multi-bucket dataset (the playback-buffering tension worth
 /// surfacing). Falls back to the access-shape heuristic when too few tiles are
 /// synthesized to trust the simulation.
-fn blob_ordering_advice(result: &AnalysisResult, data: &LoadedData) -> Option<Advice> {
+///
+/// The ranking is blended under [`ordering_sim::workload_weights`] — the same
+/// per-dataset `(scrub, pan, playback)` table the writer's `measured` ordering
+/// and the post-build `order-audit` use, keyed on the dataset's `layer_hint`
+/// and its distinct bucket count. Before it was wired here the pre-build
+/// advisor ranked at [`ordering_sim::LEGACY_WEIGHTS`], i.e. with playback
+/// *unpriced*, and could only mention playback in prose after the fact; now the
+/// playback query and its buffered-runway term are inside the cost that decides
+/// the pick.
+///
+/// ⚠️ What did NOT change: a `spatial` pick over more than one time bucket
+/// still raises the playback caveat and is still `suggestion_only`, at Medium
+/// confidence. `blobOrdering: spatial` silently breaks time-playback buffering
+/// (empty buffered ranges → stalls), so that pick is never auto-applied no
+/// matter how the cost ranks it. Weighting playback moves which ordering WINS;
+/// it does not move what a `spatial` win is allowed to do.
+fn blob_ordering_advice(
+    result: &AnalysisResult,
+    data: &LoadedData,
+    workload: OrderingWorkloadMode,
+) -> Option<Advice> {
     let samples = synthesize_tiles(result, data);
     if samples.len() < MIN_TILES_TO_SIMULATE {
         return blob_ordering_advice_heuristic(result);
     }
-
-    let opts = SimOptions::default();
-    let recommended = ordering_sim::measured_ordering(&samples, opts);
-    let auto = auto_choice(&samples);
 
     let distinct_buckets = {
         let mut tbs: Vec<i64> = samples.iter().map(|s| s.tb).collect();
@@ -150,8 +294,35 @@ fn blob_ordering_advice(result: &AnalysisResult, data: &LoadedData) -> Option<Ad
         tbs.dedup();
         tbs.len()
     };
+    let layer_hint = layer_hint_for(data);
+    let (weights, workload_label) = match workload {
+        OrderingWorkloadMode::Derived => (
+            ordering_sim::workload_weights(layer_hint, distinct_buckets),
+            layer_hint.unwrap_or("generalist").to_string(),
+        ),
+        OrderingWorkloadMode::Legacy => (
+            ordering_sim::LEGACY_WEIGHTS,
+            "legacy (playback unpriced)".to_string(),
+        ),
+    };
+    let opts = SimOptions {
+        weights,
+        ..SimOptions::default()
+    };
+    let recommended = ordering_sim::measured_ordering(&samples, opts);
+    let auto = auto_choice(&samples);
+
     let value = recommended.as_str();
-    let caveat = playback_caveat_for(value, distinct_buckets);
+    // Same gate as ever (spatial + more than one bucket); only the WORDING
+    // moves — a legacy ranking genuinely cannot see playback, so it keeps the
+    // warning-about-the-model text, while a weighted ranking priced playback in
+    // and reports a measured tradeoff instead.
+    let caveat = match workload {
+        OrderingWorkloadMode::Legacy => playback_caveat_for(value, distinct_buckets),
+        OrderingWorkloadMode::Derived => {
+            playback_caveat_weighted(value, distinct_buckets, weights.playback)
+        }
+    };
 
     // Nothing to say when the simulated best is exactly what `auto` already
     // picks AND there is no playback tension to flag.
@@ -161,11 +332,13 @@ fn blob_ordering_advice(result: &AnalysisResult, data: &LoadedData) -> Option<Ad
 
     let mut why = format!(
         "range-read simulation over {} synthesized native tiles ({} time bucket{}) \
-         ranks `{}` cheapest; `--blob-ordering auto` would pick `{}`",
+         ranks `{}` cheapest under the {} workload ({}); `--blob-ordering auto` would pick `{}`",
         samples.len(),
         distinct_buckets,
         if distinct_buckets == 1 { "" } else { "s" },
         value,
+        workload_label,
+        weights_clause(weights),
         auto.as_str(),
     );
     // A spatial win on a multi-bucket dataset trades playback buffering for
@@ -193,6 +366,50 @@ fn blob_ordering_advice(result: &AnalysisResult, data: &LoadedData) -> Option<Ad
         suggestion_only: caveat.is_some(),
         confidence,
     })
+}
+
+/// The dataset's `layer_hint` as the PRE-BUILD advisor is able to know it: the
+/// majority geometry family of the loaded features, with a fixed tie order
+/// (points > paths > polygons) so identical inputs always derive identical
+/// weights, exactly as `stt-build`'s own hint does.
+///
+/// ⚠️ **This can never return `"trips"`.** `stt-build` distinguishes trips from
+/// paths by per-vertex timestamps (or an interpolatable `[start, end]` range),
+/// and the analysis seam carries neither: [`crate::loader::AnalyzableFeature`]
+/// has a single `timestamp` and [`crate::loader::SampledFeature`] a single
+/// `timestamp_ms`. Line data therefore prices at the generalist `(1, 1, 1)` row
+/// here while the built archive may record `trips` → `(1, 1, 2)`. That gap is
+/// deliberately in the SAFE direction — the pre-build advisor never invents a
+/// playback-dominant weighting it cannot justify — and it is invisible for
+/// point data, which is hinted `"points"` on both sides. Closing it needs the
+/// loader to retain end/vertex times, which is not this item's file.
+fn layer_hint_for(data: &LoadedData) -> Option<&'static str> {
+    let (mut points, mut paths, mut polygons) = (0u64, 0u64, 0u64);
+    for feature in &data.features {
+        match feature.geometry_type {
+            GeometryType::Point | GeometryType::MultiPoint => points += 1,
+            GeometryType::LineString | GeometryType::MultiLineString => paths += 1,
+            GeometryType::Polygon | GeometryType::MultiPolygon => polygons += 1,
+            GeometryType::Unknown => {}
+        }
+    }
+    // `max_by_key` keeps the LAST maximum, so iterate reversed to make the
+    // FIRST entry win ties — the same fixed order stt-build's hint uses.
+    [(points, "points"), (paths, "paths"), (polygons, "polygons")]
+        .iter()
+        .rev()
+        .filter(|(n, _)| *n > 0)
+        .max_by_key(|(n, _)| *n)
+        .map(|&(_, kind)| kind)
+}
+
+/// The weight triple, spelled out in the advisory so a reader can tell which
+/// row of the table decided the pick.
+fn weights_clause(weights: QueryWeights) -> String {
+    format!(
+        "scrub {}/pan {}/playback {}",
+        weights.scrub, weights.pan, weights.playback
+    )
 }
 
 /// Synthesize one [`TileSample`] per occupied `(x, y, time-bucket)` cell at the
@@ -337,7 +554,11 @@ fn pack_size_advice(result: &AnalysisResult) -> Option<Advice> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::loader::{AnalyzableFeature, GeometryType, PropValue, SampledFeature};
+    use crate::loader::{AnalyzableFeature, PropValue, SampledFeature};
+    // `sample_analysis`'s density is empty, so the run layout for every fixture
+    // built on it IS `SyntheticLayout::single()` — which is what makes the
+    // plain single-tile helper the right way to build these fixtures' baselines.
+    use crate::measure::measure_sample;
     use geo_types::{Geometry, Point};
     use stt_core::types::{BoundingBox, TimeRange};
 
@@ -555,6 +776,204 @@ mod tests {
         );
         assert!(ordering.why.contains("time-major"), "{}", ordering.why);
         assert!(ordering.projected.as_deref().unwrap().contains("simulated"));
+        // The workload that decided it is on the record: this fixture's
+        // features are points over 24 buckets, so the derived row is the
+        // playback-dominant one — and `spatial` won ANYWAY. That is the caveat
+        // becoming a measured tradeoff rather than a blind spot, and the wording
+        // says so; what it must NOT do is stop being suggestion-only (asserted
+        // above).
+        assert!(
+            ordering
+                .why
+                .contains("points workload (scrub 1/pan 1/playback 2)"),
+            "{}",
+            ordering.why
+        );
+        assert!(ordering.why.contains("PRICED IN"), "{}", ordering.why);
+    }
+
+    #[test]
+    fn playback_weighting_flips_the_pick_and_clears_suggestion_only() {
+        // WM-2's mechanism at the pre-build advisor, on a fixture that actually
+        // moves: eight spatial cells × 24 hourly buckets. Scrub loves `spatial`
+        // (each cell's whole timeline is one fused run), so the LEGACY two-query
+        // ranking picks it and can only warn, in prose, that it stalls playback.
+        // With the playback family priced INTO the cost, the same fixture picks
+        // a playback-safe ordering instead — and with no `spatial` pick there is
+        // no caveat, so the advice stops being suggestion-only and can be
+        // auto-applied.
+        let mut features = Vec::new();
+        for bucket in 0..24u64 {
+            for cell in 0..8u64 {
+                features.push(analyzable(
+                    -73.0 + cell as f64 * 0.5,
+                    45.0,
+                    bucket * HOUR_MS,
+                ));
+            }
+        }
+        let data = synthetic_data_with_features(features);
+        let result = synthetic_result(SpatialDistribution::Regional, 24 * HOUR_MS, 100 << 20, None);
+        // The advisor derives `points` from the loaded geometry types, which is
+        // the playback-dominant row over 24 buckets.
+        assert_eq!(layer_hint_for(&data), Some("points"));
+
+        // The rollback: legacy weights, the historical pick and the historical
+        // warning-about-the-model caveat.
+        let legacy = advise_with(&result, &data, OrderingWorkloadMode::Legacy).unwrap();
+        let before = find(&legacy, "--blob-ordering").expect("legacy ordering advice");
+        assert_eq!(before.value.as_deref(), Some("spatial"));
+        assert!(
+            before.suggestion_only,
+            "a spatial pick is never auto-applied"
+        );
+        assert!(matches!(before.confidence, AdviceConfidence::Medium));
+        assert!(
+            before.why.contains("does not model playback buffering"),
+            "{}",
+            before.why
+        );
+        assert!(
+            before
+                .why
+                .contains("legacy (playback unpriced) workload (scrub 1/pan 1/playback 0)"),
+            "{}",
+            before.why
+        );
+
+        // The default: playback priced in, the pick moves off the stalling
+        // ordering, and `suggestion_only` clears with the caveat.
+        let advice = advise(&result, &data).unwrap();
+        let after = find(&advice, "--blob-ordering").expect("weighted ordering advice");
+        assert_ne!(
+            after.value.as_deref(),
+            Some("spatial"),
+            "playback-dominant weights must move off the stalling ordering: {}",
+            after.why
+        );
+        assert_eq!(after.value.as_deref(), Some("time-major"));
+        assert!(
+            !after.suggestion_only,
+            "with no spatial pick there is no playback tension to gate on: {after:?}"
+        );
+        assert!(matches!(after.confidence, AdviceConfidence::High));
+        assert!(
+            after
+                .why
+                .contains("points workload (scrub 1/pan 1/playback 2)"),
+            "{}",
+            after.why
+        );
+        assert!(!after.lossy);
+    }
+
+    #[test]
+    fn the_layer_hint_is_the_majority_family_with_a_fixed_tie_order() {
+        let with = |kinds: &[(GeometryType, usize)]| {
+            let mut features = Vec::new();
+            for (kind, n) in kinds {
+                for i in 0..*n {
+                    let mut f = analyzable(-73.0, 45.0, i as u64 * HOUR_MS);
+                    f.geometry_type = *kind;
+                    features.push(f);
+                }
+            }
+            layer_hint_for(&synthetic_data_with_features(features))
+        };
+        assert_eq!(with(&[(GeometryType::Point, 3)]), Some("points"));
+        assert_eq!(with(&[(GeometryType::MultiPoint, 3)]), Some("points"));
+        // Lines are `paths`, never `trips`: the analysis seam carries no
+        // per-vertex or end timestamps, so the generalist row is the only one
+        // the advisor can honestly claim.
+        assert_eq!(with(&[(GeometryType::LineString, 3)]), Some("paths"));
+        assert_eq!(with(&[(GeometryType::MultiLineString, 3)]), Some("paths"));
+        assert_eq!(with(&[(GeometryType::MultiPolygon, 3)]), Some("polygons"));
+        // Majority wins…
+        assert_eq!(
+            with(&[(GeometryType::LineString, 2), (GeometryType::Point, 5)]),
+            Some("points")
+        );
+        assert_eq!(
+            with(&[(GeometryType::Polygon, 9), (GeometryType::Point, 5)]),
+            Some("polygons")
+        );
+        // …and ties break in the fixed points > paths > polygons order, so the
+        // derived weights are a pure function of the input.
+        assert_eq!(
+            with(&[(GeometryType::Polygon, 4), (GeometryType::LineString, 4)]),
+            Some("paths")
+        );
+        assert_eq!(
+            with(&[(GeometryType::Polygon, 4), (GeometryType::Point, 4)]),
+            Some("points")
+        );
+        // Nothing classifiable → no hint → the generalist row.
+        assert_eq!(with(&[(GeometryType::Unknown, 4)]), None);
+        assert_eq!(with(&[]), None);
+    }
+
+    #[test]
+    fn publish_measures_both_arms_under_the_run_layout() {
+        // MO-4's invariant at the publish trial: the level-19 arm and the
+        // level-3 baseline must be cut the same way, or the reported shrink is
+        // partly the tile cut. The check is that the advisory's own numbers are
+        // reproducible by measuring both arms under the run's layout.
+        let data = synthetic_data(point_sample(800));
+        let mut result =
+            synthetic_result(SpatialDistribution::Regional, 30 * DAY_MS, 100 << 20, None);
+        result.density = crate::analysis::density::DensityAnalysis {
+            per_zoom: vec![crate::analysis::density::ZoomDensity {
+                zoom: 12,
+                tile_count: 1_000,
+                avg_features_per_tile: 100.0,
+                median_features_per_tile: 100,
+                max_features_per_tile: 1_000,
+                p95_features_per_tile: 200,
+                top1pct_feature_share: 0.0,
+                oversized_tiles: 0,
+                undersized_tiles: 0,
+                estimated_size_uncompressed: 0,
+                estimated_size_compressed: 0,
+            }],
+            estimated_tile_count: 1_000,
+            estimated_archive_size: 100 << 20,
+            issues: Vec::new(),
+        };
+        let layout = SyntheticLayout::from_density(&result.density);
+        assert!(layout.tiles() > 1, "fixture guard: a splitting layout");
+        // A single-tile `measured` planted beside a multi-tile density — the
+        // exact mismatch that would otherwise price the CUT as a zstd win.
+        result.measured = measure_sample(&data.sample, &MeasureSettings::default()).unwrap();
+        assert!(!layout.produced(result.measured.as_ref().unwrap()));
+
+        let publish = find(&advise(&result, &data).unwrap(), "--publish")
+            .expect("publish advice")
+            .clone();
+
+        let base = crate::measure::measure_sample_layout(
+            &data.sample,
+            &MeasureSettings::default(),
+            &layout,
+        )
+        .unwrap()
+        .unwrap();
+        let hi = crate::measure::measure_sample_layout(
+            &data.sample,
+            &MeasureSettings {
+                zstd_level: PUBLISH_ZSTD_LEVEL,
+                ..MeasureSettings::default()
+            },
+            &layout,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            publish
+                .why
+                .contains(&format!("{} B vs {} B", hi.bytes_total, base.bytes_total)),
+            "both arms must be the run layout's own numbers, got: {}",
+            publish.why
+        );
     }
 
     #[test]

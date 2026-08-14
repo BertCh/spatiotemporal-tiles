@@ -150,6 +150,14 @@ cli = ["build-cli", "optimize-cli", "validate-cli", "bundle-cli", "serve"]
 
 [dev-dependencies]
 tempfile = "3.10"
+# `tests/build_cli_reproducible.rs` synthesises the GeoParquet input it feeds
+# to the `stt-build` BINARY twice (there is no committed .parquet fixture
+# anywhere in the repo — see that file's header). Both crates are already in
+# the resolved graph at the workspace-pinned 59 (stt-core pulls `arrow`,
+# stt-build pulls `parquet`), so this adds no new third-party code — only the
+# ability to WRITE the fixture from this crate's test targets.
+arrow = { workspace = true }
+parquet = { workspace = true }
 
 # Prebuilt binaries (cargo-dist): all four CLIs, both stt-serve backends.
 [package.metadata.dist]

@@ -13,16 +13,16 @@
 //! [objects back-to-back at 8-byte-aligned offsets]
 //! ```
 //!
-//! The container is object-agnostic (keys + bytes are opaque), so it works
-//! for `formatVersion` 1 today and future manifest revisions unchanged. It
+//! The container keeps object keys + bytes opaque, but this toolchain enforces
+//! the same single v3 archive contract for bundles and exploded datasets. It
 //! reuses the parent module's manifest model, content-address helper and
-//! directory decode, so a bundle is verifiable by exactly the same checks as
-//! the exploded layout.
+//! directory decode, so a bundle is verifiable by exactly the same checks.
 
 use super::{
-    blake3_128_hex, decode_directory_entries, directory_codec_bytes, strip_object_magic,
-    verify_manifest_schemas, verify_v2_frame_template_refs, write_atomic, Manifest,
-    DIRECTORY_ENCODING_ZSTD, DIRECTORY_MAGIC, PACKED_FORMAT, PACKED_FORMAT_VERSION, PACK_MAGIC,
+    blake3_128_hex, decode_directory_entries, directory_codec_bytes, manifest_open_checks,
+    strip_object_magic, verify_manifest_schemas, verify_v2_frame_template_refs, write_atomic,
+    Manifest, DIRECTORY_ENCODING_ZSTD, DIRECTORY_MAGIC, PACKED_FORMAT, PACKED_FORMAT_VERSION,
+    PACK_MAGIC,
 };
 use crate::error::{Error, Result};
 use memmap2::Mmap;
@@ -119,7 +119,7 @@ struct ManifestObjectKey {
 
 /// Enumerate a packed manifest's object keys in the **canonical bundle
 /// order**: the directory first, then packs in `pack_id` order, then any
-/// future manifest object tables (a `formatVersion: 2` `schemas` array) in
+/// future manifest object tables after the current v3 `schemas` array in
 /// listed order. Operates on the raw JSON value so bundling stays
 /// object-agnostic across manifest revisions. Keys are traversal-validated
 /// and must be unique.
@@ -160,7 +160,7 @@ fn manifest_object_keys(manifest: &serde_json::Value) -> Result<Vec<ManifestObje
     for (i, p) in packs.iter().enumerate() {
         out.push(entry(p, &format!("packs[{i}]"))?);
     }
-    // formatVersion 2 embeds its schema templates INSIDE the manifest
+    // formatVersion 3 embeds its schema templates INSIDE the manifest
     // (`schemas: [{hash, data}]` — base64, no object keys), so they ride the
     // header's verbatim manifest and the bundle carries no schema objects.
     // (An earlier draft planned external `schemas/<hash>.sttt` objects; the
@@ -245,6 +245,8 @@ pub fn write_bundle<P: AsRef<Path>, Q: AsRef<Path>>(
         .to_string();
     let manifest_value: serde_json::Value = serde_json::from_str(&manifest_text)
         .map_err(|e| Error::InvalidArchive(format!("manifest JSON decode failed: {e}")))?;
+    let typed_manifest = Manifest::from_json_bytes(manifest_text.as_bytes())?;
+    manifest_open_checks(&typed_manifest)?;
     let keys = manifest_object_keys(&manifest_value)?;
     let manifest_rv = serde_json::value::RawValue::from_string(manifest_text)
         .map_err(|e| Error::InvalidArchive(format!("manifest is not a JSON value: {e}")))?;
@@ -420,6 +422,8 @@ pub fn unpack_bundle<P: AsRef<Path>, Q: AsRef<Path>>(
     // a dataset that could never verify.
     let manifest_value: serde_json::Value = serde_json::from_str(header.manifest.get())
         .map_err(|e| Error::InvalidArchive(format!("bundle manifest JSON decode failed: {e}")))?;
+    let typed_manifest = Manifest::from_json_bytes(header.manifest.get().as_bytes())?;
+    manifest_open_checks(&typed_manifest)?;
     for k in manifest_object_keys(&manifest_value)? {
         if !seen.contains(k.key.as_str()) {
             return Err(Error::InvalidArchive(format!(
@@ -485,6 +489,10 @@ pub fn verify_bundle_objects<P: AsRef<Path>>(bundle_path: P) -> Result<Vec<Strin
     let manifest = Manifest::from_json_bytes(header.manifest.get().as_bytes())?;
 
     let mut issues = Vec::new();
+    if let Err(error) = manifest_open_checks(&manifest) {
+        issues.push(error.to_string());
+        return Ok(issues);
+    }
 
     if manifest.format != PACKED_FORMAT {
         issues.push(format!(
@@ -596,7 +604,11 @@ pub fn verify_bundle_objects<P: AsRef<Path>>(bundle_path: P) -> Result<Vec<Strin
     if let Some(dir_bytes) = by_key.get(manifest.directory.key.as_str()) {
         match directory_codec_bytes(dir_bytes, manifest.format_version) {
             Ok(codec) => {
-                match decode_directory_entries(codec, &manifest.directory) {
+                match decode_directory_entries(
+                    codec,
+                    &manifest.directory,
+                    manifest.metadata.tile_count,
+                ) {
                     Ok(entries) => {
                         if let Some(max_pid) = entries.iter().map(|e| e.pack_id).max() {
                             if max_pid as usize >= manifest.packs.len() {

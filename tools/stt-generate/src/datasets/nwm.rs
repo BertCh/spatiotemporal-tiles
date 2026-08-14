@@ -70,7 +70,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::common::{
-    self, LineStringRecord, PropertyColumn, SttBuildOptions, StreamingLineStringParquetWriter,
+    self, LineStringRecord, PropertyColumn, StreamingLineStringParquetWriter, SttBuildOptions,
 };
 use crate::datasets::bixi::resolve_intermediate;
 
@@ -123,8 +123,10 @@ fn n_stripes() -> usize {
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(about = "Generate NOAA National Water Model river-discharge corridors \
-                   (NWM v3.0 retrospective on the NHDPlusV2 CONUS network)")]
+#[command(
+    about = "Generate NOAA National Water Model river-discharge corridors \
+                   (NWM v3.0 retrospective on the NHDPlusV2 CONUS network)"
+)]
 pub struct Args {
     /// NHDPlus flowlines GeoParquet (COMID, StreamOrde, Hydroseq, LevelPathI,
     /// Divergence, DnHydroseq, geometry_wkb WKB MultiLineString lon/lat).
@@ -151,8 +153,12 @@ pub struct Args {
 
     /// Output packed `.stt` directory (or `*.parquet` to stop at the
     /// intermediate). `--out` is accepted as an alias.
-    #[arg(short, long, alias = "out",
-          default_value = "examples/showcase/public/data/nwm-rivers-2019")]
+    #[arg(
+        short,
+        long,
+        alias = "out",
+        default_value = "examples/showcase/public/data/nwm-rivers-2019"
+    )]
     pub output: PathBuf,
 
     /// Zoom pyramid to tile into, `LO-HI` or a single `Z`. Each river is
@@ -239,8 +245,12 @@ fn parse_window(s: &str) -> Result<WindowSpec> {
         let end = NaiveDate::from_ymd_opt(y + 1, 1, 1).unwrap();
         (start, end, format!("{y}"))
     } else if let Some((ys, ms)) = s.split_once('-') {
-        let y: i32 = ys.parse().with_context(|| format!("invalid --window '{s}'"))?;
-        let m: u32 = ms.parse().with_context(|| format!("invalid --window '{s}'"))?;
+        let y: i32 = ys
+            .parse()
+            .with_context(|| format!("invalid --window '{s}'"))?;
+        let m: u32 = ms
+            .parse()
+            .with_context(|| format!("invalid --window '{s}'"))?;
         let start = NaiveDate::from_ymd_opt(y, m, 1)
             .ok_or_else(|| anyhow!("invalid --window '{s}' (expected YYYY or YYYY-MM)"))?;
         let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
@@ -250,8 +260,16 @@ fn parse_window(s: &str) -> Result<WindowSpec> {
         bail!("invalid --window '{s}' (expected YYYY or YYYY-MM)");
     };
 
-    let start_ms = start.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
-    let end_ms = end.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+    let start_ms = start
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    let end_ms = end
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
     let off_ms = start_ms - TIME_EPOCH_MS;
     if off_ms < 0 || off_ms % 3_600_000 != 0 {
         bail!("--window '{s}' starts before the retrospective time axis (1979-02-01T01Z)");
@@ -261,7 +279,12 @@ fn parse_window(s: &str) -> Result<WindowSpec> {
     if start_hour + hours > N_HOURS_TOTAL {
         bail!("--window '{s}' extends past the end of the retrospective (hour {N_HOURS_TOTAL})");
     }
-    Ok(WindowSpec { label, start_hour, hours, bucket0_ms: start_ms })
+    Ok(WindowSpec {
+        label,
+        start_hour,
+        hours,
+        bucket0_ms: start_ms,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,8 +337,12 @@ fn parse_value(s: &str) -> Result<ValueEncoding> {
 fn parse_zooms(s: &str) -> Result<(u8, u8)> {
     let s = s.trim();
     let (a, b) = s.split_once('-').unwrap_or((s, s));
-    let lo: u8 = a.parse().with_context(|| format!("invalid --zooms '{s}'"))?;
-    let hi: u8 = b.parse().with_context(|| format!("invalid --zooms '{s}'"))?;
+    let lo: u8 = a
+        .parse()
+        .with_context(|| format!("invalid --zooms '{s}'"))?;
+    let hi: u8 = b
+        .parse()
+        .with_context(|| format!("invalid --zooms '{s}'"))?;
     if lo > hi || lo < 1 || hi > 12 {
         bail!("--zooms '{s}' out of range (expected 1 ≤ LO ≤ HI ≤ 12)");
     }
@@ -336,7 +363,9 @@ fn band_min_order(z: u8) -> i32 {
 /// zoom up through `zhi` as ONE full-resolution feature (density LOD), instead
 /// of a distinct coarse resample per band (which wove overlapping copies).
 fn min_zoom_for_order(order: i32, zlo: u8, zhi: u8) -> u8 {
-    (zlo..=zhi).find(|&z| band_min_order(z) <= order).unwrap_or(zhi)
+    (zlo..=zhi)
+        .find(|&z| band_min_order(z) <= order)
+        .unwrap_or(zhi)
 }
 
 /// Grid-aligned temporal chunk plan for `[bucket0, range_end)`.
@@ -362,7 +391,12 @@ fn plan_time_chunks(
             let t1 = ((g + 1) * chunk_bucket_ms).min(range_end);
             let b0 = ((t0 - bucket0) / bin_ms) as usize;
             let b1 = ((t1 - bucket0) / bin_ms) as usize;
-            (b0, b1, bucket0 + b0 as i64 * bin_ms, bucket0 + b1 as i64 * bin_ms)
+            (
+                b0,
+                b1,
+                bucket0 + b0 as i64 * bin_ms,
+                bucket0 + b1 as i64 * bin_ms,
+            )
         })
         .collect()
 }
@@ -419,7 +453,11 @@ fn scale_flow(raw: i32) -> f32 {
 fn decode_i32_frame(compressed: &[u8], expected_cells: usize) -> Result<Vec<i32>> {
     let raw = zstd::decode_all(compressed).context("zstd decode failed")?;
     if raw.len() < expected_cells * 4 {
-        bail!("frame decodes to {} bytes, expected ≥ {}", raw.len(), expected_cells * 4);
+        bail!(
+            "frame decodes to {} bytes, expected ≥ {}",
+            raw.len(),
+            expected_cells * 4
+        );
     }
     Ok(raw
         .chunks_exact(4)
@@ -469,7 +507,10 @@ fn cache_object(
         return Ok(0);
     }
     if skip_download {
-        bail!("--skip-download set but {} is not cached ({url})", path.display());
+        bail!(
+            "--skip-download set but {} is not cached ({url})",
+            path.display()
+        );
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -493,10 +534,19 @@ fn chunk_url(t: usize, r: usize) -> String {
 /// `order` int32) — each a single bare zstd chunk object `{name}/0`.
 fn fetch_1d_raw(client: &reqwest::blocking::Client, args: &Args, name: &str) -> Result<Vec<u8>> {
     let path = args.cache_dir.join(format!("{name}.0.zst"));
-    cache_object(client, &format!("{ZARR_BASE}/{name}/0"), &path, args.skip_download)?;
+    cache_object(
+        client,
+        &format!("{ZARR_BASE}/{name}/0"),
+        &path,
+        args.skip_download,
+    )?;
     let compressed = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    zstd::decode_all(&compressed[..])
-        .with_context(|| format!("corrupt cache file {} — delete it and re-run", path.display()))
+    zstd::decode_all(&compressed[..]).with_context(|| {
+        format!(
+            "corrupt cache file {} — delete it and re-run",
+            path.display()
+        )
+    })
 }
 
 fn fetch_feature_ids(client: &reqwest::blocking::Client, args: &Args) -> Result<Vec<i64>> {
@@ -541,7 +591,12 @@ pub(crate) struct Accum {
 impl Accum {
     pub(crate) fn new(keep: Vec<u32>, n_buckets: usize) -> Self {
         let n = keep.len() * n_buckets;
-        Self { keep, n_buckets, sums: vec![0.0; n], counts: vec![0; n] }
+        Self {
+            keep,
+            n_buckets,
+            sums: vec![0.0; n],
+            counts: vec![0; n],
+        }
     }
 
     /// Fold one decoded chunk (starting at global hour `chunk_h0`, `stripe_width`
@@ -583,7 +638,13 @@ impl Accum {
             .sums
             .iter()
             .zip(&self.counts)
-            .map(|(&s, &c)| if c > 0 { (s / c as f64) as f32 } else { f32::NAN })
+            .map(|(&s, &c)| {
+                if c > 0 {
+                    (s / c as f64) as f32
+                } else {
+                    f32::NAN
+                }
+            })
             .collect();
         let medians = match bin {
             Bin::Daily => Some(
@@ -697,9 +758,18 @@ pub(crate) fn write_stripe(
 
 pub(crate) fn read_stripe(path: &Path) -> Result<StripeData> {
     let compressed = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let raw = zstd::decode_all(&compressed[..])
-        .with_context(|| format!("corrupt stripe file {} — delete it and re-run", path.display()))?;
-    let fail = || anyhow!("malformed stripe file {} — delete it and re-run", path.display());
+    let raw = zstd::decode_all(&compressed[..]).with_context(|| {
+        format!(
+            "corrupt stripe file {} — delete it and re-run",
+            path.display()
+        )
+    })?;
+    let fail = || {
+        anyhow!(
+            "malformed stripe file {} — delete it and re-run",
+            path.display()
+        )
+    };
     if raw.len() < 24 || &raw[..8] != STRIPE_MAGIC {
         return Err(fail());
     }
@@ -716,8 +786,7 @@ pub(crate) fn read_stripe(path: &Path) -> Result<StripeData> {
         return Err(fail());
     }
     let mut off = 24;
-    let indices: Vec<u32> =
-        (0..n_kept).map(|i| u32_at(off + i * 4)).collect();
+    let indices: Vec<u32> = (0..n_kept).map(|i| u32_at(off + i * 4)).collect();
     off += n_kept * 4;
     let n_vals = n_kept * n_buckets as usize;
     let values: Vec<f32> = raw[off..off + n_vals * 4]
@@ -731,7 +800,13 @@ pub(crate) fn read_stripe(path: &Path) -> Result<StripeData> {
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()
     });
-    Ok(StripeData { stripe, n_buckets, indices, values, medians })
+    Ok(StripeData {
+        stripe,
+        n_buckets,
+        indices,
+        values,
+        medians,
+    })
 }
 
 /// Local columns to persist for a stripe: zarr `order` ≥ 3 reaches **union**
@@ -750,9 +825,7 @@ fn keep_columns(
     let start = stripe * REACHES_PER_CHUNK;
     let end = (start + REACHES_PER_CHUNK).min(N_REACHES);
     (start..end)
-        .filter(|&g| {
-            zarr_orders[g] >= PERSIST_MIN_ORDER || geometry_fids.contains(&feature_ids[g])
-        })
+        .filter(|&g| zarr_orders[g] >= PERSIST_MIN_ORDER || geometry_fids.contains(&feature_ids[g]))
         .map(|g| (g - start) as u32)
         .collect()
 }
@@ -771,10 +844,17 @@ fn ensure_reduced(
     stripes: &[usize],
 ) -> Result<()> {
     let dir = reduced_dir(&args.reduced_dir, &window.label, bin);
-    let missing: Vec<usize> =
-        stripes.iter().copied().filter(|&r| !stripe_file(&dir, r).exists()).collect();
+    let missing: Vec<usize> = stripes
+        .iter()
+        .copied()
+        .filter(|&r| !stripe_file(&dir, r).exists())
+        .collect();
     if missing.is_empty() {
-        println!("♻️  Reduce cached: {} ({} stripes)", dir.display(), stripes.len());
+        println!(
+            "♻️  Reduce cached: {} ({} stripes)",
+            dir.display(),
+            stripes.len()
+        );
         return Ok(());
     }
     fs::create_dir_all(&dir)?;
@@ -804,12 +884,17 @@ fn ensure_reduced(
                 args.cache_dir.display()
             );
         }
-        println!("⬇️  Fetching {} zarr chunks (≈{:.2} GB compressed) …",
-                 keys.len(), keys.len() as f64 * 6.3 / 1024.0);
+        println!(
+            "⬇️  Fetching {} zarr chunks (≈{:.2} GB compressed) …",
+            keys.len(),
+            keys.len() as f64 * 6.3 / 1024.0
+        );
         let pb = ProgressBar::new(keys.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+                )?
                 .progress_chars("#>-"),
         );
         let downloaded = AtomicU64::new(0);
@@ -846,7 +931,10 @@ fn ensure_reduced(
             let compressed = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
             let data = decode_i32_frame(&compressed, HOURS_PER_CHUNK * REACHES_PER_CHUNK)
                 .with_context(|| {
-                    format!("corrupt cache file {} — delete it and re-run", path.display())
+                    format!(
+                        "corrupt cache file {} — delete it and re-run",
+                        path.display()
+                    )
                 })?;
             acc.ingest_chunk(t * HOURS_PER_CHUNK, &data, REACHES_PER_CHUNK, window, bin);
         }
@@ -1068,11 +1156,19 @@ impl<'a> WkbCursor<'a> {
     }
     fn u32(&mut self, le: bool) -> Result<u32> {
         let b: [u8; 4] = self.take(4)?.try_into().unwrap();
-        Ok(if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
+        Ok(if le {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        })
     }
     fn f64(&mut self, le: bool) -> Result<f64> {
         let b: [u8; 8] = self.take(8)?.try_into().unwrap();
-        Ok(if le { f64::from_le_bytes(b) } else { f64::from_be_bytes(b) })
+        Ok(if le {
+            f64::from_le_bytes(b)
+        } else {
+            f64::from_be_bytes(b)
+        })
     }
 }
 
@@ -1138,7 +1234,10 @@ fn load_flowline_comids(path: &Path) -> Result<HashSet<i64>> {
         .with_context(|| format!("open flowlines parquet {}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let mask = parquet::arrow::ProjectionMask::columns(builder.parquet_schema(), ["COMID"]);
-    let reader = builder.with_projection(mask).with_batch_size(65_536).build()?;
+    let reader = builder
+        .with_projection(mask)
+        .with_batch_size(65_536)
+        .build()?;
     let mut out = HashSet::new();
     for batch in reader {
         let batch = batch?;
@@ -1214,7 +1313,9 @@ fn load_flowlines(path: &Path, min_order: i32) -> Result<(Vec<Reach>, LoadStats)
             }
             stats.kept += 1;
             reaches.push(Reach {
-                comid: comid.get(i).ok_or_else(|| anyhow!("null COMID at row {i}"))?,
+                comid: comid
+                    .get(i)
+                    .ok_or_else(|| anyhow!("null COMID at row {i}"))?,
                 order: ord,
                 level_path: level_path.get(i).unwrap_or(0),
                 hydroseq: hydroseq.get(i).unwrap_or(0),
@@ -1272,8 +1373,7 @@ pub(crate) fn merge_runs(reaches: &[Reach]) -> (Vec<MergedRun>, MergeStats) {
         members.sort_by_key(|&i| (std::cmp::Reverse(reaches[i].hydroseq), reaches[i].comid));
         let by_hydroseq: HashMap<i64, usize> =
             members.iter().map(|&i| (reaches[i].hydroseq, i)).collect();
-        let dn_targets: HashSet<i64> =
-            members.iter().map(|&i| reaches[i].dn_hydroseq).collect();
+        let dn_targets: HashSet<i64> = members.iter().map(|&i| reaches[i].dn_hydroseq).collect();
         let mut visited: HashSet<usize> = HashSet::with_capacity(members.len());
 
         // Pass 0: true heads (no in-group upstream neighbor). Pass 1: leftovers
@@ -1296,7 +1396,9 @@ pub(crate) fn merge_runs(reaches: &[Reach]) -> (Vec<MergedRun>, MergeStats) {
                     if dn == 0 {
                         break;
                     }
-                    let Some(&next) = by_hydroseq.get(&dn) else { break };
+                    let Some(&next) = by_hydroseq.get(&dn) else {
+                        break;
+                    };
                     if visited.contains(&next) {
                         break;
                     }
@@ -1342,7 +1444,13 @@ fn build_run(order: i32, chain: &[usize], reaches: &[Reach]) -> MergedRun {
             }
         }
     }
-    MergedRun { order, comid0: reaches[chain[0]].comid, coords, seg_source, comids }
+    MergedRun {
+        order,
+        comid0: reaches[chain[0]].comid,
+        coords,
+        seg_source,
+        comids,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,7 +1505,11 @@ pub(crate) fn resample_run(
             j += 1;
         }
         let seg_len = cum[j + 1] - cum[j];
-        let t = if seg_len > 0.0 { ((d - cum[j]) / seg_len).clamp(0.0, 1.0) } else { 0.0 };
+        let t = if seg_len > 0.0 {
+            ((d - cum[j]) / seg_len).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let p = [
             coords[j][0] + (coords[j + 1][0] - coords[j][0]) * t,
             coords[j][1] + (coords[j + 1][1] - coords[j][1]) * t,
@@ -1491,7 +1603,11 @@ pub fn run(args: Args) -> Result<()> {
     // low-zoom overview tiles. A request ≥ the bucket count sends the whole
     // series in ONE tile per cell (geometry once). Otherwise grid-aligned
     // N-column temporal tiles (lighter per-tile, geometry re-sent per chunk).
-    let requested = if args.chunk_buckets == 0 { AUTO_CHUNK_BUCKETS } else { args.chunk_buckets };
+    let requested = if args.chunk_buckets == 0 {
+        AUTO_CHUNK_BUCKETS
+    } else {
+        args.chunk_buckets
+    };
     let no_chunk = requested >= n_buckets;
     let chunk_buckets = requested.min(n_buckets.max(1));
     let (chunks, build_bucket_ms): (Vec<(usize, usize, i64, i64)>, i64) = if no_chunk {
@@ -1509,7 +1625,12 @@ pub fn run(args: Args) -> Result<()> {
 
     println!("📋 Configuration:");
     println!("   Flowlines: {}", args.flowlines.display());
-    println!("   Window:    {} ({} buckets of {})", window.label, n_buckets, bin.suffix());
+    println!(
+        "   Window:    {} ({} buckets of {})",
+        window.label,
+        n_buckets,
+        bin.suffix()
+    );
     println!("   Value:     {:?}", value);
     println!(
         "   Geometry:  full-res @ z{} (~{:.0} m spacing), order ≥{}, density LOD z{}–{}",
@@ -1518,7 +1639,8 @@ pub fn run(args: Args) -> Result<()> {
     if no_chunk {
         println!(
             "   Time:      NO chunking — 1 tile/cell, geometry once, full {}-{} matrix",
-            n_buckets, bin.suffix()
+            n_buckets,
+            bin.suffix()
         );
     } else {
         println!(
@@ -1528,7 +1650,10 @@ pub fn run(args: Args) -> Result<()> {
     }
     println!("   Output:    {}", args.output.display());
     if let Some(n) = args.max_reach_stripes {
-        println!("   ⚠ Stripes limited to first {n} of {} — smoke-test mode", n_stripes());
+        println!(
+            "   ⚠ Stripes limited to first {n} of {} — smoke-test mode",
+            n_stripes()
+        );
     }
     println!();
 
@@ -1543,7 +1668,16 @@ pub fn run(args: Args) -> Result<()> {
     // The persist floor must cover the geometry's reaches, not just zarr
     // order ≥ 3 — NWM order resets on divergence paths (see keep_columns).
     let geometry_fids = load_flowline_comids(&args.flowlines)?;
-    ensure_reduced(&client, &args, &window, bin, &zarr_orders, &feature_ids, &geometry_fids, &stripes)?;
+    ensure_reduced(
+        &client,
+        &args,
+        &window,
+        bin,
+        &zarr_orders,
+        &feature_ids,
+        &geometry_fids,
+        &stripes,
+    )?;
     let medians_dir = if value == ValueEncoding::LogAnomaly {
         let year_label = window.label[..4].to_string();
         let year_window = parse_window(&year_label)?;
@@ -1691,7 +1825,10 @@ pub fn run(args: Args) -> Result<()> {
                         // Normalise each reach to its OWN annual [p2, p98] so
                         // colour reads seasonal variation, not absolute size.
                         let (lo, hi) = log_percentile_bounds(series);
-                        series.iter().map(|&q| encode_self_scaled(q, lo, hi)).collect()
+                        series
+                            .iter()
+                            .map(|&q| encode_self_scaled(q, lo, hi))
+                            .collect()
                     }
                     ValueEncoding::LogQ => series.iter().map(|&q| encode_log_q(q)).collect(),
                     ValueEncoding::LogAnomaly => {
@@ -1800,7 +1937,7 @@ pub fn run(args: Args) -> Result<()> {
         no_clip: false,
         quantize_coords: Some(10.0),
         quantize_attrs: Vec::new(),
-            blob_ordering: None,
+        blob_ordering: None,
     })?;
     let build_elapsed = t_build.elapsed();
 
@@ -1831,7 +1968,7 @@ mod tests {
         assert_eq!(min_zoom_for_order(6, 4, 8), 4);
         assert_eq!(min_zoom_for_order(5, 4, 8), 6); // order 5 first at z6
         assert_eq!(min_zoom_for_order(4, 4, 8), 8); // order 4 only at z8
-        // Below the overall floor never reaches here (filtered), but clamp holds.
+                                                    // Below the overall floor never reaches here (filtered), but clamp holds.
         assert_eq!(min_zoom_for_order(3, 4, 8), 8);
         // Every emitted river's min_zoom is a single value in [zlo, zhi].
         for o in 4..=10 {
@@ -1863,7 +2000,11 @@ mod tests {
         // wrong chunk mid-window.
         let cells: Vec<i64> = chunks.iter().map(|c| c.2.div_euclid(chunk_ms)).collect();
         for w in cells.windows(2) {
-            assert_eq!(w[1], w[0] + 1, "chunk starts must map to consecutive grid cells");
+            assert_eq!(
+                w[1],
+                w[0] + 1,
+                "chunk starts must map to consecutive grid cells"
+            );
         }
         // Interior chunk starts sit exactly on a grid edge (only the first is a
         // partial pre-roll cell, offset from the epoch grid by bucket0).
@@ -2004,9 +2145,15 @@ mod tests {
         assert_eq!(parse_bin("1d").unwrap(), Bin::Daily);
         assert_eq!(parse_bin("1h").unwrap(), Bin::Hourly);
         assert!(parse_bin("6h").is_err());
-        assert_eq!(parse_value("self-scaled").unwrap(), ValueEncoding::SelfScaled);
+        assert_eq!(
+            parse_value("self-scaled").unwrap(),
+            ValueEncoding::SelfScaled
+        );
         assert_eq!(parse_value("log-q").unwrap(), ValueEncoding::LogQ);
-        assert_eq!(parse_value("log-anomaly").unwrap(), ValueEncoding::LogAnomaly);
+        assert_eq!(
+            parse_value("log-anomaly").unwrap(),
+            ValueEncoding::LogAnomaly
+        );
         assert!(parse_value("linear").is_err());
     }
 
@@ -2039,7 +2186,12 @@ mod tests {
     // -- reduce -------------------------------------------------------------
 
     fn test_window(start_hour: usize, hours: usize) -> WindowSpec {
-        WindowSpec { label: "test".into(), start_hour, hours, bucket0_ms: 0 }
+        WindowSpec {
+            label: "test".into(),
+            start_hour,
+            hours,
+            bucket0_ms: 0,
+        }
     }
 
     /// 48 rows × 2 cols: col0 = 100 (day 0) then 200 (day 1); col1 = 300 in
@@ -2189,16 +2341,19 @@ mod tests {
         assert_eq!(encode_self_scaled(1.0, lo, hi), 0.0);
         assert_eq!(encode_self_scaled(1000.0, lo, hi), 1.0);
         assert_eq!(encode_self_scaled(31.62, lo, hi), 0.5); // 10^1.5
-        // Absolute size does NOT set the colour — a huge reach scaled to its own
-        // [10^4, 10^6] range reports the SAME 0.5 at its geometric midpoint.
+                                                            // Absolute size does NOT set the colour — a huge reach scaled to its own
+                                                            // [10^4, 10^6] range reports the SAME 0.5 at its geometric midpoint.
         let (blo, bhi) = (4.0f32, 6.0f32);
         assert_eq!(encode_self_scaled(100_000.0, blo, bhi), 0.5); // 10^5
-        // Below-p2 / above-p98 samples clamp to the ends.
+                                                                  // Below-p2 / above-p98 samples clamp to the ends.
         assert_eq!(encode_self_scaled(0.1, lo, hi), 0.0);
         assert_eq!(encode_self_scaled(1e6, lo, hi), 1.0);
         // Span floor: a near-constant reach (log span 0.1 < 0.30) only reaches a
         // proportional fraction of the ramp, so it stays dim.
-        assert_eq!(encode_self_scaled(10.0f32.powf(0.1), 0.0, 0.1), round2(0.1 / 0.30));
+        assert_eq!(
+            encode_self_scaled(10.0f32.powf(0.1), 0.0, 0.1),
+            round2(0.1 / 0.30)
+        );
         // Undefined bounds / fill → NaN → renderer fallback.
         assert!(encode_self_scaled(f32::NAN, lo, hi).is_nan());
         assert!(encode_self_scaled(5.0, f32::NAN, f32::NAN).is_nan());
@@ -2214,7 +2369,14 @@ mod tests {
         dn_hydroseq: i64,
         coords: &[[f64; 2]],
     ) -> Reach {
-        Reach { comid, order, level_path, hydroseq, dn_hydroseq, coords: coords.to_vec() }
+        Reach {
+            comid,
+            order,
+            level_path,
+            hydroseq,
+            dn_hydroseq,
+            coords: coords.to_vec(),
+        }
     }
 
     #[test]

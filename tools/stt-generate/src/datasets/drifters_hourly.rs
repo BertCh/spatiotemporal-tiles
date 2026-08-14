@@ -23,7 +23,7 @@
 //! the current. Tracks are colour-banded by sea-surface temperature.
 
 use crate::common::{
-    self, LineStringRecord, PropertyColumn, SttBuildOptions, StreamingLineStringParquetWriter,
+    self, LineStringRecord, PropertyColumn, StreamingLineStringParquetWriter, SttBuildOptions,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
@@ -36,8 +36,7 @@ use std::fs::{self, File};
 use std::path::PathBuf;
 use std::process::Command;
 
-const ERDDAP_BASE: &str =
-    "https://erddap.aoml.noaa.gov/gdp/erddap/tabledap/drifter_hourly_qc.csv";
+const ERDDAP_BASE: &str = "https://erddap.aoml.noaa.gov/gdp/erddap/tabledap/drifter_hourly_qc.csv";
 
 /// Absolute zero offset: hourly `sst` is Kelvin; the colour bands expect °C.
 const KELVIN_TO_CELSIUS: f64 = 273.15;
@@ -125,7 +124,10 @@ pub fn run(args: Args) -> Result<()> {
     // Hourly months are ~6× the bytes of the 6-hourly product — still fine
     // per-month, but a year-long single request would be hopeless.
     let months = month_starts(start, end);
-    println!("📥 Fetching {} month(s) of hourly drifter fixes...\n", months.len());
+    println!(
+        "📥 Fetching {} month(s) of hourly drifter fixes...\n",
+        months.len()
+    );
     let pb = ProgressBar::new(months.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -146,11 +148,14 @@ pub fn run(args: Args) -> Result<()> {
         let m_start = NaiveDate::from_ymd_opt(*y, *m, 1).unwrap();
         let (ny, nm) = next_month(*y, *m);
         let m_end = NaiveDate::from_ymd_opt(ny, nm, 1).unwrap().min(end);
-        let path = args
-            .cache_dir
-            .join(format!("drifters-hourly-{:04}-{:02}-{}.csv", y, m, bounds_tag));
+        let path = args.cache_dir.join(format!(
+            "drifters-hourly-{:04}-{:02}-{}.csv",
+            y, m, bounds_tag
+        ));
 
-        if args.refresh || !path.exists() || fs::metadata(&path).map(|m| m.len() < 64).unwrap_or(true)
+        if args.refresh
+            || !path.exists()
+            || fs::metadata(&path).map(|m| m.len() < 64).unwrap_or(true)
         {
             let url = build_url(
                 &format!("{}T00:00:00Z", m_start.format("%Y-%m-%d")),
@@ -400,7 +405,10 @@ fn parse_csv(
             }
         }
 
-        tracks.entry(id).or_default().push(Fix { ms, lon, lat, temp });
+        tracks
+            .entry(id)
+            .or_default()
+            .push(Fix { ms, lon, lat, temp });
         *total += 1;
     }
     Ok(())
@@ -420,7 +428,9 @@ fn parse_time_ms(s: &str) -> Option<i64> {
 }
 
 fn ms_to_dt(ms: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(ms).single().unwrap_or_else(Utc::now)
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(Utc::now)
 }
 
 /// Per-vertex SST (°C) aligned 1:1 with a segment's fixes, gap-filled so the

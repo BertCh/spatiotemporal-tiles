@@ -21,8 +21,24 @@
 
 mod common;
 
+use std::sync::Arc;
+
+use stt_build::input::ParsedFeature;
 use stt_build::tiler::{encode_single_tile_counted, generate_tiles, TileConfig};
-use stt_core::arrow_tile::{encode_tile_with, EncoderConfig};
+use stt_core::arrow_tile::{encode_tile_with, EncoderConfig, GlobalColumnPins};
+
+/// Resolve the dataset-global encoder pins the way `stt-build`'s pass 1 does.
+fn pins_for(features: &[ParsedFeature]) -> GlobalColumnPins {
+    use stt_build::columnar::{infer_property_types, AttributeFilter};
+    use stt_build::dataset_stats::collect_dataset_stats;
+
+    let filter = AttributeFilter::KeepAll;
+    let types = infer_property_types(
+        features.iter().map(|f| f.shared_properties.as_ref()),
+        &filter,
+    );
+    collect_dataset_stats(features, &filter, &types).to_pins()
+}
 
 #[test]
 fn single_tile_encoding_matches_offline_build() {
@@ -109,5 +125,107 @@ fn single_tile_encoding_matches_offline_build() {
     assert!(
         empty.is_none(),
         "an offline-empty (z,x,y,t) must encode to None"
+    );
+}
+
+/// The same parity sweep with the DATASET-GLOBAL PINS threaded through both
+/// sides — the `stt-serve` half of pass 1's contract.
+///
+/// # Why this is the guard that matters for M2
+///
+/// `stt-serve` answers tile requests one tile at a time. That is precisely the
+/// position from which a dataset-global verdict cannot be re-derived: the server
+/// has one tile's rows, so if it re-decides the numeric affine or the
+/// dictionary-vs-`Utf8` choice locally it produces a DIFFERENT tile from the one
+/// the offline build published — the same value decoding to a different number
+/// at the same address. The build↔serve byte-identity contract (shared through
+/// `build_options`) is what stops that, and it only holds if the pins reach both
+/// producers.
+///
+/// So the assertion is: given the SAME pins, the single-tile encoder reproduces
+/// the offline pipeline's payload byte for byte, across the whole
+/// zoom × bucket sweep including the clipped-trajectory tiles. Byte equality is
+/// the strongest available statement and needs no decode step — any divergence
+/// in placement, clipping, bucketing, column order, baked metadata, or (the new
+/// one) which pin was applied, fails here immediately.
+///
+/// The complementary risk — a served tile built with NO pins against a pinned
+/// archive — is not simulated here because nothing consumes the pins yet, so the
+/// two are byte-identical by construction (see
+/// `reproducible_pipeline::attaching_pins_moves_no_archive_byte`). The item that
+/// starts consuming them owns adding that negative case.
+#[test]
+fn pinned_single_tile_encoding_matches_pinned_offline_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fixture.parquet");
+    common::write_fixture_parquet(&common::fixture_rows(), &path);
+    let features = common::load_file(&path);
+    assert_eq!(features.len(), 5, "fixture decodes to 5 features");
+
+    let config = TileConfig {
+        min_zoom: 0,
+        max_zoom: 8,
+        temporal_bucket_ms: 3_600_000,
+        ..TileConfig::default()
+    };
+
+    let pins = Arc::new(pins_for(&features));
+    assert!(
+        !pins.attr.is_empty() && !pins.dict.is_empty(),
+        "the fixture must pin a numeric AND a categorical column, or this sweep \
+         proves nothing: {pins:?}"
+    );
+    let encoder = EncoderConfig {
+        global_pins: Some(pins),
+        ..EncoderConfig::default()
+    };
+
+    let offline = generate_tiles(&features, &config, 2).expect("offline generate_tiles");
+    assert!(
+        offline.len() > 20,
+        "expected a multi-tile sweep, got {}",
+        offline.len()
+    );
+
+    for tile in &offline {
+        let offline_bytes = encode_tile_with(&tile.layers, &encoder).expect("encode offline tile");
+        let (single_bytes, single_count) = encode_single_tile_counted(
+            &features,
+            tile.id.z,
+            tile.id.x,
+            tile.id.y,
+            tile.id.t as i64,
+            &config,
+            &encoder,
+        )
+        .expect("encode_single_tile_counted")
+        .unwrap_or_else(|| {
+            panic!(
+                "pinned single-tile path returned empty for offline tile z{}/{}/{} t{}",
+                tile.id.z, tile.id.x, tile.id.y, tile.id.t
+            )
+        });
+
+        assert_eq!(
+            single_count,
+            tile.feature_count(),
+            "feature count diverges under pins at z{}/{}/{} t{}",
+            tile.id.z,
+            tile.id.x,
+            tile.id.y,
+            tile.id.t
+        );
+        assert_eq!(
+            single_bytes, offline_bytes,
+            "payload bytes diverge under pins at z{}/{}/{} t{}",
+            tile.id.z, tile.id.x, tile.id.y, tile.id.t
+        );
+    }
+    assert!(
+        offline
+            .iter()
+            .flat_map(|t| &t.layers)
+            .any(|l| matches!(l.geometry.kind(), stt_core::types::GeometryType::LineString)),
+        "sweep must cover a linestring layer (clip path)"
     );
 }

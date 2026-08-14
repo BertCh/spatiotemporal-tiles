@@ -62,13 +62,25 @@ struct ArcGISFeature {
 
 #[derive(Deserialize, Debug)]
 struct ArcGISAttributes {
-    #[serde(rename = "OBJECTID", deserialize_with = "deserialize_flex_i64", default)]
+    #[serde(
+        rename = "OBJECTID",
+        deserialize_with = "deserialize_flex_i64",
+        default
+    )]
     object_id: Option<i64>,
     #[serde(rename = "INCIDENT")]
     incident: Option<String>,
-    #[serde(rename = "FIRE_YEAR", deserialize_with = "deserialize_flex_i32", default)]
+    #[serde(
+        rename = "FIRE_YEAR",
+        deserialize_with = "deserialize_flex_i32",
+        default
+    )]
     fire_year: Option<i32>,
-    #[serde(rename = "GIS_ACRES", deserialize_with = "deserialize_flex_f64", default)]
+    #[serde(
+        rename = "GIS_ACRES",
+        deserialize_with = "deserialize_flex_f64",
+        default
+    )]
     gis_acres: Option<f64>,
     #[serde(rename = "AGENCY")]
     agency: Option<String>,
@@ -206,7 +218,10 @@ struct ArcGISGeometry {
 pub fn run(args: Args) -> Result<()> {
     println!("🔥 NIFC Wildfire Data Generator");
     println!("================================\n");
-    println!("📊 Fetching wildfires from {} to {}", args.start_year, args.end_year);
+    println!(
+        "📊 Fetching wildfires from {} to {}",
+        args.start_year, args.end_year
+    );
     println!("   Minimum size: {} acres", args.min_acres);
     if args.wildfires_only {
         println!("   Filter: Wildfires only");
@@ -221,19 +236,19 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     let use_parquet = common::is_parquet_output(&intermediate_path);
-    
+
     if use_parquet {
         println!("📄 Using streaming GeoParquet output (efficient)");
     }
 
     if use_parquet {
         let count = fetch_wildfire_data_parquet(&args, &intermediate_path)?;
-        
+
         if count == 0 {
             println!("\n⚠️  No features found matching criteria");
             return Ok(());
         }
-        
+
         println!("\n✓ Written {} features", count);
     } else {
         let features = fetch_wildfire_data(&args)?;
@@ -249,14 +264,7 @@ pub fn run(args: Args) -> Result<()> {
 
     // Build STT if output is .stt
     if args.output.extension().map(|e| e == "stt").unwrap_or(false) && !args.skip_build {
-        common::run_stt_build(
-            &intermediate_path,
-            &args.output,
-            "timestamp",
-            3,
-            12,
-            "zstd",
-        )?;
+        common::run_stt_build(&intermediate_path, &args.output, "timestamp", 3, 12, "zstd")?;
 
         // Clean up intermediate file
         let _ = std::fs::remove_file(&intermediate_path);
@@ -738,8 +746,14 @@ mod tests {
 
     #[test]
     fn signed_area_sign_matches_winding() {
-        let cw: Vec<[f64; 2]> = cw_square(0.0, 0.0, 1.0).iter().map(|c| [c[0], c[1]]).collect();
-        let ccw: Vec<[f64; 2]> = ccw_square(0.0, 0.0, 1.0).iter().map(|c| [c[0], c[1]]).collect();
+        let cw: Vec<[f64; 2]> = cw_square(0.0, 0.0, 1.0)
+            .iter()
+            .map(|c| [c[0], c[1]])
+            .collect();
+        let ccw: Vec<[f64; 2]> = ccw_square(0.0, 0.0, 1.0)
+            .iter()
+            .map(|c| [c[0], c[1]])
+            .collect();
         assert!(ring_signed_area(&cw) < 0.0, "CW exterior must be negative");
         assert!(ring_signed_area(&ccw) > 0.0, "CCW hole must be positive");
     }
@@ -759,10 +773,10 @@ mod tests {
         // perimeter) plus a hole on the first. Must NOT collapse into one
         // polygon whose extra exteriors are treated as holes.
         let rings = vec![
-            cw_square(0.0, 0.0, 4.0),   // exterior A
-            ccw_square(1.0, 1.0, 1.0),  // hole of A
-            cw_square(10.0, 0.0, 3.0),  // exterior B (disjoint)
-            cw_square(20.0, 0.0, 2.0),  // exterior C (disjoint)
+            cw_square(0.0, 0.0, 4.0),  // exterior A
+            ccw_square(1.0, 1.0, 1.0), // hole of A
+            cw_square(10.0, 0.0, 3.0), // exterior B (disjoint)
+            cw_square(20.0, 0.0, 2.0), // exterior C (disjoint)
         ];
         let polys = arcgis_rings_to_polygons(&rings);
         assert_eq!(polys.len(), 3, "three distinct exteriors");
@@ -781,4 +795,3 @@ mod tests {
         assert_eq!(polys[0].len(), 1);
     }
 }
-

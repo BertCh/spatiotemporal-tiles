@@ -192,7 +192,7 @@ fn same_tile_encodes_byte_identically() {
     }
 }
 
-/// The byte-identity contract extended to a whole **formatVersion-2 dataset**:
+/// The byte-identity contract extended to a whole **formatVersion-3 dataset**:
 /// two builds of the same input — with the tiles added
 /// in DIFFERENT orders, standing in for encode parallelism — produce a
 /// byte-identical manifest (including the sorted, deduped `schemas` table)
@@ -223,9 +223,9 @@ fn v2_dataset_rebuild_is_byte_identical_including_schemas() {
     let build = |dir: &std::path::Path, reversed: bool| {
         let mut writer = PackWriter::create(dir, BlobOrdering::Auto, 8 * 1024).unwrap();
         assert_eq!(
-            writer.format_version(),
+            stt_core::arrow_tile::LAYER_FRAME_VERSION,
             2,
-            "manifest formatVersion 2 is the writer default"
+            "manifest formatVersion 3 is the writer default"
         );
         let cfg = EncoderConfig {
             quantize_coords_m: Some(1.0),
@@ -262,7 +262,7 @@ fn v2_dataset_rebuild_is_byte_identical_including_schemas() {
 
     assert!(
         !manifest_a.schemas.is_empty(),
-        "formatVersion-2 manifest must carry templates"
+        "formatVersion-3 manifest must carry templates"
     );
     let hashes: Vec<&str> = manifest_a.schemas.iter().map(|s| s.hash.as_str()).collect();
     assert!(
@@ -285,5 +285,149 @@ fn v2_dataset_rebuild_is_byte_identical_including_schemas() {
         objects(&a, &manifest_a),
         objects(&b, &manifest_b),
         "every directory/pack object must be byte-identical across rebuilds"
+    );
+}
+
+/// The **default** build path's byte-identity: `stt-build` now resolves its blob
+/// ordering by simulation (`--blob-ordering measured`) under per-dataset query
+/// weights, so the writer's ordering step is a solver — and every solver in this
+/// program lands with a byte-identical re-run test.
+///
+/// The stake is not abstract: the resolved ordering fixes the blob byte string,
+/// which fixes every pack's content address, which fixes every object name in
+/// the archive. One unstable comparison in the simulator would rename all 1,324
+/// fleet objects and force a 29.3 GiB re-upload on a rebuild of unchanged data.
+///
+/// Tiles are added in OPPOSITE orders across the two builds, standing in for the
+/// parallel tiler's nondeterministic emission order.
+#[test]
+fn measured_default_ordering_rebuilds_byte_identically() {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use stt_core::metadata::{Metadata, StyleHints};
+    use stt_core::ordering_sim::OrderingWorkloadMode;
+    use stt_core::{BlobOrdering, PackWriter, TileId};
+
+    // Enough native tiles to clear the simulation floor, over many buckets and
+    // several cells, so the ranking is decided by the simulator rather than by
+    // the small-input fallback.
+    let cells = 6u32;
+    let buckets = 20i64;
+    let bucket_ms = 3_600_000i64;
+
+    let build = |dir: &std::path::Path, reversed: bool, mode: OrderingWorkloadMode, hint: &str| {
+        let mut writer = PackWriter::create(dir, BlobOrdering::Auto, 64 * 1024)
+            .unwrap()
+            .with_measured_ordering(true)
+            .with_ordering_workload(mode);
+        let mut coords: Vec<(u32, i64)> = Vec::new();
+        for b in 0..buckets {
+            for x in 0..cells {
+                coords.push((x, b));
+            }
+        }
+        if reversed {
+            coords.reverse();
+        }
+        for (x, b) in coords {
+            let t = b * bucket_ms;
+            let mut layer = point_fixture();
+            layer.feature_ids = layer
+                .feature_ids
+                .iter()
+                .map(|id| id + u64::from(x) * 1_000 + b as u64 * 10)
+                .collect();
+            for s in layer.start_times.iter_mut() {
+                *s = t;
+            }
+            for e in layer.end_times.iter_mut() {
+                *e = t + bucket_ms - 1;
+            }
+            let payload = encode_tile(std::slice::from_ref(&layer)).unwrap();
+            writer
+                .add_tile_full(
+                    &TileId::new(10, 500 + x, 600, t as u64),
+                    t,
+                    t + bucket_ms - 1,
+                    Some(t),
+                    1,
+                    None,
+                    &payload,
+                )
+                .unwrap();
+        }
+        let mut meta = Metadata::new("measured-default")
+            .with_temporal_bucket_ms(bucket_ms as u64)
+            .with_zoom_levels(0, 10);
+        meta.style_hints = Some(StyleHints {
+            version: 1,
+            properties: vec![],
+            suggested_playback_seconds: None,
+            suggested_time_window_ms: None,
+            layer_hint: Some(hint.to_string()),
+        });
+        writer.finalize(&meta).unwrap()
+    };
+
+    let objects = |root: &std::path::Path, m: &stt_core::Manifest| -> BTreeMap<String, Vec<u8>> {
+        std::iter::once("manifest.json".to_string())
+            .chain(std::iter::once(m.directory.key.clone()))
+            .chain(m.packs.iter().map(|p| p.key.clone()))
+            .map(|key| {
+                let bytes = fs::read(root.join(&key)).unwrap();
+                (key, bytes)
+            })
+            .collect()
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+    let ma = build(&a, false, OrderingWorkloadMode::Derived, "trips");
+    let mb = build(&b, true, OrderingWorkloadMode::Derived, "trips");
+
+    // The simulator actually ran (not the small-input fallback) and recorded
+    // what it ran under.
+    let workload = ma
+        .metadata
+        .ordering_workload
+        .expect("a measured build records its workload");
+    assert_eq!(
+        (workload.scrub, workload.pan, workload.playback),
+        (1, 1, 2),
+        "trips over many buckets is the playback-dominant row"
+    );
+    assert_eq!(
+        workload.coalesce_gap_bytes,
+        stt_core::ordering_sim::DEFAULT_COALESCE_GAP_BYTES,
+        "the recorded gap must be the reader-mirroring constant"
+    );
+
+    assert_eq!(
+        ma.blob_ordering, mb.blob_ordering,
+        "the measured pick must not depend on tile add order"
+    );
+    assert_eq!(
+        objects(&a, &ma),
+        objects(&b, &mb),
+        "every object (manifest, directory, packs) must be byte-identical across rebuilds"
+    );
+
+    // The escape hatch is itself deterministic, and it really does pin the
+    // pre-workload-model weighting.
+    let (c, d) = (tmp.path().join("c"), tmp.path().join("d"));
+    let mc = build(&c, false, OrderingWorkloadMode::Legacy, "trips");
+    let md = build(&d, true, OrderingWorkloadMode::Legacy, "trips");
+    assert_eq!(objects(&c, &mc), objects(&d, &md));
+    let legacy = mc.metadata.ordering_workload.unwrap();
+    assert_eq!((legacy.scrub, legacy.pan, legacy.playback), (1, 1, 0));
+
+    // And the hint is a real input to the layout, not decoration: swapping the
+    // dominant kind changes the recorded weighting.
+    let e = tmp.path().join("e");
+    let me = build(&e, false, OrderingWorkloadMode::Derived, "polygons");
+    let generalist = me.metadata.ordering_workload.unwrap();
+    assert_eq!(
+        (generalist.scrub, generalist.pan, generalist.playback),
+        (1, 1, 1)
     );
 }
