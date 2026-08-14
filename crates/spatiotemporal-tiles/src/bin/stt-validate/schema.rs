@@ -93,6 +93,11 @@ const CRS84: &str = "OGC:CRS84";
 /// `stt_core::arrow_tile` — keep in sync if `arrow_tile` ever renames them.
 const VERTEX_TIME_ORIGIN_KEY: &str = "stt:vertex_time_origin_ms";
 const VERTEX_TIME_STEP_KEY: &str = "stt:vertex_time_step_ms";
+/// The FEATURE-ANCHORED delta step (TB-11 extension 2). Deltas count from each
+/// feature's own `start_time` instead of a layer-wide origin, so this tier
+/// carries a step and deliberately NO origin key — the anchor already ships in
+/// the CORE `start_time` column. Mutually exclusive with the pair above.
+const VERTEX_TIME_FEATURE_STEP_KEY: &str = "stt:vertex_time_feature_step_ms";
 const VERTEX_VALUE_BUCKETS_KEY: &str = "stt:vertex_value_buckets";
 
 /// Required columns and the Arrow type each must carry. Mirrors the leading
@@ -337,17 +342,60 @@ fn check_vertex_time_metadata(layer: &DecodedLayer, issues: &mut Vec<String>) {
         _ => false,
     };
     if !is_delta {
-        for key in [VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY] {
+        for key in [
+            VERTEX_TIME_ORIGIN_KEY,
+            VERTEX_TIME_STEP_KEY,
+            VERTEX_TIME_FEATURE_STEP_KEY,
+        ] {
             if schema.metadata().contains_key(key) {
                 issues.push(format!(
                     "layer '{name}': absolute (List<Int64>) vertex_time must not carry \
-                     '{key}' (the key describes the delta encoding)"
+                     '{key}' (the key describes a delta encoding)"
                 ));
             }
         }
         return;
     }
     let meta = schema.metadata();
+
+    // TWO delta tiers share the `List<UInt16|UInt32>` wire shape, and they are
+    // told apart by WHICH key is present, never by the Arrow type:
+    //
+    //   * layer-anchored  — `vt`  = origin + step   (the pair below)
+    //   * feature-anchored — `vtf` = step only, deltas measured from each
+    //     feature's own `start_time` (TB-11 ext. 2, capability
+    //     `vertex-time-feature-anchor`)
+    //
+    // Checking only the pair reported EVERY feature-anchored tile as missing
+    // both keys: a rebuild of `animals` produced 1,754 such errors against a
+    // perfectly valid archive. That is the costly direction for a false
+    // positive — this project's own rule is to treat a validator error as real
+    // until a rebuild disproves it, so the noise sends someone chasing data
+    // loss that never happened.
+    if let Some(step) = meta.get(VERTEX_TIME_FEATURE_STEP_KEY) {
+        if step.parse::<u32>().map(|s| s >= 1).unwrap_or(false) {
+            // The two tiers are mutually exclusive by construction
+            // (`TileMeta::vtf` documents it); a tile carrying both is
+            // ambiguous, and a reader honouring `vt` would resolve every
+            // vertex against an origin that does not apply.
+            for key in [VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY] {
+                if meta.contains_key(key) {
+                    issues.push(format!(
+                        "layer '{name}': feature-anchored vertex_time carries \
+                         '{VERTEX_TIME_FEATURE_STEP_KEY}' AND '{key}' — the two delta \
+                         tiers are mutually exclusive"
+                    ));
+                }
+            }
+        } else {
+            issues.push(format!(
+                "layer '{name}': '{VERTEX_TIME_FEATURE_STEP_KEY}' must be a positive \
+                 integer ms step, got {step:?}"
+            ));
+        }
+        return;
+    }
+
     match meta.get(VERTEX_TIME_ORIGIN_KEY) {
         Some(v) if v.parse::<i64>().is_ok() => {}
         Some(v) => issues.push(format!(
@@ -1038,6 +1086,89 @@ mod tests {
             issues
                 .iter()
                 .any(|i| i.contains(STT_QUANT_META_KEY) && i.contains("must not carry")),
+            "issues were: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn feature_anchored_vertex_time_is_valid_without_a_layer_origin() {
+        // REGRESSION (found by rebuilding `animals` at v3): the feature-anchored
+        // tier ships the SAME `List<UInt16|UInt32>` wire shape as the
+        // layer-anchored one, but carries `stt:vertex_time_feature_step_ms`
+        // instead of the origin/step pair — the anchor is each feature's own
+        // `start_time`. Classifying on the Arrow type alone therefore demanded
+        // keys this tier is DEFINED not to have, and reported 1,754 errors on a
+        // perfectly valid archive.
+        let step = 1u32;
+        let mut meta = HashMap::new();
+        meta.insert(VERTEX_TIME_FEATURE_STEP_KEY.to_string(), step.to_string());
+
+        let layer = ColumnarLayer {
+            polygon_parts: None,
+            name: "tracks".into(),
+            feature_ids: vec![1],
+            start_times: vec![0],
+            end_times: vec![100],
+            geometry: GeometryColumn::LineString(vec![vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]]),
+            vertex_times: Some(vec![vec![0, 50, 100]]),
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![],
+        };
+        let decoded = decode(&[layer]);
+
+        // Only the feature step: valid, and NOT reported as missing anything.
+        let anchored = with_schema_metadata(&decoded[0], meta.clone());
+        let issues = check_tile_schema(&[anchored]).errors;
+        assert!(
+            issues.is_empty(),
+            "feature-anchored vertex_time must validate on its own key; issues were: {issues:?}"
+        );
+
+        // A zero/garbage step is still rejected — the tier is recognized, not trusted.
+        let mut bad = HashMap::new();
+        bad.insert(VERTEX_TIME_FEATURE_STEP_KEY.to_string(), "0".to_string());
+        let issues = check_tile_schema(&[with_schema_metadata(&decoded[0], bad)]).errors;
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains(VERTEX_TIME_FEATURE_STEP_KEY) && i.contains("positive")),
+            "issues were: {issues:?}"
+        );
+
+        // Carrying BOTH tiers is ambiguous: a reader honouring `vt` would
+        // resolve every vertex against an origin that does not apply.
+        let mut both = meta.clone();
+        both.insert(VERTEX_TIME_ORIGIN_KEY.to_string(), "0".to_string());
+        both.insert(VERTEX_TIME_STEP_KEY.to_string(), "1".to_string());
+        let issues = check_tile_schema(&[with_schema_metadata(&decoded[0], both)]).errors;
+        assert!(
+            issues.iter().any(|i| i.contains("mutually exclusive")),
+            "issues were: {issues:?}"
+        );
+
+        // And the absolute tier must still refuse the feature key.
+        let abs_layer = ColumnarLayer {
+            polygon_parts: None,
+            name: "tracks".into(),
+            feature_ids: vec![1],
+            start_times: vec![0],
+            end_times: vec![100],
+            geometry: GeometryColumn::LineString(vec![vec![[0.0, 0.0], [1.0, 1.0]]]),
+            vertex_times: None,
+            vertex_values: None,
+            triangles: None,
+            vertex_value_matrix: None,
+            properties: vec![],
+        };
+        let abs = decode(&[abs_layer]);
+        let issues = check_tile_schema(&[with_schema_metadata(&abs[0], meta)]).errors;
+        assert!(
+            issues.is_empty()
+                || issues
+                    .iter()
+                    .any(|i| i.contains(VERTEX_TIME_FEATURE_STEP_KEY)),
             "issues were: {issues:?}"
         );
     }
