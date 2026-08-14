@@ -38,7 +38,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Geometry processing
-geo = "0.28"
+geo = "0.31"
 geo-types = "0.7"
 geojson = { version = "0.24", features = ["geo-types"] }
 
