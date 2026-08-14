@@ -38,13 +38,35 @@ say() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 # One dataset: run the generator, time it, then validate the result. A failure
 # is recorded and the run CONTINUES — one dead upstream API must not cost the
 # other twelve rebuilds.
+# Free space below which a build is refused rather than attempted. The
+# `flights` rebuild died at zoom 8 as a bare `signal: 9 (SIGKILL)` with no
+# other diagnostic, which reads like an OOM and was not: the disk was down to
+# 19 GB and the pack writer spills payloads beyond its 512 MiB budget to a temp
+# file IN THE OUTPUT DIR. A large global build therefore needs far more
+# transient space than its finished archive suggests (`flights` ships at
+# 0.85 GB). Refusing up front turns an inscrutable kill into a sentence.
+MIN_FREE_GB="${REBUILD_MIN_FREE_GB:-25}"
+
+free_gb() { df -g "$OUT" 2>/dev/null | awk 'NR==2 {print $4}'; }
+
 run_one() {
   local stem="$1"; shift
-  local start elapsed
+  local start elapsed free
+  free=$(free_gb)
+  if [ -n "$free" ] && [ "$free" -lt "$MIN_FREE_GB" ]; then
+    say "SKIP  $stem — only ${free} GB free, need ${MIN_FREE_GB} (set REBUILD_MIN_FREE_GB to override)"
+    return 1
+  fi
   start=$(date +%s)
-  say "START $stem"
+  say "START $stem  (${free} GB free)"
   if ! "$GEN" "$@" >>"$LOG" 2>&1; then
-    say "FAIL  $stem (generator exited non-zero)"
+    # Distinguish "the upstream/API said no" from "the machine ran out", since
+    # the second is retryable as-is and the first is not.
+    if [ -n "$(free_gb)" ] && [ "$(free_gb)" -lt 5 ]; then
+      say "FAIL  $stem (generator exited non-zero — DISK EXHAUSTED, $(free_gb) GB free; retryable)"
+    else
+      say "FAIL  $stem (generator exited non-zero)"
+    fi
     return 1
   fi
   elapsed=$(( $(date +%s) - start ))
