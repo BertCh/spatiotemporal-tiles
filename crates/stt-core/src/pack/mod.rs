@@ -2512,9 +2512,26 @@ fn validate_manifest_semantics(manifest: &Manifest) -> Result<()> {
         ));
     }
     if let Some(summary) = &manifest.metadata.summary_tier {
-        if !variants
-            .iter()
-            .any(|variant| variant.id == summary.variant_id && variant.kind == VariantKind::Summary)
+        // A LEGACY manifest has no variant axis at all, so its `summary_tier`
+        // carries no `variant_id` and reads back as the raw variant. That is
+        // exactly what `effective_variants` above encodes — it deliberately
+        // declares NO summary variant in that case, because a v2 directory has
+        // no column that could distinguish summary entries from raw ones.
+        // Demanding a summary declaration here therefore contradicted the
+        // function two screens up and made every Rust tool refuse a v2 archive
+        // with a summary tier ("variant 0 is not declared as kind summary"),
+        // while the TypeScript reader opened the same archive without
+        // complaint. Six published archives sit in that hole.
+        //
+        // v3 keeps the strict rule: there `variants` is required and
+        // authoritative, so a summary tier that names an undeclared variant is
+        // real drift.
+        let legacy_untagged_summary = manifest.format_version < PACKED_FORMAT_VERSION
+            && summary.variant_id == crate::tile::RAW_VARIANT_ID;
+        if !legacy_untagged_summary
+            && !variants
+                .iter()
+                .any(|v| v.id == summary.variant_id && v.kind == VariantKind::Summary)
         {
             return Err(Error::InvalidArchive(format!(
                 "metadata summary_tier variant {} is not declared as kind summary",
@@ -3142,6 +3159,8 @@ impl PackedReader {
 // ----------------------------------------------------------------------------
 
 mod bundle;
+mod migrate;
+pub use migrate::{migrate_dataset_v2_to_v3, MigrationReport};
 
 use self::bundle::parse_bundle_header;
 pub use self::bundle::{

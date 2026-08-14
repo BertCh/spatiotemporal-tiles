@@ -40,6 +40,22 @@ pub struct SummaryColumn {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryTier {
     /// Directory/manifest variant that stores this summary representation.
+    ///
+    /// `#[serde(default)]` is load-bearing for the v2 read window, not tidiness.
+    /// A formatVersion-2 manifest predates the variant axis entirely, so its
+    /// `summary_tier` carries no `variant_id` — and without a default, serde
+    /// failed the WHOLE manifest ("missing field `variant_id`"), which meant no
+    /// Rust tool could open a v2 archive that happened to have a summary tier.
+    /// That is six of the published archives, and it made `PackedReader`,
+    /// `stt-validate` and `stt-optimize` all refuse them while the TypeScript
+    /// reader opened them happily.
+    ///
+    /// Defaulting to 0 is the legacy reading, not an invention: a v2 directory
+    /// has no variant column, so every entry in such an archive — summary tiles
+    /// included — decodes as variant 0, which is exactly what
+    /// `effective_variants` and the TS `effectiveVariants` already infer. A v3
+    /// writer always states the value explicitly (1 is canonical for summary).
+    #[serde(default)]
     pub variant_id: u32,
     pub scheme: SummaryScheme,
     pub min_zoom: u8,
