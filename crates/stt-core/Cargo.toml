@@ -44,10 +44,10 @@ arrow = { workspace = true }
 criterion.workspace = true
 tempfile = "3.10"
 # Adversarial property tests (tests/adversarial_decode.rs): round-trip +
-# never-panic over the v5 directory, paged container, and tile layer frame.
+# never-panic over the current and legacy directory codecs, paged container,
+# and tile layer frame.
 proptest = "1"
 
 [[bench]]
 name = "encoding"
 harness = false
-

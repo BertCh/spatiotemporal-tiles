@@ -55,7 +55,7 @@ csv = "1.3"
 chrono = { version = "0.4", features = ["serde"] }
 rayon = "1.10"
 clap = { version = "4.5", features = ["derive", "cargo"] }
-indicatif = "0.17"
+indicatif = "0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 flate2 = "1.0"
@@ -73,6 +73,9 @@ arrow = { version = "59", default-features = false, features = [
 
 # Additional dependencies
 reqwest = { version = "0.11", features = ["blocking", "json"] }
+# Terrarium terrain-tile decode for `gtfs --bake-elevation` (dem.rs): the AWS
+# Open Data elevation tiles are 256×256 PNGs; pure-Rust decoder, no C deps.
+png = "0.17"
 # Feed-local → absolute-Unix-ms anchoring for the GTFS generator (`gtfs`
 # subcommand): GTFS clock times are offsets on the service date in the agency
 # timezone. Already in the tree via arrow's `chrono-tz` feature, so this pins

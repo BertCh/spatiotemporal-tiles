@@ -4713,3 +4713,150 @@ fn the_feature_anchored_form_is_observed_for_the_capability() {
     let (_, observed) = crate::arrow_tile::encode_tile_observed(&[narrow], &cfg).unwrap();
     assert!(!observed.feature_anchored_vertex_times);
 }
+
+// ─── vis.gl temporal field metadata ─────────────────────────────────────────
+
+/// The `visgl:temporal-*` descriptor on one field of a decoded batch, as
+/// `(kind, unit, timezone, origin, policy)`.
+fn temporal_meta(
+    batch: &RecordBatch,
+    name: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let schema = batch.schema();
+    let f = schema
+        .field_with_name(name)
+        .unwrap_or_else(|_| panic!("no `{name}` column in the decoded batch"));
+    let g = |k: &str| f.metadata().get(k).cloned();
+    (
+        g(TEMPORAL_KIND_KEY),
+        g(TEMPORAL_UNIT_KEY),
+        g(TEMPORAL_TIMEZONE_KEY),
+        g(TEMPORAL_ORIGIN_KEY),
+        g(TEMPORAL_ORIGIN_POLICY_KEY),
+    )
+}
+
+/// THE CONTRACT the descriptor buys: whichever compact form a tile's time
+/// columns took on the wire, the batch a reader is handed self-describes as
+/// ABSOLUTE UTC epoch milliseconds. Nothing in `Int64` says that on its own,
+/// and a consumer that has never heard of STT (luma.gl's `@luma.gl/arrow`,
+/// lonboard, geoarrow-rs) has no other way to learn it.
+#[test]
+fn decoded_time_columns_self_describe_as_absolute_utc_ms() {
+    let layer = sample_line_layer();
+    let cfg = EncoderConfig::default(); // compact_times: true
+    let payload = encode_tile_with(std::slice::from_ref(&layer), &cfg).unwrap();
+    let decoded = decode_tile(&payload).unwrap();
+    let batch = &decoded[0].batch;
+
+    // The columns really are compact on the wire — otherwise this test would
+    // pass without ever exercising the re-inflation completion.
+    assert_eq!(
+        batch
+            .schema()
+            .field_with_name("start_time")
+            .unwrap()
+            .data_type(),
+        &DataType::Int64
+    );
+
+    for column in ["start_time", "end_time"] {
+        let (kind, unit, tz, origin, policy) = temporal_meta(batch, column);
+        assert_eq!(kind.as_deref(), Some("timestamp"), "{column}: kind");
+        assert_eq!(unit.as_deref(), Some("millisecond"), "{column}: unit");
+        assert_eq!(tz.as_deref(), Some("UTC"), "{column}: timezone");
+        assert_eq!(origin.as_deref(), Some("0"), "{column}: origin");
+        assert_eq!(policy.as_deref(), Some("zero"), "{column}: policy");
+    }
+
+    // …and the values are untouched by any of it.
+    assert_eq!(int64_column(batch, "start_time"), layer.start_times);
+    assert_eq!(int64_column(batch, "end_time"), layer.end_times);
+}
+
+/// The `et="zero"` form omits `end_time` entirely and the decoder SYNTHESIZES
+/// it. That column is built from nothing, so it is the one place a descriptor
+/// can go missing without any encoder change looking wrong.
+#[test]
+fn a_synthesized_end_time_column_carries_the_descriptor_too() {
+    let mut layer = sample_line_layer();
+    layer.end_times = layer.start_times.clone(); // end == start → EndTimeForm::Zero
+    let payload =
+        encode_tile_with(std::slice::from_ref(&layer), &EncoderConfig::default()).unwrap();
+    let decoded = decode_tile(&payload).unwrap();
+    let batch = &decoded[0].batch;
+
+    let (kind, unit, tz, origin, policy) = temporal_meta(batch, "end_time");
+    assert_eq!(kind.as_deref(), Some("timestamp"));
+    assert_eq!(unit.as_deref(), Some("millisecond"));
+    assert_eq!(tz.as_deref(), Some("UTC"));
+    assert_eq!(origin.as_deref(), Some("0"));
+    assert_eq!(policy.as_deref(), Some("zero"));
+    assert_eq!(int64_column(batch, "end_time"), layer.start_times);
+}
+
+/// `vertex_time` is the one time column decode does NOT re-inflate — the
+/// `List<UInt16>` deltas stay deltas, anchored per-TILE by
+/// `stt:vertex_time_origin_ms`. So it advertises the logical domain and stays
+/// silent about the origin: claiming `origin = 0` there would place every
+/// vertex of every tile at the wrong instant.
+#[test]
+fn delta_encoded_vertex_times_advertise_the_domain_but_not_an_origin() {
+    let layer = sample_line_layer();
+    let payload =
+        encode_tile_with(std::slice::from_ref(&layer), &EncoderConfig::default()).unwrap();
+    let decoded = decode_tile(&payload).unwrap();
+    let batch = &decoded[0].batch;
+
+    let schema = batch.schema();
+    let vt = schema.field_with_name("vertex_time").unwrap();
+    assert!(
+        matches!(vt.data_type(), DataType::List(_)),
+        "expected the delta list form, got {:?}",
+        vt.data_type()
+    );
+
+    let (kind, unit, tz, origin, policy) = temporal_meta(batch, "vertex_time");
+    assert_eq!(kind.as_deref(), Some("timestamp"));
+    assert_eq!(unit.as_deref(), Some("millisecond"));
+    assert_eq!(tz.as_deref(), Some("UTC"));
+    assert_eq!(
+        origin, None,
+        "a per-tile anchor must never be advertised as a column origin"
+    );
+    assert_eq!(policy, None, "policy without an origin is noise");
+
+    // The anchor a reader MUST use instead is present and unambiguous.
+    assert!(schema.metadata().contains_key("stt:vertex_time_origin_ms"));
+}
+
+/// The descriptor must never reach the WIRE. It is derivable from the decoded
+/// column, so paying ~450 B of it per tile — which a self-contained frame
+/// (`stt-serve`'s inline-schema shape) would do — buys nothing and costs 2-6%
+/// of a small tile. This is also what keeps every already-published archive
+/// address stable: the encoder is untouched.
+#[test]
+fn the_temporal_descriptor_is_never_encoded() {
+    let layer = sample_line_layer();
+    let payload =
+        encode_tile_with(std::slice::from_ref(&layer), &EncoderConfig::default()).unwrap();
+    let haystack = String::from_utf8_lossy(&payload);
+    for key in [
+        TEMPORAL_KIND_KEY,
+        TEMPORAL_UNIT_KEY,
+        TEMPORAL_ORIGIN_KEY,
+        TEMPORAL_ORIGIN_POLICY_KEY,
+        TEMPORAL_TIMEZONE_KEY,
+    ] {
+        assert!(
+            !haystack.contains(key),
+            "`{key}` reached the encoded tile; it is a decode-side descriptor"
+        );
+    }
+}

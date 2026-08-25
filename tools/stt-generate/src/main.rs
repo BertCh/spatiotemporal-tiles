@@ -7,6 +7,7 @@
 
 mod common;
 mod datasets;
+mod dem;
 mod edge_bundle;
 mod radar;
 

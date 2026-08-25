@@ -1,5 +1,8 @@
 # spatiotemporal-tiles
 
+> **Status: stable, pre-1.0.** See the
+> [support and compatibility policy](../../docs/intro/status-and-support.md).
+
 **SpatioTemporal Tiles (STT)** — a packed, content-addressed tile format for
 _animated_ geospatial data: every feature carries time, so a renderer can scrub
 millions of moving points, trips, and polygons straight off static file
@@ -41,7 +44,7 @@ version in lockstep.
 cargo install spatiotemporal-tiles
 ```
 
-installs the four binaries (prebuilt binaries and a shell installer are on the
+installs the five binaries (prebuilt binaries and a shell installer are on the
 [GitHub releases page](https://github.com/BertCh/spatiotemporal-tiles/releases)):
 
 | binary         | role                                                                                 |
@@ -49,6 +52,7 @@ installs the four binaries (prebuilt binaries and a shell installer are on the
 | `stt-build`    | build packed STT archives from GeoParquet / PostGIS / DuckDB                         |
 | `stt-optimize` | analyze a dataset and recommend encoder settings; inspect/diff/doctor built tilesets |
 | `stt-validate` | validate archives: header, content hashes, Arrow IPC decode, schema                  |
+| `stt-bundle`   | pack or unpack the single-file `.sttb` interchange bundle                            |
 | `stt-serve`    | dynamic per-request tile server over live PostGIS/DuckDB (the `ST_AsMVT` analog)     |
 
 By default `stt-serve` gets the PostGIS backend; add the embedded-DuckDB

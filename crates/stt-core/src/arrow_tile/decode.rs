@@ -14,6 +14,7 @@ use super::frame::{
     SECTION_PROPS_BATCH, SECTION_TILE_META, TIME_OFFSET_MS_KEY, VERTEX_TIME_FEATURE_STEP_KEY,
     VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY, VERTEX_VALUE_BUCKETS_KEY,
 };
+use super::layer::decorate_temporal_fields;
 use super::quantize::{AttrQuant, STT_QUANT_ATTR_META_KEY, VERTEX_VALUE_QUANT_SENTINEL};
 use crate::error::{Error, Result};
 use arrow::array::{
@@ -468,6 +469,11 @@ pub(crate) fn merge_v2_layer(
         schema_meta.insert(VERTEX_VALUE_BUCKETS_KEY.to_string(), buckets.to_string());
     }
 
+    // Last step, deliberately: every compact form has been re-inflated by now,
+    // so the descriptor describes the columns the caller is handed rather than
+    // the ones that were on the wire. Never written by the encoder — see
+    // `TEMPORAL_KIND_KEY`.
+    decorate_temporal_fields(&mut fields);
     let schema = Arc::new(Schema::new_with_metadata(fields, schema_meta));
     RecordBatch::try_new(schema, columns).map_err(|e| {
         Error::Other(format!(

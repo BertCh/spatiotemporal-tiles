@@ -120,6 +120,26 @@ pub struct Args {
     /// Skip the stt-build step (write only the intermediate GeoParquet).
     #[arg(long)]
     pub skip_build: bool,
+
+    /// Bake a per-vertex terrain elevation (metres) into the archive's
+    /// `vertex_values` channel, sampled from the AWS Terrarium DEM along each
+    /// trip's geometry and shaped per mode: ground modes get a max-grade clamp
+    /// (a rail line's DEM profile over a base tunnel would otherwise climb the
+    /// massif), aerial modes (gondolas) span station-to-station instead of
+    /// hugging the ground. The renderer lifts each head dot by the value
+    /// interpolated at its live position (`elevationFromVertexValues`), so the
+    /// fleet rides a 3D terrain basemap with zero runtime DEM queries.
+    #[arg(long)]
+    pub bake_elevation: bool,
+
+    /// DEM tile zoom for `--bake-elevation` (z12 ≈ 38 m/px in mid-latitudes;
+    /// raise to 13 for sharper valleys at 4× the tile fetches).
+    #[arg(long, default_value = "12")]
+    pub dem_zoom: u8,
+
+    /// On-disk cache for fetched DEM tiles (reused across rebuilds).
+    #[arg(long, default_value = "data/dem/terrarium")]
+    pub dem_cache: PathBuf,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -162,6 +182,20 @@ pub fn run(args: Args) -> Result<()> {
         StreamingLineStringParquetWriter::with_columns(&intermediate_path, property_columns)?;
 
     let include_headsign = args.headsign;
+    let mut dem = if args.bake_elevation {
+        println!(
+            "   ⛰  baking per-vertex terrain elevation (terrarium z{}, cache {})",
+            args.dem_zoom,
+            args.dem_cache.display()
+        );
+        Some(crate::dem::TerrariumDem::new(
+            args.dem_zoom,
+            args.dem_cache.clone(),
+        )?)
+    } else {
+        None
+    };
+    let mut trips_without_elevation = 0usize;
     let stats = expand_feed(
         &args.feed,
         &args.date,
@@ -183,12 +217,25 @@ pub fn run(args: Args) -> Result<()> {
             if include_headsign && !f.headsign.is_empty() {
                 props.insert("headsign".to_string(), json!(f.headsign));
             }
+            let elevation = dem
+                .as_mut()
+                .and_then(|d| bake_elevation_profile(&f.coords, f.route_type, d));
+            if dem.is_some() && elevation.is_none() {
+                trips_without_elevation += 1;
+            }
             let mut record = LineStringRecord::new(f.coords, start_dt, Some(end_dt), props);
             record.vertex_timestamps_ms = Some(f.times_ms);
+            record.vertex_values = elevation;
             writer.write_linestring(&record)
         },
     )?;
     let rows = writer.finish()?;
+    if let Some(d) = &dem {
+        println!(
+            "   ⛰  DEM: {} tiles fetched this run, {} unavailable; {} trips left without elevation",
+            d.fetched, d.failed, trips_without_elevation
+        );
+    }
 
     println!(
         "\n   ✓ {} of {} scheduled trips expanded across {} active services \
@@ -962,6 +1009,14 @@ pub(crate) fn parse_gtfs_time_seconds(s: &str) -> Option<i64> {
 /// GTFS `route_type` code → a categorical STRING label. Deliberately never the
 /// numeric code: an all-numeric string column gets promoted to Numeric by
 /// stt-build's inference and categorical `colorMapping` silently no-ops.
+///
+/// Handles BOTH the basic codes (0–12) and the Google **extended** route types
+/// national feeds actually use (the Swiss feed is ~all extended: 700 bus,
+/// 109 suburban rail, 1300 aerial lift, …). Before 2026-08 the extended codes
+/// all fell through to "other", which silently flattened the CH archive's
+/// mode column. Extended families fold to the closest basic label; the one
+/// deliberate extra label is `rack-rail` (116), which the elevation baking
+/// must NOT grade-clamp like adhesion rail (Pilatus climbs 48%).
 pub(crate) fn route_type_label(code: &str) -> &'static str {
     match code.trim() {
         "0" => "tram",
@@ -974,8 +1029,170 @@ pub(crate) fn route_type_label(code: &str) -> &'static str {
         "7" => "funicular",
         "11" => "trolleybus",
         "12" => "monorail",
-        _ => "other",
+        other => match other.parse::<u32>() {
+            Ok(116) => "rack-rail",
+            Ok(100..=117) => "rail",
+            Ok(200..=209) => "bus", // coach services
+            Ok(405) => "monorail",
+            Ok(400..=404) => "metro",
+            Ok(700..=716) => "bus",
+            Ok(800) => "trolleybus",
+            Ok(900..=906) => "tram",
+            Ok(1000..=1021) | Ok(1200) => "ferry",
+            Ok(1300..=1307) => "gondola",
+            Ok(1400) => "funicular",
+            _ => "other",
+        },
     }
+}
+
+// ─── Elevation baking (`--bake-elevation`) ───────────────────────────────────
+// Sample the DEM at every emitted vertex, then shape the raw profile per mode
+// so the baked z is *plausible for the vehicle*, not just for the ground:
+// a DEM traced over the Gotthard Base Tunnel climbs 1,500 m over the massif,
+// and a DEM traced under a gondola dives into every gorge between towers.
+
+/// Per-mode max |grade| (metres of rise per metre of horizontal run) for the
+/// clamp below, or `None` for aerial modes that span station-to-station.
+/// Caps are deliberately ~1.5× the real-world mode maxima: the job is to cut
+/// tunnel/ridge artifacts (grades ≫ 1), not to litigate real alignments.
+fn max_grade_for(route_type: &str) -> Option<f64> {
+    match route_type {
+        "gondola" => None,         // aerial: straight spans, handled separately
+        "funicular" => Some(1.2),  // effectively unclamped — they ARE the slope
+        "rack-rail" => Some(0.50), // Pilatus tops out at 48%
+        "rail" => Some(0.08),      // adhesion max ~7% (Bernina)
+        "metro" => Some(0.12),     // Lausanne M2 reaches 12%
+        "tram" | "monorail" => Some(0.10),
+        "cable-tram" => Some(0.15),
+        "bus" | "trolleybus" => Some(0.16), // alpine pass roads ~13–14%
+        "ferry" => Some(0.01),              // water is flat; kills shoreline DEM noise
+        _ => Some(0.20),
+    }
+}
+
+// (Horizontal distance along the run reuses the file's existing haversine
+// `cumulative_meters` — the same axis the shape-dist timing walks.)
+
+/// Replace non-finite samples with the nearest finite neighbour (forward then
+/// backward fill). Returns false when NOTHING was finite.
+fn fill_missing(z: &mut [f64]) -> bool {
+    let mut last = f64::NAN;
+    for v in z.iter_mut() {
+        if v.is_finite() {
+            last = *v;
+        } else if last.is_finite() {
+            *v = last;
+        }
+    }
+    let mut next = f64::NAN;
+    for v in z.iter_mut().rev() {
+        if v.is_finite() {
+            next = *v;
+        } else if next.is_finite() {
+            *v = next;
+        }
+    }
+    z.iter().all(|v| v.is_finite())
+}
+
+/// Repair grade excursions by portal-to-portal spans: wherever the DEM
+/// profile's grade exceeds the mode's cap, the real alignment left the
+/// surface — UP-excursions are ridges the line tunnels through, DOWN-
+/// excursions are gorges it bridges. From the violation's entry vertex,
+/// find the first later vertex reachable at legal grade and replace the
+/// excursion with the straight portal line (falling back to the run's end
+/// for a steeper-than-cap but genuine climb, which then stays a straight
+/// climb). Compliant stretches keep the raw DEM exactly.
+///
+/// (A one-sided min-clamp was tried first and is a trap: it can never fill a
+/// gorge, and worse, it drags kilometres of line DOWN toward every gorge
+/// floor at `g` per metre — the rims get cut to the valley, not the valley
+/// bridged to the rims.)
+fn repair_grade_excursions(z: &mut [f64], s: &[f64], g: f64) {
+    let n = z.len();
+    let mut i = 0;
+    while i + 1 < n {
+        let ds = s[i + 1] - s[i];
+        let dz = z[i + 1] - z[i];
+        // 1 cm absolute slack so dwell duplicates (ds = 0) and float noise
+        // never register as violations.
+        if ds >= 0.0 && dz.abs() > g * ds + 0.01 {
+            let mut portal = n - 1;
+            for j in (i + 1)..n {
+                if (z[j] - z[i]).abs() <= g * (s[j] - s[i]) {
+                    portal = j;
+                    break;
+                }
+            }
+            let span = s[portal] - s[i];
+            for k in (i + 1)..portal {
+                let t = if span > 0.0 {
+                    (s[k] - s[i]) / span
+                } else {
+                    0.0
+                };
+                z[k] = z[i] + (z[portal] - z[i]) * t;
+            }
+            i = portal;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Aerial modes: straight z spans between stations instead of terrain-hugging.
+/// Station vertices are the DWELL pairs the emitter writes (a stop appears as
+/// two consecutive identical coordinates), plus the run's endpoints; between
+/// consecutive stations z is linear in horizontal distance. A gondola crossing
+/// a gorge stays up on its cable instead of diving to the ground.
+fn aerial_spans(z: &mut [f64], coords: &[[f64; 2]], s: &[f64]) {
+    let n = z.len();
+    let mut anchors = vec![0usize];
+    for i in 1..n {
+        if coords[i] == coords[i - 1] && i + 1 < n {
+            anchors.push(i);
+        }
+    }
+    anchors.push(n - 1);
+    for pair in anchors.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let span = s[b] - s[a];
+        if span <= 0.0 {
+            continue;
+        }
+        let (za, zb) = (z[a], z[b]);
+        for i in (a + 1)..b {
+            let t = (s[i] - s[a]) / span;
+            z[i] = za + (zb - za) * t;
+        }
+    }
+}
+
+/// Sample + shape one trip's per-vertex elevation. `None` when the DEM had no
+/// coverage anywhere along the run (the record then ships without the channel
+/// and the renderer leaves those dots on the ground).
+pub(crate) fn bake_elevation_profile(
+    coords: &[[f64; 2]],
+    route_type: &str,
+    dem: &mut crate::dem::TerrariumDem,
+) -> Option<Vec<f32>> {
+    if coords.is_empty() {
+        return None;
+    }
+    let mut z: Vec<f64> = coords
+        .iter()
+        .map(|c| dem.sample(c[0], c[1]).unwrap_or(f64::NAN))
+        .collect();
+    if !fill_missing(&mut z) {
+        return None;
+    }
+    let s = cumulative_meters(coords);
+    match max_grade_for(route_type) {
+        None => aerial_spans(&mut z, coords, &s),
+        Some(g) => repair_grade_excursions(&mut z, &s, g),
+    }
+    Some(z.into_iter().map(|v| v as f32).collect())
 }
 
 /// The feed's local clock: first `agency_timezone` in agency.txt, defaulting
@@ -1427,6 +1644,83 @@ mod tests {
         for code in ["0", "1", "2", "3", "4", "999"] {
             assert!(route_type_label(code).parse::<f64>().is_err());
         }
+    }
+
+    #[test]
+    fn extended_route_types_fold_to_real_labels() {
+        // The Swiss national feed is ~all extended codes; before 2026-08 every
+        // one of these fell through to "other".
+        assert_eq!(route_type_label("700"), "bus"); // 143k CH trips
+        assert_eq!(route_type_label("715"), "bus"); // demand-response
+        assert_eq!(route_type_label("202"), "bus"); // coach
+        assert_eq!(route_type_label("102"), "rail"); // long-distance
+        assert_eq!(route_type_label("106"), "rail"); // regional
+        assert_eq!(route_type_label("109"), "rail"); // S-Bahn
+        assert_eq!(route_type_label("116"), "rack-rail"); // Pilatus & friends
+        assert_eq!(route_type_label("401"), "metro");
+        assert_eq!(route_type_label("900"), "tram");
+        assert_eq!(route_type_label("1000"), "ferry");
+        assert_eq!(route_type_label("1300"), "gondola");
+        assert_eq!(route_type_label("1303"), "gondola"); // aerial tramway
+        assert_eq!(route_type_label("1400"), "funicular");
+        assert_eq!(route_type_label("1500"), "other"); // taxi
+    }
+
+    #[test]
+    fn grade_excursions_tunnel_ridges_and_bridge_gorges() {
+        let s = vec![0.0, 100.0, 200.0];
+        // A ridge the grade can't climb → the portal line cuts through it
+        // (that's the tunnel).
+        let mut ridge = vec![0.0, 100.0, 0.0];
+        repair_grade_excursions(&mut ridge, &s, 0.05);
+        assert_eq!(ridge, vec![0.0, 0.0, 0.0]);
+        // A gorge the grade can't descend → the portal line spans it (that's
+        // the bridge). The one-sided min-clamp this replaced got this exactly
+        // backwards (rims cut down to the gorge floor).
+        let mut gorge = vec![100.0, 0.0, 100.0];
+        repair_grade_excursions(&mut gorge, &s, 0.05);
+        assert_eq!(gorge, vec![100.0, 100.0, 100.0]);
+        // A compliant profile passes through unchanged.
+        let mut ok = vec![0.0, 4.0, 8.0];
+        repair_grade_excursions(&mut ok, &s, 0.05);
+        assert_eq!(ok, vec![0.0, 4.0, 8.0]);
+        // A steeper-than-cap but genuine climb (no legal portal ahead) stays
+        // a straight climb to the run's end rather than being flattened.
+        let mut climb = vec![0.0, 80.0, 50.0];
+        repair_grade_excursions(&mut climb, &s, 0.05);
+        assert_eq!(climb, vec![0.0, 25.0, 50.0]);
+    }
+
+    #[test]
+    fn aerial_spans_bridge_between_dwell_stations() {
+        // 5 vertices, dwell pair at index 2/3 (duplicated station coord):
+        // legs are [0..2] and [3..4]; interior vertices ride the straight
+        // span between station heights instead of the sampled ground.
+        let coords: Vec<[f64; 2]> = vec![
+            [8.0, 46.0],
+            [8.001, 46.0], // mid-span over a gorge
+            [8.002, 46.0], // station (dwell…
+            [8.002, 46.0], // …pair)
+            [8.003, 46.0],
+        ];
+        let s = cumulative_meters(&coords);
+        let mut z = vec![1000.0, 200.0, 2000.0, 2000.0, 2500.0];
+        aerial_spans(&mut z, &coords, &s);
+        // Mid-span vertex is halfway between 1000 and 2000 — not in the gorge.
+        assert_eq!(z[0], 1000.0);
+        assert!((z[1] - 1500.0).abs() < 1.0, "z[1] = {}", z[1]);
+        assert_eq!(z[2], 2000.0);
+        assert_eq!(z[3], 2000.0);
+        assert_eq!(z[4], 2500.0);
+    }
+
+    #[test]
+    fn fill_missing_nearest_neighbour_and_all_nan() {
+        let mut z = vec![f64::NAN, 5.0, f64::NAN, f64::NAN, 9.0, f64::NAN];
+        assert!(fill_missing(&mut z));
+        assert_eq!(z, vec![5.0, 5.0, 5.0, 5.0, 9.0, 9.0]);
+        let mut none = vec![f64::NAN, f64::NAN];
+        assert!(!fill_missing(&mut none));
     }
 
     #[test]

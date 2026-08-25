@@ -1,5 +1,8 @@
 # stt-build
 
+> **Status: stable, pre-1.0.** See the
+> [support and compatibility policy](../../docs/intro/status-and-support.md).
+
 The CLI that builds **SpatioTemporal Tiles (STT)** datasets. It reads a
 GeoParquet file with a WKB geometry column (or separate `lon`/`lat` columns)
 plus a timestamp column — or, behind opt-in cargo features, a live
@@ -53,15 +56,16 @@ Pass `--publish` for a deploy-ready build (zstd 19).
 Encoding, packing, and the directory come from [`stt-core`](../stt-core);
 `--auto` calls into [`stt-optimize`](../stt-optimize);
 [`stt-generate`](../../tools/stt-generate) shells out to this binary for every bundled
-dataset; [`stt-serve`](../stt-serve) reuses the same per-tile encoder to
-serve tiles on the fly; gate outputs in CI with
-[`stt-validate`](../stt-validate).
+dataset. The [`spatiotemporal-tiles`](../spatiotemporal-tiles) facade ships this
+CLI alongside `stt-optimize`, `stt-validate`, `stt-bundle`, and `stt-serve`;
+the server reuses the same per-tile encoder, and the validator is the CI gate
+for built archives.
 
 ## Docs
 
 - [Full flag reference](../../docs/api/cli-reference.md#stt-build)
 - [Packed format spec](../../docs/spec/stt-packed-format.md)
-- [Database input adaptors](../../docs/roadmap/db-input-adaptors.md)
+- [Database input sources](../../docs/api/cli-reference.md#database-input-sources-opt-in)
 - [Data generation guide](../../docs/guides/data-generation.md)
 
 License: MIT.

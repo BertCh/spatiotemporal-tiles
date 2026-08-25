@@ -136,7 +136,7 @@ pub fn simplify_for_zoom_with(
         .collect();
 
     // Apply Visvalingam-Whyatt simplification (better for preserving shape)
-    let simplified = line.simplify_vw(&epsilon);
+    let simplified = line.simplify_vw(epsilon);
 
     // If simplification didn't help or made it too short, return original
     if simplified.0.len() < 2 || simplified.0.len() >= coords.len() {
@@ -254,7 +254,7 @@ pub fn simplify_polygon_rings_for_zoom_with(
         to_line(&rings[0]),
         rings[1..].iter().map(|r| to_line(r)).collect(),
     );
-    let simplified = poly.simplify_vw_preserve(&epsilon);
+    let simplified = poly.simplify_vw_preserve(epsilon);
 
     // Unscale longitude on the way back out.
     let ls_to_ring = |ls: &LineString<f64>| -> Vec<Vec<f64>> {

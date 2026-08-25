@@ -1,5 +1,8 @@
 # stt-wasm
 
+> **Status: experimental and repository-only.** See the
+> [support policy](../../docs/intro/status-and-support.md).
+
 WebAssembly decoder for the **SpatioTemporal Tiles (STT)** packed format:
 open a `manifest.json` from bytes, list tiles, decode a tile blob to Arrow
 IPC. It wraps `stt-core`'s reader with `wasm-bindgen` and adds no decoding
@@ -13,9 +16,9 @@ logic of its own.
 
 The format has a Rust reader and a TypeScript reader, both written by the
 same author. Anything else — a Python notebook, a Go service, a future GDAL
-or Martin path — is not going to port a v5 varint directory, but every one of
-them already reads Arrow IPC. This crate is the cheapest bridge to that
-audience: same reader, compiled small, bytes in and Arrow out.
+or Martin path — is not going to port the current v6 varint directory, but
+every one of them already reads Arrow IPC. This crate is the cheapest bridge
+to that audience: same reader, compiled small, bytes in and Arrow out.
 
 ## I/O is inverted
 

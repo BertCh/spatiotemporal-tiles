@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "Spatiotemporal dataset analyzer and optimizer for STT file generation"
+description = "Spatiotemporal dataset analyzer and optimizer for STT archive generation"
 readme = "README.md"
 keywords = ["tiles", "spatiotemporal", "geospatial", "optimization", "cli"]
 categories = ["science::geo", "command-line-utilities"]
@@ -48,5 +48,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3.10"
-
 

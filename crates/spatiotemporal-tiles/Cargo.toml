@@ -159,7 +159,7 @@ tempfile = "3.10"
 arrow = { workspace = true }
 parquet = { workspace = true }
 
-# Prebuilt binaries (cargo-dist): all four CLIs, both stt-serve backends.
+# Prebuilt binaries (cargo-dist): all five CLIs, both stt-serve backends.
 [package.metadata.dist]
 features = ["cli"]
 

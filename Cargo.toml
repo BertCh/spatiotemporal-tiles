@@ -33,12 +33,12 @@ rust-version = "1.87"
 [workspace.dependencies]
 # Core dependencies
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Geometry processing
-geo = "0.28"
+geo = "0.33"
 geo-types = "0.7"
 geojson = { version = "0.24", features = ["geo-types"] }
 
@@ -59,7 +59,7 @@ parquet = { version = "59", default-features = false, features = [
 ] }
 
 # WKB / geometry decoding for input parsing
-geozero = { version = "0.14", default-features = false, features = [
+geozero = { version = "0.15", default-features = false, features = [
   "with-wkb",
   "with-geo",
 ] }
@@ -80,7 +80,7 @@ rayon = "1.10"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "cargo"] }
-indicatif = "0.17"
+indicatif = "0.18"
 
 # Time/Date
 chrono = { version = "0.4", features = ["serde"] }
@@ -94,7 +94,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Testing
-criterion = "0.5"
+criterion = "0.8"
 
 [profile.release]
 opt-level = 3

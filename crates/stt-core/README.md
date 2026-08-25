@@ -1,5 +1,8 @@
 # stt-core
 
+> **Status: stable, pre-1.0.** See the
+> [support and compatibility policy](../../docs/intro/status-and-support.md).
+
 Core Rust library for the **SpatioTemporal Tiles (STT)** format. The
 canonical container is the **packed format**: a per-dataset `manifest.json`
 (tiny, mutable) plus content-addressed, immutable pack objects
@@ -19,7 +22,8 @@ ordering (`curve`), per-blob zstd compression, and timestamp normalization.
 
 ## Example
 
-`stt-core` is a library (the CLIs live in the sibling crates), but it ships
+`stt-core` is a library (the five CLIs ship from the
+[`spatiotemporal-tiles`](../spatiotemporal-tiles) facade), but it includes
 operational one-offs as cargo examples:
 
 ```bash
@@ -38,11 +42,11 @@ See [`examples/README.md`](./examples/README.md) for the full list
 ## Relation to the other crates
 
 Every other crate builds on this one: [`stt-build`](../stt-build) writes
-packed datasets through `PackWriter`, [`stt-serve`](../stt-serve) encodes
-single tiles with the same encoder, [`stt-validate`](../stt-validate) checks
-archives with `verify_packed_objects` + the tile decoder, and
-[`stt-optimize`](../stt-optimize) reads archives for analysis. The
-TypeScript reader (`@poopdeck.gl/core`) is the browser-side mirror.
+packed datasets through `PackWriter`, and [`stt-optimize`](../stt-optimize)
+reads archives for analysis. The facade's `stt-serve` binary encodes single
+tiles with the same encoder; its `stt-validate` binary checks archives with
+`verify_packed_objects` plus the tile decoder. The TypeScript reader
+(`@poopdeck.gl/core`) is the browser-side mirror.
 
 ## Docs
 

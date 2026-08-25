@@ -1,5 +1,8 @@
 # stt-optimize
 
+> **Status: stable, pre-1.0.** See the
+> [support and compatibility policy](../../docs/intro/status-and-support.md).
+
 Analyzer, flag-recommender, and tileset profiler for STT builds. It reads a
 source before the build and the packed dataset after it:
 

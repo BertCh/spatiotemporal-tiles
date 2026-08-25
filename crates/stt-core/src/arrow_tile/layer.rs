@@ -9,8 +9,10 @@
 
 use crate::error::{Error, Result};
 use crate::types::GeometryType;
+use arrow::datatypes::{DataType, Field};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// GeoArrow extension-name metadata key.
 pub(crate) const GEOARROW_EXT_KEY: &str = "ARROW:extension:name";
@@ -27,6 +29,89 @@ pub(crate) const GEOARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 /// self-describing to GDAL / GeoPandas / lonboard / QGIS; without it those
 /// readers fall back to "unknown CRS" even though the geometry is plain lon/lat.
 pub(crate) const GEOARROW_CRS_METADATA: &str = r#"{"crs":"OGC:CRS84","crs_type":"authority_code"}"#;
+
+/// vis.gl temporal field-metadata keys — the `visgl:temporal-*` vocabulary
+/// luma.gl's `@luma.gl/arrow` writes onto a prepared temporal field
+/// (`modules/arrow/src/arrow/vectors/arrow-temporal-gpu-vector.ts`).
+///
+/// Why borrow someone else's namespace instead of minting `stt:*` twins: this
+/// is the same job [`GEOARROW_EXT_KEY`] does for geometry. A time column that
+/// says only `Int64` is not self-describing — nothing in the type distinguishes
+/// epoch milliseconds from an opaque counter. Emitting the vocabulary a generic
+/// Arrow consumer already looks for is what makes a tile's time columns legible
+/// to something that has never heard of STT.
+///
+/// **These keys are never written to the wire.** Every value is derivable from
+/// the decoded column, so paying for them per tile would be paying for a
+/// restatement: a self-contained frame (what `stt-serve` emits, with an inline
+/// schema section per tile) would carry ~450 B of them on EVERY tile, measured
+/// at +65 to +181 B compressed per tile on `stt-optimize`'s sample layouts.
+/// They are instead stamped on at DECODE, by [`decorate_temporal_fields`] here
+/// and by `toGeoArrowTable()` in `packages/core/src/tile.ts` — which also means
+/// every archive ever written gets them, not just ones built after this landed,
+/// and no content address churns.
+pub(crate) const TEMPORAL_KIND_KEY: &str = "visgl:temporal-kind";
+/// See [`TEMPORAL_KIND_KEY`]. One of `day`/`second`/`millisecond`/
+/// `microsecond`/`nanosecond`; STT is always `millisecond`.
+pub(crate) const TEMPORAL_UNIT_KEY: &str = "visgl:temporal-unit";
+/// See [`TEMPORAL_KIND_KEY`]. The absolute value the column's values are
+/// measured FROM, in the unit named by [`TEMPORAL_UNIT_KEY`].
+pub(crate) const TEMPORAL_ORIGIN_KEY: &str = "visgl:temporal-origin";
+/// See [`TEMPORAL_KIND_KEY`]. How [`TEMPORAL_ORIGIN_KEY`] was chosen —
+/// `zero` (absolute values) or `first-valid` (relativized against the column's
+/// own first valid value).
+pub(crate) const TEMPORAL_ORIGIN_POLICY_KEY: &str = "visgl:temporal-origin-policy";
+/// See [`TEMPORAL_KIND_KEY`]. STT timestamps are always UTC.
+pub(crate) const TEMPORAL_TIMEZONE_KEY: &str = "visgl:temporal-timezone";
+
+/// The STT time columns, in the order they appear in a decoded batch.
+pub(crate) const TEMPORAL_COLUMNS: [&str; 3] = ["start_time", "end_time", "vertex_time"];
+
+/// Whether `field` holds ABSOLUTE Unix milliseconds rather than one of the
+/// compact relative forms.
+///
+/// Signed and 64-bit. Every compact form is UNSIGNED — `UInt32` start offsets
+/// and durations, `List<UInt16|UInt32>` vertex-time deltas — so dropping the
+/// signedness clause would declare all of them absolute, which is exactly the
+/// wrong answer.
+fn is_absolute_ms(field: &Field) -> bool {
+    match field.data_type() {
+        DataType::Int64 => true,
+        DataType::List(item) => matches!(item.data_type(), DataType::Int64),
+        _ => false,
+    }
+}
+
+/// Stamp the `visgl:temporal-*` descriptor onto a decoded layer's time columns.
+///
+/// Runs at the END of decode, after every compact form has been re-inflated, so
+/// it describes what the caller is actually handed rather than what was on the
+/// wire. `start_time` / `end_time` are always absolute by then; `vertex_time`
+/// is the one column that is NOT re-inflated, so its delta forms report the
+/// domain and stay silent about the origin — their anchor is the per-tile
+/// `stt:vertex_time_origin_ms`, which is not a property of the column at all.
+/// Advertising one would place every vertex of every other tile at the wrong
+/// instant.
+///
+/// The TypeScript counterpart is `toGeoArrowTable()` in
+/// `packages/core/src/tile.ts`; the two must agree key for key.
+pub(crate) fn decorate_temporal_fields(fields: &mut [Arc<Field>]) {
+    for field in fields.iter_mut() {
+        if !TEMPORAL_COLUMNS.contains(&field.name().as_str()) {
+            continue;
+        }
+        let mut m = field.metadata().clone();
+        m.insert(TEMPORAL_KIND_KEY.to_string(), "timestamp".to_string());
+        m.insert(TEMPORAL_UNIT_KEY.to_string(), "millisecond".to_string());
+        m.insert(TEMPORAL_TIMEZONE_KEY.to_string(), "UTC".to_string());
+        if is_absolute_ms(field) {
+            m.insert(TEMPORAL_ORIGIN_KEY.to_string(), "0".to_string());
+            m.insert(TEMPORAL_ORIGIN_POLICY_KEY.to_string(), "zero".to_string());
+        }
+        *field = Arc::new(field.as_ref().clone().with_metadata(m));
+    }
+}
+
 /// A single coordinate pair (lon, lat) in WGS84 degrees.
 pub type Coord = [f64; 2];
 /// Geometry for one layer, grouped by kind. Every feature in a layer shares

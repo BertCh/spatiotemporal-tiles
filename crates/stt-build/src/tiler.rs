@@ -2629,7 +2629,6 @@ mod tests {
     /// same directory hash, same pack hashes, same manifest. This is the
     /// unit-level pin for the E1 "parallel encode, deterministic write order"
     /// contract.
-    #[test]
     /// **TB-13 pin.** The pipelined encode/flush path is BYTE-NEUTRAL.
     ///
     /// The unbudgeted path was already covered by
@@ -2698,6 +2697,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn parallel_encode_writes_byte_identical_dataset() {
         let hour = 3_600_000u64;
         let mut features = Vec::new();
