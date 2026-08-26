@@ -63,7 +63,7 @@ tracing-subscriber = { workspace = true, optional = true }
 # same H3 crate/version stt-build mints summary cells with — the summary
 # cell-id validity check must agree with the builder bit-for-bit.
 arrow = { workspace = true, optional = true }
-h3o = { version = "0.7", optional = true }
+h3o = { version = "0.10", optional = true }
 
 # stt-serve (feature `serve`): HTTP server + runtime.
 axum = { version = "0.7", optional = true }
