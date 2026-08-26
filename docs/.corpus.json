@@ -1,5 +1,5 @@
 {
-  "$comment": "The published documentation corpus spans two repositories (docs/roadmap/repo-split-2026-08.md §3). This file records which of THIS repo's pages are also served from poopdeck.gl, and which pages of the combined corpus live only there. scripts/check-doc-links.mjs reads it so a vendored page may link into the renderer's half — those links resolve wherever the whole corpus is assembled, which is the site — while a page this repository owns alone still has to keep every link local or absolute.",
+  "$comment": "The published documentation corpus spans two repositories (docs/roadmap/repo-split-2026-08.md \u00a73). This file records which of THIS repo's pages are also served from poopdeck.gl, and which pages of the combined corpus live only there. scripts/check-doc-links.mjs reads it so a vendored page may link into the renderer's half \u2014 those links resolve wherever the whole corpus is assembled, which is the site \u2014 while a page this repository owns alone still has to keep every link local or absolute.",
   "downstreamRepo": "BertCh/poopdeck.gl",
   "vendoredDownstream": [
     "docs/spec/stt-packed-format.md",
@@ -25,7 +25,8 @@
     "docs/guides/wasm.md",
     "docs/intro/concepts.md",
     "docs/intro/glossary.md",
-    "docs/intro/choosing.md"
+    "docs/intro/choosing.md",
+    "docs/roadmap/repo-split-2026-08.md"
   ],
   "downstreamOnly": [
     "docs/api/*.md",
