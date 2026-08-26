@@ -1,21 +1,27 @@
 # SpatioTemporal Tiles documentation
 
-SpatioTemporal Tiles (STT) is an open format and toolchain for streaming vector
-features by map viewport and time window. The Rust tools build, inspect,
-validate, bundle, and serve STT data. The `@poopdeck.gl/*` packages read,
-render, and work with it in web applications and AI tools.
+SpatioTemporal Tiles (STT) is an open format and Rust toolchain for streaming
+vector features by map viewport and time window. The tools here build, inspect,
+validate, bundle, and serve STT archives.
+
+Rendering is a separate project: **[poopdeck.gl][pd]** provides the
+`@poopdeck.gl/*` TypeScript packages (deck.gl, Three.js, MapLibre, Cesium) and
+the [live showcase](https://poopdeck.gl), which is also where the **complete
+documentation corpus** is published — this repository's pages and the
+renderer's, served together. Several pages below are authored here and vendored
+there so the site has one copy of each; the reverse never happens.
+
+[pd]: https://github.com/BertCh/poopdeck.gl
 
 New to the project? Follow these in order:
 
 1. Get an animated map running in five minutes with the
-   [quickstart](./intro/quickstart.md) — React or vanilla JS, against a hosted
-   dataset.
+   [quickstart](https://poopdeck.gl/docs/intro/quickstart) — against a hosted
+   dataset, no toolchain required.
 2. [Choose whether STT fits](./intro/choosing.md).
 3. Read the [core concepts](./intro/concepts.md).
 4. Build and display your own data with the
    [CSV quickstart](./guides/csv-quickstart.md).
-5. Check [status, support, and compatibility](./intro/status-and-support.md)
-   before adopting a pre-1.0 API or alternate renderer.
 
 The [glossary](./intro/glossary.md) defines project names and format terms.
 
@@ -25,7 +31,7 @@ The [glossary](./intro/glossary.md) defines project names and format terms.
   `stt-build`, `stt-optimize`, `stt-validate`, `stt-bundle`, `stt-serve`, and
   the repository-only `stt-generate`.
 - [CSV quickstart](./guides/csv-quickstart.md) — CSV → GeoParquet → archive →
-  animated React map.
+  animated map.
 - [Python guide](./guides/python.md) — GeoPandas, DuckDB, and pyarrow input
   workflows.
 - [Data generation](./guides/data-generation.md) — rebuild the bundled showcase
@@ -35,25 +41,6 @@ The [glossary](./intro/glossary.md) defines project names and format terms.
 
 Default and `--auto` builds preserve every usable feature. Summary and raster
 tiers are explicit coarse-zoom additions, not replacements for the raw tier.
-
-## Render and play
-
-- [SpatioTemporalLayer](./api/spatiotemporal-layer.md) — primary deck.gl layer
-  and tile lifecycle.
-- [Choose a backend and layer](./intro/choosing.md) — short decision tables for
-  deck.gl, Three.js, MapLibre, and the experimental Cesium source tree.
-- [Backend capability matrix](./spec/backend-capabilities.md) — generated,
-  authoritative feature comparison.
-- [STT archive reader](./api/stt-loader.md) and
-  [SpatioTemporalTileset](./api/spatiotemporal-tileset.md) — Range loading,
-  decoding, selection, caching, and prefetch.
-- [SttPlayer](./api/stt-player.md) — recommended clock and buffering facade.
-- [React integration](./api/stt-react.md) — playback hooks and controls.
-- [Layer base class](./api/spatiotemporal-layer.md) and
-  [extension compatibility](./api/extensions.md) — routes into the complete
-  deck.gl catalog.
-
-The deck.gl packages target the repository-pinned 9.3.x line.
 
 ## Deploy and operate
 
@@ -67,14 +54,11 @@ The deck.gl packages target the repository-pinned 9.3.x line.
 ## Architecture
 
 - [System overview](./architecture/system-overview.md) — end-to-end build,
-  storage, loading, and rendering pipeline.
+  storage, loading, and rendering pipeline across both repositories.
 - [Packed archive performance](./architecture/archive-format-performance.md) —
   layout and generation decisions.
 - [Tile payload](./architecture/data-format.md) — Arrow IPC and GeoArrow layer
   frames.
-- [deck.gl integration](./architecture/deckgl-integration.md) — relationship to
-  deck.gl's tile lifecycle.
-- [Render kernel](./api/render-kernel.md) — shared renderer-independent logic.
 
 ## Normative specification
 
@@ -83,22 +67,31 @@ The deck.gl packages target the repository-pinned 9.3.x line.
 - [Time model](./spec/time-model.md) and
   [tile matrix set](./spec/tile-matrix-set.json)
 - [Tile payload](./architecture/data-format.md)
-- [Sidecar assets](./spec/sidecar-assets.md) and
-  [scene schema](./spec/scene.schema.json)
-- [Conformance](./spec/conformance.md)
+- [Sidecar assets](./spec/sidecar-assets.md), the
+  [scene schema](./spec/scene.schema.json), and the
+  [AV palette contract](./spec/av-palettes.json)
+- [Conformance](./spec/conformance.md), with portable vectors in
+  [`conformance/`](../conformance/README.md)
 
 The specification is authoritative for wire behavior. Current writers emit
 packed format v3 and directory codec v6. Reference readers additionally accept
 format v2 with directory v5 read-only.
 
+## Rendering
+
+Renderer documentation — the layer catalog, extensions, the tileset and player
+APIs, backend capability matrix, and the deck.gl integration — lives with the
+code, in the [poopdeck.gl repository][pd] and on
+[poopdeck.gl/docs](https://poopdeck.gl/docs).
+
 ## AI integration
 
-- [AI suite guide](./guides/ai-suite.md) — the `poopdeck-ai` plugin, MCP server,
-  skills, and security model.
-- [`@poopdeck.gl/mcp`](./api/stt-mcp.md) — dataset discovery, analysis, map
-  composition, and gated CLI operations.
+`@poopdeck.gl/mcp` exposes this toolchain to agents: dataset discovery,
+analysis, map composition, and gated `stt-build` / `stt-validate` /
+`stt-generate` operations. It ships from the [poopdeck.gl repository][pd] and
+resolves the `stt-*` binaries off `PATH`, so it works against any installed
+version of this toolchain. See
+[the AI suite guide](https://poopdeck.gl/docs/guides/ai-suite).
 
 The repository's [`AGENTS.md`](../AGENTS.md) is the orientation and routing
-document for coding agents. Published retrieval indexes are available at
-[poopdeck.gl/llms.txt](https://poopdeck.gl/llms.txt) and
-[poopdeck.gl/llms-full.txt](https://poopdeck.gl/llms-full.txt).
+document for coding agents.

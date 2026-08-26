@@ -33,7 +33,7 @@ then:
 
     pip install xarray netcdf4 numpy pyarrow shapely
     python ecco_advect.py --input ./ecco-vel \
-      --output ../../examples/showcase/public/data/ecco-currents.stt
+      --output ../../data-fleet/ecco-currents.stt
 
 Use ``--skip-build`` to stop at the GeoParquet (handy when stt-build isn't on
 PATH yet), or ``--stt-build /path/to/stt-build`` to point at the binary.

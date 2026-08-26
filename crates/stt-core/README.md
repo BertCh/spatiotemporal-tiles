@@ -1,7 +1,7 @@
 # stt-core
 
 > **Status: stable, pre-1.0.** See the
-> [support and compatibility policy](../../docs/intro/status-and-support.md).
+> [support and compatibility policy](https://github.com/BertCh/poopdeck.gl/blob/main/docs/intro/status-and-support.md).
 
 Core Rust library for the **SpatioTemporal Tiles (STT)** format. The
 canonical container is the **packed format**: a per-dataset `manifest.json`
@@ -53,6 +53,6 @@ tiles with the same encoder; its `stt-validate` binary checks archives with
 - [Packed format spec](../../docs/spec/stt-packed-format.md)
 - [Time model](../../docs/spec/time-model.md)
 - [Conformance suite](../../docs/spec/conformance.md)
-- [Maintenance tools](../../docs/api/cli-reference.md#maintenance-tools-cargo-examples)
+- [Maintenance tools](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md#maintenance-tools-cargo-examples)
 
 License: MIT.

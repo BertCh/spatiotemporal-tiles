@@ -28,7 +28,7 @@ use geo_types::Point;
 /// "does this feature exist?" two different ways. Clamping (not rejecting) is
 /// the side every site is on — the H3 anchor, the Quadbin cell, the trajectory
 /// supercover, and the TS renderer's `MAX_MERCATOR_LAT`
-/// (`packages/core/src/geo/mercator.ts`) — and it honours the no-thinning
+/// (`poopdeck:packages/core/src/geo/mercator.ts`) — and it honours the no-thinning
 /// rule: a polar feature lands on the world's edge row instead of vanishing.
 ///
 /// The full precision matters *because* we clamp — the clamped feature lands
@@ -40,7 +40,7 @@ use geo_types::Point;
 /// `stt-build`'s `clip.rs`) then returns NO tiles at all for a polar path. One
 /// ulp inward puts `y` at `+2.2e-16` — still the world edge, but on the inside
 /// of it. It is also bit-for-bit the value the renderer clamps to
-/// (`MAX_MERCATOR_LAT` in `packages/core/src/geo/mercator.ts`), so producer and
+/// (`MAX_MERCATOR_LAT` in `poopdeck:packages/core/src/geo/mercator.ts`), so producer and
 /// consumer agree.
 pub const MERCATOR_MAX_LAT: f64 = 85.051_128_779_806_59;
 

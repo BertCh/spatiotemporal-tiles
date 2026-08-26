@@ -58,7 +58,7 @@ pub struct Args {
     #[arg(
         short,
         long,
-        default_value = "examples/showcase/public/data/bixi-flowmap"
+        default_value = "data-fleet/bixi-flowmap"
     )]
     pub output: PathBuf,
 

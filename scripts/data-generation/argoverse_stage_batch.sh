@@ -21,7 +21,7 @@ BUCKET="${BUCKET:-s3://argoverse/datasets/av2/sensor}"
 SPLIT="${SPLIT:-val}"
 PY="${PY:-$HERE/venv-av2/bin/python}"
 STT="${STT_BUILD:-$REPO/target/release/stt-build}"
-OUT="${OUT_DIR:-$REPO/examples/showcase/public/data}"
+OUT="${OUT_DIR:-$REPO/data-fleet}"
 WORK="${WORK:-$(mktemp -d)}"
 # Stage density is kept LOW enough that the densest (concentrated-scene) tile stays
 # well under the browser's per-tile decode limit — the full-range stage can put the

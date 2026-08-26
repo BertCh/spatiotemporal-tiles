@@ -35,7 +35,7 @@
  *     --attribution "USGS Earthquake Catalog (ComCat), public domain"
  *
  * `--dir` overrides the dataset root (default
- * `examples/showcase/public/data`). Publishing the change is a separate,
+ * `data-fleet`). Publishing the change is a separate,
  * deliberate step: `scripts/r2-sync.sh <stem>`.
  */
 
@@ -59,10 +59,7 @@ for (let i = 0; i < argv.length; i++) {
   }
 }
 
-const dataDir = resolve(
-  ROOT,
-  flags.get('dir') ?? 'examples/showcase/public/data',
-);
+const dataDir = resolve(ROOT, flags.get('dir') ?? 'data-fleet');
 
 function readManifest(stem) {
   const path = join(dataDir, stem, 'manifest.json');

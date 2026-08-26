@@ -138,7 +138,7 @@ pub fn dataset_dictionary_is_smaller(
 /// contract rather than an arithmetic one. The TS reader publishes a categorical
 /// column as `{indices: Uint16Array, categories: string[]}` and spells "this row
 /// has no category" as the IN-BAND sentinel `0xffff`
-/// (`packages/core/src/tile.ts`), so a live key of 65_535 would be
+/// (`poopdeck:packages/core/src/tile.ts`), so a live key of 65_535 would be
 /// indistinguishable from a null. The incumbent per-tile builder can never mint
 /// one — `build_dictionary_indices` stops accepting new categories at
 /// `u16::MAX` — but pass 1's distinct-set cap is `MAX_CATEGORIES = 65_536`, one
@@ -991,7 +991,7 @@ fn build_layer_parts(
         // column and relativize times against this value directly. Mirrors
         // exactly what the decoder computes (the min of the `start_time`
         // column); only emitted when a start-time column is present. See
-        // packages/core/src/tile.ts. With a `st: "u32"` start column it is
+        // poopdeck:packages/core/src/tile.ts. With a `st: "u32"` start column it is
         // LOAD-BEARING, not an optimization — it is the offsets' anchor.
         min_start_time,
         start_time_form,

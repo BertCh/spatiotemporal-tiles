@@ -51,7 +51,7 @@ regen that loses it is loud.
 
 Full build:
     venv-storm4d/bin/python storm4d_stations.py \
-        --out ../../examples/showcase/public/data/storm4d-stations --publish
+        --out ../../data-fleet/storm4d-stations --publish
 """
 
 from __future__ import annotations

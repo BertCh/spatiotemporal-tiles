@@ -8,7 +8,7 @@ collisions. The bundle layout and every column/JSON shape here are governed by
 ``docs/roadmap/av-cockpit.md`` (§2 data contract). **Do not deviate from the
 contract silently** — if a shape here is wrong, flag it to the lead.
 
-A scene bundle lives under ``examples/showcase/public/data/<sceneId>/``::
+A scene bundle lives under ``data-fleet/<sceneId>/``::
 
     <sceneId>/
       scene.json            # manifest (cockpit source of truth)

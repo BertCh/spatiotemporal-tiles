@@ -29,7 +29,7 @@ renders the attribution from scene.json).
 Then:
 
   python nuscenes_extract.py --dataroot ./nuscenes --version v1.0-mini \\
-    --scene 0 --out ../../examples/showcase/public/data/nuscenes-0061
+    --scene 0 --out ../../data-fleet/nuscenes-0061
 
 ``--scene`` accepts a scene name (e.g. ``scene-0061``) or an integer index into
 ``nusc.scene``. Use ``--skip-build`` to stop at GeoParquet + JSON.

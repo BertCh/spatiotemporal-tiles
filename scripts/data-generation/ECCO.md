@@ -45,7 +45,7 @@ python3 -m venv venv
 # Full pipeline (needs stt-build on PATH, or pass --stt-build <path>):
 ./venv/bin/python ecco_advect.py \
   --input ./ecco-vel \
-  --output ../../examples/showcase/public/data/ecco-currents.stt
+  --output ../../data-fleet/ecco-currents.stt
 
 # Or stop at GeoParquet and build separately:
 ./venv/bin/python ecco_advect.py --input ./ecco-vel \
@@ -70,7 +70,7 @@ split at the antimeridian so nothing draws across the dateline.
 ## 3. Verify + wire into the showcase
 
 ```bash
-stt-validate ../../examples/showcase/public/data/ecco-currents.stt
+stt-validate ../../data-fleet/ecco-currents.stt
 ```
 
 The showcase entry lives in `examples/showcase/src/datasets.ts` under id

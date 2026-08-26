@@ -36,7 +36,7 @@ DOWNLOAD (login-gated; CC BY-NC-SA 4.0 — non-commercial, attribute the source)
 Then:
 
   python argoverse_extract.py --log-dir ./av2/val/<log_id> --city PIT \\
-    --out ../../examples/showcase/public/data/argoverse-<log_id>
+    --out ../../data-fleet/argoverse-<log_id>
 
 Use ``--skip-build`` to stop at GeoParquet + JSON.
 

@@ -4,7 +4,7 @@ The one place for **dataset licensing verdicts, the blocked list, operational ti
 the non-obvious per-demo decisions** behind the shipped showcase. Replaces the four per-demo
 build logs and the dataset wishlist. Rationale and counted-out options only.
 
-**Build commands do NOT live here.** `examples/showcase/src/datasets.ts` carries the exact
+**Build commands do NOT live here.** `poopdeck:examples/showcase/src/datasets.ts` carries the exact
 rebuild recipe in a comment on each dataset entry, and it is the copy that stays current. The
 retired `rain-flood-demo-2026-07.md` proves why: it recorded a 6-hourly rain build with a
 recipe that omitted the required `--blob-ordering time-major`, while the tree had long since
@@ -112,8 +112,8 @@ local-only per §1.1. Attribution renders from each bundle's `scene.json`.
 > **The AV record lives in [av-cockpit.md](./av-cockpit.md), not here.** It is the
 > only per-demo doc that survived the 2026-07-24 consolidation, because it is not a
 > campaign log — it is a **live data contract**. Forty-four section-anchored citations
-> across `scripts/data-generation/*.py`, `packages/layers/src/layers/core/animated-bounding-box-layer.ts`
-> and `examples/showcase/src/components/av/*` point into its numbered sections, and
+> across `scripts/data-generation/*.py`, `poopdeck:packages/layers/src/layers/core/animated-bounding-box-layer.ts`
+> and `poopdeck:examples/showcase/src/components/av/*` point into its numbered sections, and
 > `scripts/data-generation/av_common.py:8` instructs extractor authors not to deviate
 > from it. It carries the georeferencing gotchas (nuScenes local frame vs Argoverse 2
 > UTM), the three-copy palette-lockstep rule and the legend↔box bug it prevents, and

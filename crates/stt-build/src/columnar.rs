@@ -600,7 +600,7 @@ fn build_polygon_layer(
     // readers used to branch on whether the LAYER had a triangle column and then
     // trust each feature's slice verbatim, so an empty list meant "draw
     // nothing" and every single-ring polygon vanished. The decoder in
-    // packages/core/src/tile.ts now BACKFILLS an empty run by earcutting the
+    // poopdeck:packages/core/src/tile.ts now BACKFILLS an empty run by earcutting the
     // feature's single ring, which completes the buffer before any of the three
     // sees it — deck's whole-layer `indices` handoff and three's layer-global
     // `hasPreBaked` switch keep working unchanged.

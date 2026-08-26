@@ -2381,7 +2381,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--out-dir",
         default=str(
-            Path(__file__).resolve().parents[2] / "examples/showcase/public/data"
+            Path(__file__).resolve().parents[2] / "data-fleet"
         ),
     )
     p.add_argument("--stt-build", default=str(

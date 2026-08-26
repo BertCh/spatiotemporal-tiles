@@ -1,7 +1,7 @@
 # stt-optimize
 
 > **Status: stable, pre-1.0.** See the
-> [support and compatibility policy](../../docs/intro/status-and-support.md).
+> [support and compatibility policy](https://github.com/BertCh/poopdeck.gl/blob/main/docs/intro/status-and-support.md).
 
 Analyzer, flag-recommender, and tileset profiler for STT builds. It reads a
 source before the build and the packed dataset after it:
@@ -91,10 +91,10 @@ to bake the `style_hints` metadata block.
 
 ## Docs
 
-- [CLI reference](../../docs/api/cli-reference.md#stt-optimize)
+- [CLI reference](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md#stt-optimize)
 - [Tuning your tiles](../../docs/guides/tuning-tiles.md) — the
   measure → interpret → decide loop, end to end
-- [`stt-build` flag reference](../../docs/api/cli-reference.md#stt-build)
+- [`stt-build` flag reference](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md#stt-build)
 - [Packed format spec](../../docs/spec/stt-packed-format.md)
 
 License: MIT.

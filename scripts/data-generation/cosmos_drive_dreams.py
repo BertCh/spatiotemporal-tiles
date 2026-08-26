@@ -72,7 +72,7 @@ import numpy as np
 import av_common as avc
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_OUT = _REPO_ROOT / "examples/showcase/public/data/cosmos-drive-dreams"
+DEFAULT_OUT = _REPO_ROOT / "data-fleet/cosmos-drive-dreams"
 DEFAULT_CACHE = Path(__file__).resolve().parent / "cosmos-raw"
 
 HF_REPO = "nvidia/PhysicalAI-Autonomous-Vehicle-Cosmos-Drive-Dreams"

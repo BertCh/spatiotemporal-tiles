@@ -28,8 +28,19 @@
  * README keeps a retired-doc mapping table (old name → the doc that absorbed
  * it), so naming a deleted file there is correct, not drift.
  *
+ * CROSS-REPO citations. Since the 2026-08-26 split, a source file here may
+ * legitimately cite a record that lives in the poopdeck.gl repository — the
+ * renderer architecture and the tile-loading records went there with the code
+ * they describe. Those are written with an explicit `poopdeck:` prefix
+ * (`poopdeck:docs/roadmap/renderer-architecture.md §2.9`), which this gate
+ * recognises, counts, and skips. The prefix exists so a cross-repo pointer is a
+ * DECLARED thing rather than the gate's pre-existing silent-ignore behaviour
+ * for unknown filenames: without it, a citation that used to be checked would
+ * quietly stop being checked, which is exactly the failure mode this file was
+ * written to end.
+ *
  * Uses `git grep` — it is C-fast, skips binaries, and already honors
- * .gitignore, so node_modules/ and dist/ never enter the scan.
+ * .gitignore, so node_modules/ and target/ never enter the scan.
  *
  * Usage: node .github/scripts/check-roadmap-citations.mjs   # exit 1 on drift
  */
@@ -44,24 +55,27 @@ const ROOT = resolve(new URL('../..', import.meta.url).pathname);
 const KNOWN_DIRS = ['docs/roadmap', 'docs/spec'];
 const SCAN = [
   'crates',
-  'packages',
-  'examples',
+  'conformance',
   'tools',
   'scripts',
-  'poopdeck-ai',
   '.github',
   // This file names docs/roadmap/README.md in its own failure message; without
   // the exclude, the checker reports itself the day that README is renamed.
   ':!.github/scripts/check-roadmap-citations.mjs',
 ];
 
+/** Repositories a citation may point INTO. `poopdeck` is the renderer repo. */
+const CROSS_REPO = ['poopdeck'];
+
 // Filenames are lowercase-hyphen by convention, but README.md is cited too.
-// Group 1 = optional known-dir prefix, 2 = filename, 3 = optional §section.
+// Group 1 = optional cross-repo prefix, 2 = optional known-dir prefix,
+// 3 = filename, 4 = optional §section.
 // A trailing sentence period is naturally excluded: `\.` must be followed by a
 // digit, so `§7.` captures `7` and `§8.5.` captures `8.5`. A lettered anchor
 // (`§3c`) IS captured, precisely so it can be reported as unresolved.
 const CITATION = new RegExp(
-  String.raw`(?:(${KNOWN_DIRS.join('|')})\/)?([A-Za-z0-9._-]+\.md)` +
+  String.raw`(?:(${CROSS_REPO.join('|')}):)?` +
+    String.raw`(?:(${KNOWN_DIRS.join('|')})\/)?([A-Za-z0-9._-]+\.md)` +
     String.raw`(?:[ \t]*§[ \t]*(\d+(?:\.\d+)*[a-z]?))?`,
   'g',
 );
@@ -139,18 +153,27 @@ const missing = new Map();
 const badAnchors = new Map();
 let citations = 0;
 let anchorsChecked = 0;
+let crossRepo = 0;
 for (const row of gitGrep().split('\n')) {
   if (!row) continue;
   const m = /^([^:]+):(\d+):([\s\S]*)$/.exec(row);
   if (!m) continue;
   const [, file, line, text] = m;
   for (const hit of text.matchAll(CITATION)) {
-    const [, dir, doc, section] = hit;
+    const [, repo, dir, doc, section] = hit;
 
     // Bare `<file>.md` with no §section carries no checkable claim beyond a
     // filename we may not own — only the explicit path form is a citation.
     if (!dir && !section) continue;
     citations += 1;
+
+    // A declared pointer into the other repository. Not resolvable from here
+    // by design; counted so the report shows how much of the corpus now lives
+    // across the seam.
+    if (repo) {
+      crossRepo += 1;
+      continue;
+    }
 
     // Resolve: explicit dir wins; otherwise the bare filename must name a doc
     // in a known dir, else it is some unrelated .md and not ours to police.
@@ -180,7 +203,8 @@ for (const row of gitGrep().split('\n')) {
 
 if (missing.size === 0 && badAnchors.size === 0) {
   console.log(
-    `roadmap citations: ${citations} checked (${anchorsChecked} with a §section), all resolve.`,
+    `roadmap citations: ${citations} checked (${anchorsChecked} with a §section, ` +
+      `${crossRepo} declared cross-repo), all resolve.`,
   );
   process.exit(0);
 }

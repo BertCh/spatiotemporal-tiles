@@ -7,7 +7,7 @@ __pycache__/
 *.pyc
 
 # ECCO raw granules + advection intermediate (the built .stt lives under
-# examples/showcase/public/data and is ignored there).
+# data-fleet and is ignored there).
 ecco-vel/
 *.nc
 *.parquet

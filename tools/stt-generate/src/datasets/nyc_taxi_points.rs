@@ -25,7 +25,7 @@ use stt_core::PackedReader;
 pub struct Args {
     /// Input LineString packed dataset (the existing taxi-paths build) — the
     /// dataset directory or its `manifest.json`.
-    #[arg(long, default_value = "examples/showcase/public/data/nyc-taxi-paths")]
+    #[arg(long, default_value = "data-fleet/nyc-taxi-paths")]
     pub input: PathBuf,
 
     /// Output .stt (or .parquet for intermediate only).

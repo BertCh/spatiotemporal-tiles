@@ -9,7 +9,8 @@ it.
 
 ## Layout
 
-Two workspaces live side by side in one checkout.
+One cargo workspace. The TypeScript renderers that CONSUME archives live in a
+separate repository, [BertCh/poopdeck.gl][pd]; this one writes them.
 
 ```
 crates/                 # cargo workspace — the 4 PUBLISHED crates
@@ -26,12 +27,12 @@ packages/               # pnpm workspace — 7 published packages + Cesium previ
   cesium/                #   experimental workspace-only backend (private)
   playback/ react/      #   clock + governor + React UI
   mcp/                  #   published MCP server (`stt-mcp`)
-examples/showcase/      # React Router demo site (dozens of real datasets)
+poopdeck:examples/showcase/      # React Router demo site (dozens of real datasets)
 tools/                  # bench, perf, render-test harnesses
   stt-generate/         #   reference-dataset generators — its OWN cargo
                         #   workspace, unpublished, off the root MSRV
 docs/                   # spec, API reference, guides, architecture
-poopdeck-ai/            # Claude Code plugin (MCP server + Agent Skills)
+poopdeck:poopdeck-ai/            # Claude Code plugin (MCP server + Agent Skills)
 ```
 
 `stt-generate` is deliberately outside the root workspace (`cargo test
@@ -41,36 +42,35 @@ are bins inside `spatiotemporal-tiles` and are feature-gated (a bare
 
 ## Setup
 
-- **Node 24+** and **pnpm** — the Node major is pinned by `.node-version`, and pnpm is
-  pinned by `packageManager` in `package.json`, so `corepack enable` is enough.
 - **Rust 1.87+** — the MSRV in `[workspace.package]`, enforced by a CI job that
   checks the four published crates on exactly that toolchain.
+- **Node 24+** and **pnpm**, for the repository gates only — nothing is built or
+  published from `package.json`. The Node major is pinned by `.node-version` and
+  pnpm by `packageManager`, so `corepack enable` is enough.
+- **Python 3.12** if you touch `scripts/data-generation/`; each extractor keeps
+  its own venv (`venv-*`, never committed).
 
 ```bash
-pnpm install
+cargo build --release
+pnpm install     # gates only
 ```
 
-## TypeScript
+## Repository gates
 
 ```bash
-pnpm build                                # turbo run build
-pnpm test                                 # turbo run test
-pnpm typecheck                            # turbo run typecheck
-
-pnpm --filter @poopdeck.gl/core test      # one package
-pnpm --filter @poopdeck.gl/showcase dev   # run the showcase locally
-
-node scripts/smoke-pack.mjs               # publish-shape gate (after build)
+pnpm project:check   # project-status.json vs Cargo.toml and the version constants
+pnpm docs:links      # every relative Markdown link resolves
+pnpm versions:check  # the workspace version and every internal path-dep agree
+pnpm citations       # every cited roadmap doc and §section exists
+pnpm pins            # golden byte pins moved only inside a declared window
+pnpm lint && pnpm format:check
+node --test .github/scripts/check-golden-pins.test.mjs
+node scripts/gen-generate-datasets.mjs --check
 ```
 
-`smoke-pack.mjs` packs real tarballs, installs them into scratch projects with
-real peers, and imports every `exports` subpath under plain Node. CI runs it on
-every PR and again before publishing, so run it yourself before touching a
-package's `exports`, `files`, or build output.
-
-The showcase consumes the packages' **built `dist/`**, which is git-ignored — if
-you edit e.g. `packages/playback/src` and the showcase does not change, rebuild
-that package.
+They are pure Node — no build, no packages, seconds to run. `pnpm pins` needs
+full history (it diffs against a merge-base) and fails closed rather than
+checking nothing.
 
 ## Rust
 
@@ -92,11 +92,15 @@ lane to `.github/workflows/ci.yml`.
 
 ## Lint & format
 
-**oxlint + oxfmt. Prettier was removed — do not add it back.** Config lives in
-`.oxlintrc.json` / `.oxfmtrc.json`; the house style is single quotes, 2-space
-indent, 80-column print width.
+Rust is `cargo fmt` + the curated clippy deny set (see the `rust-lint` CI job).
+For the `.mjs` gates and the JSON artifacts it is **oxlint + oxfmt; Prettier was
+removed — do not add it back.** Config lives in `.oxlintrc.json` /
+`.oxfmtrc.json`; the house style is single quotes, 2-space indent, 80-column
+print width. The generated JSON artifacts are in `ignorePatterns`: reformatting
+one would break the byte comparison downstream.
 
 ```bash
+cargo fmt --all
 pnpm lint          # oxlint
 pnpm lint:fix
 pnpm format        # oxfmt (writes)
@@ -125,7 +129,7 @@ To release:
    `node scripts/sync-versions.mjs` — it rewrites `[workspace.package] version`
    in `Cargo.toml`, the Claude Code plugin manifest, the marketplace entry, and
    each skill's frontmatter `metadata.version` to match
-   `packages/core/package.json`. `--check` reports drift and exits non-zero;
+   `poopdeck:packages/core/package.json`. `--check` reports drift and exits non-zero;
    CI runs it on every PR. **This is the gate that keeps crates.io and npm from
    diverging** — they did exactly that (0.4.0 vs 0.5.0) back when Cargo.toml
    was a hand edit no check covered.
@@ -153,22 +157,25 @@ violates one will be sent back regardless of how well it is implemented.
   clamping the zoom range and using temporal bucketing. The H3/Quadbin
   **summary** tier is an opt-in coarse-zoom aid, never a replacement for the
   base tier.
-- **The manifest/archive is the contract.** `manifest.json` carries
-  capabilities, the temporal block, the pack table, and optional per-property
-  style hints. Readers, CLIs, and renderers all negotiate through it — read it
-  before guessing, and keep `docs/spec/manifest.schema.json` in step with any
-  change.
+- **The manifest/archive is the contract**, and since the split it is the
+  contract _between two repositories_. `manifest.json` carries capabilities, the
+  temporal block, the pack table, and optional per-property style hints. Readers,
+  CLIs, and renderers all negotiate through it — read it before guessing, keep
+  `docs/spec/manifest.schema.json` in step with any change, and remember that a
+  reader you cannot see is bound by it too.
 - **Packs and the directory are immutable and content-addressed** (the hash is
   the filename). Only the small `manifest.json` is mutable. Never rewrite a pack
   in place — write a new one and update the manifest.
-- **deck.gl is pinned to the `9.3.x` line** across the repo (see
-  `pnpm.overrides`). Do not bump it.
-- The showcase honors `prefers-reduced-motion`; any new animated surface must
-  gate on it.
+- **Golden bytes move once, reviewed.** Both fixture trees
+  (`crates/stt-core/tests/fixtures/v2-golden/`, `conformance/vectors/`) are the
+  encoder's determinism oracle; a change needs a `Rebuild-Window: R1` commit
+  trailer, and a byte-identical relocation needs `Pin-Relocation: old -> new`,
+  which the gate verifies against the object database rather than believing.
 
 ## Pull requests
 
-Keep the diff scoped, run the relevant suite above, add a changeset if a
-published package changed, and describe _why_ in the PR body. New behavior in a
-CLI belongs in `docs/api/cli-reference.md`; new renderer behavior belongs in the
-matching `docs/api/` page.
+Keep the diff scoped, run the relevant suite above, and describe _why_ in the PR
+body. New behavior in a CLI belongs in `docs/api/cli-reference.md`; new wire
+behavior belongs in `docs/spec/`. If the change alters what a reader must
+accept, say so — a downstream reader has to follow, and the conformance vectors
+are how it finds out.

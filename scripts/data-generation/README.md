@@ -9,7 +9,7 @@ Use the unified `stt-generate` CLI tool to download and process datasets.
 cargo install --path ../../tools/stt-generate
 
 # Generate all datasets
-stt-generate all --output-dir ../../examples/showcase/public/data
+stt-generate all --output-dir ../../data-fleet
 
 # Generate individual datasets
 stt-generate earthquakes --output earthquakes.stt

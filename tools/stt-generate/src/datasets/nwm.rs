@@ -49,10 +49,10 @@
 //! ```bash
 //! # Demo 1 — full-year daily flow, each reach self-scaled to its own range:
 //! stt-generate nwm --window 2019 --bin 1d --value self-scaled \
-//!   --output examples/showcase/public/data/nwm-rivers-2019
+//!   --output data-fleet/nwm-rivers-2019
 //! # Demo 2 — March hourly flood anomaly (needs the 2019 daily pass for medians):
 //! stt-generate nwm --window 2019-03 --bin 1h --value log-anomaly \
-//!   --output examples/showcase/public/data/nwm-rivers-flood-2019-03
+//!   --output data-fleet/nwm-rivers-flood-2019-03
 //! ```
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -157,7 +157,7 @@ pub struct Args {
         short,
         long,
         alias = "out",
-        default_value = "examples/showcase/public/data/nwm-rivers-2019"
+        default_value = "data-fleet/nwm-rivers-2019"
     )]
     pub output: PathBuf,
 

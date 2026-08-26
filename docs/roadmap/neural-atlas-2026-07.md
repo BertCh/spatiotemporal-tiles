@@ -270,7 +270,7 @@ constant, not a preference.
 Two known gotchas that apply here and are already recorded elsewhere in this
 register: `metadata.bounds` is a **centroid** bbox while tiles are addressed by
 vertex, so it does not bound the data
-([tile-loading-3d-2026-07.md](./tile-loading-3d-2026-07.md)); and a playback
+([tile-loading-3d-2026-07.md](https://github.com/BertCh/poopdeck.gl/blob/main/docs/roadmap/tile-loading-3d-2026-07.md)); and a playback
 archive must be built `--blob-ordering time-major` or buffered ranges come back
 empty and the clock stalls.
 
@@ -321,7 +321,7 @@ The shape that matches this tree:
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `examples/neural-atlas/`        | `route('atlas/:sequenceId?', 'pages/NeuralAtlas.tsx')` — a chrome-free fullscreen surface next to `/drive` and `/worlds`, with the `X.tsx` + `XImpl.tsx` client-only split both already use |
 | `packages/neural-atlas-layers/` | nothing new — see below                                                                                                                                                                     |
-| `packages/neural-atlas-schema/` | the generator's contract section in this record, plus `examples/showcase/src/types.ts` for the frontend half                                                                                |
+| `packages/neural-atlas-schema/` | the generator's contract section in this record, plus `poopdeck:examples/showcase/src/types.ts` for the frontend half                                                                       |
 | `python/neural_atlas/`          | `scripts/data-generation/neural_atlas.py`, sibling to `cosmos_drive_dreams.py` and `nexrad_volume.py`                                                                                       |
 
 Promote to a package when a **second** consumer appears, not before.
@@ -339,7 +339,7 @@ All six proposed layers are existing layers with props:
 | `LatentFlowLayer`      | `AnimatedArcLayer`, or `FlowCorridorLayer` for weighted bundles   |
 | `ActivationTrailLayer` | `AnimatedTripsLayer` in trail mode — this is the `fadeTrail` path |
 
-If a genuinely new layer is needed later it earns its place in `packages/layers`
+If a genuinely new layer is needed later it earns its place in `poopdeck:packages/layers`
 with the rest, under that package's existing review and conformance rules. Note
 the standing constraint that bites here: the **WebGL2 16-attribute ceiling** binds
 trips, so a trail layer carrying many per-vertex channels will hit it.
@@ -566,7 +566,7 @@ record once acted on:
   actually a general cluster-tree carrier. Worth a guide page.
 - **A `metric` enum with a legend generated from it** (§3) is a generic
   correctness win for any demo showing more than one quantity, not a neural-atlas
-  concern. → [renderer-architecture.md](./renderer-architecture.md)
+  concern. → [renderer-architecture.md](https://github.com/BertCh/poopdeck.gl/blob/main/docs/roadmap/renderer-architecture.md)
 
 ---
 
@@ -577,9 +577,9 @@ record once acted on:
 | Piece                                     | Where                                                                                             |
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | Generator, nine cached stages             | `scripts/data-generation/neural_atlas.py` (+ `requirements-atlas.txt`)                            |
-| Frontend surface                          | `examples/showcase/src/pages/NeuralAtlas{,Impl}.tsx`, route `atlas/:metric?`                      |
-| Framing contract as types (§3)            | `examples/showcase/src/components/atlas/atlasTypes.ts`                                            |
-| Layer tree, zero new layer classes (§5.1) | `examples/showcase/src/components/atlas/buildAtlasLayers.ts`                                      |
+| Frontend surface                          | `poopdeck:examples/showcase/src/pages/NeuralAtlas{,Impl}.tsx`, route `atlas/:metric?`             |
+| Framing contract as types (§3)            | `poopdeck:examples/showcase/src/components/atlas/atlasTypes.ts`                                   |
+| Layer tree, zero new layer classes (§5.1) | `poopdeck:examples/showcase/src/components/atlas/buildAtlasLayers.ts`                             |
 | Archives                                  | `neural-atlas-anatomy`, `-regions`, `-manifolds`, `-trace-wikitext` + `neural-atlas.json` sidecar |
 
 Milestones 1–5 of §12 are done. Milestone 6 (layer bands, sweep, logit lens) and

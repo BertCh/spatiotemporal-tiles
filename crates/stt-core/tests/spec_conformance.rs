@@ -553,7 +553,7 @@ fn vertex_value_matrix_carries_consistent_bucket_count() {
 // make a CLAIM about content rather than describing structure. A malformed
 // claim is worse than an absent one, because `stt-validate` compares decoded
 // content against it — so the wire shape is pinned on BOTH sides of the
-// cross-language boundary. `packages/core/test/manifest-schema.test.ts` pins
+// cross-language boundary. `poopdeck:packages/core/test/manifest-schema.test.ts` pins
 // the TS reader against the same declarations; this is the writer half, and it
 // asserts one thing a plain schema validation cannot: that the Rust type
 // introduces no key the published schema has not declared.

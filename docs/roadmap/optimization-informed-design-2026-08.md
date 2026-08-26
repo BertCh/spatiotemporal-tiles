@@ -316,7 +316,7 @@ trigger-gated.
 - Commit the optimization-problems doc and this record; graduate the adopted items into the backlog (§7).
 - **Re-run the cold-start capture (K10)** against the republished fleet — it is both a stale-claim repair and the
   baseline every §7 (directory) decision in M4 prices against.
-- Inventory the metric harnesses each later phase cites: `tools/bench/src/frame-cost.mjs`, `getQoeStats()`,
+- Inventory the metric harnesses each later phase cites: `poopdeck:tools/bench/src/frame-cost.mjs`, `getQoeStats()`,
   `ordering_sim`, `stt-optimize inspect/diff`, the pitch×bearing selection matrix.
 - Run the §11.6 scrub measurements (time-to-first-pixel, fresh-frame fraction, bytes-during-scrub) — the recorded
   keep-vs-delete decision for the scrub-LOD wiring hinges on them, and they are cheap.

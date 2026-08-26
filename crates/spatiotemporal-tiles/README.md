@@ -1,7 +1,7 @@
 # spatiotemporal-tiles
 
 > **Status: stable, pre-1.0.** See the
-> [support and compatibility policy](../../docs/intro/status-and-support.md).
+> [support and compatibility policy](https://github.com/BertCh/poopdeck.gl/blob/main/docs/intro/status-and-support.md).
 
 **SpatioTemporal Tiles (STT)** — a packed, content-addressed tile format for
 _animated_ geospatial data: every feature carries time, so a renderer can scrub

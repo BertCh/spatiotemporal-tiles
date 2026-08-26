@@ -27,7 +27,7 @@ BUCKET="${BUCKET:-s3://argoverse/datasets/av2/sensor}"
 SPLIT="${SPLIT:-val}"
 PY="${PY:-$HERE/venv-av2/bin/python}"
 STT="${STT_BUILD:-$REPO/target/release/stt-build}"
-OUT="${OUT_DIR:-$REPO/examples/showcase/public/data}"
+OUT="${OUT_DIR:-$REPO/data-fleet}"
 WORK="${WORK:-$(mktemp -d)}"
 # Tuned "HD-XY / coarse-Z" iso3d recipe (matches the Miami reference build):
 # fine horizontal grid (CELL) over ALL returns (DECIMATE 1) with smoothing scaled

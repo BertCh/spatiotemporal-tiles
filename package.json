@@ -1,41 +1,24 @@
 {
-  "name": "spatiotemporal-tiles",
+  "name": "spatiotemporal-tiles-repo",
   "version": "0.1.0",
-  "description": "Packed spatiotemporal vector tiles for interactive time-aware visualization",
+  "description": "Repository tooling for SpatioTemporal Tiles — the Rust crates are the product; this manifest only carries the Node-based gates",
   "private": true,
   "packageManager": "pnpm@11.23.0",
-  "workspaces": [
-    "packages/*",
-    "examples/*",
-    "tools/*"
-  ],
   "scripts": {
-    "build": "turbo run build",
-    "test": "turbo run test",
-    "dev": "turbo run dev --parallel",
     "docs:links": "node scripts/check-doc-links.mjs",
-    "docs:snippets": "node scripts/check-doc-snippets.mjs",
-    "clean": "turbo run clean && rm -rf node_modules",
     "lint": "oxlint",
     "lint:fix": "oxlint --fix",
     "format": "oxfmt",
     "format:check": "oxfmt --check",
     "project:check": "node scripts/check-project-status.mjs",
-    "typecheck": "turbo run typecheck",
-    "changeset": "changeset",
-    "version-packages": "changeset version",
-    "release": "turbo run build --filter='./packages/*' && pnpm -r --filter='./packages/*' publish --access public --no-git-checks && changeset tag"
+    "versions:check": "node scripts/sync-versions.mjs --check",
+    "gen:datasets": "node scripts/gen-generate-datasets.mjs",
+    "citations": "node .github/scripts/check-roadmap-citations.mjs",
+    "pins": "node .github/scripts/check-golden-pins.mjs"
   },
   "devDependencies": {
-    "@changesets/changelog-github": "^1.0.0",
-    "@changesets/cli": "^3.0.1",
-    "@types/node": "^24.9.2",
     "oxfmt": "^0.65.0",
-    "oxlint": "^1.80.0",
-    "playwright": "^1.62.1",
-    "turbo": "^2.10.11",
-    "typescript": "^7.0.2",
-    "vitest": "^4.1.11"
+    "oxlint": "^1.80.0"
   },
   "engines": {
     "node": ">=24.0.0"
@@ -48,10 +31,10 @@
     "tiles",
     "spatiotemporal",
     "geospatial",
-    "deck.gl",
-    "visualization",
-    "time-series",
-    "animation"
+    "geoparquet",
+    "arrow",
+    "geoarrow",
+    "time-series"
   ],
   "author": "Robert Christie",
   "license": "MIT"

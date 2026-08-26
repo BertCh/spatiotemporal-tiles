@@ -29,7 +29,7 @@ The full comma2k19 is only published as monolithic ~10 GB ``Chunk_*.zip`` files
 
         python comma_extract.py \\
             --demo-parquet comma-raw/data/demo-00001-of-00003.parquet \\
-            --row 6 --out ../../examples/showcase/public/data/comma-<short>
+            --row 6 --out ../../data-fleet/comma-<short>
 
     The demo-parquet ``log`` struct flattens the on-disk tree with ``__`` joins
     (``global_pose__frame_positions``, ``processed_log__CAN__speed__value`` …).
@@ -53,7 +53,7 @@ The full comma2k19 is only published as monolithic ~10 GB ``Chunk_*.zip`` files
     pip install numpy pyarrow shapely pyproj   (pyproj for ECEF→geodetic)
 
          python comma_extract.py --segment '<dongle>|<route>/0' \\
-             --out ../../examples/showcase/public/data/comma-<route>
+             --out ../../data-fleet/comma-<route>
 
 Use ``--skip-build`` to stop at GeoParquet + JSON. In on-disk mode camera frames
 are emitted as ENTRIES only (no images committed); pass ``--extract-frames`` to

@@ -26,7 +26,7 @@ Pipeline:  Wyoming wsgi TEXT:LIST  →  parse + drift-integrate  →  GeoParquet
 Full build (exactly the §9.1 archive):
 
     venv-storm4d/bin/python storm4d_sounding.py \
-        --out ../../examples/showcase/public/data/storm4d-sounding
+        --out ../../data-fleet/storm4d-sounding
 
 Use --skip-build to stop at the GeoParquet.
 """

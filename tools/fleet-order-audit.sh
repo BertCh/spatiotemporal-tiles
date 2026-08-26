@@ -8,7 +8,7 @@
 #
 #   tools/fleet-order-audit.sh [ROOT ...] > audit.ndjson
 #
-# Defaults to the local showcase archive set (`examples/showcase/public/data`)
+# Defaults to the local showcase archive set (`data-fleet`)
 # plus `data/`. Archives are discovered by their `manifest.json` and visited in
 # LC_ALL=C sorted path order, so two runs over an unchanged tree produce
 # byte-identical output — the "zero nondeterminism" half of WM-3's acceptance is
@@ -36,7 +36,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 roots=("$@")
 if [ ${#roots[@]} -eq 0 ]; then
-  roots=("$repo_root/examples/showcase/public/data" "$repo_root/data")
+  roots=("$repo_root/data-fleet" "$repo_root/data")
 fi
 
 bin="${STT_OPTIMIZE_BIN:-}"

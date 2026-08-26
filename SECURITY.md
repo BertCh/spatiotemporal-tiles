@@ -24,10 +24,11 @@ Only the **latest published** version of each artifact gets fixes:
 | Artifact                                                   | Registry  |
 | ---------------------------------------------------------- | --------- |
 | `spatiotemporal-tiles` (+ `stt-core`/`-build`/`-optimize`) | crates.io |
-| `@poopdeck.gl/*`                                           | npm       |
 
-The project is pre-1.0 and both registries move in lockstep, so "supported"
-means the current version — patches are not backported to older 0.x lines.
+The project is pre-1.0, so "supported" means the current version — patches are
+not backported to older 0.x lines. The `@poopdeck.gl/*` npm packages are a
+separate project with its own policy; report renderer issues to
+[BertCh/poopdeck.gl](https://github.com/BertCh/poopdeck.gl/security).
 
 ## What is in scope
 
@@ -35,26 +36,25 @@ The interesting surface is **untrusted archive bytes**. A `.stt` archive is
 fetched over HTTP and decoded by code that runs in a user's browser or on their
 machine, so the decoders treat every byte as hostile input:
 
-- `stt-core` (Rust) and `@poopdeck.gl/core` (TS) — manifest parsing, pack and
-  directory decoding, zstd frames, quantized geometry. Memory-safety issues,
-  panics that a remote archive can trigger, unbounded allocation from
-  attacker-chosen lengths.
+- `stt-core` — manifest parsing, pack and directory decoding, zstd frames,
+  quantized geometry. Memory-safety issues, panics that a remote archive can
+  trigger, unbounded allocation from attacker-chosen lengths. (The TypeScript
+  reader, `@poopdeck.gl/core`, is the same surface in another language and is
+  reported downstream.)
 - The CLIs `stt-build` / `stt-optimize` / `stt-validate` / `stt-bundle` — same
   decoders, plus input parsing (GeoParquet, WKB) of files you did not author.
 - `stt-serve` — it binds a port. Anything that lets a request read outside the
   configured archive/table, or that turns a query parameter into unintended SQL
   against the Postgres or DuckDB backend.
-- The renderer packages, to the extent that archive-controlled values reach
-  shader codegen or the DOM.
+- `stt-wasm` — the same decoders compiled for a third-party host.
 
 ## What is not in scope
 
-- **The map tokens committed under `examples/showcase/`.** Mapbox and Google
-  Maps client keys are public by nature — they ship inside the built site
-  regardless. They are URL-restricted; a report that they are "leaked" is not a
-  vulnerability. Tell us instead if one is missing its URL restriction.
-- The showcase's demo datasets and the tile bucket that serves them: public
-  read-only data, published deliberately.
+- The demo datasets and the tile bucket that serves them: public read-only data,
+  published deliberately.
+- Anything in the renderer or the showcase site — including the URL-restricted
+  map client tokens it ships. Report those to
+  [BertCh/poopdeck.gl](https://github.com/BertCh/poopdeck.gl/security).
 - Denial of service achieved by pointing the tools at a deliberately enormous
   local file. Building a 100 GB archive is a supported use, not an attack.
 - Findings from automated scanners with no demonstrated impact on the above.

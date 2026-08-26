@@ -758,7 +758,7 @@ fn auto_quant_roundtrip(values: &[Option<f64>]) -> Option<(DataType, AttrQuant, 
 #[test]
 fn auto_quant_integer_column_is_exact_at_uint16_width() {
     // Summary-tier `count` / `bucket_i` / `sum_*` (measured on
-    // examples/showcase/public/data/nyc-taxi-od-summary) are integers carried
+    // poopdeck:examples/showcase/public/data/nyc-taxi-od-summary) are integers carried
     // as f64. Mapping [min,max] onto [0,65535] gives a FRACTIONAL step, so a
     // count of 7 comes back as ~7.03. An integer column must quantize at
     // step 1.0 and round-trip bit-for-bit.
@@ -851,7 +851,7 @@ fn auto_quant_integer_column_widens_to_int32_and_stays_exact() {
 
 #[test]
 fn auto_quant_leaves_hash_identifier_columns_float64() {
-    // `trip_id` on examples/showcase/public/data/nyc-taxi-points holds 64-bit
+    // `trip_id` on poopdeck:examples/showcase/public/data/nyc-taxi-points holds 64-bit
     // hashes. Quantizing them lands on o=2.35e18, s=2.3e14, so every
     // reconstructed value is wrong by up to ±1.15e14 AND the same trip decodes
     // differently in different tiles. Refusing keeps them Float64, which is

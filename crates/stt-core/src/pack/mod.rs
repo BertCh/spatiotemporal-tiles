@@ -503,7 +503,7 @@ pub struct Manifest {
     /// [`crate::metadata::Metadata::ordering_workload`]). This top-level key is
     /// canonical — it belongs beside the layout fact it co-versions, not inside
     /// the content-description block — but the shipped TS reader
-    /// (`packages/core/src/archive.ts`, `manifestBuildAssumedGapBytes`) reads the
+    /// (`poopdeck:packages/core/src/archive.ts`, `manifestBuildAssumedGapBytes`) reads the
     /// `metadata` copy, so removing the mirror would silently disable the
     /// adaptive-coalesce co-versioning guard. Both copies are written from one
     /// value at one site in [`PackWriter::finalize`] and are asserted equal by

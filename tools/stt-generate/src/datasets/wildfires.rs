@@ -441,7 +441,7 @@ fn convert_to_geojson(arcgis: &ArcGISFeature) -> Vec<Feature> {
 ///   `LIKE 'Wildfire%'` keeps all three and still excludes prescribed burns.
 ///
 /// ⚠️ Fixing the filter does NOT make this dataset reproducible. The shipped
-/// `examples/showcase/public/data/wildfires` archive holds ~460 fires; the
+/// `data-fleet/wildfires` archive holds ~460 fires; the
 /// same service on 2026-07-29 returns 98,168 records overall but only 297 for
 /// 2020–2023, of which 10 clear `--min-acres 1000` as wildfires. Upstream
 /// coverage for those years collapsed, so a regeneration produces a nearly

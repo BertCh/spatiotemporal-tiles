@@ -47,7 +47,7 @@ pub(crate) const GEOARROW_CRS_METADATA: &str = r#"{"crs":"OGC:CRS84","crs_type":
 /// schema section per tile) would carry ~450 B of them on EVERY tile, measured
 /// at +65 to +181 B compressed per tile on `stt-optimize`'s sample layouts.
 /// They are instead stamped on at DECODE, by [`decorate_temporal_fields`] here
-/// and by `toGeoArrowTable()` in `packages/core/src/tile.ts` — which also means
+/// and by `toGeoArrowTable()` in `poopdeck:packages/core/src/tile.ts` — which also means
 /// every archive ever written gets them, not just ones built after this landed,
 /// and no content address churns.
 pub(crate) const TEMPORAL_KIND_KEY: &str = "visgl:temporal-kind";
@@ -94,7 +94,7 @@ fn is_absolute_ms(field: &Field) -> bool {
 /// instant.
 ///
 /// The TypeScript counterpart is `toGeoArrowTable()` in
-/// `packages/core/src/tile.ts`; the two must agree key for key.
+/// `poopdeck:packages/core/src/tile.ts`; the two must agree key for key.
 pub(crate) fn decorate_temporal_fields(fields: &mut [Arc<Field>]) {
     for field in fields.iter_mut() {
         if !TEMPORAL_COLUMNS.contains(&field.name().as_str()) {

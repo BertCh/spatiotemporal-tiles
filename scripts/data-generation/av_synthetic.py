@@ -62,7 +62,7 @@ CAMERA_HZ = 1.0
 # regardless of the cwd the script is invoked from (this file lives at
 # <repo>/scripts/data-generation/av_synthetic.py).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_OUT = _REPO_ROOT / "examples/showcase/public/data/av-synthetic"
+DEFAULT_OUT = _REPO_ROOT / "data-fleet/av-synthetic"
 
 
 # ── Ego trajectory ───────────────────────────────────────────────────────────

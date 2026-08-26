@@ -58,7 +58,7 @@ vehicle_pose,camera_image,stats}/<segment>.parquet" \\
 Then (from scripts/data-generation, with venv-waymo active):
 
   venv-waymo/bin/python waymo_extract.py --seg <segment_context_name> \\
-    --out ../../examples/showcase/public/data/waymo-<short>
+    --out ../../data-fleet/waymo-<short>
 
 Use ``--skip-build`` to stop at GeoParquet + JSON.
 

@@ -110,8 +110,8 @@ against ever adding a third:
 - `.changeset/` holds `config.json` and nothing else; the last commit to touch
   a changeset `.md` was the 0.3.0 release (`94e807b`).
 - `packages/*/CHANGELOG.md` stop at **0.4.0** — with two tells that they are
-  now hand-maintained: `packages/maplibre/CHANGELOG.md` heads an `## Unreleased`
-  section, and `packages/mcp/CHANGELOG.md` heads `## 0.5.0` with the line "Not
+  now hand-maintained: `poopdeck:packages/maplibre/CHANGELOG.md` heads an `## Unreleased`
+  section, and `poopdeck:packages/mcp/CHANGELOG.md` heads `## 0.5.0` with the line "Not
   yet published to npm", which the registry contradicts.
 - `crates/*/CHANGELOG.md` **do not exist**, despite `release-plz.toml` setting
   `changelog_update = true`.
@@ -225,7 +225,7 @@ to name as a trusted publisher.
 replaced the positional-matrix custom-layer `render(gl, matrix)` signature. The
 host-version adapter now normalizes the supported signatures, the declared peer
 range is `^3 || ^4 || ^5 || ^6`, and the showcase runs 6.6.x
-(`packages/maplibre/src/lib/host-adapter.ts`, per `base-layer.ts`).
+(`poopdeck:packages/maplibre/src/lib/host-adapter.ts`, per `base-layer.ts`).
 
 ## Known risks / fallbacks
 

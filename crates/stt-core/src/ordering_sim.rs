@@ -8,7 +8,7 @@
 //! across space*, and *play a sliding time window through that viewport* —
 //! under HTTP range coalescing, and rank the orderings by the range-read cost
 //! they actually incur. It is a faithful Rust port of the showcase probe
-//! (`examples/showcase/src/lib/spaceCurve.ts`), sharpened to sort with the
+//! (`poopdeck:examples/showcase/src/lib/spaceCurve.ts`), sharpened to sort with the
 //! production [`crate::curve::space_time_key`] so the simulated layout is
 //! byte-identical to what the writer lays down.
 //!
@@ -35,13 +35,13 @@ use crate::curve::{self, BlobOrdering};
 
 /// Default range-read coalescing gap: two needed blobs fuse into one request
 /// when at most this many **unneeded** bytes lie between them. Matches the
-/// production reader's `DEFAULT_RANGE_COALESCE_GAP` (packages/core, archive.ts)
+/// production reader's `DEFAULT_RANGE_COALESCE_GAP` (poopdeck:packages/core, archive.ts)
 /// so the simulation models what the client actually does.
 pub const DEFAULT_COALESCE_GAP_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Default pack-object target: the `stt-build` default (`--pack-size 64`). The
 /// reader coalesces **per pack** — a range request can never bridge two pack
-/// objects (`packages/core`, archive.ts: "Coalescing is per-pack") — so the
+/// objects (`poopdeck:packages/core`, archive.ts: "Coalescing is per-pack") — so the
 /// simulator force-closes a coalesced run at every pack boundary. Without this
 /// a scattered query fused into a single archive-spanning read, which no client
 /// can issue (it modelled spatial-major's whole-map pan as one 500 MB+ read and

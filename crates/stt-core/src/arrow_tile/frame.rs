@@ -541,7 +541,7 @@ pub(crate) const VERTEX_VALUE_BUCKETS_KEY: &str = "stt:vertex_value_buckets";
 /// decoder relativizes every start/end time against this value so the times
 /// fit an f32; baking it here lets the decoder skip its client-side min-scan
 /// over the whole start-time column. Mirrors exactly what the decoder computes
-/// (the min of the `start_time` column) — see `packages/core/src/tile.ts`.
+/// (the min of the `start_time` column) — see `poopdeck:packages/core/src/tile.ts`.
 pub(crate) const TIME_OFFSET_MS_KEY: &str = "stt:time_offset_ms";
 
 #[cfg(test)]

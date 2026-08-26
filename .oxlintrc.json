@@ -1,73 +1,24 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": [
-    "typescript",
-    "unicorn",
-    "oxc",
-    "react",
-    "import",
-    "vitest",
-    "jsx-a11y"
-  ],
+  "plugins": ["unicorn", "oxc", "import"],
   "categories": {
     "correctness": "error"
   },
   "env": {
     "builtin": true,
     "es2024": true,
-    "browser": true,
     "node": true
   },
   "rules": {
     "unicorn/no-new-array": "off",
-    "unicorn/no-useless-spread": "off",
-    "vitest/require-mock-type-parameters": "off",
-    "vitest/expect-expect": "off",
-    "vitest/no-conditional-expect": "off",
-    "vitest/no-standalone-expect": "off",
-
-    // React Compiler diagnostics promoted into `correctness` by oxlint 1.74+.
-    // Kept visible as warnings rather than gating CI: the 22 current hits are
-    // idiomatic patterns (SSR `ClientOnly` mount flags, rAF samplers writing
-    // state, refs read in render for imperative handles) whose fixes are real
-    // component refactors, not lint noise. Tracked as follow-up work, not
-    // silenced.
-    "react/set-state-in-effect": "warn",
-    "react/refs": "warn",
-    "react/immutability": "warn",
-
-    "jsx-a11y/prefer-tag-over-role": "error",
-    "jsx-a11y/mouse-events-have-key-events": "error",
-    "jsx-a11y/no-static-element-interactions": "error",
-    "jsx-a11y/no-noninteractive-element-interactions": "error",
-    "jsx-a11y/click-events-have-key-events": "error"
+    "unicorn/no-useless-spread": "off"
   },
   "ignorePatterns": [
-    "**/dist/**",
-    "**/build/**",
-    "**/node_modules/**",
-    "**/.react-router/**",
-    "**/coverage/**",
-    "**/*.d.ts",
-    "**/src/**/*.js",
-    "**/src/**/*.js.map",
     "target/**",
     "data/**",
-    "**/.venv*/**",
-    "packages/mcp/docs/**",
-    "examples/showcase/public/**"
-  ],
-  "overrides": [
-    {
-      "files": [
-        "**/*.test.ts",
-        "**/*.test.tsx",
-        "**/test/**",
-        "**/__tests__/**"
-      ],
-      "env": {
-        "vitest": true
-      }
-    }
+    "conformance/vectors/**",
+    "crates/*/tests/fixtures/**",
+    "scripts/data-generation/venv-*/**",
+    "node_modules/**"
   ]
 }

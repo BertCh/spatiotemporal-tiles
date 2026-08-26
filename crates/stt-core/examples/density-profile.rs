@@ -13,7 +13,7 @@
 //!       <manifest.json> --id <id> --label "<Label>" [--space-bits 5] [--time-bins 64]
 //!
 //! JSON is written to stdout; redirect into
-//! `examples/showcase/public/density/<id>.json`.
+//! `poopdeck:examples/showcase/public/density/<id>.json`.
 
 use std::collections::{BTreeMap, BTreeSet};
 

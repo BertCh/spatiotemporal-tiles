@@ -30,7 +30,7 @@ Pipeline:  HRRR GRIB2 (.idx subset)  →  regrid  →  RK4 advection ×4 levels
 Full build (exactly the §9.1 archive):
 
     venv/bin/python storm4d_wind3d.py \
-        --out ../../examples/showcase/public/data/storm4d-wind3d
+        --out ../../data-fleet/storm4d-wind3d
 
 Use --skip-build to stop at the GeoParquet; --levels to subset for smoke runs.
 """

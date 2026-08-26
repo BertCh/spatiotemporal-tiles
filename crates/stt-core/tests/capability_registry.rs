@@ -5,7 +5,7 @@
 //! Its single machine-readable source of truth is the top-level
 //! `x-stt-capability-registry` array in `docs/spec/manifest.schema.json`;
 //! this test pins the Rust constant against it and the TS suite
-//! (`packages/core/test/manifest-schema.test.ts`) pins the TS constant
+//! (`poopdeck:packages/core/test/manifest-schema.test.ts`) pins the TS constant
 //! against the same array — so a registry addition on either side fails CI
 //! until the schema (and therefore both sides) agree.
 

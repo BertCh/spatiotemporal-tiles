@@ -1,7 +1,7 @@
 //! Emit the committed cross-impl golden fixture for the TS packed-format reader.
 //!
 //! Writes a deterministic tiny packed dataset (fixed payloads → stable content
-//! hashes) to `packages/core/test/fixtures/packed-golden/`:
+//! hashes) to `conformance/vectors/packed-golden/`:
 //!
 //!   manifest.json
 //!   index/<hash>.sttd
@@ -337,15 +337,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Pass 2 -----------------------------------------------------------
     let cfg = encoder_config(format_version, &pins);
 
-    // <crate>/../../packages/core/test/fixtures/packed-golden
+    // <crate>/../../conformance/vectors/packed-golden
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let out_dir = manifest_dir
         .join("..")
         .join("..")
-        .join("packages")
-        .join("core")
-        .join("test")
-        .join("fixtures")
+        .join("conformance")
+        .join("vectors")
         .join(format!("packed-golden{suffix}"));
 
     // Start clean so re-running is deterministic (stale packs would linger

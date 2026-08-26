@@ -429,7 +429,7 @@ pub struct Metadata {
     /// canonical home is `Manifest::ordering_workload` (serialized top-level as
     /// `orderingWorkload`, beside `blobOrdering` — the layout fact it
     /// co-versions). This copy exists because the shipped TS reader
-    /// (`packages/core/src/archive.ts`, `manifestBuildAssumedGapBytes`) resolves
+    /// (`poopdeck:packages/core/src/archive.ts`, `manifestBuildAssumedGapBytes`) resolves
     /// the build-assumed coalescing gap through
     /// `metadata.ordering_workload.coalesce_gap_bytes`; dropping it would
     /// silently disable the adaptive-coalesce co-versioning guard rather than

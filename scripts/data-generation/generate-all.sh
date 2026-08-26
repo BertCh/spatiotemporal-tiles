@@ -20,7 +20,7 @@ echo ""
 echo "🔨 Building stt-generate..."
 cargo build --release -p stt-generate
 
-OUTPUT_DIR="examples/showcase/public/data"
+OUTPUT_DIR="data-fleet"
 
 echo ""
 echo "📊 Generating datasets..."

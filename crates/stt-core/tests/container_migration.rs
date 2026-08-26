@@ -7,7 +7,7 @@
 //! must decode to exactly what the v2 archive decoded to.
 //!
 //! The fixtures are the frozen `legacy-shape` archives under
-//! `packages/core/test/fixtures/`, which are real published v2 output rather
+//! `conformance/vectors/`, which are real published v2 output rather
 //! than something synthesized here. Two of the four (`flows`, `currents`) are
 //! hand-authored for the TS reader with literal `legacy.sttd` / `legacy.sttp`
 //! object keys instead of content addresses, which the Rust reader refuses by
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use stt_core::pack::{migrate_dataset_v2_to_v3, PackedReader};
 
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/core/test/fixtures/legacy-shape")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../conformance/vectors/legacy-shape")
 }
 
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {

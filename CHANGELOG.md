@@ -21,7 +21,8 @@ published release notes are the historical record for individual artifacts.
 ### Toolchain and packages
 
 - The Rust workspace and seven public `@poopdeck.gl/*` packages are aligned on
-  0.6.0.
+  0.6.0. _(The two registries were still in lockstep at this release; they were
+  separated by the 2026-08-26 repository split above.)_
 - The umbrella Rust crate installs five binaries: `stt-build`, `stt-optimize`,
   `stt-validate`, `stt-bundle`, and `stt-serve`.
 - The Cesium backend remains experimental and private in the workspace after its
@@ -35,18 +36,12 @@ published release notes are the historical record for individual artifacts.
   continue to open read-only.
 - Tile cache keys include the variant axis; the first browser load after an
   upgrade can be cold.
-- Review the package changelog for any public API used directly:
-  [`core`](packages/core/CHANGELOG.md),
-  [`layers`](packages/layers/CHANGELOG.md),
-  [`playback`](packages/playback/CHANGELOG.md),
-  [`react`](packages/react/CHANGELOG.md),
-  [`three`](packages/three/CHANGELOG.md),
-  [`maplibre`](packages/maplibre/CHANGELOG.md), and
-  [`mcp`](packages/mcp/CHANGELOG.md).
+- Review the package changelogs for any public API used directly; they live in
+  [the poopdeck.gl repository](https://github.com/BertCh/poopdeck.gl/tree/main/packages).
 
 ## Earlier releases
 
 Earlier package histories are recorded in the package changelogs and Git tags.
 The project is pre-1.0; read the
-[status and compatibility policy](docs/intro/status-and-support.md) before
+[status and compatibility policy](https://github.com/BertCh/poopdeck.gl/blob/main/docs/intro/status-and-support.md) before
 upgrading across a minor release.

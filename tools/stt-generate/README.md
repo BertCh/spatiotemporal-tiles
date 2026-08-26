@@ -32,7 +32,7 @@ tools/stt-generate/Cargo.toml`).
 stt-generate earthquakes \
   --start-date 2020-01-01 --end-date 2024-12-31 \
   --min-magnitude 4.0 \
-  --output examples/showcase/public/data/earthquakes.stt
+  --output data-fleet/earthquakes.stt
 
 # Per-dataset flags:
 stt-generate flights --help

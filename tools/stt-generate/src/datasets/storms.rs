@@ -44,7 +44,7 @@ const BUCKET_MS: i64 = 5 * 60 * 1000;
 pub struct Args {
     /// Output directory. Writes <output>/storm-field, /storm-cells, /storm-tracks
     /// (packed STT archives) plus sibling .parquet intermediates.
-    #[arg(short, long, default_value = "examples/showcase/public/data")]
+    #[arg(short, long, default_value = "data-fleet")]
     pub output: PathBuf,
 
     /// Radar sites (WSR-88D ICAO ids) along the derecho path, west→east.

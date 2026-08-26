@@ -19,7 +19,7 @@ BUCKET="${BUCKET:-s3://argoverse/datasets/av2/sensor}"
 SPLIT="${SPLIT:-val}"
 PY="${PY:-$HERE/venv-av2/bin/python}"
 STT="${STT_BUILD:-$REPO/target/release/stt-build}"
-OUT="${OUT_DIR:-$REPO/examples/showcase/public/data}"
+OUT="${OUT_DIR:-$REPO/data-fleet}"
 WORK="${WORK:-$(mktemp -d)}"
 RING=(ring_front_center ring_front_left ring_front_right \
       ring_side_left ring_side_right ring_rear_left ring_rear_right)

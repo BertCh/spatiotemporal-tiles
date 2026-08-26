@@ -46,20 +46,20 @@ heavy optional context layers may use narrower spans (per-source spans already s
 
 ## 3. What already exists (scouted 2026-07-22)
 
-| Piece                                                                                                                      | Status                                   | Where                                                                                                   |
-| -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| Level II download/cache/decode, all sweeps + all moments decodable                                                         | ✅ exists                                | `crates/stt-generate/src/datasets/storms.rs`, `nexrad-*` crates                                         |
-| 4/3-earth beam model returning per-gate `GeoPoint3D` **with altitude_meters**                                              | ✅ exists (altitude currently discarded) | `crates/stt-generate/src/geo.rs:224-238`                                                                |
-| Geometry-native Z for POINTS (`--point-elevation-column`, quantized, zero-copy, `positionDimensions:3`)                    | ✅ exists + tested                       | `crates/stt-build/src/build_options.rs:159`, `packages/core/test/point-3d-geometry.test.ts`             |
-| Dense point-cloud rendering (deck `AnimatedPointCloudLayer`/`AnimatedPointLayer` 3D, three `STTPointCloudLayer`)           | ✅ exists (AV LiDAR proven)              | `packages/layers/src/layers/core/animated-point-*.ts`, `packages/three/src/layers/point-cloud-layer.ts` |
-| Additive home-zoom LOD for Waymo-class clouds                                                                              | ✅ exists                                | `--min/max-zoom-field`, `lidarLod`, `streaming-tile-source.ts`                                          |
-| Extruded polygons (`extruded`, `getElevation`, wireframe)                                                                  | ✅ exists                                | `animated-polygon-layer.ts:132-165`                                                                     |
-| Per-feature path altitude (`elevationProperty` on paths)                                                                   | ✅ exists                                | `animated-path-layer.ts:174-211`                                                                        |
-| Multi-source composite machinery (governor gating, fairness, per-source runway HUD, cache scaling)                         | ✅ exists                                | `buildDemoLayers.ts`, `PerformanceMonitor.tsx`                                                          |
-| GLM lightning archive for this exact window                                                                                | ✅ on R2                                 | `goes-glm-lightning`                                                                                    |
-| **Volumetric anything** (multi-sweep stacking, velocity moment, 3D gridding, voxel/isosurface payload, 3D-radar demo type) | ❌ absent                                | roadmap `dataset-candidates-2026-07.md` §G (this doc supersedes that stub)                              |
-| Continuous numeric→color ramp on deck point layers                                                                         | ❌ absent (categorical only)             | ramp primitive exists in `packages/core/src/render/style.ts:190-239` and three `rampProperty`           |
-| LineString/Polygon geometry-Z                                                                                              | ❌ 2D by design                          | `packages/core/src/tile.ts:665,698`                                                                     |
+| Piece                                                                                                                      | Status                                   | Where                                                                                                                     |
+| -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Level II download/cache/decode, all sweeps + all moments decodable                                                         | ✅ exists                                | `crates/stt-generate/src/datasets/storms.rs`, `nexrad-*` crates                                                           |
+| 4/3-earth beam model returning per-gate `GeoPoint3D` **with altitude_meters**                                              | ✅ exists (altitude currently discarded) | `crates/stt-generate/src/geo.rs:224-238`                                                                                  |
+| Geometry-native Z for POINTS (`--point-elevation-column`, quantized, zero-copy, `positionDimensions:3`)                    | ✅ exists + tested                       | `crates/stt-build/src/build_options.rs:159`, `poopdeck:packages/core/test/point-3d-geometry.test.ts`                      |
+| Dense point-cloud rendering (deck `AnimatedPointCloudLayer`/`AnimatedPointLayer` 3D, three `STTPointCloudLayer`)           | ✅ exists (AV LiDAR proven)              | `poopdeck:packages/layers/src/layers/core/animated-point-*.ts`, `poopdeck:packages/three/src/layers/point-cloud-layer.ts` |
+| Additive home-zoom LOD for Waymo-class clouds                                                                              | ✅ exists                                | `--min/max-zoom-field`, `lidarLod`, `streaming-tile-source.ts`                                                            |
+| Extruded polygons (`extruded`, `getElevation`, wireframe)                                                                  | ✅ exists                                | `animated-polygon-layer.ts:132-165`                                                                                       |
+| Per-feature path altitude (`elevationProperty` on paths)                                                                   | ✅ exists                                | `animated-path-layer.ts:174-211`                                                                                          |
+| Multi-source composite machinery (governor gating, fairness, per-source runway HUD, cache scaling)                         | ✅ exists                                | `buildDemoLayers.ts`, `PerformanceMonitor.tsx`                                                                            |
+| GLM lightning archive for this exact window                                                                                | ✅ on R2                                 | `goes-glm-lightning`                                                                                                      |
+| **Volumetric anything** (multi-sweep stacking, velocity moment, 3D gridding, voxel/isosurface payload, 3D-radar demo type) | ❌ absent                                | roadmap `dataset-candidates-2026-07.md` §G (this doc supersedes that stub)                                                |
+| Continuous numeric→color ramp on deck point layers                                                                         | ❌ absent (categorical only)             | ramp primitive exists in `poopdeck:packages/core/src/render/style.ts:190-239` and three `rampProperty`                    |
+| LineString/Polygon geometry-Z                                                                                              | ❌ 2D by design                          | `poopdeck:packages/core/src/tile.ts:665,698`                                                                              |
 
 Key consequence: **the volumetric core is an emit-path change, not a format change.**
 Emit per-gate 3D points instead of flattening to the 2D mosaic; the format and renderers
@@ -240,7 +240,7 @@ silently. FE colorMapping keys and generator band labels MUST match byte-for-byt
 - Smoke window for pipeline validation: `2024-05-21T20:00Z → 20:30Z`.
 - Raw-download cache: `scripts/data-generation/data/storm4d/<source>/` (idempotent —
   skip files already present).
-- Archives output to `examples/showcase/public/data/<stem>/` via the freshly built
+- Archives output to `data-fleet/<stem>/` via the freshly built
   `target/release/stt-build` (parquet input, packed default). Python: `venv-storm4d`
   (Py-ART) for radar; main `venv` (xarray/cfgrib/netCDF4) for GOES/HRRR; plain
   urllib/HTTPS for S3 (`https://<bucket>.s3.amazonaws.com/<key>`), no boto3.
@@ -328,10 +328,10 @@ no fabricated altitude).
   until r2-sync) + `SHIPPED_DATASET_IDS`. Legend + demoMeta (timeline, DOW 300 mph,
   WoFS 75-min lead, per-source build commands) required.
 
-### 9.3 C3 layer work (separate agent, packages/layers only)
+### 9.3 C3 layer work (separate agent, poopdeck:packages/layers only)
 
 `rampProperty` / `rampDomain` / `rampColorRamp` on `AnimatedPointLayer` reusing core
-`expandRampColors` (`packages/core/src/render/style.ts`); tests; rebuild layers dist.
+`expandRampColors` (`poopdeck:packages/core/src/render/style.ts`); tests; rebuild layers dist.
 FE v1 ships categorical bands regardless (ramp is follow-up polish, not a dependency).
 
 ### 9.4 Perf amendment — §9.1 buckets/zooms revised (2026-07-23)

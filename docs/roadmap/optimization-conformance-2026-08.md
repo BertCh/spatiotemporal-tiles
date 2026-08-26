@@ -73,7 +73,7 @@ pressure * 0.7)`. A floor clamps at 0.25; a disable threshold snaps to 0. A code
 4. **TB-12's reader inventory names the wrong single site.** The item says the decoder backfill
    "relaxes the reader contract ρ … for all three consumers at once, since all of them read the
    decoder's output buffer", and points at `tessellateFeature` in
-   `packages/core/src/render/geometry.ts`. Only **maplibre** calls `tessellateFeature`. deck hands
+   `poopdeck:packages/core/src/render/geometry.ts`. Only **maplibre** calls `tessellateFeature`. deck hands
    `binary.triangles` to deck.gl as one whole-layer `indices` attribute
    (`animated-polygon-layer.ts`), and three switches on a layer-global `hasPreBaked`
    (`polygon-buffers.ts`). A backfill placed only at `tessellateFeature` would therefore have fixed
@@ -248,7 +248,7 @@ Ranked by consequence. These are real and should be closed before R1 is run.
    _Landed:_ `HoistPolicy` now gates hoisting on the dataset-scale wire surrogate
    (`dataset_dictionary_is_smaller`, which previously had **no production caller**) plus explicit
    caps (1024 categories / 4096 category-bytes), so a high-cardinality free-text column pins `Utf8`.
-   _Still open:_ reader-side array-identity sharing in `packages/core/src/tile.ts`
+   _Still open:_ reader-side array-identity sharing in `poopdeck:packages/core/src/tile.ts`
    (`sharedArrayIdentityHits` was 0), and the `manifest.json` growth (10,353 B → 291,589 B, +2,716 %)
    on a startup-blocking un-ranged fetch. Re-measure the heap delta after both.
 2. **TB-5 is inert.** `apply_synthetic_row_ids` / `IdRenumber` have no call site outside
@@ -272,14 +272,14 @@ Ranked by consequence. These are real and should be closed before R1 is run.
 
 ## 7. Environment findings
 
-- **An in-flight v2 → v3 format break predates this program.** `packages/core/src/archive.ts` bumps
+- **An in-flight v2 → v3 format break predates this program.** `poopdeck:packages/core/src/archive.ts` bumps
   `PACKED_FORMAT_VERSION` to 3 behind a strict-equality gate while HEAD, all 64 local showcase
   archives, and the 68-archive fleet are v2 — so the working-tree reader opens none of them. The
   Rust side has the same shape (an uncommitted non-defaulted `Manifest.variants`). This blocked every
   browser-side instrument until archives were rebuilt locally at v3.
 - **The `bench-regression` CI job has been dead since the transcode-removal campaign.** Its baseline
-  `tools/bench/baselines/earthquakes-ci.stt` is a legacy single-file container (`STT\x04`) that the
-  packed-only reader tries to JSON-parse; `tools/bench/src/index.mjs` also rejects a packed directory
+  `poopdeck:tools/bench/baselines/earthquakes-ci.stt` is a legacy single-file container (`STT\x04`) that the
+  packed-only reader tries to JSON-parse; `poopdeck:tools/bench/src/index.mjs` also rejects a packed directory
   with `EISDIR`. It is **not** part of the repo's stated green definition, so it was never
   load-bearing — but no later item may cite it as a guard until it is rebuilt or retired.
 - **`stt-build --maximum-tile-features 5` produces 260 "directory `time_end` is not tight" errors**

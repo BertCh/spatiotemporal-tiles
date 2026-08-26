@@ -25,7 +25,7 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="$REPO/examples/showcase/public/data-v3"
+OUT="$REPO/data-fleet-v3"
 GEN="$REPO/tools/stt-generate/target/release/stt-generate"
 VALIDATE="$REPO/target/release/stt-validate"
 LOG="$OUT/_rebuild.log"
@@ -96,7 +96,7 @@ run_one() {
   # an honest encoding of almost no data. A version migration must never be
   # able to quietly empty a demo, so the previous archive is the baseline and a
   # material shortfall fails the dataset.
-  local old="$REPO/examples/showcase/public/data/$stem/manifest.json"
+  local old="$REPO/data-fleet/$stem/manifest.json"
   if [ -f "$old" ]; then
     local cmp
     cmp=$(python3 - "$old" "$OUT/$stem/manifest.json" <<'PY'
@@ -123,7 +123,7 @@ PY
     if [ "$4" = "REVIEW" ]; then
       local newmb livemb
       newmb=$(du -sm "$OUT/$stem" 2>/dev/null | cut -f1)
-      livemb=$(du -sm "$REPO/examples/showcase/public/data/$stem" 2>/dev/null | cut -f1)
+      livemb=$(du -sm "$REPO/data-fleet/$stem" 2>/dev/null | cut -f1)
       say "REVIEW $stem  ${elapsed}s  validate=$vexit  features $2 vs live $1 (${3}x)  size ${newmb}MB vs ${livemb}MB — more data than shipped; confirm the recipe before publishing"
       return 0
     fi

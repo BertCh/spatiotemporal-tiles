@@ -12,7 +12,7 @@ export PATH="/opt/homebrew/bin:$PATH"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 
-OUT="../../examples/showcase/public/data"
+OUT="../../data-fleet"
 STT="${STT_BUILD:-$HERE/../../target/release/stt-build}"
 PY="venv-waymo/bin/python"
 

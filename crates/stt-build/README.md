@@ -1,7 +1,7 @@
 # stt-build
 
 > **Status: stable, pre-1.0.** See the
-> [support and compatibility policy](../../docs/intro/status-and-support.md).
+> [support and compatibility policy](https://github.com/BertCh/poopdeck.gl/blob/main/docs/intro/status-and-support.md).
 
 The CLI that builds **SpatioTemporal Tiles (STT)** datasets. It reads a
 GeoParquet file with a WKB geometry column (or separate `lon`/`lat` columns)
@@ -63,9 +63,9 @@ for built archives.
 
 ## Docs
 
-- [Full flag reference](../../docs/api/cli-reference.md#stt-build)
+- [Full flag reference](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md#stt-build)
 - [Packed format spec](../../docs/spec/stt-packed-format.md)
-- [Database input sources](../../docs/api/cli-reference.md#database-input-sources-opt-in)
+- [Database input sources](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md#database-input-sources-opt-in)
 - [Data generation guide](../../docs/guides/data-generation.md)
 
 License: MIT.

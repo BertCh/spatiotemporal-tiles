@@ -12,7 +12,7 @@
 #      `city_SE3_egovehicle.feather`, `map/`, `sensors/lidar/`, and ONE ring
 #      camera (skips the other 8 cameras + stereo): ~285 MB/log, not ~1.5 GB.
 #   3. Extract — run `argoverse_extract.py` → a packed scene bundle under
-#      `examples/showcase/public/data/argoverse-<log8>/`, then delete the raw log.
+#      `data-fleet/argoverse-<log8>/`, then delete the raw log.
 #
 # Each bundle gets the full cockpit stream set (lidar / ego / objects / HD-map
 # with lane centerlines / camera inset / ego-derived telemetry).
@@ -38,7 +38,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 PY="${PY:-$HERE/venv-av2/bin/python}"
 STT_BUILD="${STT_BUILD:-$REPO/target/release/stt-build}"
-OUT_DIR="${OUT_DIR:-$REPO/examples/showcase/public/data}"
+OUT_DIR="${OUT_DIR:-$REPO/data-fleet}"
 WORK="${WORK:-$(mktemp -d)}"
 
 aws_ls() { aws s3 ls --no-sign-request "$@"; }

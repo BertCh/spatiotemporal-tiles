@@ -6,9 +6,9 @@
 > follow-ups, not a forward plan. Live/canonical docs carry the normative detail:
 >
 > - Scene-bundle + sidecar format → [`../spec/sidecar-assets.md`](../spec/sidecar-assets.md)
-> - Object cuboid layer → [`../api/animated-bounding-box-layer.md`](../api/animated-bounding-box-layer.md)
-> - LiDAR point layer → [`../api/animated-point-layer.md`](../api/animated-point-layer.md)
-> - Compression flags → [`../api/cli-reference.md`](../api/cli-reference.md) (`--quantize-attr`, `--quantize-attrs-auto`)
+> - Object cuboid layer → [`../api/animated-bounding-box-layer.md`](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md)
+> - LiDAR point layer → [`../api/animated-point-layer.md`](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md)
+> - Compression flags → [`../api/cli-reference.md`](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md) (`--quantize-attr`, `--quantize-attrs-auto`)
 
 A poopdeck.gl visualization inspired by **avs.auto / streetscape.gl** (Aurora/Uber's XVIZ
 viewer): real AV sensor logs — LIDAR, tracked-object 3D boxes, ego trajectory, CAN telemetry —
@@ -16,11 +16,11 @@ served as **spatiotemporal tiles** on a real basemap, with streetscape.gl-style 
 chrome (streams, timeline, gauges/charts, camera inset, inspector).
 
 Shipped surface: `pages/AvCockpit.tsx` + `components/av/*` (showcase, `/drive/:sceneId?`),
-`AnimatedBoundingBoxLayer` (packages/layers), and the `scripts/data-generation/*` adapters
+`AnimatedBoundingBoxLayer` (poopdeck:packages/layers), and the `scripts/data-generation/*` adapters
 (§1.4). Datasets live: synthetic + nuScenes v1.0-mini (10 scenes) + Argoverse 2 (6 cities)
 
 - comma; Waymo is local-only (license). Render-mode / Three+TSL work that grew on top of
-  this cockpit lives in [`renderer-architecture.md`](./renderer-architecture.md).
+  this cockpit lives in [`renderer-architecture.md`](https://github.com/BertCh/poopdeck.gl/blob/main/docs/roadmap/renderer-architecture.md).
 
 ---
 
@@ -83,7 +83,7 @@ source of truth. Two conventions worth restating:
 Showcase: `type:'av'` composite in `buildDemoLayers` (painter order map → lidar → ego →
 objects; ego/objects/map ride the `overlayBase` no-governor pattern, LIDAR carries the
 governor plumbing); route `/drive/:sceneId?`; chrome under `components/av/*`. Object
-cuboids render via `AnimatedBoundingBoxLayer` (packages/layers) — API doc in the header.
+cuboids render via `AnimatedBoundingBoxLayer` (poopdeck:packages/layers) — API doc in the header.
 
 ### 1.4 Adapters (scripts/data-generation/)
 
@@ -131,7 +131,7 @@ default depth/distance (height reads better on a georeferenced 3D scene — grou
 
 Waymo LIDAR was the size bottleneck. A measurement-driven pass cut a point's on-the-wire cost
 ~4.5× (whole `waymo-sf-day` bundle 3.84 GB → 633 MB, **6.07×**). The compression **flags are
-documented in [`../api/cli-reference.md`](../api/cli-reference.md)**; kept here is the _why_.
+documented in [`../api/cli-reference.md`](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md)**; kept here is the _why_.
 
 **Measure first** — before porting the research's headline lever (uint16-RTC coordinate
 quantization), we attributed a real z14 Waymo tile's bytes per column
@@ -195,7 +195,7 @@ coordinates cannot produce that — points thrown to ±180/±90 scatter z14 tile
 - **Pyramid replication** — the cloud is re-tiled at every zoom with no thinning. Collapsing to
   one/two data zooms is the biggest remaining total-archive lever but changes LOD behaviour;
   partly attacked since by the scrub-LOD track
-  ([playback-and-loading.md §7](./playback-and-loading.md#7-scrub-time-lod--a-motion-tier-that-no-application-enables)).
+  ([playback-and-loading.md §7](https://github.com/BertCh/poopdeck.gl/blob/main/docs/roadmap/playback-and-loading.md#7-scrub-time-lod--a-motion-tier-that-no-application-enables)).
 - **Additive octree + screen-space-error LOD** (Potree/COPC) — the "proper" fix, but a large
   architectural change to a 2D-mercator-keyed engine. Out of scope.
 - **Browser point codecs** (Draco / G-PCC / range-image) — only Draco is WASM-portable and

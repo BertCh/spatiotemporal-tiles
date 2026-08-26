@@ -3,7 +3,7 @@
 > **Re-consolidated 2026-07-24.** Rationale, measured baselines, negative results
 > ("don't relitigate"), counted-out items with revival triggers. Normative
 > behavior lives in [`stt-packed-format.md`](../spec/stt-packed-format.md) and
-> [`cli-reference.md`](../api/cli-reference.md); this doc never restates it.
+> [`cli-reference.md`](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md); this doc never restates it.
 > Absorbs the durable content of `stt-packed.md`, `stt-format-review-2026-07.md`,
 > `stt-packed-v2-design-2026-07.md`, `blob-ordering-heuristic-2026-07.md`,
 > `rust-audit-2026-06.md`, `stt-optimize-intelligence-2026-07.md`,
@@ -380,7 +380,7 @@ failure (z8 carrying a median 13 %, worst 0 %, of the displayed bucket) — the 
 every coarser level's row groups — the bbox statistics prune row groups, not the
 prefix. That is fine for the well-distributed POI / building-footprint datasets their
 README scopes it to, and it is not a tile directory; their reader (run merge capped at
-50 K rows plus a coalescing buffer) is behind `packages/core/src/request-scheduler.ts`
+50 K rows plus a coalescing buffer) is behind `poopdeck:packages/core/src/request-scheduler.ts`
 and the prefetch policy. And COGP has **no time axis at all** — one ladder, space.
 Residency, runway, eviction and the playhead-relative working set are the whole hard
 part here and are simply out of scope there, so this is the third entry in this section
@@ -567,7 +567,7 @@ record's, and are not restated here. Format-specific notes only:
   documents it.
 - **Temporal-LOD reader wiring beyond scrub-LOD P0–P2** — wired and kill-switched,
   but `scrubLod` is set at zero showcase call-sites, so the pyramid is consumed
-  nowhere at rest. P3/P4: [playback-and-loading.md](./playback-and-loading.md).
+  nowhere at rest. P3/P4: [playback-and-loading.md](https://github.com/BertCh/poopdeck.gl/blob/main/docs/roadmap/playback-and-loading.md).
 - **Interior-tile fast path + quadtree subdivision for polygon coverage** —
   byte-breaking follow-ups deferred from T1.1 coverage clipping; also the cross-zoom
   clip pyramid and the `geo::BooleanOps` swap (workspace pins geo 0.28; revisit at
@@ -716,7 +716,7 @@ and honest.
   `triangles` as ONE whole-layer index buffer and trust each feature's slice
   with no fallback, so a feature with an empty slice silently vanishes. The
   saving is unlocked by **one reader-side change** (backfill an empty list by
-  earcutting that feature's single ring in `packages/core/src/tile.ts`), not
+  earcutting that feature's single ring in `poopdeck:packages/core/src/tile.ts`), not
   by an encoder change. A test pins the current contract with that rationale
   so nobody "optimises" it before the readers can take it.
 - **Compact times are frame-only.** `st`/`et`/`vq` are discriminated by

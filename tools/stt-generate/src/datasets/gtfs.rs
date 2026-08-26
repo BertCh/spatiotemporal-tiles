@@ -50,7 +50,7 @@
 //! ```bash
 //! # The busiest fully-defined NL service date (Friday, 121k trips):
 //! stt-generate gtfs --feed data/gtfs-nl/feed --date 20260703 \
-//!   --output examples/showcase/public/data/gtfs-nl
+//!   --output data-fleet/gtfs-nl
 //! ```
 
 use anyhow::{anyhow, Context, Result};
@@ -91,7 +91,7 @@ pub struct Args {
         short,
         long,
         alias = "out",
-        default_value = "examples/showcase/public/data/gtfs-transit"
+        default_value = "data-fleet/gtfs-transit"
     )]
     pub output: PathBuf,
 

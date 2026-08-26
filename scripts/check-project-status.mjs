@@ -1,12 +1,25 @@
 #!/usr/bin/env node
+/**
+ * `project-status.json` is this repository's published claim about what it
+ * ships and what the reference writer emits. This gate proves every claim
+ * against the file that actually decides it — the cargo manifest, the two
+ * version constants in `stt-core`, the facade's bin table — so the document
+ * can never quietly describe a previous release.
+ *
+ * Scope is HALF the pre-split check. It also used to verify the pnpm version,
+ * the Node floors and the eight `@poopdeck.gl/*` package versions; those
+ * sources left with the renderer on 2026-08-26. The poopdeck.gl repository
+ * runs the identical gate over its half and vendors THIS document as its
+ * `stt` block, byte-compared rather than re-derived
+ * (docs/roadmap/repo-split-2026-08.md §4.4).
+ */
 
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const status = json('project-status.json');
-const rootPackage = json('package.json');
 
 function read(relativePath) {
   return readFileSync(join(ROOT, relativePath), 'utf8');
@@ -39,25 +52,6 @@ const rustVersion = capture(
 const rustMsrv = capture(cargo, /^rust-version = "([^"]+)"$/m, 'Rust MSRV');
 assertEqual(status.release.rust, rustVersion, 'Rust release');
 assertEqual(status.toolchain.rust, rustMsrv, 'Rust MSRV');
-
-const [pnpmName, pnpmVersion] = rootPackage.packageManager.split('@');
-assertEqual(pnpmName, 'pnpm', 'package manager name');
-assertEqual(status.toolchain.pnpm, pnpmVersion, 'pnpm version');
-assertEqual(
-  status.toolchain.node,
-  rootPackage.engines.node,
-  'root Node engine',
-);
-assertEqual(
-  status.toolchain.nodeMajor,
-  Number(read('.node-version').trim()),
-  '.node-version',
-);
-assertEqual(
-  status.toolchain.nodeMajor,
-  Number(read('.nvmrc').trim()),
-  '.nvmrc',
-);
 
 const packSource = read('crates/stt-core/src/pack/mod.rs');
 const directorySource = read('crates/stt-core/src/directory.rs');
@@ -125,49 +119,6 @@ assertEqual(
   'repository-only command inventory',
 );
 
-const packageDirs = readdirSync(join(ROOT, 'packages'), { withFileTypes: true })
-  .filter((entry) => entry.isDirectory())
-  .map((entry) => entry.name)
-  .sort();
-const actualPackages = packageDirs.map((dir) => {
-  const manifest = json(`packages/${dir}/package.json`);
-  return {
-    name: manifest.name,
-    version: manifest.version,
-    published: manifest.private !== true,
-    node: manifest.engines?.node,
-    // A package with a `bin` RUNS in Node, so it carries the repo's dev
-    // toolchain floor. Everything else ships browser code whose `dist` never
-    // executes under Node at all, and a floor above the current LTS lines
-    // hard-fails any consumer or CI running `engine-strict=true` for nothing
-    // (DX review 2026-08-26, F4).
-    runsInNode: manifest.bin !== undefined,
-    file: `packages/${dir}/package.json`,
-  };
-});
-const declaredByName = new Map(
-  status.packages.map((entry) => [entry.name, entry]),
-);
-assertEqual(
-  [...declaredByName.keys()].sort(),
-  actualPackages.map(({ name }) => name).sort(),
-  'package inventory',
-);
-for (const actual of actualPackages) {
-  const declared = declaredByName.get(actual.name);
-  assertEqual(declared.version, actual.version, `${actual.name} version`);
-  assertEqual(
-    declared.published,
-    actual.published,
-    `${actual.name} publication status`,
-  );
-  assertEqual(
-    actual.node,
-    actual.runsInNode ? status.toolchain.node : status.toolchain.runtimeNode,
-    `${actual.name} Node engine`,
-  );
-}
-
 const schemaPath = status.$schema;
 if (basename(schemaPath) !== 'project-status.schema.json') {
   throw new Error(`unexpected project-status schema: ${schemaPath}`);
@@ -175,5 +126,5 @@ if (basename(schemaPath) !== 'project-status.schema.json') {
 json(schemaPath.replace(/^\.\//, ''));
 
 console.log(
-  `project status: ${actualPackages.length} packages, ${facadeCommands.length} CLIs, format ${writeFormat}/directory ${writeDirectory}; all in sync`,
+  `project status: ${facadeCommands.length} CLIs, format ${writeFormat}/directory ${writeDirectory}, rust ${rustVersion} (MSRV ${rustMsrv}); all in sync`,
 );

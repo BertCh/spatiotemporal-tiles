@@ -1,7 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://poopdeck.gl/project-status.schema.json",
-  "title": "STT project status contract",
+  "title": "SpatioTemporal Tiles project status contract",
+  "description": "What this repository ships and what the reference writer emits. Every field is proved against its source by scripts/check-project-status.mjs. The renderer half of the old combined file moved to the poopdeck.gl repository, which vendors this document as its `stt` block.",
   "type": "object",
   "required": [
     "$schema",
@@ -11,30 +12,22 @@
     "toolchain",
     "archive",
     "commands",
-    "repositoryOnlyCommands",
-    "packages"
+    "repositoryOnlyCommands"
   ],
   "properties": {
     "$schema": { "type": "string" },
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": { "const": 2 },
     "updated": { "type": "string", "format": "date" },
     "release": {
       "type": "object",
-      "required": ["rust", "javascript"],
-      "properties": {
-        "rust": { "$ref": "#/$defs/version" },
-        "javascript": { "$ref": "#/$defs/version" }
-      },
+      "required": ["rust"],
+      "properties": { "rust": { "$ref": "#/$defs/version" } },
       "additionalProperties": false
     },
     "toolchain": {
       "type": "object",
-      "required": ["node", "nodeMajor", "runtimeNode", "pnpm", "rust"],
+      "required": ["rust"],
       "properties": {
-        "node": { "type": "string" },
-        "nodeMajor": { "type": "integer", "minimum": 1 },
-        "runtimeNode": { "type": "string" },
-        "pnpm": { "$ref": "#/$defs/version" },
         "rust": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" }
       },
       "additionalProperties": false
@@ -56,41 +49,16 @@
       },
       "additionalProperties": false
     },
-    "commands": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/surface" }
-    },
+    "commands": { "type": "array", "items": { "$ref": "#/$defs/surface" } },
     "repositoryOnlyCommands": {
       "type": "array",
       "items": { "$ref": "#/$defs/surface" }
     },
-    "packages": {
-      "type": "array",
-      "items": {
-        "allOf": [
-          { "$ref": "#/$defs/surface" },
-          {
-            "type": "object",
-            "required": ["version", "published"],
-            "properties": {
-              "version": { "$ref": "#/$defs/version" },
-              "published": { "type": "boolean" }
-            }
-          }
-        ]
-      }
-    },
-    "otherSurfaces": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/surface" }
-    }
+    "otherSurfaces": { "type": "array", "items": { "$ref": "#/$defs/surface" } }
   },
   "additionalProperties": false,
   "$defs": {
-    "version": {
-      "type": "string",
-      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
-    },
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
     "versionList": {
       "type": "array",
       "minItems": 1,

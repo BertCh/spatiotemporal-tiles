@@ -4,11 +4,11 @@
  * Two halves. The pure half exercises path matching and trailer parsing
  * directly. The end-to-end half builds throwaway git repositories shaped like
  * this one — a `crates/stt-core/tests/fixtures/v2-golden/` writer tree with a
- * hash pin in it, and a `packages/core/test/fixtures/` reader tree beside it —
- * and spawns the real script against them with `--repo`, because the only
- * thing worth asserting about a gate is its exit code on a real diff.
+ * hash pin in it, and a `conformance/vectors/` reader tree beside it — and
+ * spawns the real script against them with `--repo`, because the only thing
+ * worth asserting about a gate is its exit code on a real diff.
  *
- * Both trees are exercised, not just the writer one: the reader-side fixtures
+ * Both trees are exercised, not just the writer one: the reader-side vectors
  * joined the watched set on 2026-08-10, and a gate whose new root has no test
  * is a root nobody will notice falling out again.
  *
@@ -17,7 +17,7 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, describe, test } from 'node:test';
@@ -31,6 +31,7 @@ import {
   parseTrailers,
   PINNED_ROOTS,
   rebuildWindowValues,
+  relocationClaims,
   REPO_ROOT,
 } from './check-golden-pins.mjs';
 
@@ -38,8 +39,8 @@ const SCRIPT = fileURLToPath(
   new URL('./check-golden-pins.mjs', import.meta.url),
 );
 const FIXTURE_DIR = 'crates/stt-core/tests/fixtures/v2-golden';
-/** The reader-side tree, watched since 2026-08-10. */
-const TS_FIXTURE_DIR = 'packages/core/test/fixtures';
+/** The reader-side tree, watched since 2026-08-10; at conformance/ since the split. */
+const VECTORS_DIR = 'conformance/vectors';
 
 const tempRepos = [];
 after(() => {
@@ -76,7 +77,7 @@ function makeRepo({ withFixtures = true } = {}) {
   // Never let the developer's global hooks run inside a test repo.
   git(repo, ['config', 'core.hooksPath', join(repo, '.no-hooks')]);
   writeFile(repo, 'crates/stt-core/src/pack/mod.rs', '// pack writer\n');
-  writeFile(repo, 'packages/core/src/archive.ts', '// packed reader\n');
+  writeFile(repo, 'crates/stt-core/src/pack/reader.rs', '// packed reader\n');
   if (withFixtures) {
     writeFile(
       repo,
@@ -84,14 +85,10 @@ function makeRepo({ withFixtures = true } = {}) {
       '{"single":"aaa"}\n',
     );
     writeFile(repo, `${FIXTURE_DIR}/single/manifest.json`, '{"v":2}\n');
+    writeFile(repo, `${VECTORS_DIR}/packed-golden/manifest.json`, '{"v":2}\n');
     writeFile(
       repo,
-      `${TS_FIXTURE_DIR}/packed-golden/manifest.json`,
-      '{"v":2}\n',
-    );
-    writeFile(
-      repo,
-      `${TS_FIXTURE_DIR}/paged-golden/packs/64c8.sttp`,
+      `${VECTORS_DIR}/paged-golden/packs/64c8.sttp`,
       'binaryish\n',
     );
   }
@@ -123,30 +120,30 @@ describe('isPinnedPath', () => {
     assert.equal(isPinnedPath(FIXTURE_DIR), true);
   });
 
-  test('every file under the reader-side fixture tree is pinned', () => {
+  test('every file under the conformance vector tree is pinned', () => {
     // Added 2026-08-10: ~110 golden objects with the same regression-oracle
     // role had been churning entirely outside the gate.
     assert.equal(
-      isPinnedPath(`${TS_FIXTURE_DIR}/packed-golden/manifest.json`),
+      isPinnedPath(`${VECTORS_DIR}/packed-golden/manifest.json`),
       true,
     );
     assert.equal(
-      isPinnedPath(`${TS_FIXTURE_DIR}/paged-golden/packs/64c8.sttp`),
+      isPinnedPath(`${VECTORS_DIR}/paged-golden/packs/64c8.sttp`),
       true,
     );
     assert.equal(
-      isPinnedPath(`${TS_FIXTURE_DIR}/paged-golden-single/index/c591.sttd`),
+      isPinnedPath(`${VECTORS_DIR}/paged-golden-single/index/c591.sttd`),
       true,
     );
     assert.equal(
-      isPinnedPath(`${TS_FIXTURE_DIR}/legacy-shape/points/tile.arrow`),
+      isPinnedPath(`${VECTORS_DIR}/legacy-shape/points/tile.arrow`),
       true,
     );
     assert.equal(
-      isPinnedPath(`${TS_FIXTURE_DIR}/v2-golden-tracks/manifest.json`),
+      isPinnedPath(`${VECTORS_DIR}/v2-golden-tracks/manifest.json`),
       true,
     );
-    assert.equal(isPinnedPath(TS_FIXTURE_DIR), true);
+    assert.equal(isPinnedPath(VECTORS_DIR), true);
   });
 
   test('a sibling directory with the same prefix is NOT pinned', () => {
@@ -160,31 +157,30 @@ describe('isPinnedPath', () => {
       false,
     );
     assert.equal(
-      isPinnedPath('packages/core/test/fixtures-scratch/manifest.json'),
+      isPinnedPath('conformance/vectors-scratch/manifest.json'),
       false,
     );
-    assert.equal(isPinnedPath('packages/layers/test/fixtures/x.json'), false);
+    assert.equal(isPinnedPath('conformance/make-vectors.sh'), false);
   });
 
   test('ordinary source and doc paths are not pinned', () => {
     assert.equal(isPinnedPath('crates/stt-core/src/pack/mod.rs'), false);
     assert.equal(isPinnedPath('docs/roadmap/README.md'), false);
-    assert.equal(isPinnedPath('packages/core/src/tileset.ts'), false);
+    assert.equal(isPinnedPath('crates/stt-core/src/pack/mod.rs'), false);
     assert.equal(isPinnedPath('.github/workflows/ci.yml'), false);
-    // The helper that RE-CUTS a fixture is code, not a pin — it lives in
-    // test/helpers, one level up from the fixture tree, and editing it is an
-    // ordinary change.
+    // The script that RE-CUTS the vectors is code, not a pin — it sits one
+    // level up from the tree it writes, and editing it is an ordinary change.
+    assert.equal(isPinnedPath('conformance/make-vectors.sh'), false);
+    assert.equal(isPinnedPath('conformance/README.md'), false);
+    // Prose INSIDE a pinned tree is prose. No archive object is ever named
+    // README.md, so the carve-out cannot hide a real pin — and without it,
+    // correcting a fixture's explanation would need a rebuild declaration.
+    assert.equal(isPinnedPath(`${VECTORS_DIR}/legacy-shape/README.md`), false);
+    assert.equal(isPinnedPath(`${FIXTURE_DIR}/README.md`), false);
+    // …but a manifest beside it is still pinned.
     assert.equal(
-      isPinnedPath('packages/core/test/helpers/packed-fixture.ts'),
-      false,
-    );
-    assert.equal(
-      isPinnedPath('packages/core/test/packed-v2-golden.test.ts'),
-      false,
-    );
-    assert.equal(
-      isPinnedPath('packages/core/scripts/make-v2-golden.sh'),
-      false,
+      isPinnedPath(`${VECTORS_DIR}/legacy-shape/points/manifest.json`),
+      true,
     );
   });
 
@@ -194,7 +190,10 @@ describe('isPinnedPath', () => {
       isPinnedPath('crates/stt-build/tests/expected-hashes.json'),
       true,
     );
-    assert.equal(isPinnedPath('tools/bench/not-expected-hashes.json'), false);
+    assert.equal(
+      isPinnedPath('poopdeck:tools/bench/not-expected-hashes.json'),
+      false,
+    );
   });
 
   test('non-string and empty input is not pinned', () => {
@@ -296,7 +295,7 @@ describe('the fixture-existence guard', () => {
     );
     assert.deepEqual(dirs, [
       'crates/stt-core/tests/fixtures/v2-golden',
-      'packages/core/test/fixtures',
+      'conformance/vectors',
     ]);
     for (const root of PINNED_ROOTS) {
       assert.ok(root.oracle, `${root.path} must name its oracle`);
@@ -372,11 +371,7 @@ describe('the gate, end to end', () => {
 
   test('touching a READER-side fixture WITHOUT the trailer fails', () => {
     const { repo, base } = makeRepo();
-    writeFile(
-      repo,
-      `${TS_FIXTURE_DIR}/packed-golden/manifest.json`,
-      '{"v":3}\n',
-    );
+    writeFile(repo, `${VECTORS_DIR}/packed-golden/manifest.json`, '{"v":3}\n');
     commit(repo, 'chore: re-bless the TS packed golden\n');
     const r = runGate(repo, ['--base', base]);
     assert.equal(r.status, 1);
@@ -386,11 +381,7 @@ describe('the gate, end to end', () => {
 
   test('a reader-side pack counts, and the writer tree is untouched', () => {
     const { repo, base } = makeRepo();
-    writeFile(
-      repo,
-      `${TS_FIXTURE_DIR}/paged-golden/packs/64c8.sttp`,
-      'moved\n',
-    );
+    writeFile(repo, `${VECTORS_DIR}/paged-golden/packs/64c8.sttp`, 'moved\n');
     commit(repo, 'chore: recut a reader pack\n');
     const r = runGate(repo, ['--base', base]);
     assert.equal(r.status, 1);
@@ -402,11 +393,7 @@ describe('the gate, end to end', () => {
     // The teaching half of the gate: whichever tree you touched, the message
     // has to hand you the right command, not the other one.
     const { repo, base } = makeRepo();
-    writeFile(
-      repo,
-      `${TS_FIXTURE_DIR}/packed-golden/manifest.json`,
-      '{"v":4}\n',
-    );
+    writeFile(repo, `${VECTORS_DIR}/packed-golden/manifest.json`, '{"v":4}\n');
     commit(repo, 'chore: bytes moved\n');
     const r = runGate(repo, ['--base', base]);
     assert.equal(r.status, 1);
@@ -414,9 +401,9 @@ describe('the gate, end to end', () => {
       r.stderr,
       /cargo run -p stt-core --example make-golden-fixture/,
     );
-    assert.match(r.stderr, /packages\/core\/scripts\/make-v2-golden\.sh/);
+    assert.match(r.stderr, /conformance\/make-vectors\.sh/);
     assert.match(r.stderr, /crates\/stt-core\/tests\/v2_golden\.rs/);
-    assert.match(r.stderr, /packages\/core\/test\/packed-v2-golden\.test\.ts/);
+    assert.match(r.stderr, /packed-v2-golden\.test\.ts/);
     assert.match(r.stderr, /encoder bug/);
   });
 
@@ -429,7 +416,7 @@ describe('the gate, end to end', () => {
     );
     writeFile(
       repo,
-      `${TS_FIXTURE_DIR}/v2-golden-tracks/manifest.json`,
+      `${VECTORS_DIR}/v2-golden-tracks/manifest.json`,
       '{"v":3}\n',
     );
     commit(repo, 'chore: rebuild everything\n');
@@ -444,7 +431,7 @@ describe('the gate, end to end', () => {
     const { repo, base } = makeRepo();
     writeFile(
       repo,
-      `${TS_FIXTURE_DIR}/paged-golden-single/manifest.json`,
+      `${VECTORS_DIR}/paged-golden-single/manifest.json`,
       '{"v":3}\n',
     );
     commit(
@@ -587,15 +574,10 @@ describe('working-tree mode', () => {
   });
 
   test('--working-tree flags reader-side churn too', () => {
-    // This is the mode that, on THIS repo, now reports the in-flight v2→v3
-    // churn under packages/core/test/fixtures/. That report is correct and is
-    // not a reason to narrow the watched set.
+    // Reporting churn under the vector tree is CORRECT; it is not a reason to
+    // narrow the watched set.
     const { repo, base } = makeRepo();
-    writeFile(
-      repo,
-      `${TS_FIXTURE_DIR}/packed-golden/manifest.json`,
-      '{"v":9}\n',
-    );
+    writeFile(repo, `${VECTORS_DIR}/packed-golden/manifest.json`, '{"v":9}\n');
     const r = runGate(repo, ['--base', base, '--working-tree']);
     assert.equal(r.status, 1);
     assert.match(r.stderr, /working tree/);
@@ -631,5 +613,121 @@ describe('base resolution', () => {
     const r = runGate(REPO_ROOT, ['--help']);
     assert.equal(r.status, 0);
     assert.match(r.stdout, /--working-tree/);
+  });
+});
+
+describe('Pin-Relocation — a verified declaration, not a trusted one', () => {
+  // A pinned tree can MOVE without a byte moving; the 2026-08-26 repository
+  // split did exactly that. `Rebuild-Window: R1` would be the wrong thing to
+  // say (it means "the fleet needs re-uploading"), so the gate takes a second,
+  // narrower trailer — and checks it against the object database.
+  //
+  // These repos are shaped like the real move: at the base commit the vectors
+  // live at their OLD path (which PINNED_ROOTS no longer names) and the new
+  // path does not exist; the commit under test creates the new one. That is
+  // what makes the additions pinned and the deletions not, which is exactly
+  // the asymmetry a relocation has to survive.
+  const OLD_DIR = 'poopdeck:packages/core/test/fixtures';
+
+  function makeRelocationRepo() {
+    const repo = mkdtempSync(join(tmpdir(), 'golden-pins-reloc-'));
+    tempRepos.push(repo);
+    git(repo, ['init', '-q', '-b', 'main']);
+    git(repo, ['config', 'user.email', 'gate@example.invalid']);
+    git(repo, ['config', 'user.name', 'Gate Test']);
+    git(repo, ['config', 'commit.gpgsign', 'false']);
+    git(repo, ['config', 'core.hooksPath', join(repo, '.no-hooks')]);
+    writeFile(repo, 'crates/stt-core/src/pack/mod.rs', '// pack writer\n');
+    writeFile(
+      repo,
+      `${FIXTURE_DIR}/expected-hashes.json`,
+      '{"single":"aaa"}\n',
+    );
+    writeFile(repo, `${FIXTURE_DIR}/single/manifest.json`, '{"v":2}\n');
+    writeFile(repo, `${OLD_DIR}/packed-golden/manifest.json`, '{"v":2}\n');
+    writeFile(repo, `${OLD_DIR}/paged-golden/packs/64c8.sttp`, 'binaryish\n');
+    git(repo, ['add', '-A']);
+    git(repo, ['commit', '-q', '-m', 'chore: seed']);
+    return { repo, base: git(repo, ['rev-parse', 'HEAD']).trim() };
+  }
+
+  /** Move the whole tree from the old root to the new one, byte for byte. */
+  function relocate(repo) {
+    const from = join(repo, OLD_DIR);
+    const dest = join(repo, VECTORS_DIR);
+    mkdirSync(dirname(dest), { recursive: true });
+    cpSync(from, dest, { recursive: true });
+    rmSync(from, { recursive: true });
+  }
+
+  const TRAILER = `Pin-Relocation: ${OLD_DIR} -> ${VECTORS_DIR}`;
+
+  test('the trailer value parses into a from/to pair', () => {
+    assert.deepEqual(
+      relocationClaims('subject\n\nPin-Relocation: a/b -> c/d\n'),
+      [{ from: 'a/b', to: 'c/d' }],
+    );
+    // Trailing slashes are noise, and the unicode arrow is what a person types.
+    assert.deepEqual(
+      relocationClaims('subject\n\nPin-Relocation: a/b/ → c/d/\n'),
+      [{ from: 'a/b', to: 'c/d' }],
+    );
+    // Prose is not a trailer, same rule as Rebuild-Window.
+    assert.deepEqual(relocationClaims('moved with Pin-Relocation: a -> b'), []);
+  });
+
+  test('a byte-identical move with the trailer passes', () => {
+    const { repo, base } = makeRelocationRepo();
+    relocate(repo);
+    commit(
+      repo,
+      `refactor: rehome the vectors\n\nSame bytes, new path.\n\n${TRAILER}\n`,
+    );
+    const r = runGate(repo, ['--base', base]);
+    assert.equal(r.status, 0, r.stderr);
+  });
+
+  test('the same move WITHOUT the trailer is an unflagged pin movement', () => {
+    const { repo, base } = makeRelocationRepo();
+    relocate(repo);
+    commit(repo, 'refactor: rehome the vectors\n');
+    const r = runGate(repo, ['--base', base]);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /moved a golden byte pin/);
+  });
+
+  test('a move that also changes a byte is rejected, and says so', () => {
+    const { repo, base } = makeRelocationRepo();
+    relocate(repo);
+    writeFile(repo, `${VECTORS_DIR}/packed-golden/manifest.json`, '{"v":9}\n');
+    commit(repo, `refactor: rehome the vectors\n\n${TRAILER}\n`);
+    const r = runGate(repo, ['--base', base]);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /Pin-Relocation rejected/);
+    assert.match(r.stderr, /NOT byte-identical/);
+  });
+
+  test('a COPY is rejected — the old root must be gone', () => {
+    const { repo, base } = makeRelocationRepo();
+    cpSync(join(repo, OLD_DIR), join(repo, VECTORS_DIR), { recursive: true });
+    commit(repo, `chore: duplicate the vectors\n\n${TRAILER}\n`);
+    const r = runGate(repo, ['--base', base]);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /a copy, not a move/);
+  });
+
+  test('the trailer does not cover pinned changes outside the moved tree', () => {
+    const { repo, base } = makeRelocationRepo();
+    relocate(repo);
+    // A real byte re-blessing, smuggled alongside a genuine relocation.
+    writeFile(
+      repo,
+      `${FIXTURE_DIR}/expected-hashes.json`,
+      '{"single":"zzz"}\n',
+    );
+    commit(repo, `refactor: rehome the vectors\n\n${TRAILER}\n`);
+    const r = runGate(repo, ['--base', base]);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /not covered by any declared relocation/);
   });
 });

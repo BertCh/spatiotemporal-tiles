@@ -1,24 +1,24 @@
 #!/usr/bin/env node
 /**
- * Version sync for the files changesets does NOT touch.
+ * Version sync inside the cargo workspace.
  *
- * `changeset version` is expected to bump every public `@poopdeck.gl/*`
- * package.json (they are a `fixed` group), but this script verifies that
- * assumption too. Everything else in the lockstep is a hand edit:
+ * `[workspace.package] version` is one hand edit, but it is not the only place
+ * the number appears: every internal path-dependency carries a `version = "…"`
+ * alongside its `path = "../…"`, because cargo requires one for a published
+ * dependency and it is the requirement consumers resolve. Left at the previous
+ * release they do not merely go stale — `cargo update -w` fails outright
+ * ("failed to select a version for the requirement `stt-core = ^0.5.0`"), which
+ * is how the gap surfaced during the 0.6.0 cut.
  *
- *   - the cargo workspace version in `Cargo.toml` — the bug this file exists
- *     to prevent. npm shipped 0.5.0 while crates.io sat at 0.4.0 because the
- *     bump was manual and nothing compared the two numbers.
- *   - the Claude Code plugin surface —
- *     `poopdeck-ai/.claude-plugin/plugin.json`, the marketplace entry, and the
- *     `metadata.version` in each skill's frontmatter — which rots silently,
- *     one release at a time.
- *
- * Canonical version = `packages/core/package.json` (the root of the fixed
- * group; every other public @poopdeck.gl package carries the same number).
- * Private packages are deliberately excluded: for example, the frozen Cesium
- * backend remains at its last published version while workspace development
- * continues.
+ * Canonical version = `[workspace.package] version` in the root `Cargo.toml`.
+ * Before the 2026-08-26 repository split the canonical number lived in
+ * `packages/core/package.json` and this file's headline job was keeping cargo
+ * and npm level — they had diverged once (crates.io 0.4.0 against npm 0.5.0)
+ * because the cargo bump was a hand edit no check covered. That failure mode is
+ * gone rather than gated: the two stacks now release independently and are
+ * related by the archive's `formatVersion`
+ * (docs/roadmap/repo-split-2026-08.md §2.3). Do not re-add a cross-registry
+ * comparison here.
  *
  * Usage:
  *   node scripts/sync-versions.mjs            # rewrite the stragglers in place
@@ -35,11 +35,12 @@ const read = (p) => readFileSync(p, 'utf8');
 
 /** The number every other file must agree with. */
 function canonicalVersion() {
-  const pj = JSON.parse(read(join(ROOT, 'packages/core/package.json')));
-  if (typeof pj.version !== 'string' || !pj.version) {
-    throw new Error('packages/core/package.json has no version');
+  const table = cargoWorkspacePackageTable(read(join(ROOT, 'Cargo.toml')));
+  const m = table && CARGO_VERSION_RE.exec(table.text);
+  if (!m?.[1] && !m?.[2]) {
+    throw new Error('Cargo.toml has no [workspace.package] version');
   }
-  return pj.version;
+  return m[2];
 }
 
 // ---------------------------------------------------------------------------
@@ -48,53 +49,6 @@ function canonicalVersion() {
 // (anchored on the version key) rather than a parse → re-serialize round trip,
 // so formatting, quote style, and key order survive.
 // ---------------------------------------------------------------------------
-
-/** `"version": "x.y.z"` at a known JSON path, e.g. ['metadata','version']. */
-function jsonVersionTarget(file, paths) {
-  return {
-    file,
-    read() {
-      const doc = JSON.parse(read(file));
-      return paths.map((path) => {
-        let node = doc;
-        for (const key of path) node = node?.[key];
-        return { label: path.join('.'), value: node };
-      });
-    },
-    write(text, want) {
-      // Replace the version literal on each matched key. All version keys in
-      // these two files are the plugin version, so a global key-anchored
-      // replace is exact.
-      return text.replace(
-        /("version"\s*:\s*")[^"]*(")/g,
-        (_m, a, b) => a + want + b,
-      );
-    },
-  };
-}
-
-/** `metadata:\n  version: 'x.y.z'` inside a SKILL.md YAML frontmatter block. */
-const SKILL_VERSION_RE =
-  /^(metadata:\n[ \t]+version:[ \t]*)(['"]?)([^\n'"]*)\2/m;
-
-function skillVersionTarget(file) {
-  return {
-    file,
-    read() {
-      const m = SKILL_VERSION_RE.exec(frontmatter(read(file)));
-      return [{ label: 'metadata.version', value: m ? m[3] : undefined }];
-    },
-    write(text, want) {
-      const fm = frontmatter(text);
-      if (!SKILL_VERSION_RE.test(fm)) return text;
-      const next = fm.replace(
-        SKILL_VERSION_RE,
-        (_m, head, quote) => `${head}${quote}${want}${quote}`,
-      );
-      return text.replace(fm, next);
-    },
-  };
-}
 
 /**
  * The `[workspace.package]` table of a cargo manifest, as `{ start, text }`
@@ -183,43 +137,8 @@ function cargoPathDepTarget(file) {
   };
 }
 
-/** The text between the leading `---` fence and its closer (empty if absent). */
-function frontmatter(text) {
-  if (!text.startsWith('---\n')) return '';
-  const end = text.indexOf('\n---', 4);
-  return end === -1 ? '' : text.slice(4, end + 1);
-}
-
 function collectTargets() {
-  const targets = [
-    cargoWorkspaceVersionTarget(join(ROOT, 'Cargo.toml')),
-    jsonVersionTarget(join(ROOT, 'poopdeck-ai/.claude-plugin/plugin.json'), [
-      ['version'],
-    ]),
-    jsonVersionTarget(join(ROOT, '.claude-plugin/marketplace.json'), [
-      ['metadata', 'version'],
-      ['plugins', 0, 'version'],
-    ]),
-  ];
-  // Verify changesets' fixed-group promise rather than assuming it. Private
-  // workspace packages may intentionally have a different lifecycle/version.
-  const packagesDir = join(ROOT, 'packages');
-  if (existsSync(packagesDir)) {
-    for (const entry of readdirSync(packagesDir, { withFileTypes: true })
-      .filter((e) => e.isDirectory())
-      .sort((a, b) => a.name.localeCompare(b.name))) {
-      const manifest = join(packagesDir, entry.name, 'package.json');
-      if (!existsSync(manifest)) continue;
-      const pkg = JSON.parse(read(manifest));
-      if (
-        pkg.private === true ||
-        !String(pkg.name).startsWith('@poopdeck.gl/')
-      ) {
-        continue;
-      }
-      targets.push(jsonVersionTarget(manifest, [['version']]));
-    }
-  }
+  const targets = [cargoWorkspaceVersionTarget(join(ROOT, 'Cargo.toml'))];
   // Every workspace member's internal path-deps, in a stable order.
   const cratesDir = join(ROOT, 'crates');
   if (existsSync(cratesDir)) {
@@ -230,22 +149,15 @@ function collectTargets() {
       if (existsSync(manifest)) targets.push(cargoPathDepTarget(manifest));
     }
   }
-  const skillsDir = join(ROOT, 'poopdeck-ai/skills');
-  if (existsSync(skillsDir)) {
-    for (const entry of readdirSync(skillsDir, { withFileTypes: true })
-      .filter((e) => e.isDirectory())
-      .sort((a, b) => a.name.localeCompare(b.name))) {
-      const skill = join(skillsDir, entry.name, 'SKILL.md');
-      if (existsSync(skill)) targets.push(skillVersionTarget(skill));
-    }
-  }
   return targets;
 }
 
 // ---------------------------------------------------------------------------
 
 const want = canonicalVersion();
-console.log(`canonical version: ${want}  (packages/core/package.json)\n`);
+console.log(
+  `canonical version: ${want}  ([workspace.package] in Cargo.toml)\n`,
+);
 
 let drift = 0;
 let updated = 0;

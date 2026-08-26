@@ -6,10 +6,14 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](./LICENSE)
 [![MSRV](https://img.shields.io/crates/msrv/spatiotemporal-tiles?label=msrv)](./Cargo.toml)
 
-**STT** is the open format and Rust toolchain. **poopdeck.gl** is the TypeScript
-rendering ecosystem and [live showcase](https://poopdeck.gl). Together they
-turn GeoParquet, PostGIS, or DuckDB data into interactive points, paths,
-polygons, trips, flows, and events over time.
+**STT** is the open format and Rust toolchain — this repository.
+**[poopdeck.gl](https://github.com/BertCh/poopdeck.gl)** is the TypeScript
+rendering ecosystem and [live showcase](https://poopdeck.gl). Together they turn
+GeoParquet, PostGIS, or DuckDB data into interactive points, paths, polygons,
+trips, flows, and events over time. They live apart on purpose, and the seam
+between them is the archive on disk: a format change reaches every renderer at
+once, and a renderer change needs no format release
+([the split record](./docs/roadmap/repo-split-2026-08.md)).
 
 An archive is a small `manifest.json`, a compact directory, and immutable,
 content-addressed packs. A client requests only the spatial tiles and time
@@ -32,65 +36,16 @@ to individual records rather than immutable published snapshots. See
 
 ## Quick start
 
-The fastest thing that moves is the
-[five-minute Quickstart](./docs/intro/quickstart.md): a hosted dataset, half a
-million streaming earthquakes, and an animated map inside an ordinary app — no
-account, no tile server, and no Rust toolchain. It comes in React and
-vanilla-JS variants, and is the recommended front door.
+If you want to _see_ one first, the
+[five-minute Quickstart](https://poopdeck.gl/docs/intro/quickstart) renders a
+hosted dataset — half a million streaming earthquakes — inside an ordinary app,
+with no account, no tile server and no Rust toolchain. It is the recommended
+front door, and it needs nothing from this repository.
 
-### Render a hosted dataset
+To _build_ one, read on.
 
-`@poopdeck.gl/*` peer-depends on deck.gl and does **not** install it for you.
-Pin the whole deck.gl + luma.gl graph to one 9.3.x minor:
+### Build an archive
 
-```bash
-npm install @poopdeck.gl/layers @poopdeck.gl/playback \
-  @deck.gl/core@^9.3 @deck.gl/layers@^9.3 @deck.gl/geo-layers@^9.3 \
-  @deck.gl/mesh-layers@^9.3 @deck.gl/aggregation-layers@^9.3 \
-  @deck.gl/extensions@^9.3 \
-  @luma.gl/core@^9.3 @luma.gl/engine@^9.3
-```
-
-```typescript
-import { Deck } from '@deck.gl/core';
-import { AnimatedPointLayer } from '@poopdeck.gl/layers';
-import { SttPlayer } from '@poopdeck.gl/playback';
-
-// A public, CORS-enabled archive: USGS M4.0+ events, 2020-2024.
-const DATA = 'https://tiles.poopdeck.gl/data/earthquakes-v2/manifest.json';
-const TIME_RANGE = {
-  start: Date.parse('2020-01-01T00:00:00Z'),
-  end: Date.parse('2024-12-30T23:56:29Z'),
-};
-
-const player = new SttPlayer({
-  timeRange: TIME_RANGE,
-  baseRate: (TIME_RANGE.end - TIME_RANGE.start) / 60_000, // 5 years in ~60 s
-  loop: true,
-});
-
-const layer = new AnimatedPointLayer({
-  id: 'events',
-  data: DATA,
-  timeController: player.timeController,
-  timeWindow: 30 * 86_400_000,
-  radius: 'magnitude', // any prop that takes a constant also takes a column
-  onTilesetReady: (tileset) => player.setSource(tileset),
-  onBufferChange: (runway) => player.notifyBufferChange(runway),
-});
-
-new Deck({ layers: [layer] });
-player.play();
-```
-
-`SttPlayer` connects the clock to the loading runway so playback buffers instead
-of skipping unloaded time. See the
-[player](./docs/api/stt-player.md) and
-[layer](./docs/api/spatiotemporal-layer.md) references for the complete API.
-
-### Build your own archive
-
-Your own data is where the Rust toolchain comes in;
 [From CSV to an Animated Map](./docs/guides/csv-quickstart.md) is the complete
 tutorial. The short version:
 
@@ -127,23 +82,37 @@ The installed package provides five CLIs:
 | `stt-bundle`   | Pack or unpack a single-file `.sttb` interchange file  |
 | `stt-serve`    | Serve STT tiles dynamically from a live database       |
 
-`stt-generate` is a separate, repository-only tool for rebuilding showcase
-datasets; it lives in [`tools/stt-generate`](./tools/stt-generate).
+`stt-generate` is a separate, repository-only tool for rebuilding the reference
+datasets; it lives in [`tools/stt-generate`](./tools/stt-generate) and has its
+own cargo workspace.
+
+### Render it
+
+Rendering is [poopdeck.gl](https://github.com/BertCh/poopdeck.gl): seven
+published `@poopdeck.gl/*` packages with deck.gl, Three.js/WebGPU, MapLibre and
+Cesium backends, a playback clock, and React bindings. An archive built here
+streams into any of them unchanged — the manifest is the whole contract.
+
+```bash
+npm install @poopdeck.gl/layers @poopdeck.gl/playback
+```
 
 ## How the pieces fit
 
 ```text
-GeoParquet / PostGIS / DuckDB
-            │
-            ├─ stt-build ──────> static packed archive ──> CDN/object storage
-            └─ stt-serve ──────> dynamic tile endpoint
-                                      │
-                                      v
-                            @poopdeck.gl/core
-                                      │
-                    deck.gl / Three.js / MapLibre
-                                      │
-                              playback + React UI
+   ─── this repository ─────────────┐  ─── poopdeck.gl ──────────────
+                                    │
+GeoParquet / PostGIS / DuckDB       │
+            │                       │
+            ├─ stt-build ──> static packed archive ──> CDN/object storage
+            └─ stt-serve ──> dynamic tile endpoint
+                                    │            │
+                                    │            v
+                                    │    @poopdeck.gl/core
+                                    │            │
+                                    │  deck.gl / Three.js / MapLibre / Cesium
+                                    │            │
+                                    │    playback + React UI
 ```
 
 The archive manifest is the contract. It declares the temporal model,
@@ -155,15 +124,18 @@ and must never be rewritten in place.
 
 The current release line is **0.7.0** and remains pre-1.0. Writers produce
 packed format v3 with directory codec v6; reference readers also open published
-format-v2/directory-v5 archives read-only. The deck.gl integration targets the
-pinned 9.3.x line.
+format-v2/directory-v5 archives read-only.
+[`project-status.json`](./project-status.json) is the machine-readable version
+of that paragraph, and every field in it is proved against its source by a CI
+gate.
 
-Seven `@poopdeck.gl/*` packages are published: `core`, `layers`, `playback`,
-`react`, `three`, `maplibre`, and `mcp`. The Cesium backend is private,
-source-only, and experimental. See
-[Status, support, and compatibility](./docs/intro/status-and-support.md) before
-depending on a pre-1.0 API or alternate renderer, and the
-[project changelog](./CHANGELOG.md) before upgrading.
+> Since the 2026-08-26 split, the crates.io and npm version numbers are **not**
+> in lockstep. They agree at 0.7.0 by history, not by promise; what relates the
+> two stacks is the archive's `formatVersion`.
+
+See [Status, support, and compatibility](https://poopdeck.gl/docs/intro/status-and-support)
+before depending on a pre-1.0 API, and the [project changelog](./CHANGELOG.md)
+before upgrading.
 
 ## Documentation
 
@@ -172,29 +144,34 @@ depending on a pre-1.0 API or alternate renderer, and the
 - [Choose a deployment, backend, and layer](./docs/intro/choosing.md)
 - [System overview](./docs/architecture/system-overview.md)
 - [CLI reference](./docs/api/cli-reference.md)
-- [Packed-format specification](./docs/spec/stt-packed-format.md)
+- [Packed-format specification](./docs/spec/stt-packed-format.md) and
+  [conformance vectors](./conformance/README.md)
 - [Deployment guide](./docs/guides/deploying.md)
-- [Live demos](https://poopdeck.gl/demos)
+- [Renderer documentation](https://poopdeck.gl/docs) ·
+  [Live demos](https://poopdeck.gl/demos)
+
+The published site serves this repository's pages and the renderer's together;
+several of the pages above are authored here and vendored downstream so there is
+one copy of each.
 
 AI coding agents should start with [`AGENTS.md`](./AGENTS.md). It contains the
 repository map, invariant rules, and routing table to canonical documentation.
 
 ## Development and contributing
 
-The root is a Cargo and pnpm workspace. The common verification commands are:
+The root is a Cargo workspace. The common verification commands are:
 
 ```bash
 cargo test --workspace
-pnpm install
-pnpm --filter @poopdeck.gl/core build
-pnpm --filter @poopdeck.gl/core test
-pnpm --filter @poopdeck.gl/layers build
-```
+cargo test --workspace --all-features     # incl. duckdb, postgres, projection
+cargo fmt --all -- --check
 
-The showcase generator has its own Rust workspace:
-
-```bash
+# The reference-dataset generator has its own workspace.
 cargo test --manifest-path tools/stt-generate/Cargo.toml
+
+# Repository gates (Node; no packages are built here)
+pnpm install
+pnpm project:check && pnpm docs:links && pnpm versions:check && pnpm citations
 ```
 
 Read [CONTRIBUTING.md](./CONTRIBUTING.md) before submitting a change. Project

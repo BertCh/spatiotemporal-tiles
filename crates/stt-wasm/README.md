@@ -1,7 +1,7 @@
 # stt-wasm
 
 > **Status: experimental and repository-only.** See the
-> [support policy](../../docs/intro/status-and-support.md).
+> [support policy](https://github.com/BertCh/poopdeck.gl/blob/main/docs/intro/status-and-support.md).
 
 WebAssembly decoder for the **SpatioTemporal Tiles (STT)** packed format:
 open a `manifest.json` from bytes, list tiles, decode a tile blob to Arrow
