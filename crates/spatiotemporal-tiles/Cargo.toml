@@ -46,9 +46,9 @@ required-features = ["serve-core"]
 
 [dependencies]
 # The reader/format core is always present (the facade is useless without it).
-stt-core = { path = "../stt-core", version = "0.7.0" }
-stt-build = { path = "../stt-build", version = "0.7.0", optional = true }
-stt-optimize = { path = "../stt-optimize", version = "0.7.0", optional = true }
+stt-core = { path = "../stt-core", version = "0.8.0" }
+stt-build = { path = "../stt-build", version = "0.8.0", optional = true }
+stt-optimize = { path = "../stt-optimize", version = "0.8.0", optional = true }
 
 # CLI support (feature `cli-core`).
 anyhow = { workspace = true, optional = true }

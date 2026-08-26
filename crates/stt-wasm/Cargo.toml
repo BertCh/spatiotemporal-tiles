@@ -31,7 +31,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # The whole point: this crate adds NO decoding logic of its own. Every byte is
 # parsed by the same stt-core code paths the CLI uses.
-stt-core = { path = "../stt-core", version = "0.7.0" }
+stt-core = { path = "../stt-core", version = "0.8.0" }
 arrow = { workspace = true }
 serde_json.workspace = true
 # Manifest schema templates ride the manifest base64-encoded and are validated

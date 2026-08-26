@@ -3,7 +3,7 @@
   "schemaVersion": 2,
   "updated": "2026-08-26",
   "release": {
-    "rust": "0.7.0"
+    "rust": "0.8.0"
   },
   "toolchain": {
     "rust": "1.88"

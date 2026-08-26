@@ -3242,7 +3242,7 @@ dependencies = [
 
 [[package]]
 name = "spatiotemporal-tiles"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arrow 59.2.0",
@@ -3323,7 +3323,7 @@ dependencies = [
 
 [[package]]
 name = "stt-build"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arrow 59.2.0",
@@ -3352,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "stt-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arrow 59.2.0",
  "base64 0.22.1",
@@ -3377,7 +3377,7 @@ dependencies = [
 
 [[package]]
 name = "stt-optimize"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arrow 59.2.0",
@@ -3396,7 +3396,7 @@ dependencies = [
 
 [[package]]
 name = "stt-wasm"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arrow 59.2.0",
  "base64 0.22.1",
