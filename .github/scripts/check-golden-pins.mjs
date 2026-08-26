@@ -483,7 +483,16 @@ export function relocationClaims(message) {
     }));
 }
 
-/** `{ <path relative to root>: <blob sha> }` for one tree at one ref. */
+/**
+ * `{ <path relative to root>: <blob sha> }` for one tree at one ref, counting
+ * only the PINS.
+ *
+ * The `NOT_A_PIN` filter is what keeps this coherent with `isPinnedPath`: a
+ * relocation claims the byte pins moved unchanged, and a fixture's README is
+ * not one of them. Without the filter, correcting a vector's own explanation in
+ * the same commit that moves it would read as "the bytes are not identical" —
+ * which is how this was found.
+ */
 function treeBlobs(repo, ref, root) {
   let out;
   try {
@@ -506,6 +515,7 @@ function treeBlobs(repo, ref, root) {
     const sha = trimmed.slice(0, sp);
     const path = trimmed.slice(sp + 1);
     if (path === root || !path.startsWith(`${root}/`)) continue;
+    if (NOT_A_PIN.test(path)) continue;
     map.set(path.slice(root.length + 1), sha);
   }
   return map.size === 0 ? null : map;

@@ -190,10 +190,7 @@ describe('isPinnedPath', () => {
       isPinnedPath('crates/stt-build/tests/expected-hashes.json'),
       true,
     );
-    assert.equal(
-      isPinnedPath('poopdeck:tools/bench/not-expected-hashes.json'),
-      false,
-    );
+    assert.equal(isPinnedPath('tools/bench/not-expected-hashes.json'), false);
   });
 
   test('non-string and empty input is not pinned', () => {
@@ -627,7 +624,7 @@ describe('Pin-Relocation — a verified declaration, not a trusted one', () => {
   // path does not exist; the commit under test creates the new one. That is
   // what makes the additions pinned and the deletions not, which is exactly
   // the asymmetry a relocation has to survive.
-  const OLD_DIR = 'poopdeck:packages/core/test/fixtures';
+  const OLD_DIR = 'packages/core/test/fixtures';
 
   function makeRelocationRepo() {
     const repo = mkdtempSync(join(tmpdir(), 'golden-pins-reloc-'));
@@ -694,6 +691,27 @@ describe('Pin-Relocation — a verified declaration, not a trusted one', () => {
     const r = runGate(repo, ['--base', base]);
     assert.equal(r.status, 1);
     assert.match(r.stderr, /moved a golden byte pin/);
+  });
+
+  test('correcting a README in the same commit does not break the claim', () => {
+    // A fixture's README explains the vector beside it, and the move is the
+    // natural moment to fix a path it names. Prose is not a pin, so this is a
+    // clean relocation — not a byte change wearing one.
+    // The base for this case is the commit that ADDS the README, not the seed.
+    const { repo } = makeRelocationRepo();
+    writeFile(repo, `${OLD_DIR}/README.md`, '# vectors\n\nold text\n');
+    git(repo, ['add', '-A']);
+    git(repo, ['commit', '-q', '-m', 'docs: explain the vectors']);
+    const withReadme = git(repo, ['rev-parse', 'HEAD']).trim();
+    relocate(repo);
+    writeFile(
+      repo,
+      `${VECTORS_DIR}/README.md`,
+      '# vectors\n\ncorrected text\n',
+    );
+    commit(repo, `refactor: rehome the vectors\n\n${TRAILER}\n`);
+    const r = runGate(repo, ['--base', withReadme]);
+    assert.equal(r.status, 0, r.stderr);
   });
 
   test('a move that also changes a byte is rejected, and says so', () => {
