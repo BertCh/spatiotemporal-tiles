@@ -21,14 +21,22 @@ repository = "https://github.com/BertCh/spatiotemporal-tiles"
 homepage = "https://github.com/BertCh/spatiotemporal-tiles"
 # Empirically verified MSRV for the four PUBLISHED crates; enforced by the CI
 # msrv job. Bisected with `cargo +<v> check -p stt-core -p stt-build
-# -p stt-optimize -p spatiotemporal-tiles`:
+# -p stt-optimize -p spatiotemporal-tiles --locked`:
 #   1.82  — Cargo cannot even parse arrow-schema 59's manifest (edition 2024).
 #   1.85/1.86 — `u64::is_multiple_of` (stt-build/src/input.rs) is still unstable.
-#   1.87  — first version that compiles all four. ← this value
-# It used to read 1.88 only because stt-generate was a workspace member and its
-# home→osmpbf / delaunator deps demanded that; the generator now lives in its
-# own workspace at tools/stt-generate and keeps its own 1.88 there.
-rust-version = "1.87"
+#   1.87  — compiles our own code, but cargo refuses the LOCKED tree:
+#           "geo@0.33.1 requires rustc 1.88".
+#   1.88  — first version that resolves and compiles all four. ← this value
+#
+# It read 1.87 from 2026-08-24 (when stt-generate left the workspace, taking its
+# home→osmpbf / delaunator floor with it) until 2026-08-26, and that was WRONG
+# the whole time: `geo` 0.33 had already raised its own floor to 1.88, so
+# `cargo install spatiotemporal-tiles` on 1.87 failed with a resolver error
+# while the manifest promised it would work. The CI msrv job had been reporting
+# it since; nobody was reading the runs (see the T2 correction in
+# docs/roadmap/README.md). An MSRV is a promise to `cargo install` users — it
+# has to be bisected against the LOCKFILE, not just against our own source.
+rust-version = "1.88"
 
 [workspace.dependencies]
 # Core dependencies

@@ -42,7 +42,7 @@ are bins inside `spatiotemporal-tiles` and are feature-gated (a bare
 
 ## Setup
 
-- **Rust 1.87+** — the MSRV in `[workspace.package]`, enforced by a CI job that
+- **Rust 1.88+** — the MSRV in `[workspace.package]`, enforced by a CI job that
   checks the four published crates on exactly that toolchain.
 - **Node 24+** and **pnpm**, for the repository gates only — nothing is built or
   published from `package.json`. The Node major is pinned by `.node-version` and

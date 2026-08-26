@@ -355,19 +355,36 @@ and every downstream package manifest now name. Every ordering constraint that
 once made this awkward is discharged. **Accept:** both repositories exist and
 are public, and `sync-stt.mjs`'s tarball fetch resolves without credentials.
 
-**T2. GitHub Actions has never run; the CI gates are config that only ever
-executed by hand.** Zero bot commits across the repo's history and no release PR.
-_(Not re-verifiable here: no `gh` CLI in this environment. Last verified
-2026-07-24.)_ `ci.yml` now carries `cargo fmt --check`, the curated clippy deny
-set, `oxlint` and `oxfmt --check` — the older claim that the gates were
-"deliberately absent" no longer describes the file. Running every job locally on
-2026-07-31 found **four red**, each invisible to `cargo test --workspace`:
-`rust-feature-lanes` (3 of 6), `rust-all-features`, `rust-lint` (2 files) and
-`ts-lint` (11 files). All are fixed. The durable half of that finding — that two
-DB input adaptors sit behind non-default features where the default suite will
-never report a shared-type change — lives in
-[db-input-adaptors.md §5](./db-input-adaptors.md). **Accept:** one green run on
-GitHub's own runners.
+**T2 (corrected 2026-08-26). GitHub Actions HAS run — 174 times — and has been
+failing.** The claim this item carried for a month ("never run; the CI gates are
+config that only ever executed by hand", inferred from zero bot commits and no
+release PR, and explicitly marked not-re-verifiable without a `gh` CLI) was
+**wrong**. Reading the API on 2026-08-26, the day the repository went public,
+found 174 runs on this repo and a standing red on `CI` going back through
+`0e34c76`, `17989df` and earlier. The correct diagnosis was never "the gates do
+not run" but "nobody was reading the runs", which is worse: the gates were
+reporting real defects into an empty room.
+
+Two were open at the split, both pre-existing and both now fixed:
+
+- **`rust-msrv` red since `geo` 0.33 raised its floor.** `Cargo.toml` promised
+  `rust-version = 1.87` while the locked tree needed 1.88, so
+  `cargo install spatiotemporal-tiles` on 1.87 failed a resolver check the
+  manifest said would pass. An MSRV is a promise to installers; bisect it
+  against the **lockfile**, not just against our own source.
+- **`rust` (default features) died in the linker**, `ld terminated with signal
+7 [Bus error]` — the same 7 GB-runner OOM the all-features lane had already
+  documented and worked around with `CARGO_PROFILE_*_DEBUG: '0'`. The workaround
+  reached that lane as the suite grew; it now carries it too.
+
+The 2026-07-31 local run's durable half stands: two DB input adaptors sit behind
+non-default features where the default suite will never report a shared-type
+change ([db-input-adaptors.md §5](./db-input-adaptors.md)).
+
+**Accept:** one fully green run on GitHub's own runners, on both repositories.
+poopdeck.gl reached this on 2026-08-26, its first run
+(`CI` green on `e4be376`); this repository's remaining lanes are re-running with
+the two fixes above.
 
 ### K — Known defects with a named fix
 

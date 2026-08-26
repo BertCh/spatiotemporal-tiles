@@ -6,7 +6,7 @@
     "rust": "0.7.0"
   },
   "toolchain": {
-    "rust": "1.87"
+    "rust": "1.88"
   },
   "archive": {
     "writes": {
@@ -19,14 +19,37 @@
     }
   },
   "commands": [
-    { "name": "stt-build", "support": "stable" },
-    { "name": "stt-optimize", "support": "stable" },
-    { "name": "stt-validate", "support": "stable" },
-    { "name": "stt-bundle", "support": "preview" },
-    { "name": "stt-serve", "support": "preview" }
+    {
+      "name": "stt-build",
+      "support": "stable"
+    },
+    {
+      "name": "stt-optimize",
+      "support": "stable"
+    },
+    {
+      "name": "stt-validate",
+      "support": "stable"
+    },
+    {
+      "name": "stt-bundle",
+      "support": "preview"
+    },
+    {
+      "name": "stt-serve",
+      "support": "preview"
+    }
   ],
   "repositoryOnlyCommands": [
-    { "name": "stt-generate", "support": "experimental" }
+    {
+      "name": "stt-generate",
+      "support": "experimental"
+    }
   ],
-  "otherSurfaces": [{ "name": "stt-wasm", "support": "experimental" }]
+  "otherSurfaces": [
+    {
+      "name": "stt-wasm",
+      "support": "experimental"
+    }
+  ]
 }

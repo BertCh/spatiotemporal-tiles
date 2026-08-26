@@ -16,6 +16,13 @@ jobs:
       # Default features = what `cargo install` users get.
       - name: cargo test --workspace
         run: cargo test --workspace --locked
+        env:
+          # Same linker OOM the all-features lane documents below: several test
+          # binaries link concurrently and ld dies with SIGBUS ("signal 7, core
+          # dumped") under full debuginfo on the 7 GB runner. It reached this
+          # lane too as the test suite grew. Debuginfo is useless in CI.
+          CARGO_PROFILE_DEV_DEBUG: '0'
+          CARGO_PROFILE_TEST_DEBUG: '0'
 
   rust-all-features:
     name: Rust (cargo test, all features)
@@ -130,7 +137,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Keep in sync with [workspace.package] rust-version in Cargo.toml.
-      - uses: dtolnay/rust-toolchain@1.87
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       # The MSRV is a promise to `cargo install` users, so it covers exactly
       # the crates they can install — naming them beats `--workspace`, which

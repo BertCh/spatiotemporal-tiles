@@ -7,7 +7,7 @@ was counted out. Behavior of the CLIs themselves lives in
 > **Status note (2026-08-24).** This is a decision record, so dated registry
 > observations below are retained as history. For the current release procedure,
 > use [CONTRIBUTING.md](../../CONTRIBUTING.md#releasing). The checked-in manifests
-> currently define Rust **0.7.0** with MSRV **1.87**, seven public
+> currently define Rust **0.7.0** with MSRV **1.88**, seven public
 > `@poopdeck.gl/*` packages at **0.7.0**, and the private experimental Cesium
 > package at **0.5.0**. Rust crates are published manually in dependency order;
 > cargo-dist binaries require a `v{version}` tag followed by a manual **Release**
@@ -78,8 +78,12 @@ The Rust side was **behind**: crates.io `spatiotemporal-tiles` max_version was
 - Rust tag: `v{version}` (created manually; cargo-dist consumes it when the
   Release workflow is dispatched). npm tags are changesets-style
   `@poopdeck.gl/pkg@x.y.z`. No overlap.
-- MSRV: `rust-version = 1.87`, enforced by the CI `rust-msrv` job. The old 1.88
-  floor belonged to `stt-generate` before it moved to its own workspace.
+- MSRV: `rust-version = 1.88`, enforced by the CI `rust-msrv` job. It briefly
+  read 1.87 (2026-08-24 to 2026-08-26, after `stt-generate` took its
+  home→osmpbf floor into its own workspace) and that was wrong: `geo` 0.33 had
+  already raised its own floor, so the locked tree needed 1.88 and
+  `cargo install` on 1.87 failed a resolver check the manifest said would pass.
+  Bisect an MSRV against the **lockfile**, not just against our own source.
 
 ## Historical release defect — the lockstep was broken
 
@@ -206,7 +210,7 @@ to name as a trusted publisher.
 - `rust-feature-lanes`: facade `serve-postgres` / `serve-duckdb` / `cli` solo
   compiles + stt-build `--no-default-features`.
 - `rust-all-features`: tests (not just builds) the full feature surface.
-- `rust-msrv`: `cargo check --workspace` on 1.87.
+- `rust-msrv`: `cargo check --workspace` on 1.88.
 
 ## Explicit non-goals (counted out, with revival triggers)
 
