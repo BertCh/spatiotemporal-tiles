@@ -8,7 +8,7 @@
 //! the cheapest way to put the reader where a *third-party* consumer can
 //! reach it: a Python notebook, a Go or C++ host, a future GDAL or Martin
 //! path. Every one of those already knows how to read Arrow IPC, and none of
-//! them is going to port a v5 varint directory.
+//! them is going to port a v6 varint directory.
 //!
 //! So the whole API is three moves — open a manifest, list tiles, decode a
 //! tile blob to Arrow IPC — and it adds no decoding logic of its own: see

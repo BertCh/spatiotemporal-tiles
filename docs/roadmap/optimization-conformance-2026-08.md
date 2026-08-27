@@ -11,23 +11,30 @@ _House-rules note: this is a decision record, not a schedule. Open work still li
 
 ## 1. Headline
 
-**66 of the 68 work items are implemented and tested. 2 are not started.**
+**67 of the 68 work items are implemented and tested. 1 is not started.**
 
-| Section                                 | Items        | Landed                               |
-| --------------------------------------- | ------------ | ------------------------------------ |
-| §1 Phase 0 — measurement infrastructure | P0-1 … P0-8  | **8 / 8**                            |
-| §2 M5 — client cost-oracle              | CO-1 … CO-7  | **7 / 7**                            |
-| §3 M6 — byte-honest budgets             | BH-1 … BH-10 | **10 / 10**                          |
-| §4 M1 + M3 — oracle v2, `--target-size` | MO-1 … MO-9  | **9 / 9**                            |
-| §5 M4 — workload model                  | WM-1 … WM-3  | **3 / 3**                            |
-| §5 M4 — storage-layout DPs              | WM-4 … WM-6  | **3 / 3**                            |
-| §6 M7 — semantic honesty                | SH-1 … SH-6  | **6 / 6**                            |
-| §7 M2 — two-pass build                  | TB-1 … TB-6  | **6 / 6** (TB-5 inert, see §4)       |
-| §7 — the §4 builder batch + re-pin      | TB-7 … TB-14 | **7 / 8** (TB-7 … TB-13; TB-14 held) |
-| §8 M8 — declared tiers                  | DT-1 … DT-5  | **4 / 5** (DT-1, DT-2, DT-4, DT-5)   |
-| §8 — frustum selection                  | FS-1 … FS-3  | **3 / 3**                            |
+_Updated 2026-08-26: TB-14 (the golden re-pin) was executed in commit `d5163aa` with a `Rebuild-Window: R1`
+trailer, taking the count from 66 to 67. DT-3 is the remaining item._
+
+| Section                                 | Items        | Landed                                  |
+| --------------------------------------- | ------------ | --------------------------------------- |
+| §1 Phase 0 — measurement infrastructure | P0-1 … P0-8  | **8 / 8**                               |
+| §2 M5 — client cost-oracle              | CO-1 … CO-7  | **7 / 7**                               |
+| §3 M6 — byte-honest budgets             | BH-1 … BH-10 | **10 / 10**                             |
+| §4 M1 + M3 — oracle v2, `--target-size` | MO-1 … MO-9  | **9 / 9**                               |
+| §5 M4 — workload model                  | WM-1 … WM-3  | **3 / 3**                               |
+| §5 M4 — storage-layout DPs              | WM-4 … WM-6  | **3 / 3**                               |
+| §6 M7 — semantic honesty                | SH-1 … SH-6  | **6 / 6**                               |
+| §7 M2 — two-pass build                  | TB-1 … TB-6  | **6 / 6** (TB-5 wired 2026-08, see §6)  |
+| §7 — the §4 builder batch + re-pin      | TB-7 … TB-14 | **8 / 8** (TB-14 executed in `d5163aa`) |
+| §8 M8 — declared tiers                  | DT-1 … DT-5  | **4 / 5** (DT-1, DT-2, DT-4, DT-5)      |
+| §8 — frustum selection                  | FS-1 … FS-3  | **3 / 3**                               |
 
 ## 2. Test state
+
+_Dated snapshot, 2026-08-11. The `@poopdeck.gl/*` rows moved to the poopdeck.gl register with the
+packages in the 2026-08-26 split and are no longer this repository's to run; the numbers stay as
+evidence. This repository's current recorded baseline is in [the backlog](./README.md)._
 
 | Target                                    | Result                     | Baseline at session start |
 | ----------------------------------------- | -------------------------- | ------------------------- |
@@ -42,11 +49,16 @@ _House-rules note: this is a decision record, not a schedule. Open work still li
 **Zero regressions.** The 22 TypeScript failures are the pre-existing `tileKey` `#<variant>` drift
 from in-flight work that predates this program; they are unchanged and were never absorbed.
 
-The single Rust failure is `v2_golden::v2_build_is_byte_identical_to_golden`, and it is **the
+The single Rust failure was `v2_golden::v2_build_is_byte_identical_to_golden`, and it was **the
 intended signal**, not a defect: the M2 encoder changes moved archive bytes and the committed golden
-corpus has deliberately _not_ been re-blessed. Regeneration happens exactly once, under item TB-14
-inside rebuild window R1, with a `Rebuild-Window: R1` commit trailer — which the Phase 0 gate
-(`.github/scripts/check-golden-pins.mjs`) now enforces mechanically.
+corpus had deliberately not been re-blessed.
+
+_TB-14 executed in commit `d5163aa` (`Rebuild-Window: R1`): the golden corpus is re-blessed at
+`formatVersion` 3 and `v2_golden` is green — 3 passed, 0 failed, 1 ignored, with
+`regenerate_v2_golden` now ignored because "fixture regeneration replaces the formatVersion-3
+byte-stability pin". A new `golden_fixture_exercises_the_pinned_path` passes beside it, and
+`node .github/scripts/check-golden-pins.mjs` is clean. §6.2 and §6.3 below were closed in the same
+pass; §6.1's reader-side half remains open._
 
 ## 3. Defects found in the source documents
 
@@ -127,7 +139,8 @@ resumed — quietly implementing one of those five would be a register violation
 ## 5. What is NOT implemented
 
 - **DT-3** — M4/MinMaxLTTB reduced tiers. Trigger needs route-level QoE captures.
-- **TB-14** — the golden re-pin. Deliberately not run; see §2. It is also _blocked_ on §6.1–6.3.
+
+_TB-14 is no longer on this list: it was executed in commit `d5163aa`; see §2._
 
 ### Landed directly (not via the agent fleet)
 
@@ -230,9 +243,12 @@ owed work is the _evaluation_, not the feature. Partial evidence gathered:
   cannot open the archive because it is `formatVersion 2` and the working-tree reader is v3.
   Measuring it requires a local v3 rebuild first.
 - **DT-3 (reduced temporal tiers)** and **DT-5 (interval segregation)** — triggers unevaluated; both
-  need route-level QoE captures that the v2/v3 skew blocks.
-- **DT-1 (the tier-declaration spec)** and **DT-4 (the scrub decision)** are not trigger-gated and are
-  simply not started.
+  need route-level QoE captures. _The v2/v3 skew that blocked them is discharged (2026-08-14, see §7);
+  what remains is that the capture harnesses live in the poopdeck.gl repository._
+- **DT-4 (the scrub decision)** is not trigger-gated, but its keep-vs-delete evidence is P0-5's
+  measurement, which runs downstream — so the owed work is the measurement, not the feature. **DT-1
+  is landed**, not "not started": see "Landed directly" above and
+  `crates/stt-core/src/metadata.rs:267, :283, :320, :406, :811, :841`.
 
 ## 6. Open defects in what DID land
 
@@ -251,16 +267,17 @@ Ranked by consequence. These are real and should be closed before R1 is run.
    _Still open:_ reader-side array-identity sharing in `poopdeck:packages/core/src/tile.ts`
    (`sharedArrayIdentityHits` was 0), and the `manifest.json` growth (10,353 B → 291,589 B, +2,716 %)
    on a startup-blocking un-ranged fetch. Re-measure the heap delta after both.
-2. **TB-5 is inert.** `apply_synthetic_row_ids` / `IdRenumber` have no call site outside
-   `arrow_tile/layer.rs`. The APIs and their proofs (cross-tile identity, per-tile uniqueness, a
-   proptest over random clipping splits) are correct; nothing calls them. ⚠️ Wiring it naively is
-   unsafe: the guard that a **mixed** layer stays `Keyed` belongs in `build_point_layer`
-   (`crates/stt-build/src/columnar.rs`) and **was never written**, and TB-5's own test documents a
-   live pre-existing collision (explicit source id `5` vs synthetic row index `5`).
-3. **The golden fixtures cannot see M2.** `v2_golden.rs:95` and `make-golden-fixture.rs:50` both
-   build from `..EncoderConfig::default()` ⇒ `global_pins: None` ⇒ they encode on the incumbent
-   per-tile path. TB-14 must make the generator exercise pins _before_ regenerating, or it will
-   re-bless bytes that pin nothing new.
+2. ~~**TB-5 is inert.**~~ **Closed.** `build_point_layer` now calls
+   `layer.apply_synthetic_row_ids_for(origin)` (`crates/stt-build/src/columnar.rs:394`) under
+   `opts.synthetic_point_row_ids`, so ids are numbered after the sort and a synthetic point layer
+   stores `0, 1, .., n-1`; `--single-pass` is the rollback. The mixed-layer guard that was "never
+   written" is `warn_mixed_point_id_collision` (columnar.rs:370), reached only when a `Keyed` layer
+   also minted synthetic ids — which is exactly the pre-existing collision TB-5's test documented.
+3. ~~**The golden fixtures cannot see M2.**~~ **Closed before TB-14 ran.** Both the generator and the
+   test now pass `global_pins` explicitly rather than by default
+   (`crates/stt-core/examples/make-golden-fixture.rs:79`, `crates/stt-core/tests/v2_golden.rs:132`),
+   each with the reason in a doc comment, and `golden_fixture_exercises_the_pinned_path` pins that
+   they do — the direct refutation of "the fixture would look the same".
 4. **`encode.rs` hoist edge, unmeasured.** Hoisting requires
    `dict_columns == pinned_dict_columns`; a layer mixing a pinned column with an unpinned one that
    the per-tile surrogate dictionary-encodes falls back to `DictHoist::Tail`, shipping the full
@@ -276,7 +293,10 @@ Ranked by consequence. These are real and should be closed before R1 is run.
   `PACKED_FORMAT_VERSION` to 3 behind a strict-equality gate while HEAD, all 64 local showcase
   archives, and the 68-archive fleet are v2 — so the working-tree reader opens none of them. The
   Rust side has the same shape (an uncommitted non-defaulted `Manifest.variants`). This blocked every
-  browser-side instrument until archives were rebuilt locally at v3.
+  browser-side instrument until archives were rebuilt locally at v3. _Discharged 2026-08-14: the fleet
+  migrated container-only to v3 — 59/59 datasets synced and probed, all serving `formatVersion: 3` +
+  directory v6 + a variants registry, client deployed first (see [the backlog](./README.md), entry B4);
+  `crates/stt-core/src/pack/mod.rs:63` is committed at 3._
 - **The `bench-regression` CI job has been dead since the transcode-removal campaign.** Its baseline
   `poopdeck:tools/bench/baselines/earthquakes-ci.stt` is a legacy single-file container (`STT\x04`) that the
   packed-only reader tries to JSON-parse; `poopdeck:tools/bench/src/index.mjs` also rejects a packed directory
@@ -311,9 +331,8 @@ acceptance.
 
 ## 9. What a human must still do
 
-- **Decide the golden re-pin (TB-14).** The tree currently carries one intentional red. Re-pinning
-  requires a reviewed commit with a `Rebuild-Window: R1` trailer, and should not happen until §6.1–3
-  are closed.
+- ~~**Decide the golden re-pin (TB-14).**~~ **Done.** Executed in commit `d5163aa` with a
+  `Rebuild-Window: R1` trailer; §6.2 and §6.3 were closed first, and `v2_golden` is green (§2).
 - **The fleet republish is untouched and remains a human decision** (~29.3 GiB / 1,324 objects). No
   agent uploaded, published, or ran an r2-sync script at any point in this program.
 - **Browser-verified aesthetics.** This project requires the maintainer's own in-browser pass; no

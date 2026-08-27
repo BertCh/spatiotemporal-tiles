@@ -4,9 +4,13 @@
 Every AV adapter — ``av_synthetic.py`` (procedural), ``nuscenes_extract.py``,
 ``comma_extract.py``, ``argoverse_extract.py`` — imports this module and emits
 the SAME on-disk "AV scene bundle" so the cockpit + catalog compose without
-collisions. The bundle layout and every column/JSON shape here are governed by
-``docs/roadmap/av-cockpit.md`` (§2 data contract). **Do not deviate from the
-contract silently** — if a shape here is wrong, flag it to the lead.
+collisions. The bundle layout is governed by ``docs/roadmap/av-cockpit.md``
+§1.2 ("The AV scene bundle"); the column schemas, sidecar JSON shapes and
+manifest that §1.2 points at are formalized in ``docs/spec/sidecar-assets.md``,
+which is the source of truth for every shape written here. The georeferencing
+transforms below come from §1.1 ("Why AV logs fit STT — georeferencing").
+**Do not deviate from the contract silently** — if a shape here is wrong, flag
+it to the lead.
 
 A scene bundle lives under ``data-fleet/<sceneId>/``::
 

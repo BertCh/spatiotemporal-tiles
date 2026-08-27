@@ -3,7 +3,7 @@
 > **Re-consolidated 2026-07-24.** Rationale, measured baselines, negative results
 > ("don't relitigate"), counted-out items with revival triggers. Normative
 > behavior lives in [`stt-packed-format.md`](../spec/stt-packed-format.md) and
-> [`cli-reference.md`](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md); this doc never restates it.
+> [`cli-reference.md`](../api/cli-reference.md); this doc never restates it.
 > Absorbs the durable content of `stt-packed.md`, `stt-format-review-2026-07.md`,
 > `stt-packed-v2-design-2026-07.md`, `blob-ordering-heuristic-2026-07.md`,
 > `rust-audit-2026-06.md`, `stt-optimize-intelligence-2026-07.md`,
@@ -107,7 +107,7 @@ session views.
 - **D1 — single level (root + leaf pages), not a tree.** Max fleet directory
   ~560 K entries → ~137 pages at 4096/page → a ~7 KB root. COPC's K-level paging
   earns its keep at 1.2 B points; a flat page table covers this fleet.
-- **D2 — a leaf page is the v5 codec verbatim.** Slicing resets delta state and
+- **D2 — a leaf page is the leaf codec verbatim** (v5 then, v6 now). Slicing resets delta state and
   splits RLE runs at boundaries (+6–19 % at rest); reusing the
   adversarially-tested codec makes the root page the only new bytes.
 - **D3 — page descriptor = geo-bbox, not Hilbert key range (FROZEN by the step-0
@@ -124,6 +124,10 @@ session views.
 - **D5 — `layout: "paged"` discriminates; `directoryVersion` stays 5.** The draft
   bumped to v6, but the leaf codec is unchanged, so layout — not codec version —
   discriminates, and the whole-load path survives for un-migrated datasets.
+  _Status:_ the principle held; "stays 5" describes the packed-v2 moment only.
+  The codec has since bumped to **v6** for the `variant_id` column
+  (`crates/stt-core/src/directory.rs`), and layout still discriminates the
+  container independently of it.
 - **D6 — per-page zstd, NO shared dictionary**, keeping each leaf independently
   fetchable and the dictionary-less fzstd TS path working. Forfeits the
   whole-directory zstd window: **+6–19 % generally, +117 % on earthquakes** (whose
@@ -183,11 +187,12 @@ Every wire-breaking change batched into ONE bump so content addresses churn once
   hold between a `--format-version 1` build and serve.
   _(Overtaken by events: serve now emits **self-contained v2 frames** — inline
   schemas remain its only mode, which is the same reasoning applied to the v2
-  frame — and does advertise `formatVersion` on `/metadata.json`. What it still
-  lacks is a `capabilities` channel, so a served tile using compact times
-  declares nothing; see §10.4. Byte parity is now scoped to the default build,
-  which is why `stt-serve` carries no `--no-compact-times` /
-  `--quantize-vertex-values` twins.)_
+  frame — and advertises both `formatVersion` and a `capabilities` array on
+  `/metadata.json` (§9). Byte parity is scoped to an offline
+  `--no-compact-times` build, because compact feature times are ON by default in
+  `stt-build` and OPT-IN on serve; `--compact-times` restores parity with a
+  default build. That is why `stt-serve` carries the POSITIVE `--compact-times`
+  flag and no `--quantize-vertex-values` twin.)_
 
 ### 3.3 Build intelligence: measure, don't model
 
@@ -429,7 +434,7 @@ media types, `capabilities` must-understand (exactly Zarr v3's `must_understand`
   the loaders.gl `TileSource` shape — decide which schema wins before unifying casing.
 - Enforcement: `spec_conformance.rs`, the compression byte-set freeze,
   `v2_golden.rs` (the byte pin; `v1_golden.rs` went with v1 support on
-  2026-07-26), `capability_registry.rs` + `manifest-schema.test.ts` (the
+  2026-07-26), `capability_registry.rs` + `poopdeck:packages/core/test/manifest-schema.test.ts` (the
   registry ⇄ schema ⇄ both-readers pin), `reproducible_build.rs`, and the
   `cli_reference_doc.rs` + per-binary
   `cli_flags_are_documented_in_cli_reference` gates (a new flag fails
@@ -464,6 +469,12 @@ Re-triaged 2026-07-24 against the tree.
   becomes a real problem; it is off the per-session path today.
 - **Manifest-inlined directory root** (saves one RTT) — deferred: couples
   immutable-derived data into the mutable manifest.
+- **A declared abstract-plane CRS in the manifest** — tiles unchanged, projection
+  declared. Today `/worlds` and `/atlas` each hand-roll their own synthetic
+  lon/lat mapping and fight Mercator anisotropy separately, each carrying its own
+  `local_to_lonlat` convention (handed here from
+  [neural-atlas-2026-07.md](./neural-atlas-2026-07.md) §13). **Trigger:** a third
+  non-geographic dataset, or a manifest CRS field arriving for another reason.
 - **Dataset-global dictionary hoist**, **delta-coded quantized coordinates**,
   and a native **`geoarrow.multipolygon`** geometry type — all three deferred
   2026-07-26 with measurements and blockers in §10.3. The dictionary hoist is
@@ -544,16 +555,20 @@ backs `inspect`, `diff`, `doctor`, `order-audit`. Removed from the register.
 
 ## 9. Open tail
 
-The backlog lives in [README.md](./README.md); K2, K5, K6 and K10 are this
-record's, and are not restated here. Format-specific notes only:
+The backlog lives in [README.md](./README.md); **K2** is this record's and is not
+restated here. K5, K6 and K10 are renderer defects and moved to the
+[poopdeck.gl register](https://github.com/BertCh/poopdeck.gl/blob/main/docs/roadmap/README.md)
+at the 2026-08-26 split. Format-specific notes only:
 
-- **The fleet is on packed v2** — all 68 registered manifests as of 2026-07-31,
-  from 24 still on v1 that morning. With v1 read support withdrawn (§10, spec
-  §9.1) that flip was a prerequisite for shipping the reader, not a follow-up.
-  The publish ordering it produced is a standing procedure in
-  [shipping.md](./shipping.md). Still outstanding is the capture it gates: the
-  **requests- / bytes-to-first-frame** figures (the COPC "4 reads" benchmark) are
-  pre-flip and measure the old layout — **K10**.
+- **The fleet's v1 → v2 flip (2026-07-31) has itself been superseded.** All 68
+  registered manifests reached packed v2 that day, from 24 still on v1 that
+  morning; with v1 read support withdrawn (§10, spec §9.1) the flip was a
+  prerequisite for shipping the reader, not a follow-up. The publish ordering it
+  produced is a standing procedure in [shipping.md](./shipping.md). On 2026-08-14
+  a **container-only v2 → v3 migration** carried 59/59 live datasets to
+  `formatVersion: 3` + directory v6 without rewriting a pack; five summary-tier
+  archives stay on v2 by design (a v2 directory cannot say which entries are
+  aggregates). See README B4.
 - **Lazy-props client materialization** — format-enabled by the core/props split;
   the reader is eager-only. Already decided: the Arrow parse must run in the decode
   worker and cached tile `byteSize` must be re-accounted through an explicit tileset
@@ -572,12 +587,14 @@ record's, and are not restated here. Format-specific notes only:
   byte-breaking follow-ups deferred from T1.1 coverage clipping; also the cross-zoom
   clip pyramid and the `geo::BooleanOps` swap (workspace pins geo 0.28; revisit at
   ≥ 0.30). **T5.1 memory heads** (§2) are the next scale target.
-- **Known issue (not a framework, **K6**):** the AV render-mode set is declared in
-  four-plus drifting places — the `renderModes` existence-probe memo in `AvCockpitImpl.tsx`,
-  the `datasets.ts` regex gates (`HELD_BACK_AV_MODES`, `WAYMO_LOCAL_ONLY`), the
-  route/mode-param handling, and the deck↔three parity copy. One registry row per
-  mode would kill it; nothing else from the retired preprocessing-framework design
-  is needed.
+- **Known issue, moved downstream (**K6**):** the AV render-mode set is declared in
+  four-plus drifting places — the `renderModes` existence-probe memo in
+  `poopdeck:examples/showcase/src/pages/AvCockpitImpl.tsx`, the regex gates in
+  `poopdeck:examples/showcase/src/datasets.ts` (`HELD_BACK_AV_MODES`,
+  `WAYMO_LOCAL_ONLY`), the route/mode-param handling, and the deck↔three parity
+  copy. One registry row per mode would kill it; nothing else from the retired
+  preprocessing-framework design is needed. It is a renderer defect and now
+  belongs to the poopdeck.gl register.
 
 **Corrected while consolidating:** the space×time LOD audit table claimed "polygons &
 timeless lines are **never** simplified." False since the kind-parity campaign —
@@ -599,7 +616,7 @@ measurement, and what was deliberately NOT done.
 
 The batching discipline of §3.2 was applied again: **six wire changes, one
 churn event.** Content addresses churn exactly once, and the whole published
-fleet re-uploads once (§9.3 of the spec spells out the deploy consequence).
+fleet re-uploads once ([shipping.md](./shipping.md) carries the deploy consequence: upload the immutable objects, deploy the reader, then flip the manifests).
 
 ### 10.1 What shipped, and what it measured
 
@@ -834,11 +851,10 @@ build-global, so there is a place to hang it.
 - **Shipped archives are not retroactively fixed.** Every published dataset
   keeps the old quantizer's wrong integer values, the bridged MultiPolygon
   tessellations, and the inflated `feature_count` until it is rebuilt.
-- **`stt-serve` emits compact times with no capability channel.**
-  `/metadata.json` carries `formatVersion` but has no `capabilities` field, so
-  a served tile using `st`/`et` declares nothing. Safe only because the client
-  decoder ships in this repo. Either add the channel or document the lockstep
-  assumption in `stt-serve-protocol.md`.
+- **`stt-serve` emits compact times with no capability channel — closed.**
+  `/metadata.json` now carries a `capabilities` array beside `formatVersion`,
+  and compact times are additionally opt-in on serve, so a default served tile
+  emits none. Normative text: [`../spec/stt-serve-protocol.md`](../spec/stt-serve-protocol.md) §4.
 - **`toGeoArrowTable()` leaks the wire shape.** The TS re-inflation lives in
   `tableToBinaryFeatures` — where the CPU win is — so a GeoArrow consumer
   going through `toGeoArrowTable` sees a `UInt32` `start_time` and a `UInt16`

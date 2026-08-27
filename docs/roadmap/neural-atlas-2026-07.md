@@ -648,9 +648,15 @@ surface kinds have their own archives from day one:
 G1 said nothing cuts an archive until B1 lands and B2's republish is scheduled.
 B1 is still uncommitted. The archives therefore exist **locally only** and the
 `/atlas` nav entry is gated off the public deploy by `ATLAS_AVAILABLE` in
-`datasets.ts` — the same defect class the gate exists for, expressed for a
-surface that is not a `Dataset`. Flip `ATLAS_ARCHIVES_SYNCED` in the pass that
-r2-syncs the four `neural-atlas-*` stems and verifies each manifest 200.
+`poopdeck:examples/showcase/src/datasets.ts` — the same defect class the gate
+exists for, expressed for a surface that is not a `Dataset`. Flip
+`ATLAS_ARCHIVES_SYNCED` in the pass that r2-syncs the four `neural-atlas-*`
+stems and verifies each manifest 200.
+
+**Status 2026-08-26:** B1/B2 are discharged and the archives ARE synced — all
+four `neural-atlas-*` manifests, their `.meta.json` sidecars and both
+`neural-atlas-node-{index,series}.bin` blobs return 200. The one artefact still
+missing is the generator sidecar `/data/neural-atlas.json`; see §15.8.
 
 ### 14.6 Finding — the SAE context-length cliff
 
@@ -708,6 +714,8 @@ hierarchy exactly as predicted.
 
 - Browser-verify. Nothing here has been looked at in a browser yet.
 - r2-sync the four stems and flip `ATLAS_ARCHIVES_SYNCED` (§14.5), behind B2.
+  **Superseded 2026-08-26:** the stems are synced; the remaining blocker is the
+  generator sidecar, tracked as **L1** in [README.md](./README.md) — see §15.8.
 - Milestones 6 and 7.
 - The §13 borrow-backs are untouched: the abstract-plane CRS is still the honest
   fix for the synthetic-lon/lat trick that `/worlds` and now `/atlas` both carry.
@@ -842,12 +850,12 @@ projection is unambiguous and clears before the next, and only at sweep speeds
 does it widen to a trail, which is the one thing a fixed 3-token window could
 not do at both ends.
 
-### 15.5a Emphasis
+### 15.6 Emphasis
 
 The map is 294,912 points of context and a few hundred points of event, and at
 anything like equal weight the context wins — a quarter-million faint points sum
 to a bright fog no amount of brightness on the event can beat. So the ratio is
-set in one place (`EMPHASIS` in `buildAtlasLayers`): the anatomy sits at 0.2
+set in one place (`EMPHASIS` in `poopdeck:examples/showcase/src/components/atlas/buildAtlasLayers.ts`): the anatomy sits at 0.2
 opacity with its layer hues desaturated 42% toward the page backdrop, and drops
 to 0.09 as soon as anything is selected. The freed headroom goes to the trace
 (full opacity, larger, `splat` so it reads as light rather than as dots) and to
@@ -896,14 +904,14 @@ density and labels each with the terms most over-represented (plain TF-IDF
 against the whole label corpus) among the published Neuronpedia explanations of
 the ~600 latents nearest it. A place has a position and no edges, which is
 exactly as much as the data supports. The smooth per-pixel density is available
-as an optional `AnimatedHeatmapLayer` over the same archive; the point cloud's
+as an optional `AnimatedHeatmapLayer` (`poopdeck:packages/layers`) over the same archive; the point cloud's
 own overdraw is already a density field for most purposes, so it is off by
 default rather than costing a second tileset.
 
 The `neural-atlas-regions` archive is no longer built. Cluster identity is still
 carried per latent for inspection and filtering, which is what it actually is.
 
-### 15.6 Open after the rebuild
+### 15.8 Open after the rebuild
 
 - Browser-verify. Still true, and now the point.
 - **Concept detail view is NOT built.** The concept loci layer is still the one
@@ -915,7 +923,8 @@ carried per latent for inspection and filtering, which is what it actually is.
   (which digit does this latent prefer), and `feature_stats.npz` only carries
   probe sums aggregated over all member tokens. That is a new generator stage
   plus a partial forward pass, not a frontend change.
-- r2-sync and `ATLAS_ARCHIVES_SYNCED`, unchanged and still behind B2.
-</content>
-
-</invoke>
+- r2-sync and `ATLAS_ARCHIVES_SYNCED`. **Updated 2026-08-26:** B1/B2 are
+  discharged and the archives, `.meta.json` sidecars and both `.bin` blobs are
+  live. The single remaining blocker on `ATLAS_ARCHIVES_SYNCED` is the generator
+  sidecar `/data/neural-atlas.json`, which `r2-sync.sh` structurally cannot
+  upload; it is **L1** in [README.md](./README.md), where the analysis lives.

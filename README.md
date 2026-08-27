@@ -49,6 +49,10 @@ To _build_ one, read on.
 [From CSV to an Animated Map](./docs/guides/csv-quickstart.md) is the complete
 tutorial. The short version:
 
+Prebuilt binaries for macOS, Linux, and Windows are attached to each
+[GitHub Release](https://github.com/BertCh/spatiotemporal-tiles/releases);
+`cargo install` builds from source.
+
 ```bash
 cargo install spatiotemporal-tiles
 
@@ -64,13 +68,18 @@ stt-build \
 stt-validate tiles
 ```
 
-Use `stt-build --auto` when you want the toolchain to recommend the zoom range,
-temporal bucket, and compression. Explicit flags still win.
+Use `stt-build --auto` when you want the toolchain to recommend the zoom range
+and temporal bucket, or `--auto encode` to also apply the non-lossy encoding
+levers (zstd level, blob ordering, pack size). Explicit flags still win, and
+lossy advice is never auto-applied.
 
 Builds preserve every usable feature by default. STT does **not** silently
 sample, thin, or aggregate data to meet a byte target. Control size first with
 an honest maximum zoom and temporal bucketing. Summary and raster tiers are
-explicit, coarse-zoom additions; they do not replace the raw tier.
+explicit, coarse-zoom additions; they do not replace the raw tier. When you do
+have a byte budget, `--target-size 250MiB` solves for a recipe that fits it
+using reversible levers only — it never drops a feature, and it reports the
+shadow price of any lossy option you would have to opt into by hand.
 
 The installed package provides five CLIs:
 
@@ -81,6 +90,11 @@ The installed package provides five CLIs:
 | `stt-validate` | Verify integrity, schemas, decoding, and time metadata |
 | `stt-bundle`   | Pack or unpack a single-file `.sttb` interchange file  |
 | `stt-serve`    | Serve STT tiles dynamically from a live database       |
+
+A bare `cargo install` gets all five binaries with GeoParquet and PostGIS
+support. The DuckDB paths are opt-in:
+`cargo install spatiotemporal-tiles --features duckdb,serve-duckdb` (it bundles
+a C++ build).
 
 `stt-generate` is a separate, repository-only tool for rebuilding the reference
 datasets; it lives in [`tools/stt-generate`](./tools/stt-generate) and has its
@@ -122,7 +136,7 @@ and must never be rewritten in place.
 
 ## Project status
 
-The current release line is **0.7.0** and remains pre-1.0. Writers produce
+The current release line is **0.8.0** and remains pre-1.0. Writers produce
 packed format v3 with directory codec v6; reference readers also open published
 format-v2/directory-v5 archives read-only.
 [`project-status.json`](./project-status.json) is the machine-readable version
@@ -130,8 +144,8 @@ of that paragraph, and every field in it is proved against its source by a CI
 gate.
 
 > Since the 2026-08-26 split, the crates.io and npm version numbers are **not**
-> in lockstep. They agree at 0.7.0 by history, not by promise; what relates the
-> two stacks is the archive's `formatVersion`.
+> in lockstep. They both read 0.8.0 today by coincidence, not by promise; what
+> relates the two stacks is the archive's `formatVersion`.
 
 See [Status, support, and compatibility](https://poopdeck.gl/docs/intro/status-and-support)
 before depending on a pre-1.0 API, and the [project changelog](./CHANGELOG.md)

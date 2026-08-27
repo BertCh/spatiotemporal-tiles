@@ -79,14 +79,14 @@ home, its exemplar objects, and its current formalization level.
 | --- | ------------------------ | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1   | Projection & tile grid   | `stt-core/src/projection.rs`, `poopdeck:packages/core/src/geo/mercator.ts`, `archive.ts`               | Web-Mercator forward/inverse, `MERCATOR_MAX_LAT`, slippy `(z,x,y)`                                                                        | **High in code** (one-ulp lemma with pinning test), scattered; two lat→row copies with different guards                                                                                                                                 |
 | 2   | Address algebra & curves | `tile.rs`, `curve.rs`, `pack/mod.rs`                                                                   | `TileId`, 2D Hilbert (normative vectors), 3D Hilbert/Morton, sort keys                                                                    | **Highest**: spec §4 pseudocode + 24 vectors + reference reimplementation; but three different "directory orders" coexist                                                                                                               |
-| 3   | Quantization             | `arrow_tile/quantize.rs`, `columns.rs`, `tile.ts`                                                      | World-anchored coord affine, attr affine `v = o + q·s`, vertex-value 0xFFFF sentinel, vertex-time delta tiers                             | **Good**: decision tables in `data-format.md`, `{:.17e}` byte-pinned; rounding modes inconsistent across maps (round vs floor vs truncate) and unstated                                                                                 |
+| 3   | Quantization             | `arrow_tile/quantize.rs`, `columns.rs`, `poopdeck:packages/core/src/tile.ts`                           | World-anchored coord affine, attr affine `v = o + q·s`, vertex-value 0xFFFF sentinel, vertex-time delta tiers                             | **Good**: decision tables in `data-format.md`, `{:.17e}` byte-pinned; rounding modes inconsistent across maps (round vs floor vs truncate) and unstated                                                                                 |
 | 4   | Time model               | `timestamp.rs`, `docs/spec/time-model.md`, `tiler.rs`                                                  | Unix-ms wire unit, `bucket(t)=⌊t/Δ⌋·Δ`, LOD pyramid divisibility, interval semantics                                                      | **Mixed**: bucket algebra is the most mathematical spec text in the repo; but `timeWindow = [t±w/2]` — the single most load-bearing temporal fact — appears in no normative doc, and `--adaptive-temporal` violates the spec's own MUST |
 | 5   | Archive semantics        | `pack/`, `directory*.rs`, `encode.rs`, golden fixtures                                                 | Content addressing, determinism, canonical orders, round-trip laws                                                                        | **Strong via tests** (L1–L33 below); encode is one-oracle everywhere; `t0 = min(start)` is test-pinned but spec-unstated                                                                                                                |
 | 6   | Build geometry           | `stt-build/src/{tiler,clip,simplify,summary,quadbin}.rs`                                               | Multi-zoom assignment, Liang–Barsky/Sutherland–Hodgman clipping, antimeridian split, per-zoom simplification ladder, H3/Quadbin anchoring | **Test-strong, spec-absent**: the antimeridian suite asserts area conservation and ring simplicity — the only end-to-end numeric conservation law in the pipeline — yet none of it is written down outside the tests                    |
 | 7   | Delivery/selection       | `poopdeck:packages/core/src/{archive,spatiotemporal-tileset,tile-budget}.ts`, `geo/viewport-bounds.ts` | Viewport repair, tile-cover lattice, coverage index, runway, 4-tier eviction, EV parent gate                                              | **Code-formal**: dense in-source derivations (the `p.tMin` prune bound has a written proof) but zero spec presence; three different "covered" predicates                                                                                |
 | 8   | Playback control         | `poopdeck:packages/playback/src/*`                                                                     | Clock dynamics, gate conditions, watermark re-fit, fluid feasibility, DRR fairness, auto-speed ladder                                     | **Test-strong** (a 3,917-line governor suite), spec-weak: time-model §6 documents a fraction of the shipped surface; the roadmap doc describes the _legacy_ fairness formula                                                            |
-| 9   | Presentation kernels     | `poopdeck:packages/core/src/render/*`, four backends                                                   | Time-filter α (two oracles), trips interpolation, cells, arcs, heatmaps, seam masks, picking                                              | **Bimodal**: the α kernel is the best-specified math in the repo (`render-spec.json`, 12-op algebra, two independent derivations); everything else is prose with measured divergences                                                   |
-| 10  | Estimators & measurement | `stt-optimize/src/*`, `ordering_sim.rs`, `throughput.ts`                                               | Leave-one-out attribution, ratio-estimator stderr, sample-encode oracle, EWMA throughput/latency                                          | **Discipline-formal**: the MO-4 one-layout invariant and one-sided noise gates are stated and enforced; the estimators' semantics (what is measured vs estimated vs prior) is labeled in code, unlabeled in any spec                    |
+| 9   | Presentation kernels     | `poopdeck:packages/core/src/render/*`, four backends                                                   | Time-filter α (two oracles), trips interpolation, cells, arcs, heatmaps, seam masks, picking                                              | **Bimodal**: the α kernel is the best-specified math in the repo (`poopdeck:docs/spec/render-spec.json`, 12-op algebra, two independent derivations); everything else is prose with measured divergences                                |
+| 10  | Estimators & measurement | `stt-optimize/src/*`, `ordering_sim.rs`, `poopdeck:packages/core/src/throughput.ts`                    | Leave-one-out attribution, ratio-estimator stderr, sample-encode oracle, EWMA throughput/latency                                          | **Discipline-formal**: the MO-4 one-layout invariant and one-sided noise gates are stated and enforced; the estimators' semantics (what is measured vs estimated vs prior) is labeled in code, unlabeled in any spec                    |
 
 ### 1.2 What is already formal — build on it, do not duplicate it
 
@@ -112,13 +112,13 @@ accumulate. The model should **harvest** these, not restate them:
   with proofs-by-test: the `MERCATOR_MAX_LAT` one-ulp-inward argument
   (`projection.rs:36–45`, pinned by `f64::from_bits(nearest−1)` equality);
   the near-pole cancellation analysis in `latToTileY`
-  (`archive.ts:5095–5119`); the paged-prune upper bound
+  (`poopdeck:packages/core/src/archive.ts:5095–5119`); the paged-prune upper bound
   `p.tMin ≤ coverTMin < timeStart + bucketMs` with its written proof
-  (`archive.ts:3084–3105`); the `ordering_sim` coalescer fast-path equivalence
+  (`poopdeck:packages/core/src/archive.ts:3084–3105`); the `ordering_sim` coalescer fast-path equivalence
   argument, cross-validated against brute force.
-- **The two-oracle render contract.** `docs/spec/render-spec.json` freezes a
+- **The two-oracle render contract.** `poopdeck:docs/spec/render-spec.json` freezes a
   12-op expression algebra (`step`, `clamp01`, lazy `select`, …) with two
-  independently derived oracles (`time-filter.ts` if-form vs `shader-codegen.ts`
+  independently derived oracles (`poopdeck:packages/core/src/render/time-filter.ts` if-form vs `shader-codegen.ts`
   branchless AST) and four per-backend conformance obligations. It has already
   caught two real specification ambiguities (`wakeLength ≤ 0`, negative
   `fadeIn`). This is the template the rest of the presentation layer needs.
@@ -186,20 +186,28 @@ split, simplification ladder) whose laws currently live only in tests.
 The review also caught outright defects in the formal surfaces themselves —
 these are not gaps but contradictions, and they are cheap to fix:
 
-1. **Three vacuous adversarial tests.** `adversarial_decode.rs:443,457,471`
-   construct doctored directories with version byte `5`; `DIRECTORY_VERSION`
-   is `6` and the version check precedes the guards under test, so all three
-   allocation/overflow-guard regressions pass vacuously on the version
-   mismatch. One byte per test restores them.
+1. **Three vacuous adversarial tests.** `adversarial_decode.rs` constructs
+   doctored directories with version byte `5` while `DIRECTORY_VERSION` is `6`.
+   **Discharged 2026-08-26 — no fix needed, the finding was wrong.** The decoder
+   accepts `MIN_DIRECTORY_VERSION..=DIRECTORY_VERSION` = `5..=6`
+   (`directory.rs:145`, `:373`), so a v5 header is a legitimate input and
+   execution reaches the entry-count and run-length guards under test.
 2. **Spec §4 v5/v6 drift.** `stt-packed-format.md` §4's heading and body say
    directory v5 while its own layout block, `manifest.schema.json`,
-   `directory.rs:126`, and `directory.ts:31` all say 6 — and §9.1 describes
+   `directory.rs:126`, and `poopdeck:packages/core/src/directory.ts:31` all say 6 — and §9.1 describes
    "the planned v6" as future work that is not what shipped.
+   **Discharged 2026-08-26:** §4 and §9.1 both read v6.
 3. **Stale single-file container spec.** ~60 lines of byte-exact spec in
    `data-format.md` for a container `conformance.md` says was removed.
-4. **Broken fixture generator.** `make-v2-golden.sh` still passes the removed
-   `--format-version` flag; two TS golden families are unregenerable until it
-   is fixed.
+   **Discharged 2026-08-26** by the competing-definitions pass: the container
+   sections, the duplicated v1 layer frame, and the v1-vs-v2 relocation prose
+   are gone from `data-format.md`; the `0xFFFF`-escape rationale survives,
+   stated once, in packed spec §5.1.
+4. **Broken fixture generator.** `make-v2-golden.sh` passed the removed
+   `--format-version` flag, leaving two TS golden families unregenerable.
+   **Discharged 2026-08-26:** the generator moved into this repository at the
+   split as `conformance/make-vectors.sh` and passes no version override; the
+   TypeScript reader vendors what it produces.
 
 ---
 
@@ -573,13 +581,13 @@ in the law registry; nothing here edits the backlog. Citations verified
 
 ### 5.1 Contradictions (fix first; they undermine the surfaces the model builds on)
 
-| #   | Finding                                                                                                                           | Where                                                                                     |
-| --- | --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| C1  | Three adversarial-decode regression tests vacuous (version byte 5 vs `DIRECTORY_VERSION = 6`; guards under test never reached)    | `crates/stt-core/tests/adversarial_decode.rs:443,457,471`                                 |
-| C2  | Packed spec §4 says directory v5 in heading/body; layout, schema, both decoders say 6; §9.1 describes v6 as unshipped future work | `docs/spec/stt-packed-format.md:267,271,1007`                                             |
-| C3  | ~60 lines of byte-exact spec for the removed single-file container                                                                | `docs/architecture/data-format.md` (container sections)                                   |
-| C4  | `make-v2-golden.sh` passes a removed flag; two TS golden families unregenerable                                                   | `poopdeck:packages/core/scripts/make-v2-golden.sh`                                        |
-| C5  | `docs/roadmap/playback-and-loading.md` documents the _legacy_ fairness weight formula; shipped default is the progressive fill    | `playback-and-loading.md:196-199` vs `poopdeck:packages/playback/src/fairness.ts:101-139` |
+| #   | Finding                                                                                                                                                | Where                                                                                     |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| C1  | ✅ **Discharged 2026-08-26 — not a defect.** `MIN_DIRECTORY_VERSION = 5`, so the v5 header is a legitimate input and the guards under test ARE reached | `crates/stt-core/tests/adversarial_decode.rs`, `crates/stt-core/src/directory.rs:145,373` |
+| C2  | ✅ **Discharged 2026-08-26.** Packed spec §4 said directory v5 in heading/body while layout, schema and both decoders said 6                           | `docs/spec/stt-packed-format.md` §4, §9.1                                                 |
+| C3  | ✅ **Discharged 2026-08-26.** ~60 lines of byte-exact spec for the removed single-file container                                                       | `docs/architecture/data-format.md` (container sections, now deleted)                      |
+| C4  | ✅ **Discharged 2026-08-26.** The generator moved here at the split, renamed, and passes no version override                                           | `conformance/make-vectors.sh`                                                             |
+| C5  | `docs/roadmap/playback-and-loading.md` documents the _legacy_ fairness weight formula; shipped default is the progressive fill                         | `playback-and-loading.md:196-199` vs `poopdeck:packages/playback/src/fairness.ts:101-139` |
 
 ### 5.2 Cross-backend math divergences (renderer parity)
 
@@ -603,22 +611,22 @@ in the law registry; nothing here edits the backlog. Citations verified
 
 ### 5.3 Client-delivery hazards
 
-| #     | Finding                                                                                                                                                                                                                                                                 |
-| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| H1    | `latToTileClamped` (tileset copy) lacks the pre-clamp that fixes the near-pole NaN; safe only because `update()` normalizes first; the pass-2 fail-open does not fire on NaN (`NaN>NaN` false) → parent silently dropped. Defense-in-depth fix or a stated precondition |
-| H2–H3 | Slack ring not seam-aware; wrap intervals adjacent mod n at the one-world cap                                                                                                                                                                                           |
-| H4    | Boundary-bucket `≤` vs `<` disagrees across `getBufferedRunway` / `estimateCost` / profile / `bytesForHorizon` — pin one convention                                                                                                                                     |
-| H5    | Horizon floored at `bucketMs` in the runway walk but deliberately unfloored in `bytesForHorizon` (bisect monotonicity) — bless + state                                                                                                                                  |
-| H6–H7 | Behind-playhead sentinel and 1e15/5e14 tier separation are unstated arithmetic bounds                                                                                                                                                                                   |
-| H8    | Three "covered" predicates (fetch EV / render pass-2 / ancestor DP) — bless the monotone hierarchy, state all three                                                                                                                                                     |
-| H9    | During scrub, coverage/readiness measure the undegraded set while selection runs degraded — bless (preview-honesty) + state                                                                                                                                             |
-| H10   | The `4×timeWindow` runway horizon multiplier has no recorded derivation                                                                                                                                                                                                 |
-| H11   | Parent-gate λ = 1/16 is derived-not-measured (needs the blank-frame harness; already NEEDS-HARNESS in the implementation plan)                                                                                                                                          |
-| H12   | Cell budget is a stopgap for frustum selection; its inertness claim fails for `--min-features-per-tile` archives                                                                                                                                                        |
-| H13   | `metadata.bounds` = centroid bbox does not bound the data (builder fix rides B2/R1); reader compensates by never intersecting                                                                                                                                           |
-| H14   | `parseTileKey` accepts negative/fractional parts; `@0` is a distinct nonsensical tier                                                                                                                                                                                   |
-| H15   | `estimateTileSize` sums whole `ArrayBuffer`s — over-counts subarray views, varying with quantization settings                                                                                                                                                           |
-| H16   | Eviction band function applied across mixed metric spaces (sim-ms vs wall-ms) sharing one field                                                                                                                                                                         |
+| #     | Finding                                                                                                                                                                                                                                                                                                                                            |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| H1    | `latToTileClamped` (tileset copy) lacks the pre-clamp that fixes the near-pole NaN; safe only because `update()` normalizes first; the pass-2 fail-open does not fire on NaN (`NaN>NaN` false) → parent silently dropped. Defense-in-depth fix or a stated precondition                                                                            |
+| H2–H3 | Slack ring not seam-aware; wrap intervals adjacent mod n at the one-world cap                                                                                                                                                                                                                                                                      |
+| H4    | Boundary-bucket `≤` vs `<` disagrees across `getBufferedRunway` / `estimateCost` / profile / `bytesForHorizon` — pin one convention                                                                                                                                                                                                                |
+| H5    | Horizon floored at `bucketMs` in the runway walk but deliberately unfloored in `bytesForHorizon` (bisect monotonicity) — bless + state                                                                                                                                                                                                             |
+| H6–H7 | Behind-playhead sentinel and 1e15/5e14 tier separation are unstated arithmetic bounds                                                                                                                                                                                                                                                              |
+| H8    | Three "covered" predicates (fetch EV / render pass-2 / ancestor DP) — bless the monotone hierarchy, state all three                                                                                                                                                                                                                                |
+| H9    | During scrub, coverage/readiness measure the undegraded set while selection runs degraded — bless (preview-honesty) + state                                                                                                                                                                                                                        |
+| H10   | The `4×timeWindow` runway horizon multiplier has no recorded derivation                                                                                                                                                                                                                                                                            |
+| H11   | Parent-gate λ = 1/16 is derived-not-measured (needs the blank-frame harness; already NEEDS-HARNESS in the implementation plan)                                                                                                                                                                                                                     |
+| H12   | Cell budget is a stopgap for frustum selection; its inertness claim fails for `--min-features-per-tile` archives                                                                                                                                                                                                                                   |
+| H13   | ✅ **Discharged with R1.** `metadata.bounds` was a centroid bbox that did not bound the data; `BoundsMode::Vertex` is now the builder default (`crates/stt-build/src/input.rs:896-906`, `profile_features` at `:1543`), with `--bounds-mode centroid` kept as the documented rollback. Only pre-R1 published manifests still carry centroid bounds |
+| H14   | `parseTileKey` accepts negative/fractional parts; `@0` is a distinct nonsensical tier                                                                                                                                                                                                                                                              |
+| H15   | `estimateTileSize` sums whole `ArrayBuffer`s — over-counts subarray views, varying with quantization settings                                                                                                                                                                                                                                      |
+| H16   | Eviction band function applied across mixed metric spaces (sim-ms vs wall-ms) sharing one field                                                                                                                                                                                                                                                    |
 
 ### 5.4 Core-format asymmetries (from the stt-core inventory)
 
@@ -699,12 +707,10 @@ writing + adjudication (no behavior change); FM-5 is tests; FM-0 and parts of
 FM-5 touch code.
 
 **FM-0 — Repair the formal surfaces (small, immediate, independent).**
-Fix C1 (three one-byte test fixes — restores three regression guards), C2
-(v5→v6 spec pass), C3 (delete the dead container spec), C4 (fixture
-generator), C5 (fairness formula in the roadmap doc). Add the registry lint
-skeleton (a script asserting law-cited test names exist). Acceptance: the
-three adversarial tests fail when their guards are removed; spec greps for
-"v5" return only the changelog.
+C1–C4 are discharged (see §5.1); what remains is C5 (fairness formula in the
+downstream roadmap doc) plus the registry lint skeleton (a script asserting
+law-cited test names exist). Acceptance: the three adversarial tests fail when
+their guards are removed; spec greps for "v5" return only the changelog.
 
 **FM-1 — Notation + the closed core (Layers 0–2).**
 One spec document (proposed `docs/spec/semantic-model.md`; splitting into a
@@ -719,13 +725,16 @@ and either a binding-test cite or an FM-5 backlog row.
 **FM-2 — Dataset/archive semantics + the semantic-invariant definitions
 (Layer 3).**
 Tiling-as-cover, clip and antimeridian laws promoted from tests, determinism
-sub-law decomposition, aggregation pushforward algebra, and — the
-highest-leverage deliverable — the **fingerprint function family** for
-semantic conformance, handed to SH-1..6 as their definition input (closing
-the class-C gap that let 106 scrambled archives validate). Adjudicate §5.4
-and §5.6. Specify `t0` and `BlobOrdering::choose` (5.5 items 14–15).
-Acceptance: SH items can cite definitions by law ID; every §5.4 row has a
-verdict.
+sub-law decomposition, and aggregation pushforward algebra. The **fingerprint
+function family** for semantic conformance — the highest-leverage deliverable
+this phase was to hand to SH-1..6 — **shipped with R1 rather than waiting for
+the definition**: `stt-validate` check 12
+(`crates/spatiotemporal-tiles/src/bin/stt-validate/fingerprint.rs`) against
+`metadata.content_fingerprint` (`crates/stt-core/src/metadata.rs:454`), plus
+SH-2's declared-bounds containment over `input::profile_features`. What remains
+here is retro-fitting law IDs onto what shipped. Adjudicate §5.4 and §5.6.
+Specify `t0` and `BlobOrdering::choose` (5.5 items 14–15). Acceptance: SH items
+can cite definitions by law ID; every §5.4 row has a verdict.
 
 **FM-3 — Delivery + control semantics (Layers 4–5).**
 Selection soundness with its stated caveats, the viewport-repair function,
@@ -740,7 +749,7 @@ has a verdict; time-model.md's MUST list covers the shipped clock surface.
 Agreement-class declarations for every §5.2 row; per-kernel spec entries on
 the render-spec template; the S1 arc fix and S17 quadbin consolidation as the
 two code changes worth making immediately (both byte-neutral, renderer-side).
-Acceptance: `render-spec.json` (or successors) covers every kernel with a
+Acceptance: `poopdeck:docs/spec/render-spec.json` (or successors) covers every kernel with a
 declared class; S1 resolved; no undeclared cross-backend divergence remains
 in the catalog.
 

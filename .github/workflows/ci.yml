@@ -31,16 +31,20 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Everything at once: facade `cli` (all five bins, both serve
-      # backends), `projection` (proj-sys vendors libproj via cmake), etc.
+      # Everything at once. The features that actually exist and make this
+      # lane heavy: the facade `cli` (all five bins, both serve backends),
+      # `duckdb` / `serve-duckdb` (the `duckdb` crate's `bundled` feature
+      # compiles and statically links libduckdb — a large C++ build),
+      # `postgres` / `serve-postgres`, and `serve-postgres-tls` (native-tls).
       # This is a TEST job — the old CI built --all-features but never ran
       # the feature-gated tests.
       - name: cargo test --workspace --all-features
         run: cargo test --workspace --all-features --locked
         env:
-          # The all-features link jobs (bundled DuckDB C++ + vendored libproj
-          # + arrow, several test binaries linking concurrently) OOM the 7 GB
-          # runner's linker under full debuginfo — ld dies with SIGBUS
+          # The all-features link jobs (statically linked bundled DuckDB C++
+          # + arrow/parquet + all five CLI binaries, several test binaries
+          # linking concurrently) OOM the 7 GB runner's linker under full
+          # debuginfo — ld dies with SIGBUS
           # ("signal 7, core dumped"). Debuginfo is useless in CI; dropping
           # it shrinks the link inputs by an order of magnitude.
           CARGO_PROFILE_DEV_DEBUG: '0'
@@ -72,9 +76,9 @@ jobs:
       # `cargo clippy --workspace --all-targets` prints the standing backlog.
       # `clippy::float_cmp` is deliberately absent: exact float comparison is
       # intended here (integrality probes, encode/decode roundtrip assertions).
-      # Default features, matching the `rust` job — linting the duckdb, postgres
-      # and projection paths costs a bundled C++ and libproj build, and
-      # rust-all-features already compiles them.
+      # Default features, matching the `rust` job — linting the duckdb path
+      # costs the bundled libduckdb C++ build, and rust-all-features already
+      # compiles it (along with the postgres and TLS paths).
       - name: cargo clippy (curated deny set)
         run: |
           cargo clippy --workspace --all-targets --locked -- \

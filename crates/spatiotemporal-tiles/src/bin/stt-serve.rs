@@ -784,11 +784,17 @@ fn metadata_json(
 ) -> Result<serde_json::Value> {
     let mut meta = serde_json::json!({
         "format": format,
-        // The LAYER-FRAME version this server emits — the serve protocol's
-        // version channel. Frames are self-describing to `decode_tile`, but a
-        // client that pins a decoder needs to know before it fetches. Named
-        // `formatVersion` to match the packed manifest key a client reads for
-        // the same purpose; the two axes are pinned to the same number.
+        // The LAYER-FRAME version this server emits
+        // (`stt_core::arrow_tile::LAYER_FRAME_VERSION`, currently 2) — the
+        // serve protocol's version channel. Frames are self-describing to
+        // `decode_tile`, but a client that pins a decoder needs to know before
+        // it fetches. Named `formatVersion` to match the packed manifest key a
+        // client reads for the same purpose, but the two are DIFFERENT axes on
+        // different numbers: a packed manifest's `formatVersion` is the
+        // CONTAINER version (`stt_core::pack::PACKED_FORMAT_VERSION`,
+        // currently 3), while a live server has no container to version at
+        // all, so the only version it can meaningfully advertise is the
+        // frame's. Do not assume the two ever match.
         "formatVersion": stt_core::arrow_tile::LAYER_FRAME_VERSION,
         // The serve protocol's CAPABILITY channel, the twin of the packed
         // manifest's `capabilities` (packed spec §3.1) and derived from the

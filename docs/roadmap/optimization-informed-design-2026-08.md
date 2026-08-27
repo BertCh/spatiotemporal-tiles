@@ -9,6 +9,10 @@ _House-rules note: this is a decision record — rationale and an adoption map. 
 line lands in [the backlog](./README.md); §7 below carries the proposed lines for that pass. Counted-out items keep
 their revival triggers in the records that own them._
 
+_Status 2026-08-26: M1–M7 and DT-1/2/4/5 landed in commit `d5163aa`; see
+[optimization-conformance-2026-08.md](./optimization-conformance-2026-08.md) for the item-level record and the open
+defects. The mechanism definitions and §5's do-not-touch register remain binding._
+
 ---
 
 ## 1. What the formalization actually says
@@ -143,8 +147,9 @@ least five recorded wants in one investment:
 
 ### M3 — `--target-size B`: the flagship solver (§5.2)
 
-The single most user-facing coherence move: today no target archive size exists anywhere in the CLI, and a human
-closes the loop over ~10 coupled knobs. Ship a budget mode in `stt-optimize` that runs a Lagrangian / MCKP sweep
+The single most user-facing coherence move: at the time of writing no target archive size existed anywhere in the CLI,
+and a human closed the loop over ~10 coupled knobs. _Shipped 2026-08 as `stt-optimize recommend --target-size`
+(`crates/stt-optimize/src/budget_solver.rs`)._ Ship a budget mode in `stt-optimize` that runs a Lagrangian / MCKP sweep
 over the admissible levers against M1's sample oracle:
 
 - Feasible set: Θ₀ (zoom clamp, bucket width, LOD tiers, zstd, ordering, pack size) searched automatically;
@@ -240,7 +245,9 @@ should be designed once, not grown as four mechanisms:
 2. **Additive home-zoom decomposition** (§1.1/§4.5): each feature at exactly one deterministic home zoom, reader
    unions — the O(N) corner of the assignment polytope vs today's O(|Z|·N) full replication (earthquakes: 523 K
    stored rows for 47.5 K quakes; the doctrine's recorded cost is "up to 11×"). Reader support (`lodMode:
-'additive'`) already ships; the build-side assignment is the counted-out half. Trigger stands: per-zoom
+'additive'`) already ships; the build-side assignment landed 2026-08 as DT-2
+   (`crates/stt-build/src/home_zoom.rs`, wired at `crates/spatiotemporal-tiles/src/bin/stt-build.rs:1658`), so what stays
+   counted-out is its trigger EVALUATION, not the code. Trigger stands: per-zoom
    duplication dominating a dataset that matters.
 3. **M4/MinMaxLTTB reduced tiers** (§13.3): the declared-variant escape that cuts zoomed-out playback bytes up to
    ~100× while the base tier stays lossless. Trigger stands: base-tier bandwidth-bound wide-window playback.
@@ -304,7 +311,8 @@ range semantics (§11.5); preview-never-gates and the restore invariant (§11.6)
 
 ## 6. The plan
 
-Sequencing rationale: **(a)** B3 — the 0.6.0 cut — ships first and is untouched by this program; **(b)** client-side
+Sequencing rationale: **(a)** _superseded: the B1 → B2 → B3 chain is discharged and 0.8.0 shipped 2026-08-26; phases 0–5
+were executed in commit `d5163aa` — see [optimization-conformance-2026-08.md](./optimization-conformance-2026-08.md);_ **(b)** client-side
 mechanisms (M5, M6) carry no byte risk and ship continuously behind the existing test + browser-verify gates;
 **(c)** measurement precedes controllers wherever the doc demands it (K10; the §11.6 deletion clause); **(d)** all
 byte-changing builder work lands in **one rebuild window (R1)** with one fleet republish under the standing

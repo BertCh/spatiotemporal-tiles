@@ -36,6 +36,7 @@
     "docs/guides/ai-suite.md",
     "docs/intro/quickstart.md",
     "docs/intro/status-and-support.md",
+    "docs/intro/choosing-a-renderer.md",
     "docs/roadmap/renderer-architecture.md",
     "docs/roadmap/playback-and-loading.md",
     "docs/roadmap/ai-suite.md",

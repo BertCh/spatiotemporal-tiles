@@ -4,31 +4,26 @@ _How this project is published, why the scheme looks the way it does, and what
 was counted out. Behavior of the CLIs themselves lives in
 [../api/cli-reference.md](../api/cli-reference.md)._
 
-> **Status note (2026-08-24).** This is a decision record, so dated registry
+> **Status note (2026-08-26).** This is a decision record, so dated registry
 > observations below are retained as history. For the current release procedure,
 > use [CONTRIBUTING.md](../../CONTRIBUTING.md#releasing). The checked-in manifests
-> currently define Rust **0.7.0** with MSRV **1.88**, seven public
-> `@poopdeck.gl/*` packages at **0.7.0**, and the private experimental Cesium
-> package at **0.5.0**. Rust crates are published manually in dependency order;
-> cargo-dist binaries require a `v{version}` tag followed by a manual **Release**
-> workflow dispatch. The deleted release-plz workflow is not part of the current
-> release path.
+> currently define Rust **0.8.0** with MSRV **1.88**. Rust crates are published
+> manually in dependency order; cargo-dist binaries require a `v{version}` tag
+> followed by a manual **Release** workflow dispatch. The deleted release-plz
+> workflow is not part of the current release path.
 
-**Historical registry snapshot (verified 2026-07-26).** The npm side
-was current: **eight** `@poopdeck.gl` packages, **all eight published at 0.5.0**
-(`core`, `playback`, `layers`, `maplibre`, `three`, `cesium`, `react`, `mcp` —
-`mcp` shipped at 0.5.0, so any note calling it "the unpublished one" is stale).
-The Rust side was **behind**: crates.io `spatiotemporal-tiles` max_version was
-**0.4.0**, published 2026-07-06. See "Historical release defect" below.
+**Historical registry snapshot (verified 2026-07-26).** crates.io
+`spatiotemporal-tiles` max_version was **0.4.0**, published 2026-07-06, three
+minor versions behind what the same tree had already shipped to npm. See
+"Historical release defect" below.
 
 ## Distribution pathways (decided)
 
-| channel               | artifact                                                                                                                             | mechanism                                                                                       |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
-| npm `@poopdeck.gl`    | 7 public packages: core, playback, layers, maplibre, three, react, mcp; Cesium is private/experimental                               | changesets (fixed/lockstep group) + `release-npm.yml`; `pnpm -r publish` rewrites `workspace:*` |
-| crates.io             | **one user-facing name**: `spatiotemporal-tiles` (facade lib + all 5 CLI bins, feature-gated) over 3 published implementation crates | manual publish in dependency order; `sync-versions.mjs --check` gates lockstep                  |
-| GitHub Releases       | prebuilt `stt-*` binaries, 5 targets + shell/powershell installers                                                                   | cargo-dist 0.32.0 via manual `release.yml` dispatch for an existing tag                         |
-| Cloudflare (existing) | showcase site + R2 tile data                                                                                                         | unchanged (`wrangler`, `scripts/r2-sync.sh`)                                                    |
+| channel               | artifact                                                                                                                             | mechanism                                                                                    |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| crates.io             | **one user-facing name**: `spatiotemporal-tiles` (facade lib + all 5 CLI bins, feature-gated) over 3 published implementation crates | manual publish in dependency order; `sync-versions.mjs --check` gates the internal path-deps |
+| GitHub Releases       | prebuilt `stt-*` binaries, 5 targets + shell/powershell installers                                                                   | cargo-dist 0.32.0 via manual `release.yml` dispatch for an existing tag                      |
+| Cloudflare (existing) | R2 tile data (the showcase site deploys from poopdeck.gl)                                                                            | `scripts/r2-sync.sh`                                                                         |
 
 ## Naming rationale
 
@@ -57,8 +52,7 @@ The Rust side was **behind**: crates.io `spatiotemporal-tiles` max_version was
   docs.rs is configured that way too (`no-default-features`, features
   `build, optimize, postgres, duckdb`).
 - `build` / `optimize` → library re-exports; `postgres` / `duckdb` forward to
-  stt-build's input sources; `projection` (system libproj) is never in
-  defaults, docs.rs, or dist builds.
+  stt-build's input sources.
 - `cli` → all five bins, both stt-serve backends; it is what
   `[package.metadata.dist]` builds. Lighter serve:
   `--features build-cli,optimize-cli,validate-cli,serve-postgres` skips the
@@ -72,12 +66,16 @@ The Rust side was **behind**: crates.io `spatiotemporal-tiles` max_version was
 
 ## Version/tag scheme
 
-- The seven public npm packages and four published Rust crates are meant to be
-  lockstep (npm `fixed` group; `[workspace.package] version`), and the tree is
-  currently **0.7.0**. The private Cesium package is outside that release set.
+- **The two registries are not lockstep.** crates.io and npm last agreed at
+  0.7.0 by history, not by promise; from here each moves on its own cadence. What
+  relates the two stacks is the archive's `formatVersion`, declared in
+  `project-status.json` on each side — read that, not the version string. The
+  four published crates share one `[workspace.package] version`, currently
+  **0.8.0**, and `sync-versions.mjs --check` gates the internal path-dep pins
+  against it.
 - Rust tag: `v{version}` (created manually; cargo-dist consumes it when the
-  Release workflow is dispatched). npm tags are changesets-style
-  `@poopdeck.gl/pkg@x.y.z`. No overlap.
+  Release workflow is dispatched). npm's tags live downstream and cannot collide
+  with it.
 - MSRV: `rust-version = 1.88`, enforced by the CI `rust-msrv` job. It briefly
   read 1.87 (2026-08-24 to 2026-08-26, after `stt-generate` took its
   home→osmpbf floor into its own workspace) and that was wrong: `geo` 0.33 had
@@ -106,17 +104,11 @@ lockstep broke, both of which outlive any one release:
 
 The repo used to carry **three** independent release mechanisms and used none of
 them end-to-end. `release-plz.toml` and `.github/workflows/release-plz.yml` are
-now **gone** (verified 2026-07-26): changesets owns npm, while cargo-dist builds
-Rust binaries from a manually dispatched workflow for an existing `v{version}`
-tag. The evidence that forced the deletion is kept because it is the argument
-against ever adding a third:
+now **gone** (verified 2026-07-26): changesets owns npm from the renderer
+repository, while cargo-dist builds Rust binaries from a manually dispatched
+workflow for an existing `v{version}` tag. The evidence that forced the deletion
+is kept because it is the argument against ever adding a third:
 
-- `.changeset/` holds `config.json` and nothing else; the last commit to touch
-  a changeset `.md` was the 0.3.0 release (`94e807b`).
-- `packages/*/CHANGELOG.md` stop at **0.4.0** — with two tells that they are
-  now hand-maintained: `poopdeck:packages/maplibre/CHANGELOG.md` heads an `## Unreleased`
-  section, and `poopdeck:packages/mcp/CHANGELOG.md` heads `## 0.5.0` with the line "Not
-  yet published to npm", which the registry contradicts.
 - `crates/*/CHANGELOG.md` **do not exist**, despite `release-plz.toml` setting
   `changelog_update = true`.
 - 0.5.0 landed as a hand-edited bump commit (`8bdc01d`, "bump workspace and npm
@@ -125,12 +117,10 @@ against ever adding a third:
 **The reasoning that settled it, kept as the standing rule.** release-plz's value
 is the release-PR/changelog workflow, and that workflow produced zero PRs and zero
 changelogs here — a third system whose only effect was to make the crate
-changelogs look _missing_ rather than absent-by-choice. Changesets keeps npm (it
-already owns the `fixed` group and the `@poopdeck.gl/pkg@x.y.z` tags); cargo-dist
-keeps Rust binary distribution. **The release ritual must end with a
-`v{version}` tag and a successful manual Release workflow dispatch, or the
-binaries silently stop existing** — that is the failure mode the deletion did
-not remove.
+changelogs look _missing_ rather than absent-by-choice. cargo-dist keeps Rust
+binary distribution. **The release ritual must end with a `v{version}` tag and a
+successful manual Release workflow dispatch, or the binaries silently stop
+existing** — that is the failure mode the deletion did not remove.
 
 ## Operational constraint: publishing crates from this network
 
@@ -138,12 +128,12 @@ not remove.
 `PUT`-with-body hangs; plain HTTP/1.1 to crates.io is fine, and setting
 `multiplexing = false` does **not** help. It is not cargo, not the sandbox, and
 not crates.io being down. **Publish the crate from a different network** (or
-from CI, once CI can run). Budget for this when planning a release; it has
-eaten a release window before.
+from a CI runner). Budget for this when planning a release; it has eaten a
+release window before.
 
 ## Publishing the tile fleet to R2 — the ordering is the whole procedure
 
-The npm/crates half above ships code; this half ships the ~65 GiB of archives the
+The crates half above ships code; this half ships the ~65 GiB of archives the
 code reads. It has its own release ritual, learned from the 2026-07-31 republish
 of the whole fleet (29.3 GiB, 1,324 objects, 68/68 manifests flipped).
 
@@ -176,7 +166,7 @@ Three standing rules that fall out of it:
   **4-hour 404 on an object that is present and correct in the bucket**. `HEAD`
   bypasses the cache and returns 200, which makes the symptom look inconsistent;
   `cf-cache-status: HIT` on the GET is the tell. Verify with a plain **GET**.
-  Neither token in `.env` carries the Cache Purge permission.
+  Neither Cloudflare token in `.env` carries the Cache Purge permission.
 - **A pass that matches nothing fails silently.** `r2-sync.sh` is a list of
   filtered `rclone copy` passes, each ending in `- **`; a file that matches no
   pass is simply never uploaded and nothing reports it. This has now bitten twice
@@ -186,31 +176,57 @@ Three standing rules that fall out of it:
 
 ## Auth lifecycle (token → OIDC)
 
-Bootstrap tokens live in the gitignored root `.env` (`NPM_TOKEN`,
-`CRATES_TOKEN`). The current npm workflow is the future trusted-publisher target:
-configure each public package for `release-npm.yml`, enable provenance when the
-repository is public, then revoke `NPM_TOKEN`. Rust publishing remains the manual
-dependency-order procedure in `CONTRIBUTING.md`; there is no release-plz workflow
-to name as a trusted publisher.
+The bootstrap token lives in the gitignored root `.env` (`CRATES_TOKEN`). Rust
+publishing remains the manual dependency-order procedure in `CONTRIBUTING.md`;
+there is no release-plz workflow to name as a trusted publisher, so there is
+nothing here to migrate to OIDC until one exists.
 
 ## CI gates that keep publishability true
 
-> These gates exist **as config only** — GitHub Actions has never run for this
-> repo (zero bot commits), so the release automation is unproven end-to-end
-> (**T2**). They are not untested, though: running every job by hand on
-> 2026-07-31 found four red and fixed them, which is how the feature lanes below
-> earned their keep — see [db-input-adaptors.md §5](./db-input-adaptors.md).
+> ⚠️ **The gates have always run; nobody was reading them.** This section spent a
+> month asserting that GitHub Actions had never run here, inferred from zero bot
+> commits. It was wrong — 184 runs, with a standing red on `CI`. "Nobody reads the
+> runs" is the worse failure of the two, because the gates were reporting real
+> defects into an empty room for a month: `rust-msrv` had been red since `geo`
+> 0.33 raised the locked tree's floor above the `rust-version` this file
+> promised, and the default-features lane was dying in the linker. Both are
+> fixed; `CI` and `Release` are green at `35cc8fe`. The 2026-07-31 by-hand run
+> keeps its place in the record, because it found four red and is how the feature
+> lanes below earned their keep — see
+> [db-input-adaptors.md §5](./db-input-adaptors.md).
 
-- `smoke-pack` (a step in the `typescript` CI job, and the `release-npm`
-  pre-publish gate — `scripts/smoke-pack.mjs`): packs every package tarball,
-  scratch-installs with real peers, imports EVERY exports key under plain Node,
-  plus a deck-free core+playback+react install (HoverPreview regression).
-- `rust-package`: `cargo package --workspace --exclude stt-generate --locked`
-  on every PR.
-- `rust-feature-lanes`: facade `serve-postgres` / `serve-duckdb` / `cli` solo
-  compiles + stt-build `--no-default-features`.
-- `rust-all-features`: tests (not just builds) the full feature surface.
-- `rust-msrv`: `cargo check --workspace` on 1.88.
+Ten jobs in `.github/workflows/ci.yml`:
+
+- `rust` / `rust-all-features`: `cargo test --workspace --locked` at default
+  features (what `cargo install` users get) and at `--all-features` — tests, not
+  just builds, so the feature-gated tests actually run. Both set
+  `CARGO_PROFILE_*_DEBUG: '0'`; full debuginfo OOMs the 7 GB runner's linker.
+- `rust-lint`: `cargo fmt --all -- --check` plus a curated correctness clippy
+  set the workspace satisfies in full, so every hit is a fresh regression.
+- `rust-feature-lanes`: six solo compiles — facade lib with no features, facade
+  bare `serve` (both backends), `serve-postgres`, `serve-duckdb`, full `cli`, and
+  stt-build `--no-default-features`. Workspace feature unification would
+  otherwise hide a missing cfg gate until a user hit it.
+- `rust-package`: `cargo package --workspace --exclude stt-generate --locked` on
+  every PR, so package excludes and versioned path-deps fail here rather than at
+  release time.
+- `rust-msrv`: `cargo check --locked` on 1.88 over the four **published** crates
+  by name — not `--workspace`, which dragged the unpublished `stt-generate`'s
+  osmpbf/home/delaunator floor into the number users see.
+- `rust-duckdb`: `cargo test -p stt-build --features duckdb`, plus the `#[ignore]`d
+  `spatial_roundtrip_smoke` — the only test that runs the SQL the server emits.
+- `rust-postgres-parity`: the ignored PostGIS source-parity tests against a
+  `postgis/postgis:16-3.4` service container.
+- `python`: the data-generation tests, and `emit_av_palettes.py --check` — the
+  seam gate that keeps `docs/spec/av-palettes.json` current, since the renderer
+  now asserts against that artifact instead of reading `av_common.py`
+  ([repo-split-2026-08.md §4.3](./repo-split-2026-08.md)).
+- `gates` (Node): `sync-versions.mjs --check`, `check-project-status.mjs`,
+  `check-doc-links.mjs`, `check-roadmap-citations.mjs`, `check-golden-pins.mjs`
+  and its own self-test, `gen-generate-datasets.mjs --check` (the second seam
+  gate — the generator subcommand inventory the MCP server binds its enum to,
+  [repo-split-2026-08.md §8.2](./repo-split-2026-08.md)), then `pnpm lint` and
+  `pnpm format:check`.
 
 ## Explicit non-goals (counted out, with revival triggers)
 
@@ -222,14 +238,8 @@ to name as a trusted publisher.
 - **Docker image / Homebrew tap**: cargo-dist's installers + `cargo install`
   cover it. Revive with a ghcr.io image for `stt-serve` if someone actually
   asks to run the server as a service.
-- Node 20 and earlier (EOL; `.node-version`, the root, and package engines require
-  Node 24+), apache-arrow stays a hard dep of core.
-
-**Closed, do not re-litigate: MapLibre v5/v6.** This was counted out when v5
-replaced the positional-matrix custom-layer `render(gl, matrix)` signature. The
-host-version adapter now normalizes the supported signatures, the declared peer
-range is `^3 || ^4 || ^5 || ^6`, and the showcase runs 6.6.x
-(`poopdeck:packages/maplibre/src/lib/host-adapter.ts`, per `base-layer.ts`).
+- Node 20 and earlier (EOL; `.node-version` and the `gates` job require Node
+  24+).
 
 ## Known risks / fallbacks
 

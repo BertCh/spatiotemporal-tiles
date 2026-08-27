@@ -3,15 +3,15 @@
 Orientation for any AI coding agent (Claude Code, Codex, Cursor, Gemini CLI, …)
 dropped into this checkout. `AGENTS.md` is the cross-harness convention that
 Cursor, Codex, and Gemini CLI read automatically; Claude Code users additionally
-get the `poopdeck:poopdeck-ai` plugin (see [How agents get help](#how-agents-get-help)).
+get the `poopdeck-ai` plugin (see [How agents get help](#how-agents-get-help)).
 Read this first, then follow the routing table to the canonical docs.
 
 ## What this repo is
 
 **SpatioTemporal Tiles (STT)** — the open **format** and the Rust **toolchain**
 that writes it. A dataset is a tiny `manifest.json` plus many immutable,
-content-addressed **pack** objects (`.stt` archive) that combine a spatial tile
-pyramid with a temporal axis — each tile is addressed by `(zoom, x, y,
+content-addressed **pack** objects — a directory, not a single file — that
+combine a spatial tile pyramid with a temporal axis — each tile is addressed by `(zoom, x, y,
 time-bucket)`. Five Rust CLIs (`stt-build`, `stt-optimize`, `stt-serve`,
 `stt-validate`, `stt-bundle`) build / analyze / serve those archives, and the
 repo-only `stt-generate` rebuilds the reference datasets. Scope is **vector**
@@ -26,10 +26,10 @@ time-varying rasters/datacubes are out of scope.
 > checkout. The two repositories meet at the archive on disk;
 > `docs/roadmap/repo-split-2026-08.md` is the contract.
 >
-> **What this repo owes downstream, it owes as artifacts.** 24 doc pages,
-> `conformance/vectors/`, `docs/spec/av-palettes.json`,
-> `docs/spec/stt-generate-datasets.json` and `project-status.json` are vendored
-> into poopdeck.gl and byte-gated there. Change them here; the downstream copy
+> **What this repo owes downstream, it owes as artifacts.** The pages and
+> generated contracts listed in `docs/.corpus.json` (`vendoredDownstream`),
+> `conformance/vectors/`, and `project-status.json` are vendored into
+> poopdeck.gl and byte-gated there. Change them here; the downstream copy
 > follows. Never the other way round.
 
 [pd]: https://github.com/BertCh/poopdeck.gl
@@ -74,7 +74,7 @@ Arrow IPC with GeoArrow-encoded geometry.
 
 | You want to…                                                              | Tool / package                                                   | Canonical docs                                                 |
 | ------------------------------------------------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------- |
-| Turn **your own** GeoParquet / PostGIS / DuckDB into a `.stt`             | `stt-build` (`--auto` to infer knobs)                            | `docs/guides/csv-quickstart.md`, `docs/api/cli-reference.md`   |
+| Turn **your own** GeoParquet / PostGIS / DuckDB into an archive           | `stt-build` (`--auto` to infer knobs)                            | `docs/guides/csv-quickstart.md`, `docs/api/cli-reference.md`   |
 | Get build knobs recommended from a source file                            | `stt-optimize` (powers `stt-build --auto`)                       | `docs/api/cli-reference.md`, `docs/guides/tuning-tiles.md`     |
 | Shrink / lint / diff / audit a **built** archive                          | `stt-optimize inspect`/`doctor`/`diff`/`order-audit`             | `docs/guides/tuning-tiles.md`                                  |
 | Serve tiles dynamically off a live DB                                     | `stt-serve` (PostGIS/DuckDB, axum)                               | `docs/api/cli-reference.md`, `docs/spec/stt-serve-protocol.md` |
@@ -95,42 +95,45 @@ it here.
 ```
 crates/                 # Rust workspace (5 members)
   stt-core/             # archive + Arrow tile format library (every CLI links it)
-  stt-build/            # GeoParquet / PostGIS / DuckDB → packed .stt (library)
+  stt-build/            # GeoParquet / PostGIS / DuckDB → packed archive (library)
   stt-optimize/         # input analysis + archive inspect/doctor/diff (powers --auto)
   stt-wasm/             # stt-core → WebAssembly decoder; publish = false (docs/guides/wasm.md)
   spatiotemporal-tiles/ # umbrella crate: re-exports the libs + ships the published CLIs
     src/bin/            #   stt-build, stt-optimize, stt-validate, stt-bundle, stt-serve
 tools/stt-generate/     # bundled showcase-dataset generators. NOT a root-workspace
-                        #   member: its own [workspace] + lockfile keep its higher
-                        #   MSRV off the published crates, so `-p stt-generate` from
-                        #   the root does not resolve — `cargo install --path` it
-packages/               # TypeScript (@poopdeck.gl/*)
-  core/                 # STTArchive reader, decoder pool, OPFS cache, render kernel
-  layers/               # deck.gl backend (primary)
-  three/ maplibre/ cesium/   # alternate renderer backends
-  playback/ react/      # clock + governor + React UI
-  mcp/                  # MCP server (@poopdeck.gl/mcp)
-poopdeck:examples/showcase/      # interactive demo app (deck.gl + MapLibre + Three)
+                        #   member: its own [workspace] + lockfile keep its dep tree
+                        #   (osmpbf, nexrad-*, tokio, reqwest) and whatever MSRV that
+                        #   tree demands off the four published crates, so
+                        #   `-p stt-generate` from the root does not resolve —
+                        #   `cargo install --path` it
+conformance/            # portable reader vectors + make-vectors.sh
 docs/                   # spec, API reference, guides, architecture
-poopdeck:poopdeck-ai/            # Claude Code plugin (Agent Skills + MCP server wiring)
+data-fleet/             # built archives, untracked
+poopdeck:packages/, poopdeck:examples/showcase/, poopdeck:poopdeck-ai/  # the OTHER repository
 ```
 
-## Where the docs live — key entry points
+## Where the docs live
 
-- `docs/intro/concepts.md` — the space×time tile model, packed archives, playback.
-- `docs/intro/choosing.md` — static vs served; which renderer.
-- `docs/intro/status-and-support.md` — maturity tiers, compatibility window, and
-  support expectations; `project-status.json` is the machine-readable summary.
-- `docs/intro/glossary.md` — canonical product, format, archive, and API names.
-- `docs/architecture/system-overview.md` — how the pieces fit end to end.
-- `docs/api/cli-reference.md` — canonical flags for every `stt-*` CLI.
-- `docs/spec/conformance.md` + `conformance/README.md` — what a conformant
-  reader/writer is, and the portable vectors that check one.
-- `docs/spec/stt-packed-format.md` — the on-disk format (manifest + packs +
-  directory v6; machine-checkable schema: `docs/spec/manifest.schema.json`).
+`docs/README.md` indexes every page in this repository. The routing table above
+already names the doc for each task; these are the ones it does not, and the
+`docs/spec/` pages are **normative** — they win over any roadmap record:
+
+- `docs/spec/stt-packed-format.md` — the container: manifest + packs +
+  directory v6 (machine-checkable schema: `docs/spec/manifest.schema.json`).
+- `docs/spec/time-model.md` — buckets, the temporal LOD pyramid, read-time
+  pruning.
 - `docs/architecture/data-format.md` — the per-tile Arrow layer-frame encoding.
-- `docs/guides/` — task guides (`csv-quickstart`, `tuning-tiles`, `deploying`,
-  `export`, `python`, `data-generation`, `wasm`, `ai-suite`).
+- `docs/spec/sidecar-assets.md` — the scene-bundle profile (AV cockpit, and any
+  multi-stream or `anchored-local` dataset).
+- `docs/architecture/{system-overview,archive-format-performance}.md` — how the
+  pieces fit end to end, and the no-thinning generation policy.
+- `docs/intro/{concepts,choosing,glossary}.md` — the tile model, the
+  static-vs-served choice, and the canonical spelling of every name.
+- `docs/roadmap/README.md` — the decision-record index **and the only backlog**;
+  open work is not tracked anywhere else in this repository.
+- <https://poopdeck.gl/docs/intro/status-and-support> — maturity tiers,
+  compatibility window, support expectations; `project-status.json` is this
+  repository's machine-readable half.
 
 ## Build / test basics
 
@@ -140,7 +143,7 @@ One **cargo** workspace, plus a handful of Node gates. Infer exact flags from
 ```bash
 cargo build --release          # CLI binaries → target/release/{stt-build,stt-optimize,...}
 cargo test --workspace
-cargo test --workspace --all-features       # incl. duckdb, postgres, projection
+cargo test --workspace --all-features       # incl. duckdb, postgres, both serve backends
 cargo test --manifest-path tools/stt-generate/Cargo.toml   # its own workspace
 
 pnpm install                   # only for the gates below; nothing is built
@@ -149,6 +152,8 @@ pnpm docs:links
 pnpm versions:check
 pnpm citations
 pnpm pins                      # golden byte pins
+pnpm lint                      # oxlint
+pnpm format:check              # oxfmt
 ```
 
 The published CLIs also install via `cargo install spatiotemporal-tiles`. Only
@@ -156,11 +161,14 @@ run commands you can verify from the manifests — do not invent scripts.
 
 ## How agents get help
 
-- **Claude Code:** install the **`poopdeck:poopdeck-ai` plugin** from this repo root — it
-  wires an **MCP server** (`@poopdeck.gl/mcp`, live dataset discovery / analysis /
-  `@deck.gl/json` map composition / gated build+validate) _and_ a set of **Agent
-  Skills** that route between the CLIs and MCP tools. Start with the
-  `poopdeck-overview` skill (the router). See `poopdeck:poopdeck-ai/README.md`.
+- **Claude Code:** install the **`poopdeck-ai` plugin**. It lives in the OTHER
+  repository — that checkout's root is the marketplace, not this one
+  (`/plugin marketplace add /path/to/poopdeck.gl`, then
+  `/plugin install poopdeck-ai`). It wires an **MCP server**
+  (`@poopdeck.gl/mcp`, live dataset discovery / analysis / `@deck.gl/json` map
+  composition / gated build+validate) _and_ ten **Agent Skills** that route
+  between the CLIs and MCP tools. Start with the `poopdeck-overview` skill (the
+  router). See `poopdeck:poopdeck-ai/README.md`.
 - **Other harnesses (Cursor / Codex / Gemini CLI):** the Skills are authored to
   the [agentskills.io](https://agentskills.io) open standard (portable frontmatter)
   and load in any skill-aware harness. The MCP server also exposes

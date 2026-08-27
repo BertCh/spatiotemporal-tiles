@@ -2,9 +2,10 @@
 
 > The open format and Rust toolchain for time-aware vector tiles. STT packs
 > large spatiotemporal datasets (points, paths, polygons, trips, flows, events)
-> into streamable, animated `.stt` archives that a client fetches by map
-> viewport AND time window over ordinary HTTP Range requests. Five CLIs build,
-> analyze, validate, bundle and serve them.
+> into streamable, animated archives — a small `manifest.json`, a compact
+> directory, and immutable content-addressed pack objects — that a client
+> fetches by map viewport AND time window over ordinary HTTP Range requests.
+> Five CLIs build, analyze, validate, bundle and serve them.
 
 > **Rendering is a separate project.** The `@poopdeck.gl/*` TypeScript packages
 > (deck.gl, Three.js/WebGPU, MapLibre, Cesium), the playback clock, the MCP
@@ -14,29 +15,31 @@
 > under <https://poopdeck.gl/llms/>.
 
 ## Start here
+- [Documentation index](docs/README.md): every page in this repository, grouped by task.
 - [Agent guide (AGENTS.md)](https://github.com/BertCh/spatiotemporal-tiles/blob/main/AGENTS.md): how coding agents should work in this repo.
 - [Concepts](docs/intro/concepts.md): the space×time tile model, packed archives, playback.
-- [Choosing an approach](docs/intro/choosing.md): static vs served; which renderer.
+- [Choosing an approach](docs/intro/choosing.md): does STT fit; static vs served.
 - [Glossary and naming](docs/intro/glossary.md): canonical project, archive, format, and API terminology.
-- [CSV quickstart](docs/guides/csv-quickstart.md): fastest path from a table to a map.
+- [CSV quickstart](docs/guides/csv-quickstart.md): fastest path from a table to a map — `stt-build` from GeoParquet.
 - [System overview](docs/architecture/system-overview.md): how the pieces fit, across both repositories.
 
 ## Command-line tools
 - [CLI reference](docs/api/cli-reference.md): canonical flags for the five installed binaries — `stt-build`, `stt-optimize`, `stt-validate`, `stt-bundle`, `stt-serve` — plus the repo-only `stt-generate`.
-- [Build a dataset](docs/guides/csv-quickstart.md): `stt-build` from GeoParquet / PostGIS / DuckDB.
-- [Tune & lint tiles](docs/guides/tuning-tiles.md): `stt-optimize` inspect/doctor/diff/order-audit; publish encoding.
-- [Serve & deploy](docs/guides/deploying.md): `stt-serve` and static publishing to a CDN/R2.
-- [Python](docs/guides/python.md): GeoPandas, DuckDB and pyarrow input workflows.
+- [Tune & lint tiles](docs/guides/tuning-tiles.md): `stt-optimize` analyze/recommend/inspect/doctor/diff/order-audit; `--auto`; style hints.
+- [Deploy](docs/guides/deploying.md): static publishing to R2/any CDN — cache regimes, CORS, packs-first publication order.
+- [Python](docs/guides/python.md): GeoPandas, DuckDB and pyarrow paths to the GeoParquet `stt-build` reads.
 - [Data generation](docs/guides/data-generation.md): the reference `stt-generate` datasets and the Python extractors.
+- [Export](docs/guides/export.md): `stt-optimize export` back to GeoParquet 1.1.
+- [WASM decoder](docs/guides/wasm.md): `stt-core` compiled to a browser decoder.
 
 ## Format & protocol
 - [Packed format spec](docs/spec/stt-packed-format.md): manifest + content-addressed packs, directory v6, quant/zstd.
 - [Tile payload](docs/architecture/data-format.md): the per-tile Arrow IPC / GeoArrow layer frame.
-- [Time model](docs/spec/time-model.md): buckets, LOD pyramid, temporal bounds.
-- [Serve protocol](docs/spec/stt-serve-protocol.md): dynamic tile routes.
+- [Time model](docs/spec/time-model.md): buckets, LOD pyramid, temporal pruning.
+- [Serve protocol](docs/spec/stt-serve-protocol.md): `stt-serve`'s dynamic tile routes over PostGIS/DuckDB.
 - [Sidecar assets](docs/spec/sidecar-assets.md) and the [scene schema](docs/spec/scene.schema.json): the multi-stream scene bundle.
 - [Conformance](docs/spec/conformance.md) and the [portable vectors](conformance/README.md): what a conformant reader/writer is, and how to check one.
-- [Archive performance](docs/architecture/archive-format-performance.md): layout and generation decisions.
+- [Archive layout & generation policy](docs/architecture/archive-format-performance.md): the current contract and the no-thinning rules.
 
 ## Machine-readable contracts
 - [manifest.schema.json](docs/spec/manifest.schema.json): the archive manifest.
@@ -44,6 +47,11 @@
 - [project-status.json](project-status.json): what this toolchain writes and reads, gate-verified.
 - [av-palettes.json](docs/spec/av-palettes.json): the AV cockpit's cross-language palette contract.
 - [stt-generate-datasets.json](docs/spec/stt-generate-datasets.json): the reference generator's subcommand inventory.
+- [docs/.corpus.json](docs/.corpus.json): which pages here are vendored into poopdeck.gl, and which live only there.
+
+## Decision records
+- [Roadmap register](docs/roadmap/README.md): the record index, plus the single backlog of open work for the format, the tiler, the optimizer and the data fleet.
+- [Repository split](docs/roadmap/repo-split-2026-08.md): the two-repository contract and the seam artifacts.
 
 ## Rendering
 - Everything: <https://poopdeck.gl/docs> and <https://github.com/BertCh/poopdeck.gl>.

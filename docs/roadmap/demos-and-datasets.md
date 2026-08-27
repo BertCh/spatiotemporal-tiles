@@ -30,16 +30,16 @@ nothing about license (nuScenes is the counterexample).
 
 ### 1.1 Blocked or conditional (verified verbatim 2026-07-01 — do not use without re-reading)
 
-| Dataset                              | Verdict                                                                                                                                                                                                                                                                                                                                     |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **OpenSky ADS-B**                    | **HARD BLOCKER** — non-profit research/education only; no distribution outside licensee's institute; restrictions attach to "any and all subsequent uses and disclosures". Escape hatch: their separately-licensed **CC-BY 4.0 Zenodo derivatives** (e.g. 2019–2020 crowdsourced air traffic, ~41.9 M flights, doi:10.5281/zenodo.3931948). |
-| **Global Fishing Watch**             | **CC BY-NC 4.0** — derived tiles redistributable but non-commercial only; usable only if the showcase is definitively non-commercial. Legacy GEE V1 subset is CC-BY-SA.                                                                                                                                                                     |
-| **Gaia DR3**                         | **CC BY-NC 3.0 IGO** (not BY-SA as often assumed) — NC blocker.                                                                                                                                                                                                                                                                             |
-| **WWLLN / Earth Networks lightning** | Copyrighted/commercial, no redistribution. GOES GLM is the open substitute.                                                                                                                                                                                                                                                                 |
-| **ESA DISCOS**                       | Registration-gated, no redistribution right.                                                                                                                                                                                                                                                                                                |
-| **Japan ODPT transit**               | Bespoke license, full text unverifiable without an account; patchwork CC-BY subsets only. Legal risk for public rehosting.                                                                                                                                                                                                                  |
-| **MERIT Hydro**                      | Dual CC-BY-NC / ODbL — usable **only** by electing ODbL (share-alike). Prefer NHDPlus/NWM.                                                                                                                                                                                                                                                  |
-| **Waymo Open Dataset**               | Non-commercial **and** no-redistribution. Enforced in code, not by convention: `WAYMO_LOCAL_ONLY = /^waymo-/` filters every `waymo-*` bundle out of the dataset list whenever tiles are served remotely, so no Waymo scene reaches `/demos`, the cockpit switcher, or a `/drive/:id` route on the public site.                              |
+| Dataset                              | Verdict                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **OpenSky ADS-B**                    | **HARD BLOCKER** — non-profit research/education only; no distribution outside licensee's institute; restrictions attach to "any and all subsequent uses and disclosures". Escape hatch: their separately-licensed **CC-BY 4.0 Zenodo derivatives** (e.g. 2019–2020 crowdsourced air traffic, ~41.9 M flights, doi:10.5281/zenodo.3931948).                   |
+| **Global Fishing Watch**             | **CC BY-NC 4.0** — derived tiles redistributable but non-commercial only; usable only if the showcase is definitively non-commercial. Legacy GEE V1 subset is CC-BY-SA.                                                                                                                                                                                       |
+| **Gaia DR3**                         | **CC BY-NC 3.0 IGO** (not BY-SA as often assumed) — NC blocker.                                                                                                                                                                                                                                                                                               |
+| **WWLLN / Earth Networks lightning** | Copyrighted/commercial, no redistribution. GOES GLM is the open substitute.                                                                                                                                                                                                                                                                                   |
+| **ESA DISCOS**                       | Registration-gated, no redistribution right.                                                                                                                                                                                                                                                                                                                  |
+| **Japan ODPT transit**               | Bespoke license, full text unverifiable without an account; patchwork CC-BY subsets only. Legal risk for public rehosting.                                                                                                                                                                                                                                    |
+| **MERIT Hydro**                      | Dual CC-BY-NC / ODbL — usable **only** by electing ODbL (share-alike). Prefer NHDPlus/NWM.                                                                                                                                                                                                                                                                    |
+| **Waymo Open Dataset**               | Non-commercial **and** no-redistribution. Enforced in code, not by convention: `WAYMO_LOCAL_ONLY = /^waymo-/` (`poopdeck:examples/showcase/src/datasets.ts`) filters every `waymo-*` bundle out of the dataset list whenever tiles are served remotely, so no Waymo scene reaches `/demos`, the cockpit switcher, or a `/drive/:id` route on the public site. |
 
 ### 1.2 Operational time-bombs (check before any new build)
 
@@ -58,7 +58,7 @@ nothing about license (nuScenes is the counterexample).
 
 The fleet-wide defects this section carried through July are **closed** — all 68
 registered manifests return `formatVersion: 2`, `wpc-fronts` / `wpc-fronts-pips` are synced,
-and `LOCAL_ONLY_DATASETS` is empty. What survives is the standing lesson and one open item.
+and `LOCAL_ONLY_DATASETS` (`poopdeck:examples/showcase/src/datasets.ts`) is empty. What survives is the standing lesson and one open item.
 
 - **Standing lesson: a demo is only as gated as its _least_ synced archive.** The gate keys on
   demo ids, so it cannot reach an overlay stem inside an otherwise-live composite — which is
@@ -97,11 +97,46 @@ regardless of the Gemma Terms verdict. Not a licence blocker; an access one. See
 [neural-atlas-2026-07.md](./neural-atlas-2026-07.md) §14.2.
 
 Gate status: still **LOCAL-ONLY**, held off the public deploy by `ATLAS_AVAILABLE`
-in `datasets.ts` — the surface is not a `Dataset`, so `LOCAL_ONLY_DATASETS` cannot
+in `poopdeck:examples/showcase/src/datasets.ts` — the surface is not a `Dataset`, so `LOCAL_ONLY_DATASETS` cannot
 reach it and it needed its own flag. The archives, their `.meta.json` files and
 both `.bin` blobs are synced and return 200; the one artefact still missing is the
 generator sidecar `/data/neural-atlas.json`, which is **L1** in the
 [roadmap README](./README.md).
+
+### 1.5 Rebuild drift — a rebuild is not a replacement (measured 2026-08-14)
+
+Eight API-tier datasets were rebuilt from a clean checkout while the fleet's `formatVersion: 3`
+move was still framed as a regeneration. Only three came back boring, and the three failure modes
+are properties of the SOURCE or of changed builder defaults — none of them of the format. The
+migration went another way (**B4** in the [roadmap README](./README.md)), but the per-dataset
+verdicts stand and apply to any future rebuild of these stems.
+
+- **`wildfires` — the data is gone upstream.** The run produced an archive of 175 features
+  against the live 4,600, and it passed every gate then in place: the manifest really did declare
+  the new format version and `stt-validate` really did exit 0, on a flawless encoding of almost no
+  data. NIFC now returns 15 source perimeters for 2020–2023 where it once returned hundreds, and
+  `tools/stt-generate/src/datasets/wildfires.rs` has carried a warning about exactly this since
+  2026-07-29. Not recoverable here — re-source before touching it (**K9** in the README).
+- **`satellites` — bucket drift, not loss.** 0.342× the live features from MORE satellites: the
+  shipped archive used a 5-minute temporal bucket and today's builder auto-picks 1 hour, so the
+  same 16,087 objects (against the live archive's ~12,700) land in 2,125 tiles instead of 24,480.
+  The generator does not expose `--temporal-bucket`, so reproducing the shipped shape needs
+  `--skip-build` plus a direct `stt-build`, **and** a pinned `--start-time` with a matching
+  `timeRange` in `poopdeck:examples/showcase/src/datasets.ts` — propagation runs from _now_, and a
+  mismatched range renders the demo empty rather than wrong.
+- **`ais-all-us` and `flights` — the opposite drift, and it is a decision.** Today's default
+  `--sample-minutes 0` preserves every usable row, which is this document's own no-thinning ground
+  rule; both shipped archives were built thinned. `ais-all-us` comes back at 6.45× the features
+  and 2.2 GB against 0.51 GB, `flights` at 5.93× and 4.2 GB against 0.81 GB. Neither is a defect —
+  the rebuilds are the more honest artifacts — but ~5× the bytes against a ~18 GB fleet is a
+  density call to make per dataset BEFORE uploading, not one to discover on the bill.
+
+**The gate this produced, and why it had to exist.** Neither `stt-validate` nor a `formatVersion`
+check can distinguish a correct encoding of almost no data from a correct encoding of all of it —
+`wildfires` proved that by passing both. `scripts/rebuild-fleet-v3.sh` therefore compares
+`feature_count` against the archive currently serving, fails a dataset on a material shortfall,
+and reports anything above 1.5× for review rather than passing it silently. Any future
+regeneration script owes the same check.
 
 ## 2. AV cockpit (`/drive`)
 
@@ -111,17 +146,16 @@ local-only per §1.1. Attribution renders from each bundle's `scene.json`.
 
 > **The AV record lives in [av-cockpit.md](./av-cockpit.md), not here.** It is the
 > only per-demo doc that survived the 2026-07-24 consolidation, because it is not a
-> campaign log — it is a **live data contract**. Forty-four section-anchored citations
-> across `scripts/data-generation/*.py`, `poopdeck:packages/layers/src/layers/core/animated-bounding-box-layer.ts`
-> and `poopdeck:examples/showcase/src/components/av/*` point into its numbered sections, and
+> campaign log — it is a **live data contract**. Section-anchored citations across
+> `scripts/data-generation/*.py` (25 here, the rest downstream in
+> `poopdeck:packages/layers/src/layers/core/animated-bounding-box-layer.ts` and
+> `poopdeck:examples/showcase/src/components/av/*`) point into its numbered sections, and
 > `scripts/data-generation/av_common.py:8` instructs extractor authors not to deviate
 > from it. It carries the georeferencing gotchas (nuScenes local frame vs Argoverse 2
-> UTM), the three-copy palette-lockstep rule and the legend↔box bug it prevents, and
+> UTM), the generated palette contract and the legend↔box bug it prevents, and
 > the measured LiDAR compression story (3.84 GB → 633 MB) with its counted-out levers.
->
-> ⚠️ Some of its inbound citations were already stale before the consolidation — the
-> `§3c` anchors in `animated-bounding-box-layer.ts` do not match its current §3. Fix
-> the anchors, not the doc, and add them to the roadmap-citation CI check (W1.1).
+> Stranding those anchors once — a lettered-subsection rewrite the filename check could
+> not see — is why `.github/scripts/check-roadmap-citations.mjs` also verifies the `§`.
 
 ---
 
@@ -221,35 +255,15 @@ dealias spikes don't) and must sit inside the same `--crop-km` scene. An **oppos
 couplet, whose pair at 20:26:00Z was (−62.9, −9.5) m/s — violent rotation embedded in strong
 one-signed inflow.
 
-**Perf amendment — the two fixes are GENERAL renderer fixes, not storm-specific.** The composite
-first ran at ~4 fps (2.7 s main-thread stalls, ~4,000 tile decodes in the opening seconds, 280+
-point sublayers, and a React "Maximum update depth exceeded" crash ~5 s into playback). Two
-_storage_ knobs were responsible — no feature, timestamp, or column changed:
-
-1. **1-minute buckets on tiny archives.** At ~288× playback the playhead crossed five 1-min
-   buckets per real second, churning selection/fetch/decode/sublayer builds on every one of ten
-   tilesets. Worse, `--end-time-field` replicates a feature into every bucket its [start, end]
-   overlaps, so each ~30-min warning polygon was stored ~30×. Rebuilt to 1h/30m/2h buckets:
-   warnings 4,205 → 113 tiles, reports 1,968 → 80, stations 32,256 → 190, sounding 807 → 4.
-2. **Full zoom pyramids under a fixed-framing demo.** Overlay pyramids clamped z3–9 → z3–6
-   (cloudtop z3–8 → z3–6, 16,750 → 2,960 tiles, 81 → 42 MB). Detail is unchanged — the base
-   level is lossless and the camera never needs deeper spatial partitioning at this framing.
-
-Their renderer counterparts are the durable part, and both apply to **any** full-duplication
-archive:
-
-- `SpatioTemporalLayer` grew a `refinementStrategy` prop (`'best-available' | 'no-overlap'`,
-  default `'best-available'`). Every storm4d layer passes `'no-overlap'` because these archives
-  are FULL-DUPLICATION pyramids (every zoom carries every feature — 18.3 M gates per level on the
-  volume), so deck's best-available parent fallback fetched, decoded and drew up to 4 extra
-  complete copies of the visible data per bucket.
-- `SpatioTemporalTileset.getVisibleTiles` pass-2 parent-cover scan is now clamped to the
-  viewport's primary-zoom tile range. The bug this prevents: a parent spatially larger than the
-  viewport always contains child cells outside it, which are never selected and so can never
-  enter `primaryCover` — without the clamp such a parent passes the "some child uncovered" test
-  FOREVER and keeps rendering on top of the fully-streamed primary tiles. The clamp preserves the
-  sparse-archive contract (`--min-features-per-tile` omits deep tiles, so an in-viewport cell
-  with no primary tile keeps its parent).
+**Perf amendment — the measurements belong to
+[storm-4d-greenfield-2026-07.md](./storm-4d-greenfield-2026-07.md) §9.4, not here.** The build
+gotcha worth carrying is that the composite's ~4 fps opening was two _storage_ knobs — 1-minute
+buckets on tiny archives (compounded by `--end-time-field` replicating each ~30-min warning
+polygon into every bucket it overlaps) and full zoom pyramids under a fixed-framing demo — with
+no feature, timestamp, or column changed, so the no-thinning verdict above is untouched. §9.4
+carries the fps, tile-count and byte figures, and the two renderer fixes the amendment produced
+(`refinementStrategy: 'no-overlap'` and the parent-cover clamp), which are general fixes for any
+full-duplication archive rather than storm-specific ones.
 
 **Superseded:** the amendment's optional "rebuild the volume `--min-zoom 6` to drop the z4+z5
 duplicate levels (~230 MB of 556 MB)" is obsolete. The generator now bakes a **stratified
@@ -257,7 +271,7 @@ duplicate levels (~230 MB of 556 MB)" is obsolete. The generator now bakes a **s
 doubling per zoom out) keeps one representative per cell — the **strongest-echo** gate, so the
 coarse skeleton is the meaningful storm core rather than noise; gates that never win a cell
 default to `max_zoom`, so **the deepest tier stays lossless**. This exists because
-`--maximum-tile-features --drop-densest` is a **no-op on a homogeneous point cloud** — every
+`--maximum-tile-features --drop-densest-as-needed` is a **no-op on a homogeneous point cloud** — every
 single-vertex gate scores equally, so the cap just truncates scan order and drops whole regions.
 
 ### 4.2 `storm-3d-conus` — the national companion
@@ -278,7 +292,7 @@ no radar geometry (MRMS is already QC'd and Cartesian). Live on R2.
   against a 4,500 km-wide continent. One shared `elevationScale` per demo across all
   altitude-bearing layers; mixed scales would make the scene lie.
 - The dBZ band labels are a **byte-for-byte contract** across `nexrad_volume.py`,
-  `mrms_volume.py` and the frontend `STORM4D_DBZ_COLORS`. Drift silently breaks the color map.
+  `mrms_volume.py` and the frontend `STORM4D_DBZ_COLORS` (`poopdeck:examples/showcase/src/datasets.ts`). Drift silently breaks the color map.
 
 ---
 
@@ -291,17 +305,17 @@ temporal bucket (rain 2-hourly, rivers daily), so the two cadences coexist on on
 single scrub drives both without re-fetching geometry.
 
 This **replaced the standalone March-2019 flood demo**; `nwm-rivers-flood-2019-03` is gone from
-`datasets.ts`. `rainfall-2019` currently 404s on R2 — see §1.3.
+`poopdeck:examples/showcase/src/datasets.ts`. `rainfall-2019` is live on R2 (200, re-checked 2026-08-26).
 
 **⚠ `--min-zoom 0` is load-bearing.** The overview/storyboard preload tier
-(`preloadOverviewTier`, `spatiotemporal-tileset.ts`) enumerates zooms
+(`preloadOverviewTier`, `poopdeck:packages/core/src/spatiotemporal-tileset.ts`) enumerates zooms
 `max(0, minZoom) … min(overviewMaxZoom = 1, maxZoom)` across the FULL time range and pins them so
 a scrub always renders via parent-fallback. If the archive's `min_zoom > 1` that range is EMPTY →
 the tier reports `no-tiles` and preloading silently does nothing. So the rain archive MUST build
 with `--min-zoom 0`. The composite then overrides the default to pin **z0 only** — one
 whole-CONUS tile per bucket, the ideal scrub thumbnail; z1 would double the always-resident cost
 for no gain at this framing — with a raised budget, because the tier is dropped wholesale as
-`over-budget` if it does not fit. Current tree (`buildDemoLayers.ts`, `case 'polygon'`): 4,380 z0
+`over-budget` if it does not fit. Current tree (`poopdeck:examples/showcase/src/components/demo/buildDemoLayers.ts`, `case 'polygon'`): 4,380 z0
 tiles ≈ 81 MB against a 128 MiB budget.
 
 **Categorical-band rule:** `precip_band` is a non-numeric RANGE label (`"0.5-1"` … `"20+"`) so
@@ -316,8 +330,8 @@ collapses the field into the faint tier.
 
 **Sources + license.** Netherlands via OVapi/NDOV national GTFS — **CC0**, with real
 `shapes.txt` geometry and free keyless realtime; it was the lowest-risk start. Switzerland via
-opentransportdata.swiss — open with attribution plus a keep-updated duty. `gtfs-ch` currently
-404s on R2 — see §1.3.
+opentransportdata.swiss — open with attribution plus a keep-updated duty. `gtfs-ch` is live on
+R2 (200, re-checked 2026-08-26).
 
 - **The Swiss feed publishes no `shapes.txt`** (and the geOps mirror doesn't add them either), so
   the CH rebuild map-matches the feed onto OSM with **pfaedle** first (ad-freiburg/pfaedle, built
@@ -329,7 +343,7 @@ opentransportdata.swiss — open with attribution plus a keep-updated duty. `gtf
   and each vertex carries a BAKED terrain elevation (AWS Terrarium DEM → the `vertex_values`
   channel, shaped per mode: grade-capped modes tunnel ridges / bridge gorges, gondolas span
   station-to-station); the demo renders it over 3D basemap terrain (`basemapTerrain` +
-  `elevationFromVertexValues` in datasets.ts, `elevationScale` = the terrain exaggeration).
+  `elevationFromVertexValues` in `poopdeck:examples/showcase/src/datasets.ts`, `elevationScale` = the terrain exaggeration).
 - **Schedule expansion is a build stage**: a trip runs iff its `service_id` is active on `--date`
   (weekly `calendar.txt` plus `calendar_dates.txt` exceptions, removals win — the NL feed is
   calendar_dates-only). Stops are positioned by `shape_dist_traveled`; shape vertices between
@@ -352,7 +366,7 @@ opentransportdata.swiss — open with attribution plus a keep-updated duty. `gtf
 **Source + license.** `s3://noaa-nwm-retrospective-3-0-pds` (anonymous): hourly modeled
 streamflow for ~2.7 M CONUS river reaches, 1979 → Jan 2023. Registry terms: "Open Data. There are
 no restrictions on the use of this data." Reach geometry from USGS NHDPlusV2 (public domain).
-Live on R2. Renders through `FlowCorridorLayer` as-is — zero new layer code, as designed.
+Live on R2. Renders through `FlowCorridorLayer` (`poopdeck:packages/layers`) as-is — zero new layer code, as designed.
 
 - **Self-scaled won.** Each reach is baked against its own annual [p2, p98] log-discharge → [0, 1],
   because absolute `log-q` let the great rivers pin the scale and left every tributary flat-dim.

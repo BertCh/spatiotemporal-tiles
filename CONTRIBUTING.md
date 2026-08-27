@@ -13,25 +13,23 @@ One cargo workspace. The TypeScript renderers that CONSUME archives live in a
 separate repository, [BertCh/poopdeck.gl][pd]; this one writes them.
 
 ```
-crates/                 # cargo workspace — the 4 PUBLISHED crates
+crates/                 # cargo workspace — the 4 PUBLISHED crates + stt-wasm
   stt-core/             #   archive + Arrow tile format library
   stt-build/            #   GeoParquet / PostGIS / DuckDB → packed .stt
   stt-optimize/         #   input analysis + archive inspect/doctor/diff
+  stt-wasm/             #   stt-core → WebAssembly decoder; publish = false
   spatiotemporal-tiles/ #   umbrella crate: re-exports the libs + ships the CLIs
     src/bin/            #     stt-build, stt-optimize, stt-validate,
                         #     stt-bundle, stt-serve
-packages/               # pnpm workspace — 7 published packages + Cesium preview
-  core/                 #   reader, decoder pool, cache, render kernel
-  layers/               #   deck.gl backend (primary)
-  three/ maplibre/       #   published alternate renderer backends
-  cesium/                #   experimental workspace-only backend (private)
-  playback/ react/      #   clock + governor + React UI
-  mcp/                  #   published MCP server (`stt-mcp`)
-poopdeck:examples/showcase/      # React Router demo site (dozens of real datasets)
-tools/                  # bench, perf, render-test harnesses
+conformance/            # portable reader vectors + make-vectors.sh
+tools/                  # fleet-order-audit.sh + the reference-dataset generator
   stt-generate/         #   reference-dataset generators — its OWN cargo
                         #   workspace, unpublished, off the root MSRV
 docs/                   # spec, API reference, guides, architecture
+
+# the OTHER repository, BertCh/poopdeck.gl:
+poopdeck:packages/               # the 7 published @poopdeck.gl/* packages + Cesium
+poopdeck:examples/showcase/      # React Router demo site (dozens of real datasets)
 poopdeck:poopdeck-ai/            # Claude Code plugin (MCP server + Agent Skills)
 ```
 
@@ -112,27 +110,20 @@ the file you are editing.
 
 ## Releasing
 
-npm and crates.io versions move in **lockstep** — one number, both registries.
-There is one release system: **changesets drives the version, cargo-dist builds
-the binaries.** (There used to be three; two of them had never produced a
-release. release-plz was deleted rather than left as config nobody runs.)
-
-Add `pnpm changeset` to any PR that changes a published package. The
-`@poopdeck.gl/*` packages are a `fixed` group, so they all bump together.
+crates.io and npm release **independently**; what relates the two stacks is the
+archive's `formatVersion`, not the version string. This repository ships the
+crates, and cargo-dist builds the binaries.
 
 To release:
 
-1. **npm.** `release-npm.yml` opens a Version Packages PR from the accumulated
-   changesets; merging it runs `pnpm version-packages` → `pnpm release`
-   (build + `smoke-pack` + publish). That is what sets the canonical number.
-2. **Everything else follows the canonical number.** Run
-   `node scripts/sync-versions.mjs` — it rewrites `[workspace.package] version`
-   in `Cargo.toml`, the Claude Code plugin manifest, the marketplace entry, and
-   each skill's frontmatter `metadata.version` to match
-   `poopdeck:packages/core/package.json`. `--check` reports drift and exits non-zero;
-   CI runs it on every PR. **This is the gate that keeps crates.io and npm from
-   diverging** — they did exactly that (0.4.0 vs 0.5.0) back when Cargo.toml
-   was a hand edit no check covered.
+1. **Bump the number.** `[workspace.package] version` in the root `Cargo.toml`
+   is canonical, and it is a hand edit.
+2. **Propagate it.** `node scripts/sync-versions.mjs` rewrites the
+   `version = "…"` on every internal path-dependency in `crates/*/Cargo.toml`;
+   cargo requires one for a published dependency, and `cargo update -w` fails
+   outright when they lag. `--check` reports drift and exits non-zero; CI runs
+   it on every PR. Then `node scripts/check-project-status.mjs` re-proves
+   `project-status.json` against the manifests and the `stt-core` constants.
 3. **crates.io.** Publish by hand, in dependency order:
    `stt-core` → `stt-optimize` → `stt-build` → `spatiotemporal-tiles`.
    `stt-generate` is `publish = false`. Note the standing constraint in
@@ -143,9 +134,9 @@ To release:
    configured with `dispatch-releases = true`, so pushing the tag alone does
    **not** build anything.
 
-Changelogs: `packages/*/CHANGELOG.md` are written by changesets — do not
-hand-edit them. The crates have **no** changelog files, deliberately; the
-GitHub Release cargo-dist creates in step 4 is the crate-side record.
+The crates have **no** changelog files, deliberately; the GitHub Release
+cargo-dist creates in step 4 is the crate-side record. Root `CHANGELOG.md`
+carries the format-and-toolchain summary.
 
 ## Invariants — do not break these
 
@@ -179,3 +170,5 @@ body. New behavior in a CLI belongs in `docs/api/cli-reference.md`; new wire
 behavior belongs in `docs/spec/`. If the change alters what a reader must
 accept, say so — a downstream reader has to follow, and the conformance vectors
 are how it finds out.
+
+[pd]: https://github.com/BertCh/poopdeck.gl

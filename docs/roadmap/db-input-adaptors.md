@@ -119,16 +119,19 @@ _concentrated, not sprawling_ is one good seam and a few recurring smells.
    outside it (lesson 5).
 
 2. **Process-wide mutable encoder globals are a silent-divergence + concurrency
-   footgun.** The encoder historically read six process-wide statics
-   (vertex-time precision, coord/attr quantization, attrs-auto, vector groups,
-   point-elevation — `stt-core/src/arrow_tile.rs`, statics block ~890–1105).
+   footgun.** The encoder historically read its settings from process-wide
+   statics (coord/attr quantization, attrs-auto, vector groups,
+   point-elevation — `crates/stt-core/src/arrow_tile/config.rs`).
    The _original_ serve bug was exactly this: `stt-serve` never called the
    setters, so quantized/vector-grouped datasets served subtly wrong tiles with
    **no error**. Fixed by threading an explicit `EncoderConfig`
-   (`encode_tile_with`) per request — also what made multi-dataset serve
-   possible (different quantization configs in one process, live-verified).
-   The offline CLI still uses the global setters — fine for a one-shot
-   process; see the backlog.
+   (`arrow_tile/encode.rs` `encode_tile_with`) per request — also what made
+   multi-dataset serve possible (different quantization configs in one process,
+   live-verified). **Both** producers now thread it: `stt-build` carries an
+   `EncoderConfig` on its `PackWriter` and `stt-serve` one per dataset, so
+   nothing in this workspace's build path mutates the globals. They survive
+   only for external one-shot `encode_tile` / `encode_layer` callers, which
+   snapshot them via `EncoderConfig::from_globals`.
 
 3. **Silent degradation is the dangerous failure mode.** The DB readers
    originally dropped per-vertex columns to `None` with no warning — an entire
@@ -154,10 +157,12 @@ _concentrated, not sprawling_ is one good seam and a few recurring smells.
    row→`ParsedFeature` decode rules were consolidated the same way
    (`db_input_common.rs` — every rule lives once, so a new engine can't
    silently diverge). Still outside the seam: the Python extractors
-   hand-assemble flags and the showcase keeps dual-copy palettes — both
-   mechanically guarded by parity tests rather than codegen (counted out;
-   revive if the flag surface churns enough that those tests become the
-   bottleneck).
+   hand-assemble flags, guarded by a parity test rather than codegen (counted
+   out; revive if the flag surface churns enough that the test becomes the
+   bottleneck). The palette half was **discharged 2026-08-26**: the dual copy is
+   now an artifact contract, not a two-tree test — `av_common.py` generates
+   `docs/spec/av-palettes.json` (`emit_av_palettes.py --check` in CI) and the
+   renderer asserts against the artifact.
 
 6. **WKB is the ingest lingua franca; bundled/in-process is the CI win.** All
    readers bridge geometry through WKB → `parse_wkb_geometry`. DuckDB-bundled
@@ -174,15 +179,15 @@ _concentrated, not sprawling_ is one good seam and a few recurring smells.
 
 ### Where each lesson lives in code
 
-| Lesson                            | Anchor                                                                                                   |
-| --------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `ParsedFeature` seam              | `crates/stt-build/src/input.rs` (struct + the file reader)                                               |
-| Encoder globals / `EncoderConfig` | `crates/stt-core/src/arrow_tile.rs` (statics ~890–1105; `EncoderConfig` + `encode_tile_with` below them) |
-| Shared flag→config                | `crates/stt-build/src/build_options.rs`                                                                  |
-| Per-tile reuse                    | `crates/stt-build/src/tiler.rs` `encode_single_tile_counted`                                             |
-| Parity comparator                 | `crates/stt-build/tests/common/mod.rs`, `tests/source_parity.rs`                                         |
-| Shared name predicates            | `crates/stt-build/src/input.rs` `is_coordinate_column_name` / `is_vertex_metadata_column`                |
-| Shared DB decode rules            | `crates/stt-build/src/db_input_common.rs`                                                                |
+| Lesson                            | Anchor                                                                                                                             |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `ParsedFeature` seam              | `crates/stt-build/src/input.rs` (struct + the file reader)                                                                         |
+| Encoder globals / `EncoderConfig` | `crates/stt-core/src/arrow_tile/config.rs` (statics, `EncoderConfig`, `from_globals`); `arrow_tile/encode.rs` (`encode_tile_with`) |
+| Shared flag→config                | `crates/stt-build/src/build_options.rs`                                                                                            |
+| Per-tile reuse                    | `crates/stt-build/src/tiler.rs` `encode_single_tile_counted`                                                                       |
+| Parity comparator                 | `crates/stt-build/tests/common/mod.rs`, `tests/source_parity.rs`                                                                   |
+| Shared name predicates            | `crates/stt-build/src/input.rs` `is_coordinate_column_name` / `is_vertex_metadata_column`                                          |
+| Shared DB decode rules            | `crates/stt-build/src/db_input_common.rs`                                                                                          |
 
 ## 5. Consistency notes
 
@@ -384,11 +389,12 @@ remains is deliberately unscheduled:
   `stt-serve` rejects that flag loudly at startup, §3) or an incremental /
   append rebuild that needs to re-aggregate one cell without re-reading the
   whole feature set.
-- **Retire the offline encoder globals entirely** — counted out: the offline
-  CLI's global setters are fine for a one-shot process (one archive = one
-  config); plumbing `EncoderConfig` through the config-agnostic
-  `TileWriter::write_tile` impls is cleanliness with no correctness payoff.
-  Revive if the offline builder ever needs multiple configs in one process.
+- **Retire the offline encoder globals entirely** — **DISCHARGED.** The offline
+  build path threads an explicit `EncoderConfig` end to end (every
+  `encode_tile_with` call site in `crates/stt-build/src/tiler.rs`), so nothing
+  in this workspace reads the globals. They remain only as the snapshot behind
+  the no-arg `encode_tile` / `encode_layer` wrappers for external one-shot
+  callers.
 - **`stream_arrow` batch ingest for the DuckDB reader** — originally blocked on
   the workspace arrow-version split; that trigger **fired** (arrow ≥59 landed
   2026-07). Re-triaged 2026-07-07 against §6.1: the row-`ValueRef` API already

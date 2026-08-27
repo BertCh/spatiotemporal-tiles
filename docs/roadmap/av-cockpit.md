@@ -6,9 +6,9 @@
 > follow-ups, not a forward plan. Live/canonical docs carry the normative detail:
 >
 > - Scene-bundle + sidecar format → [`../spec/sidecar-assets.md`](../spec/sidecar-assets.md)
-> - Object cuboid layer → [`../api/animated-bounding-box-layer.md`](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md)
-> - LiDAR point layer → [`../api/animated-point-layer.md`](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md)
-> - Compression flags → [`../api/cli-reference.md`](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md) (`--quantize-attr`, `--quantize-attrs-auto`)
+> - Object cuboid layer → [`poopdeck:docs/api/animated-bounding-box-layer.md`](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/animated-bounding-box-layer.md)
+> - LiDAR point layer → [`poopdeck:docs/api/animated-point-layer.md`](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/animated-point-layer.md)
+> - Compression flags → [`../api/cli-reference.md`](../api/cli-reference.md) (`--quantize-attr`, `--quantize-attrs-auto`)
 
 A poopdeck.gl visualization inspired by **avs.auto / streetscape.gl** (Aurora/Uber's XVIZ
 viewer): real AV sensor logs — LIDAR, tracked-object 3D boxes, ego trajectory, CAN telemetry —
@@ -99,28 +99,45 @@ pure-numpy), and the no-deps `av_synthetic.py` bootstrap all emit byte-identical
 Two rounds refined the cockpit to match/exceed the canonical viewers (streetscape.gl /
 XVIZ, nuScenes & av2 devkits, Cabana/openpilot); both committed in HEAD. **Round 1
 (code-only):** object labels + velocity arrows on `AnimatedBoundingBoxLayer`, telemetry
-strip-charts, object inspector, ego footprint + predicted-path ribbon. **Round 2 (re-gen +
-data):** the §1.1 georef corrections; the HD-map substrate (static `map_poly`/`map_line`
-streams for nuScenes + AV2 — Waymo has no HD map and correctly excludes it); real AV2
-velocity finite-differenced per `track_uuid` (replacing a hardcoded 0.0); richer CAN
-channels (wheel speeds, gyro, yaw-rate, turn signals) the strip-charts auto-render.
+strip-charts, object inspector, ego footprint + predicted-path ribbon.
+
+**Round 2 (re-gen + data)** — the four items the extractors cite by number:
+
+- **R2.1 — the §1.1 georef corrections.** Argoverse 2 city frames read as UTM
+  through `av_common.utm_to_lonlat`; the nuScenes `mercator=True` mode removed.
+- **R2.2 — the HD-map substrate.** Static `map_poly` / `map_line` streams for
+  nuScenes + AV2, carrying the `map_layer` name set every extractor validates
+  against (Waymo has no HD map and correctly excludes it).
+- **R2.3 — real AV2 velocity**, finite-differenced per `track_uuid`, replacing a
+  hardcoded 0.0; the cockpit's velocity arrows read it.
+- **R2.4 — richer CAN channels** (wheel speeds, gyro, yaw-rate, turn signals)
+  the strip-charts auto-render.
 
 ### Object-class palette — canonical copy + provenance
 
 The rendered palette is the **nuScenes `get_colormap()` projection** (RGBA, alpha ~235;
 vehicles warm — car `[255,158,0]` — pedestrians blue, cyclists crimson; the full table
-lives in `datasets.ts AV_OBJECT_COLORS`, guarded by the parity test below).
+lives in `poopdeck:examples/showcase/src/datasets.ts` as `AV_OBJECT_COLORS`, held to the
+contract below).
 
 Provenance: the first cut invented an arbitrary palette (car = blue) that baked into
 `scene.json.objectColors` (legend/inspector) while the boxes used a different `datasets.ts`
 palette (car = orange) — a legend↔box mismatch; both were reconciled to the devkit
 `color_map.py` projection above.
 
-**Rule — three copies MUST stay in lockstep:** `av_common.OBJECT_COLORS` (→ `scene.json`,
-Python side) ⇄ `datasets.ts AV_OBJECT_COLORS` (box render) ⇄ the map palette `AV_MAP_COLORS`.
-Parity is guarded by `scripts/data-generation/test_av_palette_parity.py`. Map-layer RGBA
-lives only on the TS side; Python keeps just the `MAP_LAYERS` key set — no dead Python color
-copy to drift.
+**Rule — one authority, one generated contract.** `av_common.py` is the authority
+(its values reach `scene.json` and the tiles). It EXPORTS them as
+[`../spec/av-palettes.json`](../spec/av-palettes.json) via
+`scripts/data-generation/emit_av_palettes.py`, gated in STT CI by
+`emit_av_palettes.py --check`; poopdeck.gl vendors that JSON and asserts
+`poopdeck:examples/showcase/src/datasets.ts` against it
+([repo-split-2026-08.md](./repo-split-2026-08.md) §4.3). This replaced the
+cross-tree `test_av_palette_parity.py`, which could not survive the split.
+The obligations differ per palette: `OBJECT_COLORS`, `LIDARSEG_COLORS` and
+`HEIGHT_BAND_COLORS` are **value-locked** (key set AND RGBA), while `MAP_LAYERS`
+and `ISO_DENSITY_BANDS` are **key sets only** — map-layer RGBA lives on the TS
+side alone, so there is no dead Python color copy to drift. One documented
+TS-only key: `ego`.
 
 **Deliberate divergences (not bugs):** LIDAR is colored by **height band**, not the devkit's
 default depth/distance (height reads better on a georeferenced 3D scene — ground vs façades).
@@ -131,7 +148,7 @@ default depth/distance (height reads better on a georeferenced 3D scene — grou
 
 Waymo LIDAR was the size bottleneck. A measurement-driven pass cut a point's on-the-wire cost
 ~4.5× (whole `waymo-sf-day` bundle 3.84 GB → 633 MB, **6.07×**). The compression **flags are
-documented in [`../api/cli-reference.md`](https://github.com/BertCh/poopdeck.gl/blob/main/docs/api/.md)**; kept here is the _why_.
+documented in [`../api/cli-reference.md`](../api/cli-reference.md)**; kept here is the _why_.
 
 **Measure first** — before porting the research's headline lever (uint16-RTC coordinate
 quantization), we attributed a real z14 Waymo tile's bytes per column
@@ -179,13 +196,31 @@ default (`common.rs::run_stt_build_with_full_options`): coord quantization
   measured case for the standing rule that depth is a renderer prop over a column, never
   baked into geometry.
 
-⚠️ **How to verify a re-encode, cheaply.** `stt-validate` **passes on scrambled coordinates**
-— it never checks coords-in-tile — so it is the wrong tool. The bbox from `stt-optimize export`
-works but needs a decode. The cheap positive proof is the directory alone
-(`stt-optimize inspect --sample 0`): in a correct single-scene AV archive the **z14 entry count
-exactly equals its temporal-bucket count**, i.e. one z14 tile for the whole scene. Scrambled
-coordinates cannot produce that — points thrown to ±180/±90 scatter z14 tiles across the planet
-— so a single coarse tile is positive proof of spatial coherence, with no decode.
+⚠️ **How to verify a re-encode.** `stt-validate` now ships the check this defect
+class wrote — **check 12, the semantic content fingerprint**
+(`crates/spatiotemporal-tiles/src/bin/stt-validate/fingerprint.rs`), which folds
+the decode into replication-invariant statistics and compares them against
+`metadata.content_fingerprint`. The acceptance workflow for any lossless
+transform is two runs:
+
+```text
+stt-validate before/ --emit-fingerprint   truth.json   # capture from the trusted source
+stt-validate after/  --expect-fingerprint truth.json   # accept the transform against it
+```
+
+The expectation must come from the archive as it was BEFORE the transform:
+`--emit-fingerprint` refuses to run under `--sample` / `--skip-decode` (an
+understated expectation is a check that cannot fail), and a transforming tool
+must carry `content_fingerprint` through verbatim rather than re-stamping its own
+output — recomputing is exactly how a corrupting transform self-certifies.
+
+Archives published before SH-1 carry no fingerprint and the validator warns and
+continues, so for those the decode-free fallback still applies
+(`stt-optimize inspect --sample 0`): in a correct single-scene AV archive the
+**z14 entry count exactly equals its temporal-bucket count**, i.e. one z14 tile
+for the whole scene. Scrambled coordinates cannot produce that — points thrown to
+±180/±90 scatter z14 tiles across the planet — so a single coarse tile is positive
+proof of spatial coherence, with no decode.
 
 **Deferred levers (measured, declined — revisit only on a concrete trigger):**
 
@@ -207,9 +242,14 @@ coordinates cannot produce that — points thrown to ±180/±90 scatter z14 tile
 ## 4. Remaining work
 
 The republish and R2 sync halves of the shared ops gate landed on 2026-07-31, including the
-rebuilt argoverse/waymo bundles. What is left for `/drive` is **in-browser verify** (the
-re-linked route, and `AnimatedBoundingBoxLayer` boxes now actually rotating to heading and
-scaling to dimensions where they were silently identity), tracked once as **L2** in the
-[roadmap README](./README.md) rather than restated per-doc. The one structural defect this
-doc owns is **K6** — the render-mode set declared in four-plus drifting places. The §3
-deferred levers stay counted out unless their triggers fire.
+rebuilt argoverse/waymo bundles. Two follow-ups **moved downstream with the renderer** at the
+2026-08-26 split and are no longer tracked in this repository's register:
+
+- **In-browser verify of `/drive`** (the re-linked route, and `AnimatedBoundingBoxLayer`
+  boxes now actually rotating to heading and scaling to dimensions where they were silently
+  identity) — **L2** in the
+  [poopdeck.gl register](https://github.com/BertCh/poopdeck.gl/blob/main/docs/roadmap/README.md).
+- **The render-mode set declared in four-plus drifting places** — **K6**, same register.
+
+The §3 deferred levers stay counted out unless their triggers fire; those are this
+repository's.

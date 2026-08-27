@@ -5,20 +5,35 @@ Use the unified `stt-generate` CLI tool to download and process datasets.
 ## Quick Start
 
 ```bash
-# Install the tool
+# Install the tool. stt-generate is its OWN cargo workspace under tools/, so a
+# root-workspace `cargo build -p stt-generate` does NOT resolve it — build it
+# through its own manifest:
+#   cargo build --release --manifest-path ../../tools/stt-generate/Cargo.toml
 cargo install --path ../../tools/stt-generate
 
-# Generate all datasets
-stt-generate all --output-dir ../../data-fleet
-
-# Generate individual datasets
+# One subcommand per dataset — there is NO `stt-generate all`
 stt-generate earthquakes --output earthquakes.stt
 stt-generate hurricanes --output hurricanes.stt
 stt-generate wildfires --output wildfires.stt
-stt-generate ais --date 2024-01-01 --output ais.stt
+stt-generate ais --date 2024-01-01 --output ais-traffic.stt
 stt-generate flights --date 2020-01-06 --output flights.stt
 stt-generate satellites --output satellites.stt
+
+# Or drive every self-contained (auto-downloading) dataset in one pass
+./generate-all.sh              # all of them, into data-fleet/
+./generate-all.sh --list       # the exact command each one runs
+./generate-all.sh earthquakes flights   # just a subset
 ```
+
+`generate-all.sh` covers only the datasets that download their own source data.
+The rest (bixi, gtfs, osm-edits, nwm, nyc-taxi-points, nyc-rideshare, and the
+experimental drifters-hourly) need a local input file or a local service, so run
+those subcommands directly — the script prints the invocation for each.
+
+`stt-generate` shells out to `stt-build`, resolved from `$STT_BUILD_BIN`, then
+the repo's `target/release/stt-build`, then `PATH`. Build the root workspace
+(`cargo build --release`) first, or a stale installed `stt-build` can silently
+produce archives with no schemas and no capabilities.
 
 See the [Data Generation Guide](../../docs/guides/data-generation.md) for full documentation.
 

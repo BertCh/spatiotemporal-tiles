@@ -38,24 +38,30 @@ Located in [`data-generation/`](./data-generation/), with helper scripts for gen
 ### Quick Start
 
 ```bash
-# Install the unified stt-generate tool
+# Install the unified stt-generate tool. It is its OWN cargo workspace under
+# tools/, so it is never built by a root-workspace `-p stt-generate`.
 cargo install --path ../tools/stt-generate
 
-# Generate all datasets
-stt-generate all --output-dir ../data-fleet
-
-# Or generate individually
+# One subcommand per dataset — there is no `all` subcommand
 stt-generate earthquakes --output earthquakes.stt
 stt-generate hurricanes --output hurricanes.stt
 stt-generate wildfires --output wildfires.stt
-stt-generate ais --input ais.csv --output ais.stt
+stt-generate ais --date 2024-01-01 --output ais-traffic.stt
+
+# Or drive every self-contained (auto-downloading) dataset in one go
+./data-generation/generate-all.sh          # --list shows what it runs
 ```
+
+`stt-generate` shells out to `stt-build`, which it resolves from `$STT_BUILD_BIN`,
+then this repo's `target/release/stt-build`, then `PATH` — so build the root
+workspace first (`cargo build --release`) or a stale installed binary may be used.
 
 ### Available Datasets
 
 `stt-generate <subcommand>` covers earthquakes, AIS ship traffic, flights,
 hurricanes, wildfires, NYC rideshare (+ taxi points/paths/trips/flows),
-BIXI flowmaps, satellites, ocean drifters, animal migration, OSM edits, and
+BIXI flowmaps, GTFS transit feeds, NWM river discharge, satellites, ocean
+drifters (+ the experimental hourly variant), animal migration, OSM edits, and
 NEXRAD storm radar. Run `stt-generate --help` for the full registered list.
 
 `emit_av_palettes.py` is not a generator: it exports the AV cockpit's palette

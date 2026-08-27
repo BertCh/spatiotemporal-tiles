@@ -1,26 +1,33 @@
 # Conformance vectors
 
-Six small packed archives, produced by the reference **writer** (`stt-build`),
-that a candidate **reader** must be able to open. They are the portable half of
+Six vector directories — nine datasets — that a candidate **reader** opens.
+They are the portable half of
 [`docs/spec/conformance.md`](../docs/spec/conformance.md): the spec says what
 conformance means, and these say what it looks like in bytes.
 
-| Vector                 | What it exercises                                                                                                                                                            |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `v2-golden/`           | Points; numeric column with nulls, two dictionary columns with nulls, 1 m coord quantization, per-tile `qa` attribute affines, 2 zooms × 2 time buckets, **paged** directory |
-| `v2-golden-tracks/`    | LineString trajectories with duration: interpolated u16-delta `vertex_time`, TILE_META `vt`, Float64 coords, **single** directory                                            |
-| `packed-golden/`       | The plain packed shape                                                                                                                                                       |
-| `paged-golden/`        | Paged directory                                                                                                                                                              |
-| `paged-golden-single/` | Paged directory holding a single page                                                                                                                                        |
-| `legacy-shape/`        | A published shape a conformant reader still has to open read-only                                                                                                            |
+Five are `formatVersion: 3` / directory codec v6, and every conformant reader
+MUST open them. The sixth, `legacy-shape/`, is four frozen `formatVersion: 2` /
+directory-v5 datasets that exercise the **optional** read window of packed-format
+§9.1 — a v3-only reader may refuse them and still be conformant.
+
+| Vector                 | What it exercises                                                                                                                                                                                  |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `v2-golden/`           | Points; numeric column with nulls, two dictionary columns with nulls, 1 m coord quantization, per-tile `qa` attribute affines, 2 zooms × 2 time buckets, **paged** directory of a single leaf page |
+| `v2-golden-tracks/`    | LineString trajectories with duration: interpolated u16-delta `vertex_time`, TILE_META `vt`, Float64 coords, **single** (whole-load) directory                                                     |
+| `packed-golden/`       | The plain packed shape: manifest folding, v6 directory decode (12 entries), byte-identical blob dedup, multi-pack cutting, self-contained inline-schema frames                                     |
+| `paged-golden/`        | Paged directory — 32 leaf pages over a 252-tile corpus                                                                                                                                             |
+| `paged-golden-single/` | The SAME 252-tile corpus emitted whole-load — the paged ⇄ whole-load differential: identical packs, identical decoded results, only the directory container differs                                |
+| `legacy-shape/`        | Four frozen `formatVersion: 2` datasets — directory codec v5, no `variants` registry, none of `TILE_META.st`/`et`/`vq` — the OPTIONAL v2 read window                                               |
 
 ## Using them
 
 Point your reader at each `manifest.json` and open every tile the directory
-lists. A conformant reader opens all six without special-casing any of them —
-both directory layouts, every `vertex_time` width, both `TILE_META` time forms,
-quantized and raw per-vertex value columns, and unknown additive columns and
-fields (§1 of the conformance page).
+lists. A conformant reader opens the five v3 vectors without special-casing any
+of them — both directory layouts, every `vertex_time` width, both `TILE_META`
+time forms, quantized and raw per-vertex value columns, and unknown additive
+columns and fields (§1 of the conformance page). `legacy-shape/` is the optional
+extra: opening it demonstrates the v2 read window, and refusing it is conformant
+too.
 
 The vectors are **byte-pinned**. They change only inside a declared rebuild
 window, flagged with a `Rebuild-Window: R1` commit trailer and enforced by
@@ -30,15 +37,31 @@ destroys the evidence that tells them apart.
 
 ## Regenerating
 
+Three families, three answers:
+
 ```bash
+# v2-golden/, v2-golden-tracks/ — the real reference writer (stt-build) over
+# synthetic DuckDB sources. The script builds `spatiotemporal-tiles --features
+# duckdb` itself and runs `stt-validate` over both outputs before exiting; the
+# first run needs network for DuckDB's `INSTALL spatial`. The source data lives
+# in the script as SQL `VALUES` — no input files, no downloads.
 conformance/make-vectors.sh
+
+# packed-golden/, paged-golden/, paged-golden-single/ — hand-built payloads
+# through stt-core's PackWriter.
+cargo run -p stt-core --example make-golden-fixture
 ```
 
-Needs `cargo` (it builds `spatiotemporal-tiles --features duckdb`) and, on the
-first run, network for DuckDB's `INSTALL spatial`. Builds are byte-reproducible,
-so a re-run is a no-op diff unless the writer's bytes intentionally changed. The
-source data is synthetic and lives in the script itself as SQL `VALUES` — no
-input files, no downloads.
+`legacy-shape/` is regenerated by nothing, ever — see
+`vectors/legacy-shape/README.md` for why.
+
+Builds are byte-reproducible, so a re-run is a no-op diff unless the writer's
+bytes intentionally changed.
+
+⚠️ `make-golden-fixture` still resolves the `paged-golden*` pair's output to the
+pre-split `packages/core/test/fixtures/` path instead of `conformance/vectors/`,
+so those two are not actually refreshed by the command above until that is
+fixed.
 
 ## Who consumes them
 

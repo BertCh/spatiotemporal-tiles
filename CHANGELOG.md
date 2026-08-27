@@ -48,10 +48,11 @@ No format change, no CLI change, no behaviour change: archives written by 0.7.0
 and 0.8.0 are byte-identical, and the version exists to mark the repository
 split. `formatVersion` stays 3 and `directoryVersion` stays 6.
 
-**crates.io and npm are no longer released in lockstep.** They last agreed at
-0.7.0 by history; from here each moves on its own. What relates the two stacks
-is the archive's `formatVersion`, declared in `project-status.json` on both
-sides — read that, not the version string.
+**crates.io and npm are no longer released in lockstep.** Both stacks happen to
+cut 0.8.0 on this date; that is history, not a promise, and from here each moves
+on its own. What relates the two stacks is the archive's `formatVersion`,
+declared in `project-status.json` on both sides — read that, not the version
+string.
 
 ## 0.6.0 — 2026-08-13
 

@@ -376,28 +376,47 @@ fn delta_list_u32(vt: &[Vec<i64>], feature_count: usize, min: i64, step: u32) ->
 
 /// Build the optional per-vertex time column.
 ///
-/// Timestamps are stored as deltas relative to a per-layer origin and step
+/// Timestamps are stored as deltas relative to an origin and step
 /// (`absolute = origin + delta * step`), with the step bounded by
-/// `max_step_ms` (see [`DEFAULT_VERTEX_TIME_MAX_STEP_MS`]). Three tiers are
-/// tried in width order, each at the SMALLEST step that fits its width:
+/// `max_step_ms` (see [`DEFAULT_VERTEX_TIME_MAX_STEP_MS`]). FOUR tiers are
+/// tried, in this order, each at the SMALLEST step that fits its width — a
+/// tier is taken only if that step is within `max_step_ms`, otherwise the next
+/// one is tried:
 ///
-/// | tier | delta ceiling | exact-ms span | bytes/vertex |
-/// |---|---|---|---|
-/// | `List<UInt16>` | 65 535 | 65.5 s (18.2 h at the 1 s default step) | 2 |
-/// | `List<UInt32>` | 4 294 967 295 | **49.7 days** | 4 |
-/// | `List<Int64>` (absolute) | — | unbounded | 8 |
+/// | # | tier | origin | delta ceiling | exact-ms span | bytes/vertex |
+/// |---|---|---|---|---|---|
+/// | 1 | `List<UInt16>` | per-layer `min` | 65 535 | 65.5 s (18.2 h at the 1 s default step) | 2 |
+/// | 2 | `List<UInt16>` | per-feature `start_time` | 65 535 **per feature** | 65.5 s per feature (unbounded layer span) | 2 |
+/// | 3 | `List<UInt32>` | per-layer `min` | 4 294 967 295 | **49.7 days** | 4 |
+/// | 4 | `List<Int64>` (absolute) | — | — | unbounded | 8 |
 ///
-/// The u32 tier exists because falling from u16 straight to absolute `Int64`
-/// doubles the column for every layer spanning more than ~18 h (14.3% of
+/// Tier 2 (TB-11 extension 2) is tried only where the layer-anchored u16 tier
+/// failed, and only against u16 — at u32 the layer origin is already wide
+/// enough that re-anchoring buys nothing. It exists for TRIP-shaped layers,
+/// whose LAYER span is wide (trips all day) but whose PER-FEATURE span is
+/// narrow (one trip lasts minutes): a layer-wide origin prices every feature at
+/// the layer's span and forces a coarse step, while each feature's own deltas
+/// fit u16 at step 1. The anchor is free on the wire because `start_time`
+/// already ships in CORE. It is declined when any vertex precedes its feature's
+/// `start_time` (a signed delta), when every delta would be zero (degenerate,
+/// already covered by tier 1), or when its own step exceeds `max_step_ms`.
+///
+/// Tier 3 exists because falling from u16 straight to absolute `Int64` doubles
+/// the column for every layer spanning more than ~18 h (14.3% of
 /// `nyc-taxi-flows`' tile bytes) even though a 4-byte delta at step 1 is both
 /// smaller AND lossless. `Int64` is reached only when even a u32 delta would
 /// need a step coarser than the ceiling (a span beyond ~136 years at the 1 s
 /// default) — bounded quantization or no quantization, never a silent
 /// precision cliff.
 ///
-/// No manifest capability is needed for the u32 tier: `vt` already tells the
-/// reader the column is delta-coded, and a reader that ignored the Arrow child
-/// type would already have been broken on the u16 tier.
+/// Capabilities: no manifest capability is needed for the u32 tier — `vt`
+/// already tells the reader the column is delta-coded, and a reader that
+/// ignored the Arrow child type would already have been broken on the u16
+/// tier. The FEATURE-ANCHORED tier does need one
+/// ([`CAPABILITY_VERTEX_TIME_FEATURE_ANCHOR`](crate::pack::CAPABILITY_VERTEX_TIME_FEATURE_ANCHOR)),
+/// because it changes which origin the deltas are relative to, which a reader
+/// cannot infer from the Arrow type; `stt-build` declares it on the writer when
+/// any tile takes this tier.
 pub(crate) fn build_vertex_time_array(
     vertex_times: &Option<Vec<Vec<i64>>>,
     feature_count: usize,
