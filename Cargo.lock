@@ -3355,7 +3355,7 @@ name = "stt-core"
 version = "0.8.0"
 dependencies = [
  "arrow 59.2.0",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "byteorder",
  "chrono",
@@ -3399,7 +3399,7 @@ name = "stt-wasm"
 version = "0.8.0"
 dependencies = [
  "arrow 59.2.0",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "crc32c",
  "serde_json",
