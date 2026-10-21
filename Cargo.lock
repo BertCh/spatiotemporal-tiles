@@ -1522,15 +1522,16 @@ dependencies = [
 
 [[package]]
 name = "h3o"
-version = "0.7.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "537b141fa7998c2c993b9431247f6e2eb69d606bd51173ab85394792f3a7cdf7"
+checksum = "f033ee4f3b98f6842df9ce5111ff2dd36fd9be9804b9c0afd43e69e3891a6fbf"
 dependencies = [
  "ahash 0.8.12",
  "either",
  "float_eq",
  "h3o-bit",
  "libm",
+ "ordered-float",
 ]
 
 [[package]]
@@ -2273,6 +2274,15 @@ dependencies = [
  "libc",
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "ordered-float"
+version = "5.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c7c9e0d9b23589f26070720bac724174bfec1083e82f7854cdd0267518343c0"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
