@@ -12,4 +12,6 @@ built and analysed as packed directories.
 | `point_column_stats`  | Per-column byte breakdown for a point dataset.                                                      |
 | `pack-cover`          | Backfill the tight `cover_t_min` covering bound on a packed dataset (tile payload bytes untouched). |
 | `encoding-experiment` | Measure candidate per-column encodings against the packed baseline.                                 |
+| `trajectory-codec`    | Tile-local predictive coding of trajectory geometry + `vertex_time` vs. the stored columns.         |
+| `trajectory-lossy`    | Rate–distortion of quantization, TD-TR, greedy linear and Hermite keyframes at measured SED error.  |
 | `make-golden-fixture` | Regenerate the cross-impl golden packed fixture.                                                    |

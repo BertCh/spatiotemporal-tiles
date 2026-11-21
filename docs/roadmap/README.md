@@ -76,6 +76,10 @@ Three house rules:
   [**-conformance**](./optimization-conformance-2026-08.md) — the optimization
   program: the formal problem statements, the six defects and the design that
   answers them, the work items, and the conformance obligations.
+- [**trajectory-codec-2026-11.md**](./trajectory-codec-2026-11.md) — motion
+  codecs vs. what STT ships: tile-local predictive coding of quantized
+  trajectories (−38…−48 % whole-tile, lossless) and `vertex_time` delta coding
+  bear fruit; fitted motion curves and a swept-bounds segment index do not.
 - [**formal-semantics-2026-08.md**](./formal-semantics-2026-08.md) — the
   semantic layer under the format trilogy: the enforced laws and the
   adjudication register.
