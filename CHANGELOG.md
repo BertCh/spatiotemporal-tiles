@@ -5,7 +5,7 @@ GitHub Release that cargo-dist creates for each tag is the per-crate record.
 Renderer changes are recorded downstream, in the
 [poopdeck.gl changelog](https://github.com/BertCh/poopdeck.gl/blob/main/CHANGELOG.md).
 
-## Unreleased
+## 0.9.0 — 2026-11-22
 
 ### Added
 
