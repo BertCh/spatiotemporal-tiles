@@ -13,7 +13,25 @@ updates:
       # arrow or duckdb bump gets read rather than rubber-stamped.
       cargo-minor-and-patch:
         patterns: ['*']
+        # Not duckdb. The crate packs the ENGINE version into its minor field
+        # (1.10505 is DuckDB 1.5.5, 1.20001 is DuckDB 2.0.1), so an engine
+        # major reads as a semver-minor and rode this group in — which is what
+        # kept the grouped PR red from 2026-10. Out of the group, it arrives as
+        # its own PR and gets read like the major it is.
+        exclude-patterns: ['duckdb', 'libduckdb-sys']
         update-types: [minor, patch]
+    ignore:
+      # arrow-rs 59.3.2 changed the IPC writer (apache/arrow-rs#11820, "write
+      # empty validity buffers for arrays without nulls"), which moves the
+      # bytes the encoder emits: the v2-golden pin is green on 59.3.1 and red
+      # on 59.3.2. Golden bytes move once, in a rebuild window — so the 59.x
+      # patch line stops at 59.3.1 here, and whoever opens that window deletes
+      # this block in the same change. The upper bound is deliberate: an arrow
+      # MAJOR still gets its own PR, and that PR is the reminder.
+      - dependency-name: 'arrow*'
+        versions: ['>=59.3.2, <60']
+      - dependency-name: 'parquet'
+        versions: ['>=59.3.2, <60']
     commit-message:
       prefix: 'deps'
 # Deliberately NOT enabled for npm: the workspace hard-pins the deck.gl and

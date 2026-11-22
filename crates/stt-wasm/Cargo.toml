@@ -38,7 +38,7 @@ serde_json.workspace = true
 # by blake3-128 before use (packed spec §3.2). stt-core keeps its own decoder
 # private, so the two hashes below reproduce it — `open_parity` in
 # tests/decode_roundtrip.rs pins the reproduction against the real reader.
-base64 = "0.22"
+base64 = "0.23"
 blake3.workspace = true
 crc32c.workspace = true
 # Unconditional (not target-gated) so the exported façade type-checks and runs
