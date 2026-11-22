@@ -2081,6 +2081,7 @@ fn encode_and_add_tiles(
     // order-independent and deterministic regardless of worker scheduling;
     // read after the pool joins, below.
     let feature_anchored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let path_codec = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // TB-11: the archive's base bucket, so a tier tile's vertex-time ceiling
     // can be scaled by its own width relative to it.
     let budget = writer.memory_budget();
@@ -2121,6 +2122,9 @@ fn encode_and_add_tiles(
                         stt_core::arrow_tile::encode_tile_observed(&tile.layers, cfg.as_ref())?;
                     if observed.feature_anchored_vertex_times {
                         feature_anchored.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if observed.path_codec {
+                        path_codec.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     Ok(payload)
                 })
@@ -2192,6 +2196,12 @@ fn encode_and_add_tiles(
     if feature_anchored.load(std::sync::atomic::Ordering::Relaxed) {
         writer.declare_capability(stt_core::pack::CAPABILITY_VERTEX_TIME_FEATURE_ANCHOR);
     }
+    // The path codec likewise: declared only if some layer actually carried
+    // the section, so a `--path-codec` build with no eligible layer locks out
+    // no reader.
+    if path_codec.load(std::sync::atomic::Ordering::Relaxed) {
+        writer.declare_capability(stt_core::pack::CAPABILITY_PATH_CODEC);
+    }
     Ok(())
 }
 
@@ -2236,7 +2246,7 @@ pub fn write_tiles_parallel_with_base_bucket(
 /// here reads process-wide state.
 impl TileWriter for stt_core::PackWriter {
     fn write_tile(&mut self, tile: &GeneratedTile) -> Result<()> {
-        let payload = stt_core::arrow_tile::encode_tile_with(&tile.layers, &self.encoder_config())?;
+        let payload = encode_and_declare(self, tile)?;
         self.add_tile_full(
             &tile.id,
             tile.time_start,
@@ -2257,6 +2267,23 @@ impl TileWriter for stt_core::PackWriter {
     }
 }
 
+/// Encode one tile with `writer`'s config and declare the capabilities the
+/// encode OBSERVED on it — the single-tile twin of the bookkeeping
+/// [`encode_and_add_tiles`] does for a batch, so no write path can emit a
+/// `PATH_CODEC` section (or a feature-anchored vertex time) under a manifest
+/// that does not declare it.
+fn encode_and_declare(writer: &mut stt_core::PackWriter, tile: &GeneratedTile) -> Result<Vec<u8>> {
+    let (payload, observed) =
+        stt_core::arrow_tile::encode_tile_observed(&tile.layers, &writer.encoder_config())?;
+    if observed.feature_anchored_vertex_times {
+        writer.declare_capability(stt_core::pack::CAPABILITY_VERTEX_TIME_FEATURE_ANCHOR);
+    }
+    if observed.path_codec {
+        writer.declare_capability(stt_core::pack::CAPABILITY_PATH_CODEC);
+    }
+    Ok(payload)
+}
+
 /// Sink that also forwards the per-tile temporal bucket size.
 pub trait LodTileWriter {
     /// Persist one tile, tagging the directory entry with `temporal_bucket_ms`.
@@ -2273,7 +2300,7 @@ impl LodTileWriter for stt_core::PackWriter {
         tile: &GeneratedTile,
         temporal_bucket_ms: Option<u64>,
     ) -> Result<()> {
-        let payload = stt_core::arrow_tile::encode_tile_with(&tile.layers, &self.encoder_config())?;
+        let payload = encode_and_declare(self, tile)?;
         self.add_tile_full(
             &tile.id,
             tile.time_start,

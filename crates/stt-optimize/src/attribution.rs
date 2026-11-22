@@ -62,8 +62,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
-use arrow::datatypes::{Field, Schema};
+use arrow::array::{new_empty_array, ArrayRef, ListArray, RecordBatch, RecordBatchOptions};
+use arrow::buffer::OffsetBuffer;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use stt_core::compression::compress_zstd_with_dict_level;
 
@@ -156,6 +157,18 @@ pub fn ipc_zstd_len(batch: &RecordBatch, zstd_level: i32) -> Result<u64> {
     Ok(compress_zstd_with_dict_level(&buf, None, zstd_level)?.len() as u64)
 }
 
+/// Arrow IPC stream bytes of a batch (no compression).
+fn ipc_bytes(batch: &RecordBatch) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
+            .context("attribution: IPC writer init")?;
+        writer.write(batch).context("attribution: IPC write")?;
+        writer.finish().context("attribution: IPC finish")?;
+    }
+    Ok(buf)
+}
+
 /// IPC + zstd length of `batch` projected to `keep`.
 fn projected_len(batch: &RecordBatch, keep: &[usize], zstd_level: i32) -> Result<u64> {
     ipc_zstd_len(&project(batch, keep)?, zstd_level)
@@ -238,6 +251,84 @@ pub fn attribute_columns(
             })
             .collect(),
     })
+}
+
+/// The attribution line a layer's `PATH_CODEC` section is reported under.
+///
+/// Bracketed so it cannot collide with a property column: no Arrow column of a
+/// tile is named that way.
+pub const PATH_CODEC_COLUMN: &str = "[path-codec]";
+
+/// Attribute one decoded layer AS STORED.
+///
+/// For an ordinary layer this is exactly [`attribute_columns`]. For a layer
+/// that carried a `PATH_CODEC` section (`section`, from
+/// `stt_core::arrow_tile::frame_v2_path_codec_sections`), the decoded batch's
+/// `geometry` / `vertex_time` are the RECONSTRUCTED columns, which were never
+/// on the wire as Arrow buffers. Pricing them as Arrow columns would describe a
+/// different archive, so the batch is first put back into its stored shape —
+/// both columns all-empty lists, as the CORE batch holds them — and the
+/// section is charged as its own line, [`PATH_CODEC_COLUMN`], appended after
+/// the schema-order columns. (Its own line rather than folded into the two
+/// columns: the section interleaves both, and any split between them would be
+/// an invention.)
+///
+/// The section line follows the active design: under
+/// [`AttributionDesign::LeaveOneOutV2`] it is the marginal
+/// `zstd(IPC(stored batch) ‖ section) − zstd(IPC(stored batch))`, under
+/// [`AttributionDesign::SingletonV1`] the section compressed alone.
+pub fn attribute_layer_as_stored(
+    batch: &RecordBatch,
+    section: Option<&[u8]>,
+    zstd_level: i32,
+    design: AttributionDesign,
+) -> Result<Vec<ColumnBytes>> {
+    let Some(section) = section else {
+        return attribute_columns(batch, zstd_level, design);
+    };
+    let schema = batch.schema();
+    let mut columns = batch.columns().to_vec();
+    for (i, field) in schema.fields().iter().enumerate() {
+        if field.name() != "geometry" && field.name() != "vertex_time" {
+            continue;
+        }
+        if let DataType::List(item) = field.data_type() {
+            columns[i] = Arc::new(ListArray::new(
+                item.clone(),
+                OffsetBuffer::new_zeroed(batch.num_rows()),
+                new_empty_array(item.data_type()),
+                None,
+            )) as ArrayRef;
+        }
+    }
+    let stored = RecordBatch::try_new_with_options(
+        schema.clone(),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .context("attribution: stored-shape batch build failed")?;
+    let mut out = attribute_columns(&stored, zstd_level, design)?;
+    let (bytes, marginal_bytes) = match design {
+        AttributionDesign::LeaveOneOutV2 => {
+            let all: Vec<usize> = (0..schema.fields().len()).collect();
+            let mut joined = ipc_bytes(&project(&stored, &all)?)?;
+            let without = compress_zstd_with_dict_level(&joined, None, zstd_level)?.len() as u64;
+            joined.extend_from_slice(section);
+            let whole = compress_zstd_with_dict_level(&joined, None, zstd_level)?.len() as u64;
+            let m = whole.saturating_sub(without);
+            (m, m)
+        }
+        AttributionDesign::SingletonV1 => (
+            compress_zstd_with_dict_level(section, None, zstd_level)?.len() as u64,
+            0,
+        ),
+    };
+    out.push(ColumnBytes {
+        name: PATH_CODEC_COLUMN.to_string(),
+        bytes,
+        marginal_bytes,
+    });
+    Ok(out)
 }
 
 // ----------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 # Conformance vectors
 
-Six vector directories — nine datasets — that a candidate **reader** opens.
+Seven vector directories — eleven datasets, plus two JSON vector files — that
+a candidate **reader** opens.
 They are the portable half of
 [`docs/spec/conformance.md`](../docs/spec/conformance.md): the spec says what
 conformance means, and these say what it looks like in bytes.
@@ -10,14 +11,19 @@ MUST open them. The sixth, `legacy-shape/`, is four frozen `formatVersion: 2` /
 directory-v5 datasets that exercise the **optional** read window of packed-format
 §9.1 — a v3-only reader may refuse them and still be conformant.
 
-| Vector                 | What it exercises                                                                                                                                                                                  |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `v2-golden/`           | Points; numeric column with nulls, two dictionary columns with nulls, 1 m coord quantization, per-tile `qa` attribute affines, 2 zooms × 2 time buckets, **paged** directory of a single leaf page |
-| `v2-golden-tracks/`    | LineString trajectories with duration: interpolated u16-delta `vertex_time`, TILE_META `vt`, Float64 coords, **single** (whole-load) directory                                                     |
-| `packed-golden/`       | The plain packed shape: manifest folding, v6 directory decode (12 entries), byte-identical blob dedup, multi-pack cutting, self-contained inline-schema frames                                     |
-| `paged-golden/`        | Paged directory — 32 leaf pages over a 252-tile corpus                                                                                                                                             |
-| `paged-golden-single/` | The SAME 252-tile corpus emitted whole-load — the paged ⇄ whole-load differential: identical packs, identical decoded results, only the directory container differs                                |
-| `legacy-shape/`        | Four frozen `formatVersion: 2` datasets — directory codec v5, no `variants` registry, none of `TILE_META.st`/`et`/`vq` — the OPTIONAL v2 read window                                               |
+| Vector                 | What it exercises                                                                                                                                                                                    |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `v2-golden/`           | Points; numeric column with nulls, two dictionary columns with nulls, 1 m coord quantization, per-tile `qa` attribute affines, 2 zooms × 2 time buckets, **paged** directory of a single leaf page   |
+| `v2-golden-tracks/`    | LineString trajectories with duration: interpolated u16-delta `vertex_time`, TILE_META `vt`, Float64 coords, **single** (whole-load) directory                                                       |
+| `packed-golden/`       | The plain packed shape: manifest folding, v6 directory decode (12 entries), byte-identical blob dedup, multi-pack cutting, self-contained inline-schema frames                                       |
+| `paged-golden/`        | Paged directory — 32 leaf pages over a 252-tile corpus                                                                                                                                               |
+| `paged-golden-single/` | The SAME 252-tile corpus emitted whole-load — the paged ⇄ whole-load differential: identical packs, identical decoded results, only the directory container differs                                  |
+| `legacy-shape/`        | Four frozen `formatVersion: 2` datasets — directory codec v5, no `variants` registry, none of `TILE_META.st`/`et`/`vq` — the OPTIONAL v2 read window                                                 |
+| `path-codec/`          | The `path-codec` capability (packed-format §5.2.7): two archives (world-grid and decimal mode) plus `sections.json` / `tiles.json` — exact expected values and must-reject sections (see its README) |
+
+`path-codec/` is conformance for the CAPABILITY: a reader that implements
+`path-codec` MUST pass all of it; a reader that does not MUST refuse its two
+archives at open (and so need not run the JSON vectors).
 
 ## Using them
 
@@ -37,7 +43,7 @@ destroys the evidence that tells them apart.
 
 ## Regenerating
 
-Three families, three answers:
+Four families, four answers:
 
 ```bash
 # v2-golden/, v2-golden-tracks/ — the real reference writer (stt-build) over
@@ -50,6 +56,9 @@ conformance/make-vectors.sh
 # packed-golden/, paged-golden/, paged-golden-single/ — hand-built payloads
 # through stt-core's PackWriter.
 cargo run -p stt-core --example make-golden-fixture
+
+# path-codec/ — section, tile and archive vectors through stt-core.
+cargo run -p stt-core --example make-path-codec-vectors
 ```
 
 `legacy-shape/` is regenerated by nothing, ever — see

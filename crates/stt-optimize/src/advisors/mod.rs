@@ -159,6 +159,7 @@ struct SettingsKey {
     quantize_coords_bits: Option<u64>,
     quantize_attrs_auto: bool,
     compact_times: bool,
+    path_codec: bool,
     quantize_attrs: Vec<(String, u64)>,
 }
 
@@ -169,6 +170,7 @@ impl SettingsKey {
             quantize_coords_bits: settings.quantize_coords_m.map(f64::to_bits),
             quantize_attrs_auto: settings.quantize_attrs_auto,
             compact_times: settings.compact_times,
+            path_codec: settings.path_codec,
             quantize_attrs: settings
                 .quantize_attrs
                 .iter()

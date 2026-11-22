@@ -214,6 +214,24 @@ pub struct EncoderConfig {
     /// affine's only channel is `TILE_META`, which the standalone
     /// `encode_layer*` shape does not have.
     pub quantize_vertex_values: bool,
+    /// Store eligible LineString layers' coordinates and per-vertex times in
+    /// the `PATH_CODEC` layer-frame section (the opt-in `path-codec` manifest
+    /// capability) instead of as Arrow leaf buffers — `stt-build
+    /// --path-codec`.
+    ///
+    /// LOSSLESS, including the vertex times: a codec layer decodes to exactly
+    /// the coordinates a non-codec build would carry and to absolute
+    /// millisecond `List<Int64>` vertex times, so `vertex_time_max_step_ms`
+    /// does not apply to it. Eligible: a `LineString` layer whose every
+    /// feature has either no vertex times or one per vertex, all strictly
+    /// within ±2^52 ms. Any other layer is encoded exactly as without the flag.
+    ///
+    /// Default OFF. Frame path only, like [`Self::compact_times`]: the section
+    /// has nowhere to live in the standalone `encode_layer*` shape, which
+    /// ignores the flag. Whether a layer actually took the codec is reported
+    /// through [`EncodeObservations::path_codec`](crate::arrow_tile::EncodeObservations::path_codec),
+    /// which is what obliges the writer to declare the capability.
+    pub path_codec: bool,
     /// Layer-frame format version. Only [`LAYER_FRAME_VERSION`] is accepted; the
     /// field is retained so a frame-format revision has an explicit, checked
     /// channel rather than a silent assumption at the encode boundary.
@@ -254,6 +272,7 @@ impl Default for EncoderConfig {
             vertex_time_max_step_ms: DEFAULT_VERTEX_TIME_MAX_STEP_MS,
             compact_times: true,
             quantize_vertex_values: false,
+            path_codec: false,
             format_version: LAYER_FRAME_VERSION,
             template_collector: None,
             global_pins: None,

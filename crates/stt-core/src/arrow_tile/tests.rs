@@ -2923,7 +2923,7 @@ fn compact_times_reject_inconsistent_tile_meta() {
             "but 'end_time' is Int64",
         ),
     ] {
-        let err = merge_v2_layer(core.clone(), None, &meta)
+        let err = merge_v2_layer(core.clone(), None, &meta, None)
             .expect_err("inconsistent TILE_META must error");
         assert!(
             err.to_string().contains(want),
@@ -3298,8 +3298,8 @@ fn vertex_value_quant_rejects_inconsistent_tile_meta() {
             "list leaf is Float32",
         ),
     ] {
-        let err =
-            merge_v2_layer(core.clone(), None, &meta).expect_err("an inconsistent vq must error");
+        let err = merge_v2_layer(core.clone(), None, &meta, None)
+            .expect_err("an inconsistent vq must error");
         assert!(
             err.to_string().contains(want),
             "expected {want:?}, got: {err}"

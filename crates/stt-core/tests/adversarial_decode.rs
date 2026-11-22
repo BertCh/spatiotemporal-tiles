@@ -1330,3 +1330,227 @@ fn prop_pinned_encoding_decodes_one_value_one_way_across_arbitrary_partitions() 
         })
         .expect("pinned multi-tile decode agreement");
 }
+
+// ----------------------------------------------------------------------
+// The path codec (`PATH_CODEC`, packed-format §5.2.7): the section codec is
+// lossless over its whole input domain (bit-exact f64, any i32 grid index,
+// any time inside ±2^52 ms, unsorted, empty and single-vertex features), and
+// neither the section decoder nor the frame decoder panics on arbitrary or
+// corrupted bytes.
+// ----------------------------------------------------------------------
+
+use stt_core::arrow_tile::frame_v2_path_codec_sections;
+use stt_core::arrow_tile::path_codec::{self, PathCoords, PathLayer};
+
+/// A coordinate double: mostly short decimals (the realistic case, where the
+/// integer grid applies), plus arbitrary bit patterns (NaN payloads, ±inf,
+/// subnormals, `-0.0`) that must ride the XOR patches.
+fn arb_coord_f64() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        4 => (-18_000_000i64..18_000_000).prop_map(|k| k as f64 / 1e5),
+        1 => any::<u64>().prop_map(f64::from_bits),
+        1 => proptest::sample::select(vec![-0.0, 0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY]),
+    ]
+}
+
+fn arb_time() -> impl Strategy<Value = i64> {
+    let bound = path_codec::MAX_TIME_MS - 1;
+    prop_oneof![
+        3 => (1_600_000_000_000i64..1_800_000_000_000).prop_map(|t| t - t % 60_000),
+        2 => 1_600_000_000_000i64..1_800_000_000_000,
+        1 => -bound..=bound,
+    ]
+}
+
+fn arb_path_layer() -> impl Strategy<Value = PathLayer> {
+    (
+        proptest::collection::vec(0u32..7, 0..8),
+        any::<bool>(),
+        any::<bool>(),
+    )
+        .prop_flat_map(|(counts, decimal, timed)| {
+            let nv: usize = counts.iter().map(|&c| c as usize).sum();
+            let coords = if decimal {
+                proptest::collection::vec([arb_coord_f64(), arb_coord_f64()], nv)
+                    .prop_map(PathCoords::Decimal)
+                    .boxed()
+            } else {
+                proptest::collection::vec([any::<i32>(), any::<i32>()], nv)
+                    .prop_map(PathCoords::Grid)
+                    .boxed()
+            };
+            let times = if timed {
+                proptest::collection::vec(arb_time(), nv)
+                    .prop_map(Some)
+                    .boxed()
+            } else {
+                Just(None).boxed()
+            };
+            (Just(counts), coords, times).prop_map(|(counts, coords, times)| PathLayer {
+                counts,
+                coords,
+                times,
+            })
+        })
+}
+
+/// A smooth track on a world grid with irregular times — the shape where
+/// TIME_VEL / CONST_VEL actually win, so their arithmetic gets exercised.
+fn arb_smooth_track() -> impl Strategy<Value = PathLayer> {
+    (
+        proptest::collection::vec(1i64..600_000, 2..40),
+        -1000i32..1000,
+        -1000i32..1000,
+    )
+        .prop_map(|(dts, vx, vy)| {
+            let mut t = vec![1_700_000_000_000i64];
+            for d in &dts {
+                t.push(t.last().unwrap() + d);
+            }
+            let coords: Vec<[i32; 2]> = t
+                .iter()
+                .map(|&ti| {
+                    let s = (ti - t[0]) / 1000;
+                    [(s * vx as i64 / 7) as i32, (s * vy as i64 / 7) as i32]
+                })
+                .collect();
+            PathLayer {
+                counts: vec![coords.len() as u32],
+                coords: PathCoords::Grid(coords),
+                times: Some(t),
+            }
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    #[test]
+    fn path_codec_round_trips(layer in arb_path_layer()) {
+        let bytes = path_codec::encode(&layer).unwrap();
+        prop_assert_eq!(path_codec::decode(&bytes).unwrap(), layer.clone());
+        prop_assert_eq!(path_codec::encode(&layer).unwrap(), bytes, "deterministic");
+    }
+
+    #[test]
+    fn path_codec_round_trips_smooth_tracks(layer in arb_smooth_track()) {
+        let bytes = path_codec::encode(&layer).unwrap();
+        prop_assert_eq!(path_codec::decode(&bytes).unwrap(), layer);
+    }
+
+    #[test]
+    fn path_codec_decode_never_panics_on_byte_soup(
+        bytes in proptest::collection::vec(any::<u8>(), 0..256),
+        lead in 0u8..4,
+    ) {
+        // Lead with a valid version byte (and plausible flags) often enough to
+        // get past the first check.
+        let mut b = bytes;
+        if lead > 0 && !b.is_empty() {
+            b[0] = path_codec::PATH_CODEC_VERSION;
+            if b.len() > 1 {
+                b[1] &= 0b11;
+            }
+        }
+        let _ = path_codec::decode(&b);
+        let _ = path_codec::decode_header(&b);
+    }
+
+    #[test]
+    fn path_codec_decode_never_panics_on_mutations(
+        layer in arb_path_layer(),
+        edits in proptest::collection::vec((any::<usize>(), any::<u8>(), 0u8..3), 1..6),
+    ) {
+        let mut b = path_codec::encode(&layer).unwrap();
+        for (at, byte, op) in edits {
+            match op {
+                0 if !b.is_empty() => { let i = at % b.len(); b[i] = byte; }
+                1 if !b.is_empty() => { b.truncate(at % b.len()); }
+                _ => { let i = at % (b.len() + 1); b.insert(i, byte); }
+            }
+        }
+        if let Ok(l) = path_codec::decode(&b) {
+            // Whatever decodes is internally consistent.
+            let n: u64 = l.counts.iter().map(|&c| c as u64).sum();
+            prop_assert_eq!(n as usize, l.coords.len());
+            if let Some(t) = &l.times {
+                prop_assert_eq!(t.len(), l.coords.len());
+            }
+        }
+    }
+}
+
+fn codec_tile(seed: u64) -> Vec<u8> {
+    let n = 2 + (seed % 5) as usize;
+    let lines: Vec<Vec<[f64; 2]>> = (0..n)
+        .map(|i| {
+            (0..(i % 4))
+                .map(|v| {
+                    [
+                        -122.0 + v as f64 * 0.001_37,
+                        37.0 + (i + v) as f64 * 0.000_7,
+                    ]
+                })
+                .collect()
+        })
+        .collect();
+    let times: Vec<Vec<i64>> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            (0..l.len())
+                .map(|v| 1_700_000_000_000 + (i * 1000 + v * 61) as i64)
+                .collect()
+        })
+        .collect();
+    let layer = ColumnarLayer {
+        name: "tracks".into(),
+        feature_ids: (0..n as u64).collect(),
+        start_times: vec![1_700_000_000_000; n],
+        end_times: vec![1_700_000_060_000; n],
+        geometry: GeometryColumn::LineString(lines),
+        vertex_times: Some(times),
+        vertex_values: None,
+        vertex_value_matrix: None,
+        triangles: None,
+        polygon_parts: None,
+        properties: vec![],
+    };
+    let cfg = EncoderConfig {
+        path_codec: true,
+        quantize_coords_m: seed.is_multiple_of(2).then_some(1.0),
+        ..EncoderConfig::default()
+    };
+    encode_tile_with(&[layer], &cfg).unwrap()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// A codec tile frame with a corrupted `PATH_CODEC` section, or truncated
+    /// anywhere, decodes to `Ok` or `Err`, never a panic — the section, its
+    /// context checks against the CORE batch and the column substitution
+    /// included.
+    ///
+    /// Mutations stay inside the section for the reason the frame test above
+    /// gives: arrow-rs' IPC reader panics on corrupt Arrow metadata, which is
+    /// upstream code and unreachable past the per-blob CRC.
+    #[test]
+    fn codec_tile_frame_never_panics_on_mutations(
+        seed in any::<u64>(),
+        edits in proptest::collection::vec((any::<usize>(), any::<u8>()), 1..6),
+        cut in any::<proptest::sample::Index>(),
+    ) {
+        let mut b = codec_tile(seed);
+        let _ = decode_tile(&b[..cut.index(b.len() + 1)]);
+        let (start, len) = {
+            let sections = frame_v2_path_codec_sections(&b).unwrap();
+            let s = sections[0].expect("the layer is a codec layer");
+            (s.as_ptr() as usize - b.as_ptr() as usize, s.len())
+        };
+        for (at, byte) in edits {
+            b[start + at % len] = byte;
+        }
+        let _ = decode_tile(&b);
+    }
+}

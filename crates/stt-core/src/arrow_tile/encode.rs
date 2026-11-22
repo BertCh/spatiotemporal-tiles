@@ -17,23 +17,26 @@ use super::frame::{
     EndTimeForm, StartTimeForm, TileMeta, FRAME_ALIGN, FRAME_V2_ESCAPE, FRAME_V2_VERSION,
     LAYER_FRAME_VERSION, REF_KIND_INLINE, REF_KIND_NO_PROPS, REF_KIND_TEMPLATE_HASH,
     SECTION_CORE_BATCH, SECTION_INLINE_SCHEMA_CORE, SECTION_INLINE_SCHEMA_PROPS,
-    SECTION_PROPS_BATCH, SECTION_TILE_META, TIME_OFFSET_MS_KEY, VERTEX_TIME_FEATURE_STEP_KEY,
-    VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY, VERTEX_VALUE_BUCKETS_KEY,
+    SECTION_PATH_CODEC, SECTION_PROPS_BATCH, SECTION_TILE_META, TIME_OFFSET_MS_KEY,
+    VERTEX_TIME_FEATURE_STEP_KEY, VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY,
+    VERTEX_VALUE_BUCKETS_KEY,
 };
 use super::layer::{
     ColumnarLayer, GeometryColumn, PropertyColumn, VectorElem, GEOARROW_CRS_METADATA,
     GEOARROW_EXT_KEY, GEOARROW_EXT_META_KEY, TRIANGLES_METADATA_KEY,
 };
+use super::path_codec::{self, PathCoords, PathLayer};
 use super::quantize::{
     build_quantized_numeric_for_column, validate_quantize_coords_m, world_grid_affine,
     world_grid_affine_3d, AttrQuant, STT_QUANT_ATTR_META_KEY, STT_QUANT_META_KEY,
 };
 use crate::error::{Error, Result};
 use arrow::array::{
-    Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Float64Array, Int64Array,
-    ListBuilder, RecordBatch, StringArray, UInt16Array, UInt16Builder, UInt32Array, UInt32Builder,
-    UInt64Array, UInt8Array,
+    new_empty_array, Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array,
+    Float64Array, Int32Array, Int64Array, Int64Builder, ListArray, ListBuilder, RecordBatch,
+    StringArray, UInt16Array, UInt16Builder, UInt32Array, UInt32Builder, UInt64Array, UInt8Array,
 };
+use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, UInt16Type};
 use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
 use arrow::ipc::{root_as_message, MessageHeader, MetadataVersion};
@@ -444,6 +447,8 @@ struct FrameOnlyEncodings {
     compact_times: bool,
     /// `TILE_META.vq` — see [`EncoderConfig::quantize_vertex_values`].
     quantize_vertex_values: bool,
+    /// The `PATH_CODEC` section — see [`EncoderConfig::path_codec`].
+    path_codec: bool,
 }
 
 /// Everything a frame assembler needs about one built layer: the Arrow fields
@@ -485,6 +490,81 @@ struct LayerParts {
     /// per-tile tail. Always [`DictHoist::Tail`] without pins, which is what
     /// keeps an unpinned encode byte-identical to a pre-M2 one.
     props_dict_hoist: DictHoist,
+    /// The layer's `PATH_CODEC` section bytes when it took the path codec
+    /// (its `geometry` / `vertex_time` columns are then all-empty lists).
+    path_codec_section: Option<Vec<u8>>,
+}
+
+/// The path-codec input for `layer` (its geometry already built into
+/// `geom_array`), or `None` when the layer is not eligible and must be encoded
+/// as without the codec.
+///
+/// Eligible: LineString geometry with a 2-wide coordinate, and vertex times
+/// either absent or present one-per-vertex on every feature and strictly
+/// within ±2^52 ms. A feature whose time list disagrees with its vertex count
+/// has no codec spelling (the section ties times to vertices 1:1), so such a
+/// layer keeps the Arrow columns — and so do the empty-list-vs-null nuances
+/// that go with it.
+fn path_codec_input(layer: &ColumnarLayer, geom_array: &ArrayRef) -> Option<PathLayer> {
+    let GeometryColumn::LineString(lines) = &layer.geometry else {
+        return None;
+    };
+    let counts: Vec<u32> = lines
+        .iter()
+        .map(|l| u32::try_from(l.len()).ok())
+        .collect::<Option<_>>()?;
+    let times = match &layer.vertex_times {
+        None => None,
+        Some(vt) => {
+            if vt.len() != lines.len() || vt.iter().zip(lines).any(|(t, l)| t.len() != l.len()) {
+                return None;
+            }
+            let flat: Vec<i64> = vt.iter().flatten().copied().collect();
+            if !path_codec::times_in_range(&flat) {
+                return None;
+            }
+            Some(flat)
+        }
+    };
+    let list = geom_array.as_any().downcast_ref::<ListArray>()?;
+    let fsl = list
+        .values()
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()?;
+    if fsl.value_length() != 2 {
+        return None;
+    }
+    let leaf = fsl.values();
+    let coords = if let Some(v) = leaf.as_any().downcast_ref::<Int32Array>() {
+        PathCoords::Grid(v.values().chunks_exact(2).map(|c| [c[0], c[1]]).collect())
+    } else if let Some(v) = leaf.as_any().downcast_ref::<Float64Array>() {
+        PathCoords::Decimal(v.values().chunks_exact(2).map(|c| [c[0], c[1]]).collect())
+    } else {
+        return None;
+    };
+    Some(PathLayer {
+        counts,
+        coords,
+        times,
+    })
+}
+
+/// The all-empty-lists column a codec layer's CORE batch carries in place of
+/// `column`: same Arrow type (so the schema template does not fork), `rows`
+/// zero-length non-null lists, no child values.
+fn empty_list_column(column: &ArrayRef, rows: usize) -> Result<ArrayRef> {
+    let DataType::List(item) = column.data_type() else {
+        return Err(Error::Other(format!(
+            "path codec: expected a List column, got {}",
+            column.data_type()
+        )));
+    };
+    Ok(Arc::new(ListArray::new(
+        item.clone(),
+        OffsetBuffer::new_zeroed(rows),
+        new_empty_array(item.data_type()),
+        None,
+    )))
 }
 
 /// Pick the compact form of a layer's two feature-time columns from that
@@ -556,6 +636,7 @@ fn build_layer_parts(
     let FrameOnlyEncodings {
         compact_times,
         quantize_vertex_values,
+        path_codec,
     } = frame_only;
     layer.validate()?;
     let n = layer.feature_count();
@@ -686,13 +767,44 @@ fn build_layer_parts(
         Field::new("geometry", geom_array.data_type().clone(), false)
             .with_metadata(geom_meta.into_iter().collect()),
     ));
-    columns.push(geom_array);
+
+    // The path codec takes the coordinates AFTER quantization (so world-grid
+    // mode stores exactly the Int32 indices the leaf would have held) and the
+    // raw vertex times; the CORE batch then carries empty lists in both
+    // columns, typed as the Int64-tier layer would be, so the template is
+    // the one an absolute-`vertex_time` layer of the same shape uses.
+    let codec = if path_codec {
+        path_codec_input(layer, &geom_array)
+    } else {
+        None
+    };
+    let mut path_codec_section: Option<Vec<u8>> = None;
+    if let Some(input) = &codec {
+        path_codec_section = Some(path_codec::encode(input)?);
+        columns.push(empty_list_column(&geom_array, n)?);
+    } else {
+        columns.push(geom_array);
+    }
 
     // Track per-layer vertex-time encoding so the schema metadata (set
     // below) records the origin/step needed for the u16-delta reader path.
     let mut vertex_time_encoding: Option<(i64, u32)> = None;
     let mut vertex_time_feature_step: Option<u32> = None;
-    if let Some(vt_col) = build_vertex_time_array(
+    if codec.is_some() {
+        if layer.vertex_times.is_some() {
+            let mut builder = ListBuilder::new(Int64Builder::new());
+            for _ in 0..n {
+                builder.append(true);
+            }
+            let empty: ArrayRef = Arc::new(builder.finish());
+            fields.push(Arc::new(Field::new(
+                "vertex_time",
+                empty.data_type().clone(),
+                true,
+            )));
+            columns.push(empty);
+        }
+    } else if let Some(vt_col) = build_vertex_time_array(
         &layer.vertex_times,
         n,
         cfg.vertex_time_max_step_ms,
@@ -1010,6 +1122,7 @@ fn build_layer_parts(
         } else {
             DictHoist::Tail
         },
+        path_codec_section,
     })
 }
 
@@ -1073,6 +1186,10 @@ fn assemble_layer_ipc_self_describing(parts: LayerParts) -> Result<Vec<u8>> {
         parts.vertex_value_quant.is_empty(),
         "the standalone layer shape has no TILE_META to carry vq"
     );
+    debug_assert!(
+        parts.path_codec_section.is_none(),
+        "the standalone layer shape has no section to carry the path codec"
+    );
     // Schema-level metadata records the layer name and geometry kind so a
     // reader does not have to inspect the geometry column. When the
     // vertex_time column is u16-delta encoded we add `origin_ms` and
@@ -1128,6 +1245,8 @@ pub(crate) struct EncodedLayerV2 {
     /// This layer used the TB-11 feature-anchored vertex-time form. Bubbles up
     /// to [`EncodeObservations`] so the writer can declare the capability.
     pub(crate) feature_anchored_vertex_times: bool,
+    /// The layer's `PATH_CODEC` section, when it took the path codec.
+    pub(crate) path_codec_section: Option<Vec<u8>>,
 }
 
 /// Locate the end of the leading schema message by walking the Arrow IPC
@@ -1340,6 +1459,7 @@ pub(crate) fn encode_layer_v2_parts(
         FrameOnlyEncodings {
             compact_times: cfg.compact_times,
             quantize_vertex_values: cfg.quantize_vertex_values,
+            path_codec: cfg.path_codec,
         },
     )?;
 
@@ -1431,6 +1551,7 @@ pub(crate) fn encode_layer_v2_parts(
         props,
         tile_meta_json,
         feature_anchored_vertex_times: parts.vertex_time_feature_step.is_some(),
+        path_codec_section: parts.path_codec_section,
     })
 }
 
@@ -1481,6 +1602,12 @@ pub struct EncodeObservations {
     /// obliging the manifest to declare
     /// [`crate::pack::CAPABILITY_VERTEX_TIME_FEATURE_ANCHOR`].
     pub feature_anchored_vertex_times: bool,
+    /// Some layer carries a `PATH_CODEC` section ([`EncoderConfig::path_codec`]
+    /// took it), obliging the manifest to declare
+    /// [`crate::pack::CAPABILITY_PATH_CODEC`]. Observed rather than derived
+    /// from the flag, so a `--path-codec` build with no eligible layer locks
+    /// out no reader.
+    pub path_codec: bool,
 }
 
 /// [`encode_tile_with`], plus what the encode observed. Byte-identical output —
@@ -1544,6 +1671,7 @@ fn encode_tile_frame_v2(
         }
         let enc = encode_layer_v2_parts(layer, cfg)?;
         observed.feature_anchored_vertex_times |= enc.feature_anchored_vertex_times;
+        observed.path_codec |= enc.path_codec_section.is_some();
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(name);
 
@@ -1579,6 +1707,9 @@ fn encode_tile_frame_v2(
                 sections.push((SECTION_INLINE_SCHEMA_PROPS, template));
             }
             sections.push((SECTION_PROPS_BATCH, tail));
+        }
+        if let Some(section) = &enc.path_codec_section {
+            sections.push((SECTION_PATH_CODEC, section));
         }
         out.push(sections.len() as u8);
         for (tag, bytes) in &sections {
