@@ -1648,8 +1648,8 @@ fn multi_dataset_router(registry: Arc<Registry>) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/datasets", get(datasets_handler))
-        .route("/:dataset/metadata.json", get(metadata_handler_multi))
-        .route("/:dataset/tiles/:z/:x/:y/:t", get(tile_handler_multi))
+        .route("/{dataset}/metadata.json", get(metadata_handler_multi))
+        .route("/{dataset}/tiles/{z}/{x}/{y}/{t}", get(tile_handler_multi))
         .with_state(registry)
 }
 
@@ -1660,7 +1660,7 @@ fn single_dataset_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/metadata.json", get(metadata_handler))
-        .route("/tiles/:z/:x/:y/:t", get(tile_handler))
+        .route("/tiles/{z}/{x}/{y}/{t}", get(tile_handler))
         .with_state(state)
 }
 
@@ -2060,7 +2060,7 @@ mod tests {
     //
     // Why a real socket rather than driving the `Router` as a `tower::Service`:
     // `tower` is not a declared dependency of this crate (it arrives only
-    // transitively, under axum) and axum 0.7 re-exports neither `tower` nor
+    // transitively, under axum) and axum 0.8 re-exports neither `tower` nor
     // `ServiceExt`, so `oneshot` is unreachable here without a manifest change.
     // Binding `127.0.0.1:0` needs nothing but the `tokio` this binary already
     // links — and it pins the actual status line and headers, which is what the
