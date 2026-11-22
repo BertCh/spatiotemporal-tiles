@@ -1213,6 +1213,10 @@ fn encoder_settings(args: &Args) -> EncoderSettings {
         // must come through this struct, so `required_capabilities()` picks it
         // up on `/metadata.json` in the same change.
         quantize_vertex_values: false,
+        // The path codec stays OFF on serve: its capability is declared from
+        // what an encode OBSERVED, and `/tilejson` is published before any
+        // tile is encoded.
+        path_codec: false,
     }
 }
 

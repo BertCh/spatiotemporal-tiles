@@ -42,6 +42,12 @@ pub const SECTION_CORE_BATCH: u8 = 0x03;
 pub const SECTION_INLINE_SCHEMA_PROPS: u8 = 0x04;
 /// Layer-frame section tag: PROPS batch IPC tail (as 0x03, props schema).
 pub const SECTION_PROPS_BATCH: u8 = 0x05;
+/// Layer-frame section tag: the path codec (`path-codec` capability) — the
+/// layer's LineString coordinates and per-vertex times as per-feature
+/// predictor residuals ([`super::path_codec`]). Its presence marks the layer
+/// as codec-encoded: the CORE batch's `geometry` and `vertex_time` columns are
+/// then all-empty lists the decoder replaces with the reconstructed ones.
+pub const SECTION_PATH_CODEC: u8 = 0x06;
 
 /// Layer-frame `ref_kind`: the schema rides inline in an `INLINE_SCHEMA_*` section
 /// (self-contained blob — no template registry needed to decode).

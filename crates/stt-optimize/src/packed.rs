@@ -132,6 +132,13 @@ impl PackedTileset {
     pub fn read_layers(&self, entry: &TileEntry) -> Result<Vec<DecodedLayer>> {
         Ok(self.reader.read_layers(entry)?)
     }
+
+    /// Decode a payload from [`read_payload`](Self::read_payload) — for a
+    /// caller that needs both the decoded layers and the frame bytes (the
+    /// per-column attribution prices a `PATH_CODEC` section from the frame).
+    pub fn decode_payload(&self, payload: &[u8]) -> Result<Vec<DecodedLayer>> {
+        Ok(self.reader.decode_payload(payload)?)
+    }
 }
 
 #[cfg(test)]

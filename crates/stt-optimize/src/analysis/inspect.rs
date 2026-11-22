@@ -30,10 +30,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result};
 use arrow::datatypes::{DataType, Field};
 use serde::{Deserialize, Serialize};
-use stt_core::arrow_tile::{DecodedLayer, STT_QUANT_ATTR_META_KEY, STT_QUANT_META_KEY};
+use stt_core::arrow_tile::{
+    frame_v2_path_codec_sections, DecodedLayer, STT_QUANT_ATTR_META_KEY, STT_QUANT_META_KEY,
+};
 use stt_core::TileEntry;
 
-use crate::measure::attribution::{attribute_columns, AttributionDesign, ShareDispersion};
+use crate::measure::attribution::{
+    attribute_layer_as_stored, AttributionDesign, ShareDispersion, PATH_CODEC_COLUMN,
+};
 use crate::packed::PackedTileset;
 
 /// zstd level for the standalone per-column re-encode. Fixed at the publish
@@ -602,18 +606,21 @@ pub fn inspect_with_designs(
             None => &entries[k],
             Some(ix) => &entries[ix[k]],
         };
-        let layers = tileset.read_layers(e).with_context(|| {
+        let context = || {
             format!(
                 "decoding tile z{}/{}/{} t{}",
                 e.zoom, e.x, e.y, e.time_start
             )
-        })?;
+        };
+        let payload = tileset.read_payload(e).with_context(context)?;
+        let layers = tileset.decode_payload(&payload).with_context(context)?;
+        let sections = frame_v2_path_codec_sections(&payload).with_context(context)?;
         tiles_decoded += 1;
         schemas.insert(schema_signature(&layers));
         // Bytes this ONE tile attributes per column, merged over its layers —
         // the observation unit `share_stderr` is estimated from.
         let mut per_tile: BTreeMap<String, u64> = BTreeMap::new();
-        for layer in &layers {
+        for (layer, section) in layers.iter().zip(sections) {
             let batch = &layer.batch;
             let rows = batch.num_rows() as u64;
             features_decoded += rows;
@@ -623,7 +630,13 @@ pub fn inspect_with_designs(
             // bytes) and returns costs in SCHEMA ORDER, index-aligned with the
             // fields walked below. The encoding note is derived from the
             // ORIGINAL field, so the metadata still reaches the report.
-            let attributed = attribute_columns(batch, COLUMN_ZSTD_LEVEL, attribution)?;
+            //
+            // A path-codec layer is priced as STORED: its empty CORE columns,
+            // plus one extra `[path-codec]` line for the section that actually
+            // carries the geometry and vertex times (see
+            // `attribute_layer_as_stored`).
+            let attributed =
+                attribute_layer_as_stored(batch, section, COLUMN_ZSTD_LEVEL, attribution)?;
             let schema = batch.schema();
             for (i, field) in schema.fields().iter().enumerate() {
                 let a = &attributed[i];
@@ -633,8 +646,24 @@ pub fn inspect_with_designs(
                 c.marginal += a.marginal_bytes;
                 c.rows += rows;
                 c.dtype = format!("{:?}", field.data_type());
-                c.note = encoding_note(field);
+                c.note = if section.is_some()
+                    && (field.name() == "geometry" || field.name() == "vertex_time")
+                {
+                    format!("empty on the wire; carried by {PATH_CODEC_COLUMN}")
+                } else {
+                    encoding_note(field)
+                };
                 *per_tile.entry(field.name().clone()).or_insert(0) += a.bytes;
+            }
+            if let Some(a) = attributed.get(schema.fields().len()) {
+                debug_assert_eq!(a.name, PATH_CODEC_COLUMN);
+                let c = cols.entry(a.name.clone()).or_default();
+                c.compressed += a.bytes;
+                c.marginal += a.marginal_bytes;
+                c.rows += rows;
+                c.dtype = "PATH_CODEC section (0x06)".to_string();
+                c.note = "path codec section (geometry + vertex_time)".to_string();
+                *per_tile.entry(a.name.clone()).or_insert(0) += a.bytes;
             }
         }
         dispersion.observe_tile(&per_tile);
@@ -916,6 +945,62 @@ mod tests {
             .with_temporal_bucket_ms(bucket as u64)
             .with_zoom_levels(3, 5);
         w.finalize(&meta).unwrap();
+    }
+
+    /// A `--path-codec` archive is priced AS STORED: the section is its own
+    /// `[path-codec]` line, and the empty CORE `geometry` / `vertex_time`
+    /// columns cost (next to) nothing.
+    #[test]
+    fn inspect_attributes_the_path_codec_section_as_its_own_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dataset");
+        let mut w = PackWriter::create(&out, BlobOrdering::Auto, 64 * 1024).unwrap();
+        let cfg = EncoderConfig {
+            template_collector: Some(w.template_collector()),
+            path_codec: true,
+            ..EncoderConfig::default()
+        };
+        let (payload, observed) =
+            stt_core::arrow_tile::encode_tile_observed(&[line_layer(7, 40)], &cfg).unwrap();
+        assert!(observed.path_codec);
+        w.declare_capability(stt_core::pack::CAPABILITY_PATH_CODEC);
+        w.add_tile_full(
+            &TileId::new(5, 1, 1, 0),
+            0,
+            999,
+            Some(0),
+            40,
+            None,
+            &payload,
+        )
+        .unwrap();
+        w.finalize(&Metadata::new("codec").with_zoom_levels(5, 5))
+            .unwrap();
+
+        let ts = PackedTileset::open(&out).unwrap();
+        let report = inspect(&ts, None).unwrap();
+        let col = |n: &str| {
+            report
+                .per_column
+                .iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("no column {n}"))
+        };
+        let codec = col(PATH_CODEC_COLUMN);
+        assert!(codec.compressed_bytes > 0);
+        assert!(codec.encoding_note.contains("path codec"));
+        for name in ["geometry", "vertex_time"] {
+            let c = col(name);
+            // Only the empty column's framing (schema entry + zero offsets).
+            assert!(c.compressed_bytes < 128, "{name}: {}", c.compressed_bytes);
+            assert!(
+                c.encoding_note.contains(PATH_CODEC_COLUMN),
+                "{}",
+                c.encoding_note
+            );
+        }
+        let share_sum: f64 = report.per_column.iter().map(|c| c.share).sum();
+        assert!((share_sum - 1.0).abs() < 1e-9);
     }
 
     #[test]

@@ -11,15 +11,19 @@ use super::frame::{
     EndTimeForm, StartTimeForm, TemplateRegistry, TileMeta, FRAME_ALIGN, FRAME_V2_ESCAPE,
     FRAME_V2_VERSION, REF_KIND_INLINE, REF_KIND_NO_PROPS, REF_KIND_TEMPLATE_HASH,
     SECTION_CORE_BATCH, SECTION_INLINE_SCHEMA_CORE, SECTION_INLINE_SCHEMA_PROPS,
-    SECTION_PROPS_BATCH, SECTION_TILE_META, TIME_OFFSET_MS_KEY, VERTEX_TIME_FEATURE_STEP_KEY,
-    VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY, VERTEX_VALUE_BUCKETS_KEY,
+    SECTION_PATH_CODEC, SECTION_PROPS_BATCH, SECTION_TILE_META, TIME_OFFSET_MS_KEY,
+    VERTEX_TIME_FEATURE_STEP_KEY, VERTEX_TIME_ORIGIN_KEY, VERTEX_TIME_STEP_KEY,
+    VERTEX_VALUE_BUCKETS_KEY,
 };
 use super::layer::decorate_temporal_fields;
+use super::path_codec::{self, PathCoords};
 use super::quantize::{AttrQuant, STT_QUANT_ATTR_META_KEY, VERTEX_VALUE_QUANT_SENTINEL};
 use crate::error::{Error, Result};
 use arrow::array::{
-    Array, ArrayRef, Float32Array, Int64Array, ListArray, RecordBatch, UInt16Array, UInt32Array,
+    Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    ListArray, RecordBatch, UInt16Array, UInt32Array,
 };
+use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use std::collections::{BTreeMap, HashMap};
@@ -400,19 +404,168 @@ fn reinflate_quantized_vertex_values(
     Ok(())
 }
 
+/// Replace a codec layer's all-empty `geometry` / `vertex_time` CORE columns
+/// with the ones reconstructed from its `PATH_CODEC` section — the sibling of
+/// [`reinflate_compact_times`], and for the same reason: after it the layer is
+/// indistinguishable from a non-codec layer whose `vertex_time` is the
+/// absolute `List<Int64>` tier, so nothing downstream branches on the codec.
+///
+/// Validates the section against the batch before trusting it: the flags must
+/// agree with the schema (TIME ⇔ a `vertex_time` column, DECIMAL ⇔ a
+/// `Float64` leaf), `feature_count` must equal the row count, both CORE
+/// columns must really be empty, and TILE_META must not describe a
+/// delta-coded `vertex_time` for a column the codec owns.
+///
+/// A feature with zero vertices decodes to a NULL `vertex_time` entry, as the
+/// encoder's Arrow columns spell it; its geometry is an empty (non-null) list.
+fn substitute_path_codec(
+    fields: &mut [Arc<Field>],
+    columns: &mut [ArrayRef],
+    rows: usize,
+    meta: &TileMeta,
+    section: &[u8],
+) -> Result<()> {
+    let bad = |msg: String| Error::Other(format!("path codec layer: {msg}"));
+    let header = path_codec::decode_header(section)?;
+    if header.feature_count != rows as u64 {
+        return Err(bad(format!(
+            "section describes {} features but the CORE batch has {rows} rows",
+            header.feature_count
+        )));
+    }
+    if meta.vt.is_some() || meta.vtf.is_some() {
+        return Err(bad(
+            "TILE_META carries a vt/vtf vertex-time encoding for a codec layer".into(),
+        ));
+    }
+    let geom_idx = fields
+        .iter()
+        .position(|f| f.name() == "geometry")
+        .ok_or_else(|| bad("no 'geometry' column".into()))?;
+    let geom = columns[geom_idx]
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| bad(format!("'geometry' is {}", columns[geom_idx].data_type())))?;
+    let DataType::List(vertex_field) = geom.data_type().clone() else {
+        unreachable!("a ListArray has a List type");
+    };
+    let DataType::FixedSizeList(coord_field, 2) = vertex_field.data_type().clone() else {
+        return Err(bad(format!(
+            "'geometry' is {}, not a 2-wide LineString",
+            geom.data_type()
+        )));
+    };
+    let decimal_leaf = match coord_field.data_type() {
+        DataType::Float64 => true,
+        DataType::Int32 => false,
+        other => return Err(bad(format!("geometry leaf is {other}"))),
+    };
+    if decimal_leaf != header.is_decimal() {
+        return Err(bad(format!(
+            "section DECIMAL flag is {} but the geometry leaf is {}",
+            header.is_decimal(),
+            coord_field.data_type()
+        )));
+    }
+    if !geom.values().is_empty() {
+        return Err(bad("CORE 'geometry' column is not all-empty lists".into()));
+    }
+    let vt_idx = fields.iter().position(|f| f.name() == "vertex_time");
+    if vt_idx.is_some() != header.has_time() {
+        return Err(bad(format!(
+            "section TIME flag is {} but the layer {} a 'vertex_time' column",
+            header.has_time(),
+            if vt_idx.is_some() { "has" } else { "has no" }
+        )));
+    }
+    let vt_item = match vt_idx {
+        Some(i) => {
+            let list = columns[i]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| bad(format!("'vertex_time' is {}", columns[i].data_type())))?;
+            let DataType::List(item) = list.data_type().clone() else {
+                unreachable!("a ListArray has a List type");
+            };
+            if item.data_type() != &DataType::Int64 {
+                return Err(bad(format!(
+                    "'vertex_time' is {}, expected List<Int64>",
+                    list.data_type()
+                )));
+            }
+            if !list.values().is_empty() {
+                return Err(bad(
+                    "CORE 'vertex_time' column is not all-empty lists".into()
+                ));
+            }
+            Some(item)
+        }
+        None => None,
+    };
+
+    if header.vertex_count > i32::MAX as u64 {
+        return Err(bad(format!(
+            "{} vertices overflow the Arrow i32 list offsets",
+            header.vertex_count
+        )));
+    }
+    let decoded = path_codec::decode(section)?;
+    let offsets = OffsetBuffer::<i32>::from_lengths(decoded.counts.iter().map(|&c| c as usize));
+    let leaf: ArrayRef = match decoded.coords {
+        PathCoords::Grid(g) => Arc::new(Int32Array::from(
+            g.into_iter().flatten().collect::<Vec<i32>>(),
+        )),
+        PathCoords::Decimal(f) => Arc::new(Float64Array::from(
+            f.into_iter().flatten().collect::<Vec<f64>>(),
+        )),
+    };
+    let coords = FixedSizeListArray::try_new(coord_field, 2, leaf, None)
+        .map_err(|e| bad(format!("coordinate array: {e}")))?;
+    let geometry = ListArray::try_new(vertex_field, offsets.clone(), Arc::new(coords), None)
+        .map_err(|e| bad(format!("geometry array: {e}")))?;
+    columns[geom_idx] = Arc::new(geometry);
+
+    if let (Some(i), Some(item), Some(times)) = (vt_idx, vt_item, decoded.times) {
+        let any_empty = decoded.counts.contains(&0);
+        let nulls = any_empty
+            .then(|| NullBuffer::from(decoded.counts.iter().map(|&c| c > 0).collect::<Vec<_>>()));
+        let vt = ListArray::try_new(item, offsets, Arc::new(Int64Array::from(times)), nulls)
+            .map_err(|e| bad(format!("vertex_time array: {e}")))?;
+        fields[i] = Arc::new(
+            fields[i]
+                .as_ref()
+                .clone()
+                .with_data_type(vt.data_type().clone()),
+        );
+        columns[i] = Arc::new(vt);
+    }
+    Ok(())
+}
+
 /// Merge a framed layer's decoded CORE + PROPS batches back into the single
 /// flat batch, RE-INJECTING the TILE_META values into schema/field metadata
 /// with the exact formatting the standalone `encode_layer` path writes — so
 /// every downstream consumer (validator, stt-optimize, tests, renderers) sees
 /// ONE decoded-layer shape and never branches on how the tile was framed.
+///
+/// `path_codec` is the layer's `PATH_CODEC` section, when it has one; its
+/// columns are substituted first (see [`substitute_path_codec`]).
 pub(crate) fn merge_v2_layer(
     core: RecordBatch,
     props: Option<RecordBatch>,
     meta: &TileMeta,
+    path_codec: Option<&[u8]>,
 ) -> Result<RecordBatch> {
     let mut fields: Vec<Arc<Field>> = core.schema().fields().iter().cloned().collect();
     let mut columns: Vec<ArrayRef> = core.columns().to_vec();
     let mut schema_meta: HashMap<String, String> = core.schema().metadata().clone();
+
+    // The codec columns first: index-independent (looked up by name), and
+    // touching only `geometry` / `vertex_time`, which no other re-inflation
+    // reads.
+    if let Some(section) = path_codec {
+        substitute_path_codec(&mut fields, &mut columns, core.num_rows(), meta, section)?;
+    }
 
     // Re-inflate the compact time columns FIRST, while `fields`/`columns` are
     // still exactly the CORE prefix, so a synthesized `end_time` lands at its
@@ -604,7 +757,13 @@ fn decode_tile_v2(
             )?)
         };
 
-        let batch = merge_v2_layer(core, props, &tile_meta)?;
+        let batch = merge_v2_layer(
+            core,
+            props,
+            &tile_meta,
+            sections.get(&SECTION_PATH_CODEC).copied(),
+        )
+        .map_err(|e| Error::Other(format!("layer '{name}': {e}")))?;
         layers.push(DecodedLayer { name, batch });
     }
     Ok(layers)
@@ -665,6 +824,58 @@ pub fn frame_v2_template_refs(payload: &[u8]) -> Result<Vec<[u8; 16]>> {
         }
     }
     Ok(refs)
+}
+
+/// Each layer's `PATH_CODEC` section bytes (`None` for a layer without one),
+/// index-aligned with the layers [`decode_tile`] returns — a header + TOC walk
+/// like [`frame_v2_template_refs`], with no Arrow decode.
+///
+/// For tools that price a tile AS STORED (`stt-optimize`'s per-column
+/// attribution): a decoded codec layer's `geometry` / `vertex_time` columns
+/// are the reconstructed ones, so the bytes that actually carried them have to
+/// come from the frame.
+pub fn frame_v2_path_codec_sections(payload: &[u8]) -> Result<Vec<Option<&[u8]>>> {
+    if !is_frame_v2(payload) {
+        return Err(Error::Other("not a v2 layer frame (missing escape)".into()));
+    }
+    let mut pos = 2usize;
+    let frame_version = read_slice(payload, &mut pos, 1)?[0];
+    if frame_version != FRAME_V2_VERSION {
+        return Err(Error::Other(format!(
+            "unsupported layer-frame version {frame_version} (this reader knows v2)"
+        )));
+    }
+    read_slice(payload, &mut pos, 1)?; // flags
+    let count = read_u16(payload, &mut pos)? as usize;
+    let mut out = Vec::with_capacity(count.min(64));
+    for _ in 0..count {
+        let name_len = read_u16(payload, &mut pos)? as usize;
+        read_slice(payload, &mut pos, name_len)?;
+        for _ in 0..2 {
+            if read_slice(payload, &mut pos, 1)?[0] == REF_KIND_TEMPLATE_HASH {
+                read_slice(payload, &mut pos, 16)?;
+            }
+        }
+        let section_count = read_slice(payload, &mut pos, 1)?[0] as usize;
+        let mut toc: Vec<(u8, usize)> = Vec::with_capacity(section_count);
+        for _ in 0..section_count {
+            let tag = read_slice(payload, &mut pos, 1)?[0];
+            toc.push((tag, read_u32(payload, &mut pos)? as usize));
+        }
+        let pad = (FRAME_ALIGN - pos % FRAME_ALIGN) % FRAME_ALIGN;
+        read_slice(payload, &mut pos, pad)?;
+        let mut section = None;
+        for (tag, len) in toc {
+            let bytes = read_slice(payload, &mut pos, len)?;
+            if tag == SECTION_PATH_CODEC {
+                section = Some(bytes);
+            }
+            let pad = (FRAME_ALIGN - pos % FRAME_ALIGN) % FRAME_ALIGN;
+            read_slice(payload, &mut pos, pad)?;
+        }
+        out.push(section);
+    }
+    Ok(out)
 }
 
 fn read_u16(buf: &[u8], pos: &mut usize) -> Result<u16> {

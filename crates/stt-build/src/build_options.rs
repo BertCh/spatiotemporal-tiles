@@ -238,6 +238,14 @@ pub struct EncoderSettings {
     /// range-adaptive affine (the `vertex-value-quant` capability). Opt-in
     /// because it is lossy; off by default.
     pub quantize_vertex_values: bool,
+    /// `--path-codec`: store eligible LineString layers' coordinates and
+    /// per-vertex times in the `PATH_CODEC` layer-frame section. Lossless;
+    /// off by default and never turned on by `--auto`. Deliberately NOT in
+    /// [`required_capabilities`](Self::required_capabilities): whether a
+    /// layer is eligible depends on the data, so the `path-codec` capability
+    /// is declared from what the encoder OBSERVED
+    /// (`EncodeObservations::path_codec`), never from this flag alone.
+    pub path_codec: bool,
 }
 
 impl EncoderSettings {
@@ -270,6 +278,10 @@ impl EncoderSettings {
 
         if self.quantize_vertex_values {
             enabled.push("quantize-vertex-values".to_string());
+        }
+
+        if self.path_codec {
+            enabled.push("path-codec".to_string());
         }
 
         if !self.vector_group.is_empty() {
@@ -324,6 +336,7 @@ impl EncoderSettings {
                 .max(1),
             compact_times: !self.no_compact_times,
             quantize_vertex_values: self.quantize_vertex_values,
+            path_codec: self.path_codec,
             // The format-v2 fields (`format_version`, `template_collector`)
             // default to v1 / no-collector; the PACK WRITER overrides both from
             // its own `--format-version` (`PackWriter::encoder_config`), so
@@ -568,6 +581,23 @@ mod tests {
             ["time-delta", "vertex-value-quant"]
         );
         assert_eq!(on.enabled_summary().unwrap(), ["quantize-vertex-values"]);
+    }
+
+    /// `--path-codec` turns the encoder setting on but declares NOTHING by
+    /// itself: the capability is observation-driven (a build with no eligible
+    /// layer must not lock readers out).
+    #[test]
+    fn path_codec_drives_the_encoder_flag_but_not_the_capability() {
+        let off = EncoderSettings::default();
+        assert!(!off.resolve().unwrap().path_codec);
+
+        let on = EncoderSettings {
+            path_codec: true,
+            ..Default::default()
+        };
+        assert!(on.resolve().unwrap().path_codec);
+        assert_eq!(on.required_capabilities(), ["time-delta"]);
+        assert_eq!(on.enabled_summary().unwrap(), ["path-codec"]);
     }
 
     #[test]

@@ -744,6 +744,19 @@ struct Args {
     #[arg(long = "quantize-vertex-values", default_value_t = false)]
     quantize_vertex_values: bool,
 
+    /// Store eligible LineString layers' coordinates and per-vertex times as
+    /// per-feature predictor residuals in a `PATH_CODEC` layer-frame section
+    /// instead of Arrow buffers. LOSSLESS: Float64 coordinates are bit-exact
+    /// and vertex times keep full millisecond precision (the default build
+    /// truncates them to a per-tile step; `--vertex-time-precision` does not
+    /// apply to a codec layer). Declares the `path-codec` capability when at
+    /// least one layer took it — a reader without it refuses the archive. A
+    /// layer is eligible when its vertex times are absent or present one per
+    /// vertex; anything else encodes as without the flag. Off by default and
+    /// never enabled by `--auto`.
+    #[arg(long = "path-codec", default_value_t = false)]
+    path_codec: bool,
+
     /// Deprecated compatibility flag. It is accepted only when the encoder
     /// requires no capabilities, where it has no effect; a conforming v2 build
     /// refuses to suppress any required-to-understand declaration.
@@ -1345,6 +1358,7 @@ fn main() -> Result<()> {
         point_elevation_column: args.point_elevation_column.clone(),
         no_compact_times: args.no_compact_times,
         quantize_vertex_values: args.quantize_vertex_values,
+        path_codec: args.path_codec,
     };
     // `mut` because pass 1 (below, after the features are loaded and their
     // property kinds resolved) fills in `global_pins`.

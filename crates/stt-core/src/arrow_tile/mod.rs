@@ -81,6 +81,9 @@
 //!   layer-frame assembly.
 //! - `decode` — the standalone single-layer IPC decode and the layer-frame
 //!   walk.
+//! - [`path_codec`] — the `PATH_CODEC` section (`path-codec` capability). The
+//!   one PUBLIC submodule, not re-exported: its `encode`/`decode` are the
+//!   section codec, not a tile codec, and stay namespaced as such.
 
 mod columns;
 mod config;
@@ -88,6 +91,7 @@ mod decode;
 mod encode;
 mod frame;
 mod layer;
+pub mod path_codec;
 mod quantize;
 
 pub use self::columns::*;

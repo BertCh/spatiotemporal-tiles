@@ -5,6 +5,20 @@ GitHub Release that cargo-dist creates for each tag is the per-crate record.
 Renderer changes are recorded downstream, in the
 [poopdeck.gl changelog](https://github.com/BertCh/poopdeck.gl/blob/main/CHANGELOG.md).
 
+## Unreleased
+
+### Added
+
+- **Opt-in lossless path codec.** `stt-build --path-codec` stores eligible
+  LineString coordinates and per-vertex times in the `PATH_CODEC` (`0x06`)
+  layer-frame section. Float64 coordinates are bit-exact and vertex times
+  retain exact millisecond precision. The `path-codec` capability is declared
+  only when at least one layer actually uses it; the flag is off by default
+  and is not enabled by `--auto`. Conformance vectors live in
+  `conformance/vectors/path-codec/`. `stt-optimize inspect` attributes the
+  section on its own `[path-codec]` line. Normative rules:
+  [packed format §5.2.7](docs/spec/stt-packed-format.md#527-path-codec-section-path_codec--capability-path-codec).
+
 ## 0.8.0 — 2026-08-26
 
 ### Repository split

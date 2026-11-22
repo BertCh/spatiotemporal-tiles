@@ -22,8 +22,8 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use stt_core::arrow_tile::{
-    decode_tile, encode_tile_with, ColumnarLayer, Coord, EncoderConfig, GeometryColumn,
-    PropertyColumn,
+    decode_tile, encode_tile_with, frame_v2_path_codec_sections, ColumnarLayer, Coord,
+    EncoderConfig, GeometryColumn, PropertyColumn,
 };
 use stt_core::compression::compress_zstd_with_dict_level;
 
@@ -36,8 +36,8 @@ use crate::loader::{PropValue, SampledFeature};
 // up as its authors asked. These re-exports keep `crate::measure::attribution::*`
 // resolving for every existing caller.
 pub use crate::attribution::{
-    self, attribute_columns, attribute_columns_loo, attribute_columns_singleton, AttributionDesign,
-    ColumnBytes, LooCost, ShareDispersion,
+    self, attribute_columns, attribute_columns_loo, attribute_columns_singleton,
+    attribute_layer_as_stored, AttributionDesign, ColumnBytes, LooCost, ShareDispersion,
 };
 
 /// Below this many usable sampled features the measurement is noise (zstd
@@ -263,6 +263,11 @@ pub struct MeasureSettings {
     /// times measured **+3.4% wire while −13.1% uncompressed** — a sign
     /// inversion no pre-compression model could have caught.
     pub compact_times: bool,
+    /// Store eligible LineString layers in the `PATH_CODEC` section
+    /// (`stt-build --path-codec`). `false`, the build default, so the field
+    /// is byte-neutral for every existing measurement; nothing in the
+    /// recommender turns it on (it is not an `--auto` lever).
+    pub path_codec: bool,
 }
 
 impl Default for MeasureSettings {
@@ -276,6 +281,7 @@ impl Default for MeasureSettings {
             quantize_attrs_auto: false,
             quantize_attrs: BTreeMap::new(),
             compact_times: true,
+            path_codec: false,
         }
     }
 }
@@ -469,6 +475,7 @@ pub fn measure_sample_layout_with(
             .map(|(name, step)| (name.clone(), *step))
             .collect(),
         compact_times: settings.compact_times,
+        path_codec: settings.path_codec,
         ..EncoderConfig::default()
     };
 
@@ -748,9 +755,10 @@ fn accumulate_columns(
     dispersion: &mut ShareDispersion,
 ) -> Result<()> {
     let layers = decode_tile(payload).context("sample tile decode failed")?;
+    let sections = frame_v2_path_codec_sections(payload).context("sample tile frame walk")?;
     let mut per_tile: BTreeMap<String, u64> = BTreeMap::new();
-    for layer in &layers {
-        for column in attribute_columns(&layer.batch, zstd_level, design)? {
+    for (layer, section) in layers.iter().zip(sections) {
+        for column in attribute_layer_as_stored(&layer.batch, section, zstd_level, design)? {
             let entry = acc.entry(column.name.clone()).or_default();
             entry.bytes += column.bytes;
             entry.marginal += column.marginal_bytes;

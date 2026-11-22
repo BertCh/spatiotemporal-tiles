@@ -201,6 +201,18 @@ pub const CAPABILITY_TRIANGLES_PARTIAL: &str = "triangles-partial";
 /// or anchors them against an origin it invented. Both are silent, which is why
 /// the form is gated rather than merely additive.
 pub const CAPABILITY_VERTEX_TIME_FEATURE_ANCHOR: &str = "vertex-time-feature-anchor";
+/// `manifest.capabilities` entry: the PATH CODEC. A LineString layer carrying
+/// the `PATH_CODEC` (`0x06`) layer-frame section stores its coordinates and
+/// per-vertex times there, as per-feature predictor residuals, and its CORE
+/// batch's `geometry` / `vertex_time` columns are all-empty lists.
+///
+/// A reader that skips the unknown section (the frame's additive rule) would
+/// decode every such feature as a path with ZERO vertices — every trajectory
+/// silently vanishes — which is why the section is gated at open rather than
+/// merely additive. Declared from what the encoder OBSERVED
+/// ([`crate::arrow_tile::EncodeObservations::path_codec`]), never from the
+/// `--path-codec` flag alone.
+pub const CAPABILITY_PATH_CODEC: &str = "path-codec";
 /// Every `manifest.capabilities` value this toolchain implements — the
 /// required-to-understand feature registry (`docs/spec/stt-packed-format.md`
 /// §3.1). Each capability RE-TYPES existing columns, so a reader that lacks it
@@ -215,6 +227,7 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     CAPABILITY_VERTEX_VALUE_QUANT,
     CAPABILITY_TRIANGLES_PARTIAL,
     CAPABILITY_VERTEX_TIME_FEATURE_ANCHOR,
+    CAPABILITY_PATH_CODEC,
 ];
 
 /// Default pack target size — 64 MiB. Well under the 512 MB CDN per-object cap,
