@@ -1,7 +1,12 @@
 # Trajectory representation — motion codecs, motion segments, and what actually pays (2026-11)
 
-**Status:** investigation record, branch `trajectory`. Nothing here changes the
-encoder, the format, or a default. Two harnesses and their measurements.
+**Status:** investigation record, branch `trajectory`. Round 1 (2026-11-21)
+changed nothing. Round 2 (2026-11-22, [below](#round-2-2026-11-22--from-estimate-to-implementation))
+re-measured claim 1 on real tile payloads, extended it to bit-exact f64, and
+implemented it as the opt-in **path codec** (`stt-build --path-codec`,
+capability `path-codec`, [packed spec §5.2.7](../spec/stt-packed-format.md#527-path-codec-section-path_codec--capability-path-codec),
+rationale in [path-codec-wire-2026-11.md](./path-codec-wire-2026-11.md)).
+No default changed.
 
 **Question.** Two outside techniques suggested that STT might gain a lot by
 storing motion instead of samples: TRiGS (continuous Bézier / SE(3) motion with
@@ -278,14 +283,214 @@ id would turn the wire id from noise into a repeated, compressible value. That
 is a dataset-preparation lever already documented in the CLI reference, not a
 format change, but it is the next-largest term after the geometry.
 
+## Round 2 (2026-11-22) — from estimate to implementation
+
+Round 1 priced the codec column by column and against a re-serialised IPC
+frame. Round 2 asked three things: is the number honest on the bytes that
+actually ship, does it need `--quantize-coords`, and does it hold on fast,
+smooth motion. Then it built the codec.
+
+### What round 1 got wrong or left open
+
+- **The whole-layer ratio included schema bytes.** The round-1 "whole-layer
+  IPC" frames carried their Arrow schema, and the codec side's schema was
+  smaller (no nested geometry field, no `stt:quant` JSON). Real tiles store the
+  schema once, in a template. Round 2 edits the real decompressed payload
+  instead (below). The honest figure for the round-1 design is −34 % to −39 %,
+  not −38 % to −48 %.
+- **`vertex_time` was already lossy, so "lossless" was measured on truncated
+  values.** The default build stores vertex times as u16 offsets from the
+  layer minimum at `step = ceil(span / 65535)` and truncates
+  (`columns.rs`). With 1 h buckets that is a step of up to 55 ms. It truncates
+  98 % of AIS layers (mean step 43 ms) and 95 % of flight layers (28 ms).
+  Exact times need `--vertex-time-precision 1`, which costs +6 % on AIS.
+- **The source-id residue was a prep artifact.** `prep.py` writes ids as
+  `<object>-<start ms>`, which is why the string `id` column cost 13 B per
+  feature. A plain object id would be far smaller. The wire-id finding stands.
+- **Flights were missing.** Now covered: 168,231 tracks and 18.7 M fixes over
+  CONUS at 10 s cadence, from one day of adsb.lol `globe_history` heatmap
+  files (`prep.py adsb`). Positions are on a 1e-6° grid.
+- **The `measure` harness cannot be the gate.** Its sampled features have no
+  end time and no per-vertex times, and it does not clip, so a trajectory
+  layer never reaches it in the shape that ships
+  (`stt-optimize/src/loader.rs`, `measure.rs`). The gate used here is a real
+  build of each corpus both ways.
+
+### Method: edit the real payload
+
+`trajectory-frontier` reads each tile's decompressed layer frame, finds the
+geometry and `vertex_time` buffers inside the CORE record batch, cuts them out,
+appends the codec bytes, and re-zstds the whole frame. The frame header,
+TILE_META, ids, compact times and PROPS stay byte-identical, and the batch's
+flatbuffer keeps describing the removed buffers, so the codec is charged
+slightly too much. It runs on an f64 archive built with
+`--vertex-time-precision 1` and emulates the other stored forms from it.
+Re-compressing the untouched payload reproduces the directory's stored sizes to
+1.1 %, and the emulated `--quantize-coords 1` AIS archive matches the real one
+to 0.2 %.
+
+### Bit-exact f64: the codec does not need quantization
+
+Source coordinates are decimal: AIS and drifters at 1e-5° to 1e-6°, ADS-B at
+1e-6°. For a decimal exponent `e`, `round(v · 10^e) / 10^e` reproduces the f64
+bit pattern of every source vertex, so the integers can be predicted and
+varint-coded exactly as on the quantized grid. Vertices the tiler interpolates
+(tile-edge clips, bucket-boundary slices) are not decimal. Each keeps its
+rounded integer, so the predictor chain stays smooth, plus an XOR patch against
+`k / 10^e`. The scheme is exact for any input; a non-decimal source costs
+bytes, not correctness.
+
+| corpus   | values needing a patch | at feature endpoints | patch bytes       |
+| -------- | ---------------------- | -------------------- | ----------------- |
+| AIS      | 7.9 %                  | 77.5 %               | 0.79 B per vertex |
+| ADS-B    | 4.9 %                  | 97.0 %               | 0.41 B per vertex |
+| drifters | 1.1 %                  | 64.5 %               | 0.21 B per vertex |
+
+Interior patches are the vertices the clipper adds where a track leaves a tile
+and re-enters it.
+
+### Exact vertex times that cost less than the lossy ones
+
+Times are split on an epoch-aligned unit `U`: `t = U·q + r`. `U` is the
+coarsest unit most of the layer's times are a multiple of (1 s for AIS, 10 s
+for ADS-B, 1 h for drifters), so source fixes get `r = 0` and a small regular
+`Δq`, and an interpolated clip vertex keeps millisecond precision in `r`
+without disturbing its neighbours. Bytes per vertex, column zstd'd alone:
+
+| form                              | AIS      | ADS-B    | drifters |
+| --------------------------------- | -------- | -------- | -------- |
+| exact, stored today (u32 offsets) | 2.57     | 1.23     | 0.90     |
+| default today (u16, truncated)    | 1.83     | 0.85     | 0.51     |
+| exact, ms delta varint            | 1.34     | 0.57     | 0.23     |
+| exact, quotient/remainder         | **1.08** | **0.51** | 0.27     |
+
+### Frame-level results
+
+A 1/4 sample of tiles per corpus, zstd-3, real payloads. "Default" is today's
+default build (f64 coordinates, truncated u16 times).
+
+| variant                              | AIS     | ADS-B   | drifters |
+| ------------------------------------ | ------- | ------- | -------- |
+| exact codec vs default               | −49.4 % | −55.9 % | −53.7 %  |
+| exact codec vs `--quantize-coords`   | −27.1 % | −25.0 % | −19.5 %  |
+| grid codec vs `--quantize-coords`    | −36.3 % | −39.9 % | −41.4 %  |
+| exact codec vs default, both zstd-19 | −43.5 % | −49.9 % | not run  |
+
+The bit-exact codec is smaller than today's _lossy_ quantized build. The grid
+is 1 m for AIS and ADS-B, 10 m for drifters. Flights behave like the others:
+the time-aware predictor is chosen for 50 % of flight features and constant
+velocity for 41 %.
+
+Layout choices, AIS, each against the alternative: a side section instead of
+Arrow `Binary` columns −4.8 %; a per-feature predictor tag instead of one per
+layer −1.6 %; the first vertex relative to the previous feature's −1.9 %; three
+predictors instead of delta only −5.2 % (−13 % on ADS-B).
+
+An order-0 entropy bound on the grid residuals is 1.23 B per vertex on AIS
+against 1.71 for varint + zstd (2.47 against 2.99 on ADS-B). A custom entropy
+coder could take roughly a fifth off the geometry stream. That is not enough to
+justify a second decoder in JavaScript.
+
+### What was built
+
+- **Format.** Layer-frame section `0x06 PATH_CODEC`, must-understand
+  capability `path-codec`. The CORE batch keeps its `geometry` and
+  `vertex_time` columns but with every list empty, so the schema template does
+  not fork; the decoder substitutes the reconstructed columns before anything
+  downstream sees the layer.
+- **Rust.** `stt-core::arrow_tile::path_codec`, frame integration, the
+  capability, `stt-build --path-codec` (off by default, not enabled by
+  `--auto`), a `[path-codec]` line in `stt-optimize inspect`, conformance
+  vectors in `conformance/vectors/path-codec/`.
+- **TypeScript.** `packages/core/src/path-codec.ts` in poopdeck.gl, substituted
+  at the same stage that undoes the compact time columns. No renderer backend
+  changed.
+
+Pack bytes of real builds, zstd-3:
+
+| corpus          | without the codec       | `--path-codec` | change  |
+| --------------- | ----------------------- | -------------- | ------- |
+| AIS, f64        | 905.5 MB (default)      | 441.4 MB       | −51.3 % |
+| ADS-B, f64      | 1967.6 MB (exact times) | 834.7 MB       | −57.6 % |
+| drifters, f64   | 506.2 MB (default)      | 220.4 MB       | −56.5 % |
+| AIS, 1 m grid   | 621.2 MB                | 378.3 MB       | −39.1 % |
+| ADS-B, 1 m grid | 1130.7 MB               | 658.8 MB       | −41.7 % |
+
+The ADS-B f64 baseline is the exact-time build, which the frame-level emulation
+puts 2.4 % above the default; no default ADS-B f64 archive was built.
+
+**Oracle.** `path-codec-equivalence` decodes every tile of a codec archive and
+of the same build without the codec at `--vertex-time-precision 1`, and
+compares geometry by bit pattern, vertex times as absolute milliseconds, and
+every other column by Arrow equality. AIS, ADS-B and drifters in f64 and an
+ADS-B grid build are identical: 905,688 tiles, 257 M vertices. poopdeck.gl
+carries the same oracle as an opt-in test
+(`packages/core/test/path-codec-archive-equivalence.test.ts`).
+
+**Reader cost.** The TypeScript decoder costs 20–25 ns per vertex for a whole
+`decodeTile` against about 6 ns for a plain quantized tile, which is +14–19 ms
+per million vertices in the worker pool. Most of it is varint decoding in
+JavaScript (four varints per vertex). Round 1's bench had estimated +7–13 ms.
+
+### What the code reading turned up in the tiler
+
+None of these is a codec matter. They are recorded here because a codec that
+claims exactness has to say exact _to what_: the codec reproduces the tiler's
+output, and the tiler's output differs from the source in these ways.
+
+- **Repeated positions are dropped.** The clipper pushes a vertex only if it
+  moved more than 1e-9° from the last one (`clip.rs`), so a stationary object's
+  later fixes, and their timestamps, are gone.
+- **Exit and re-entry are joined.** A track that leaves a tile and comes back is
+  stored as one segment, with a straight edge from the exit point to the
+  re-entry point.
+- **Clip vertices are not flagged.** Nothing marks a vertex as interpolated.
+- **`additive-partition` is emitted by `--additive-lod` but is not in
+  `KNOWN_CAPABILITIES`**, so the Rust reader appears to refuse such an archive
+  at open. Round 1's `ais-q1-add` produced no harness output, which fits. Not
+  verified further.
+
+### Plan
+
+Done on branch `trajectory` in both repositories, uncommitted.
+
+1. **Land it.** The new conformance vectors need a `Rebuild-Window: R1` commit
+   trailer for the `pins` gate. poopdeck.gl's vendored copies were synced from
+   the local checkout; its pinned ref moves once upstream is pushed.
+2. **Release the reader first.** A published `@poopdeck.gl/core` that declares
+   `path-codec` has to exist before any hosted archive is rebuilt with the
+   flag. Only then is default-on worth discussing.
+3. **Make `measure` see trajectories** (end time, per-vertex times, clipping in
+   the synthetic layout). Until it does, `--auto` cannot recommend the codec on
+   evidence.
+4. **Next size levers, in measured order:**
+   - a shared zstd dictionary: a further −9 % (ADS-B) to −33 % (drifters) on
+     codec tiles, most at deep zooms where tiles are under 1 KB. Blocked on the
+     TypeScript zstd decoder, which cannot take a dictionary;
+   - clip-vertex patches: 14 % of an AIS codec tile. A clip vertex is a
+     deterministic function of its two source neighbours and the tile edge, so
+     it could be derived instead of patched, at the price of freezing the
+     clipper's arithmetic into the format;
+   - the per-segment wire id: 5–6 % of a codec tile, and no trips renderer
+     reads it. The dense-id renumbering (`IdRenumberMap`) is written but not
+     wired.
+5. **Reader cost.** If +14–19 ms per million vertices shows up in frame
+   pacing, the options are a WASM decode path or a fixed-width residual layout
+   that trades bytes for speed. Not started; no evidence yet that it is needed.
+6. **Scope.** v1 covers 2-wide LineString layers. Static lines are already
+   eligible but unmeasured (osm-streets is the obvious corpus). Polygon rings
+   and 3-wide coordinates are not covered.
+7. **Still open from round 1:** the quantization-aware greedy keyframe selector
+   for `--simplify --time-aware-simplify` (20–30 % over TD-TR).
+
 ## Limits of this record
 
-- One day of AIS and three months of drifters. Flights could not be fetched (see
-  Setup), so dense, smooth, high-speed motion is represented only by AIS-underway.
-- Column-alone and whole-layer IPC sizes, not a real encoder change. The
-  whole-layer ratio is the honest number. The 27–35 % margin over zstd-19 makes
-  a sign flip implausible, but the `measure` harness on a real encode is the
-  gate.
+- One day of AIS, three months of drifters, and (round 2) 18.5 hours of CONUS
+  flights at 10 s cadence. Round 1's lossy comparison (§2) still has only
+  AIS-underway as its smooth corpus; it was not rerun on flights.
+- Round 1's sizes are column-alone and whole-layer IPC, not a real encoder
+  change, and its whole-layer ratio is overstated (see round 2). Round 2's are
+  real payloads and real builds.
 - Lossy error is measured at the original fixes only. There is no ground truth
   between them, which is exactly why fitted curves cannot claim to be more
   accurate there.
@@ -305,4 +510,23 @@ cargo run --release -p stt-core --example trajectory-codec -- ais-q1/manifest.js
 cargo run --release -p stt-core --example trajectory-lossy -- ais.bin
 # poopdeck.gl: reader cost
 node tools/bench/trajectory-codec/decode-bench.mjs ais.bin 1
+```
+
+Round 2:
+
+```bash
+# poopdeck.gl: flights corpus from adsb.lol globe_history heatmap files
+python tools/bench/trajectory-codec/prep.py adsb heatmap/*.bin.ttf adsb.parquet
+
+# exact-time reference and codec builds (same flags otherwise)
+stt-build -i ais.parquet -o ais-f64x -t start_time --end-time-field end_time \
+  --min-zoom 4 --max-zoom 12 --temporal-bucket 1h --vertex-time-precision 1
+stt-build -i ais.parquet -o ais-pc   -t start_time --end-time-field end_time \
+  --min-zoom 4 --max-zoom 12 --temporal-bucket 1h --path-codec
+
+# frame-level estimates on the reference: <manifest> <grid m> <every nth tile> <zstd level>
+cargo run --release -p stt-core --example trajectory-frontier -- ais-f64x/manifest.json 1 4 3
+# oracle: the codec archive decodes like the reference
+cargo run --release -p stt-core --example path-codec-equivalence -- \
+  ais-pc/manifest.json ais-f64x/manifest.json
 ```

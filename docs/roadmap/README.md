@@ -77,9 +77,14 @@ Three house rules:
   program: the formal problem statements, the six defects and the design that
   answers them, the work items, and the conformance obligations.
 - [**trajectory-codec-2026-11.md**](./trajectory-codec-2026-11.md) — motion
-  codecs vs. what STT ships: tile-local predictive coding of quantized
-  trajectories (−38…−48 % whole-tile, lossless) and `vertex_time` delta coding
-  bear fruit; fitted motion curves and a swept-bounds segment index do not.
+  codecs vs. what STT ships: per-feature predictive coding of trajectories
+  bears fruit (−51…−58 % on real default builds, bit-exact, with exact vertex
+  times; −39…−42 % on quantized builds); fitted motion curves and a
+  swept-bounds segment index do not. Carries the plan for what comes next.
+  Path codec: **landed (opt-in)**.
+- [**path-codec-wire-2026-11.md**](./path-codec-wire-2026-11.md) — **landed
+  (opt-in)**; wire-choice rationale, with normative text in
+  [packed spec §5.2.7](../spec/stt-packed-format.md#527-path-codec-section-path_codec--capability-path-codec).
 - [**formal-semantics-2026-08.md**](./formal-semantics-2026-08.md) — the
   semantic layer under the format trilogy: the enforced laws and the
   adjudication register.
