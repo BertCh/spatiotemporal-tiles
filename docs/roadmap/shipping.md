@@ -4,10 +4,10 @@ _How this project is published, why the scheme looks the way it does, and what
 was counted out. Behavior of the CLIs themselves lives in
 [../api/cli-reference.md](../api/cli-reference.md)._
 
-> **Status note (2026-08-26).** This is a decision record, so dated registry
+> **Status note (2026-11-22).** This is a decision record, so dated registry
 > observations below are retained as history. For the current release procedure,
 > use [CONTRIBUTING.md](../../CONTRIBUTING.md#releasing). The checked-in manifests
-> currently define Rust **0.8.0** with MSRV **1.88**. Rust crates are published
+> currently define Rust **0.9.0** with MSRV **1.88**. Rust crates are published
 > manually in dependency order; cargo-dist binaries require a `v{version}` tag
 > followed by a manual **Release** workflow dispatch. The deleted release-plz
 > workflow is not part of the current release path.
@@ -71,7 +71,7 @@ minor versions behind what the same tree had already shipped to npm. See
   relates the two stacks is the archive's `formatVersion`, declared in
   `project-status.json` on each side — read that, not the version string. The
   four published crates share one `[workspace.package] version`, currently
-  **0.8.0**, and `sync-versions.mjs --check` gates the internal path-dep pins
+  **0.9.0**, and `sync-versions.mjs --check` gates the internal path-dep pins
   against it.
 - Rust tag: `v{version}` (created manually; cargo-dist consumes it when the
   Release workflow is dispatched). npm's tags live downstream and cannot collide
